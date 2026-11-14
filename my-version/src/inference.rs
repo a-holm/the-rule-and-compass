@@ -36,6 +36,81 @@ pub fn normal_cdf(x: f64) -> f64 {
 
 pub use crate::noise::normal_quantile;
 
+/// #1184: upper tail `P(T > t)` of Student's t with `df` degrees of freedom,
+/// from the regularised incomplete beta function (continued fraction, `f64`).
+/// A tail below the normal tail never occurs for `t > 0`.
+pub fn student_t_sf(t: f64, df: f64) -> f64 {
+    if t.is_nan() || !(df > 0.0) {
+        return f64::NAN;
+    }
+    if t == f64::INFINITY {
+        return 0.0;
+    }
+    if t == f64::NEG_INFINITY {
+        return 1.0;
+    }
+    if t < 0.0 {
+        return 1.0 - student_t_sf(-t, df);
+    }
+    // sf = I_x(df/2, 1/2) / 2 with x = df / (df + t^2); y = 1 - x without cancellation.
+    let (a, b) = (df / 2.0, 0.5);
+    let x = df / (df + t * t);
+    let y = t * t / (df + t * t);
+    let ln_front = crate::diagnostics::ln_gamma(a + b) - crate::diagnostics::ln_gamma(a) - crate::diagnostics::ln_gamma(b)
+        + a * x.ln()
+        + b * y.ln();
+    let i = if x < (a + 1.0) / (a + b + 2.0) {
+        ln_front.exp() * beta_cf(a, b, x) / a
+    } else {
+        1.0 - ln_front.exp() * beta_cf(b, a, y) / b
+    };
+    0.5 * i
+}
+
+/// Continued fraction of the incomplete beta function (modified Lentz).
+fn beta_cf(a: f64, b: f64, x: f64) -> f64 {
+    const TINY: f64 = 1e-300;
+    let (qab, qap, qam) = (a + b, a + 1.0, a - 1.0);
+    let mut c = 1.0;
+    let mut d = 1.0 - qab * x / qap;
+    if d.abs() < TINY {
+        d = TINY;
+    }
+    d = 1.0 / d;
+    let mut h = d;
+    for m in 1..=2000 {
+        let m = m as f64;
+        let m2 = 2.0 * m;
+        let aa = m * (b - m) * x / ((qam + m2) * (a + m2));
+        d = 1.0 + aa * d;
+        if d.abs() < TINY {
+            d = TINY;
+        }
+        c = 1.0 + aa / c;
+        if c.abs() < TINY {
+            c = TINY;
+        }
+        d = 1.0 / d;
+        h *= d * c;
+        let aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2));
+        d = 1.0 + aa * d;
+        if d.abs() < TINY {
+            d = TINY;
+        }
+        c = 1.0 + aa / c;
+        if c.abs() < TINY {
+            c = TINY;
+        }
+        d = 1.0 / d;
+        let del = d * c;
+        h *= del;
+        if (del - 1.0).abs() < 1e-16 {
+            break;
+        }
+    }
+    h
+}
+
 pub fn mean(x: &[f64]) -> f64 {
     if x.is_empty() {
         f64::NAN

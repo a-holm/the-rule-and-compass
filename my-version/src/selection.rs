@@ -715,6 +715,7 @@ pub const ROBUST_SEED: u64 = 0x9e37_79b9_7f4a_7c15;
 pub enum SelectRule {
     ValidationObjective,
     Robust,
+    Occam,
 }
 
 impl SelectRule {
@@ -722,8 +723,9 @@ impl SelectRule {
         match s.trim().to_ascii_lowercase().as_str() {
             "validation_objective" | "validation-objective" => Ok(SelectRule::ValidationObjective),
             "robust" => Ok(SelectRule::Robust),
+            "occam" => Ok(SelectRule::Occam),
             other => Err(format!(
-                "unknown --select-rule '{}' (expected validation_objective or robust)",
+                "unknown --select-rule '{}' (expected validation_objective, robust or occam)",
                 other
             )),
         }
@@ -733,6 +735,7 @@ impl SelectRule {
         match self {
             SelectRule::ValidationObjective => "validation_objective",
             SelectRule::Robust => "robust",
+            SelectRule::Occam => "occam",
         }
     }
 }
