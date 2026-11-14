@@ -259,6 +259,8 @@ the CPU f64 evaluator would silently select against a different objective.
 A checkpoint written before this record existed loads as `backend unknown` and
 is allowed to resume (there is no saved identity to check).
 
+Every snapshot of one process (periodic boundary saves and the exit save) writes the same `backend` value. It is `gpu` when the device scored candidates in this process or defers the whole evaluation to the device, and `cpu` otherwise. A run whose device only fits constants (a metric with no native device score, so the host scores every candidate) is a `cpu` run: both its periodic and its exit checkpoints say `cpu`, and a resume computes the same `cpu` from the configuration. The checkpoint bytes of every other run (CPU runs, native device metric runs) are unchanged. For a fit-only device run the periodic checkpoints now also carry `error_kind f64` (they carried `f32_proxy`) and the build identity of the `cpu` backend (no device or driver). A checkpoint that an older binary wrote periodically during a fit-only device run says `gpu` and an older exit checkpoint of the same run says `cpu`; the saved value is read as written, so the `gpu` one is refused on the `cpu` resume until `--allow-backend-change` is given, as before.
+
 ## Determinism guarantee and its limits
 
 Given the same data, seed, configuration and a checkpoint taken at a generation
