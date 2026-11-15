@@ -2263,17 +2263,6 @@ impl Accum {
             let regime_states: Vec<Vec<bool>> = regime_values.iter().map(|v| v.iter().map(|&s| s > 0.5).collect()).collect();
             // #1203: the in-report candidate columns sit on the target grid of the rows before the gate.
             let column_times = (want_columns && !target_grid).then(|| target_times(&d.test_rows));
-            if let Some(Some(k)) = plan.switches.first().copied() {
-                let mut last: HashMap<u64, (bool, u64)> = HashMap::new();
-                let mut next = 0u64;
-                for i in 0..d.test_rows.len() {
-                    let on = d.test_states[k][i] > 0.5;
-                    let g = d.test_rows[i].group;
-                    let id = match last.get(&g) { Some(&(s, id)) if s == on => id, _ => { next += 1; next } };
-                    last.insert(g, (on, id));
-                    d.test_rows[i].group = (1u64 << 50) + id;
-                }
-            }
             if let Some(k) = plan.mask {
                 apply_mask(&mut d, k, window_index);
             }

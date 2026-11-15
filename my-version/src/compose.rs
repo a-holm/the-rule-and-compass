@@ -993,7 +993,7 @@ pub fn compose(req: &Request, book: &FitnessBook, slices: &Slices, ctx: &Context
 
     // Validation rows: every composite that is not pruned.
     let validation_states: Vec<Vec<bool>> = slices.gates.iter().map(|g| g.validation.clone().unwrap_or_default()).collect();
-    let val = slice_vals(req, &columns, slices.validation_values, &slices.validation.rows, &[], { let _ = &validation_states; None }).map_err(|e| (2, format!("validation rows: {}", e)))?;
+    let val = slice_vals(req, &columns, slices.validation_values, &slices.validation.rows, &[], Some(&validation_states)).map_err(|e| (2, format!("validation rows: {}", e)))?;
     let vspec = TradingSpec { segment_starts: ctx.validation_segments.to_vec(), ..ctx.spec.clone() };
     let mut scored: Vec<Option<Scored>> = Vec::with_capacity(composites.len());
     for c in &composites {
@@ -1096,7 +1096,7 @@ pub fn compose(req: &Request, book: &FitnessBook, slices: &Slices, ctx: &Context
 
     // The test rows, read now that the finalist is fixed.
     let test_states: Vec<Vec<bool>> = slices.gates.iter().map(|g| g.test.clone()).collect();
-    let test = slice_vals(req, &columns, slices.test_values, &slices.test.rows, &[], { let _ = &test_states; None }).map_err(|e| (2, format!("test rows: {}", e)))?;
+    let test = slice_vals(req, &columns, slices.test_values, &slices.test.rows, &[], Some(&test_states)).map_err(|e| (2, format!("test rows: {}", e)))?;
     let tspec = TradingSpec { segment_starts: ctx.test_segments.to_vec(), ..ctx.spec.clone() };
     let c = &composites[finalist];
     let vpred = pred(c, &val);
