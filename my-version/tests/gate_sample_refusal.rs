@@ -57,7 +57,7 @@ fn write_store(dir: &Path, csv: &str) -> String {
 fn write_spec(dir: &Path) -> String {
     let text = "{\"schema\":\"rcsr-target-spec/1\",\"targets\":[{\"column\":\"y\",\"name\":\"raw_target\",\
          \"kind\":\"forward_return\",\"deprecated\":false,\"return_column\":\"r\",\"return_units\":\"log\",\
-         \"horizon_seconds\":900,\"entry_offset_seconds\":0,\"delay_seconds\":0,\
+         \"horizon_seconds\":900,\"stride_seconds\":900,\"entry_offset_seconds\":0,\"delay_seconds\":0,\
          \"entry_price\":\"open\",\"exit_price\":\"close\",\"offset\":0.0,\
          \"scale\":{\"kind\":\"constant\",\"value\":1.0},\"clip\":null,\"units\":\"log_return\",\
          \"cost_bps\":null,\"cost_in_label\":false,\"construction_columns\":[],\"note\":null}]}";
@@ -163,9 +163,9 @@ fn assert_refused(o: &Output, flags: &[&str], dir: &Path) {
 #[test]
 fn sample_rows_refused_with_gate_commands() {
     let f = fixture();
-    assert_refused(&masked(&f, &["--sample-rows", "100"]), &["--sample-rows", "--pnl-mask"], &f.dir);
-    assert_refused(&compose(&f, &["--sample-rows", "100"]), &["--sample-rows", "rcsr compose"], &f.dir);
-    assert_refused(&switch(&f, &["--sample-rows", "100"]), &["--sample-rows", "rcsr switch"], &f.dir);
+    assert_refused(&masked(&f, &["--sample-rows", "1000"]), &["--sample-rows", "--pnl-mask"], &f.dir);
+    assert_refused(&compose(&f, &["--sample-rows", "1000"]), &["--sample-rows", "rcsr compose"], &f.dir);
+    assert_refused(&switch(&f, &["--sample-rows", "1000"]), &["--sample-rows", "rcsr switch"], &f.dir);
     // n at or above the row count is a full load; the flag is what is refused.
     assert_refused(&masked(&f, &["--sample-rows", "999999"]), &["--sample-rows", "--pnl-mask"], &f.dir);
 }
@@ -183,7 +183,7 @@ fn sample_rows_without_a_gate_still_runs() {
     let f = fixture();
     let mut args = vec!["--data", &f.store, "--target-spec", &f.spec];
     args.extend_from_slice(&RUN_FLAGS);
-    args.extend(["--fitness", "pnl", "--cpu", "--seed", "3", "--generations", "1", "--pop", "8", "--sample-rows", "100", "--json"]);
+    args.extend(["--fitness", "pnl", "--cpu", "--seed", "3", "--generations", "1", "--pop", "8", "--sample-rows", "1000", "--json"]);
     let o = run(&args);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
 }
