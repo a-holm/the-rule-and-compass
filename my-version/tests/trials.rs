@@ -792,3 +792,63 @@ fn trials_refuse_mixed_missing_score_rules() {
     let o = run(&["trials", "--wf", &flat, &same, "--draws", "50", "--block-len", "8"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
 }
+
+/// #1176: a `walkforward --front --all-members` report on a 3-symbol panel and a front of 3 members.
+fn members_report(dir: &Path) -> String {
+    let mut csv = String::from("ts,sym,x,target\n");
+    for i in 0..300i64 {
+        for (s, sym) in ["A", "B", "C"].iter().enumerate() {
+            let s = s as i64;
+            let x = ((i * 7 + s * 3) % 11) as f64 - 5.0;
+            let y = (((i * 5 + s * 7) % 13) as f64 - 6.0) / 4096.0;
+            csv.push_str(&format!("{},{},{},{}\n", i * 3600, sym, x, y));
+        }
+    }
+    let data = dir.join("panel.csv");
+    std::fs::write(&data, csv).unwrap();
+    let front = dir.join("run.json");
+    std::fs::write(
+        &front,
+        r#"{"tool":"rcsr","variables":["x"],"target_spec":{"return_column":"target"},
+        "split":{"train_time":[0,356400],"validation_time":[360000,536400],"required_purge_seconds":3600,"purge_seconds":3600},
+        "objective":{"spec":{"threshold":0,"per_side_bps":10}},
+        "pareto":[{"expression":"x"},{"expression":"0.5 - x"},{"expression":"sqrt(x) - 1"}]}"#,
+    )
+    .unwrap();
+    let out = dir.join("wf_members.json");
+    let o = run(&[
+        "walkforward", "--data", data.to_str().unwrap(), "--time", "ts", "--group-by", "sym", "--horizon", "3600",
+        "--periods-per-year", "8760", "--front", front.to_str().unwrap(), "--all-members", "--period-grid", "target",
+        "--window", "w,0,540000,543600,1080000", "--json", "--out", out.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    out.to_string_lossy().into_owned()
+}
+
+#[test]
+fn trials_reads_members() {
+    let (_s, dir) = trials_dir();
+    let report = members_report(&dir);
+    let all = stdout_json(&run(&["trials", "--wf", &report, "--members", "all", "--draws", "50"]));
+    assert_eq!(num(&all, &["series"]), 3.0);
+    let labels: Vec<String> = match at(&all, &["members"]) {
+        Json::Arr(m) => m.iter().map(|e| at(e, &["label"]).as_str().unwrap().to_string()).collect(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(labels, ["wf_members#1", "wf_members#2", "wf_members#3"]);
+    for args in [vec![], vec!["--members", "selected"]] {
+        let one = stdout_json(&run(&[&["trials", "--wf", report.as_str(), "--draws", "50"][..], &args].concat()));
+        assert_eq!(num(&one, &["series"]), 1.0, "{args:?}");
+    }
+    // A report without members, an unknown mode and --compare are refused.
+    let plain = write_report(&dir, "plain", &noise(N, 1, 0.01), &Spec::new(N));
+    let o = run(&["trials", "--wf", &plain, "--members", "all", "--draws", "50"]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).contains("'members'") && stderr(&o).contains("--all-members"), "{}", stderr(&o));
+    let o = run(&["trials", "--wf", &report, "--members", "some", "--draws", "50"]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).contains("--members must be all or selected"), "{}", stderr(&o));
+    let o = run(&["trials", "--compare", &report, &report, "--members", "all", "--draws", "50"]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).contains("--members does not apply to --compare"), "{}", stderr(&o));
+}

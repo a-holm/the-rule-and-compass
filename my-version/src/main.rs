@@ -11785,6 +11785,20 @@ OPTIONS:
                              period_entries and period_bh, so `rcsr trials --regimes`
                              reports exposure and alpha per stratum (implied by the
                              regime flags above)
+  --emit-series              #1176: --period-series plus pooled.period_cost (gross - net,
+                             so gross - m x cost is the net at m times the cost),
+                             period_entry_stamp (1 when a row enters a long run),
+                             period_bh_net (the buy-and-hold control of the same rows
+                             at the report cost) and entry_times (distinct entry stamps)
+  --all-members              #1176, with --front: also price every front member alone
+                             with its own carried threshold and band, as --expr <member>
+                             would, into members[] (archive_rank, complexity, expression,
+                             constant, dropped_rows, per-window metrics, pooled metrics
+                             with entry_times and cost_ladder, and the --emit-series
+                             series); selection.source front_all_members, diagnostic true.
+                             The selection of the report is unchanged and no member feeds
+                             it; implies --emit-series. --select-band, --threshold-fit,
+                             --policy vote and --locked-test exit 2
   --block-len <L>            block length in periods (default
                              max(h, hold, n^(1/3))); must be >= max(h, hold)
   --null-draws <B>           draws of the hour-block permutation null and the
@@ -12011,6 +12025,8 @@ fn run_walkforward(args: &[String]) -> ! {
     let mut regime_band_arg: Option<String> = None;
     let mut regime_dwell_arg: Option<String> = None;
     let mut period_series = false;
+    let mut emit_series = false;
+    let mut all_members = false;
 
     let need = |args: &[String], i: usize, flag: &str| -> String {
         match args.get(i) {
@@ -12133,6 +12149,8 @@ fn run_walkforward(args: &[String]) -> ! {
                 i += 1;
             }
             "--period-series" => period_series = true,
+            "--emit-series" => emit_series = true,
+            "--all-members" => all_members = true,
             "--threshold-quantile" => {
                 quantile = number(
                     need(args, i + 1, "--threshold-quantile"),
@@ -12391,6 +12409,12 @@ fn run_walkforward(args: &[String]) -> ! {
         eprintln!("error: {}", msg);
         std::process::exit(EXIT_INPUT);
     };
+    if all_members {
+        let vote = policy == walkforward::Policy::Vote;
+        if let Some(msg) = walkforward::all_members_conflict(front_path.is_some(), band_select, threshold_fit, vote, locked_test) {
+            usage_fail(&msg);
+        }
+    }
     // #487: one declaration of the label window, the return units and the
     // cost, read from a target spec or from the run that selected the book.
     let given = |names: &[&str]| args.iter().any(|a| names.iter().any(|n| a == n || a.starts_with(&format!("{}=", n))));
@@ -12534,6 +12558,7 @@ fn run_walkforward(args: &[String]) -> ! {
             run: path.clone(),
             run_sha256: run.sha256.clone(),
             labels: run.front.iter().map(|m| format!("front_rank_{}", m.rank)).collect(),
+            ranks: run.front.iter().map(|m| m.rank).collect(),
         });
         if vars_src.is_none() && !run.variables.is_empty() {
             vars_src = Some(run.variables.join(","));
@@ -12728,7 +12753,9 @@ fn run_walkforward(args: &[String]) -> ! {
             enforce_gate_columns("objective.spec.pnl_mask", &g.columns, &specs, &names, false);
         }
     }
-    popts.period_series = period_series;
+    popts.emit_series = emit_series || all_members;
+    popts.all_members = all_members;
+    popts.period_series = period_series || popts.emit_series;
     let horizon = horizon.unwrap_or(0.0);
     let target = target.unwrap_or_else(|| {
         eprintln!("error: walkforward needs --target\n\n{}", walkforward_usage());

@@ -203,6 +203,7 @@ long/flat from the training mean, matched-exposure random long seeded by
 `--control-seed`) with exposure, turnover, beta and excess over cash; see
 `src/baselines.rs`.
 `--front run.json` takes the candidates from the Pareto front of a run, carries the run's threshold and per-side cost, defaults `--trials` to the front size (the search trials only when a window is in sample; `--from-run` uses one trial for an out-of-sample book) and refuses a window that tests rows the run trained or selected on (`docs/walkforward.md`).
+`--front run.json --all-members` (#1176) also prices every front member alone, with its own carried threshold and band, into `members[]` (per-window and pooled metrics, cost ladder, entry timestamps and per-period series) without changing the selection; `--emit-series` writes the per-period gross, cost, exposure, entries, entry stamps and buy-and-hold net beside `pooled.period_net`, and `rcsr trials --members all` reads one series per member (`docs/walkforward.md`).
 Pass `--batch-pnl` to score every candidate on every window in one batch (`src/wf_batch.rs`, kernel `src/cuda/wf_batch.cu`), per window and pooled, with the baseline ladder; finalist values stay exact CPU f64 and batch values are labelled `gpu_proxy`. Its timings are printed in a separate `batch_timings` object, outside `report_sha256`.
 `--policy top-tercile` holds the top `floor(n/3)` finite scores of each timestamp long and the rest flat (no threshold); it prices the book of a search run with `--position top_tercile` on an `xs_rank` target made by `rcsr panel rank` (`docs/time-series.md`).
 
@@ -254,7 +255,7 @@ rcsr ladder --data panel.rcsb --target y60 --return-col fwd60 --time ts --group 
   --vol-col vol96 --reversal-col ret_1 --signal-col trend96 --sr-run pilot/A2.run.json --out ladder.json --markdown ladder.md
 ```
 
-`--sr-run` scores the finalist of one search run on every fold; a fold that starts before the run's last seen row plus purge is refused (exit 3) unless `--allow-in-sample`, which labels it `oof:false` and drops it from every pooled statistic. `rcsr ablation score` applies the same check.
+`--sr-run` scores the finalist of one search run on every fold; a fold that starts before the run's last seen row plus purge is refused (exit 3) unless `--allow-in-sample`, which labels it `oof:false` and drops it from every pooled statistic. `rcsr ablation score` applies the same check. A run that searched under `--pnl-mask` (`objective.spec.pnl_mask`) exits 2 naming `pnl_mask`: the rung prices the raw formula and cannot price a mask; `walkforward --from-run` prices it.
 
 `rcsr ablation` runs the add-one-family ablation under the decision rule committed in `protocol/ablation.json`: arms `A0` (B0) to `A5`, a fixed generation budget, 3 seeds per arm (5 with `--finalist`), one manifest per arm, a placebo arm and a circular-block-permuted arm. `rcsr ablation prepare` builds the null columns separately per segment of every guarded locked range and its purge band (`--purge-seconds`, `--target-spec`, default 219,600 s) and lists the segments in `<csv>.lockbox.json`. `rcsr --arm A1` writes the arm, the feature-list hash, the generation budget and the generations reached into run.json.
 

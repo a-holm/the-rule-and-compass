@@ -152,6 +152,12 @@ pub struct ProtocolOptions {
     /// #1203: what the book does on a row with a finite target and no finite
     /// score (`--missing-score`).
     pub missing_score: MissingScore,
+    /// #1176: `--emit-series`: the pooled block adds the cost, entry-stamp and
+    /// buy-and-hold net series and `entry_times` to the #1175 series.
+    pub emit_series: bool,
+    /// #1176: `--all-members`: every candidate of `--front` is also priced alone,
+    /// with its own carried threshold and band, into `members`. Reporting only.
+    pub all_members: bool,
 }
 
 /// #1214: a candidate whose book is a switch, and the run field it came from.
@@ -273,6 +279,8 @@ pub struct FrontSource {
     pub run_sha256: String,
     /// Archive rank label of every candidate, in candidate order.
     pub labels: Vec<String>,
+    /// #1176: archive rank of every candidate, in candidate order.
+    pub ranks: Vec<usize>,
 }
 
 impl Default for ProtocolOptions {
@@ -308,11 +316,12 @@ impl Default for ProtocolOptions {
             threshold_fit: None,
             mask: None,
             regimes: None,
-            regime_exprs: Vec::new(),
             period_series: false,
             period_grid: PeriodGrid::Score,
             switches: Vec::new(),
             missing_score: MissingScore::Flat,
+            emit_series: false,
+            all_members: false,
         }
     }
 }
@@ -754,6 +763,10 @@ pub struct Report {
     pub gate: Option<String>,
     /// #1175: per-period exposure, entries, gross and buy-and-hold beside `period_net`.
     pub period_extra: Option<PeriodExtra>,
+    /// #1176: print the `--emit-series` fields of `period_extra`.
+    pub emit_series: bool,
+    /// #1176: every front member priced alone (`--all-members`).
+    pub members: Option<Vec<Member>>,
     /// #487: cost source and return units of the book.
     pub cost: crate::target::CostDecl,
     pub cost_bps: f64,
@@ -838,6 +851,19 @@ pub struct Report {
     pub economics: crate::wf_protocol::Economics,
     pub inference: Option<crate::wf_protocol::Inference>,
     dropped_rows: usize,
+}
+
+/// #1176: one front member priced alone under `--all-members`: the report of
+/// `--expr <member>` with the member's carried threshold and band. Nothing in
+/// it feeds the selection of the parent report.
+#[derive(Clone, Debug)]
+pub struct Member {
+    pub archive_rank: usize,
+    pub label: String,
+    pub complexity: usize,
+    /// The expression has no input: the book takes one position on every row.
+    pub constant: bool,
+    pub report: Report,
 }
 
 /// A one-sided binomial sign test over fold expectancies.
@@ -1563,6 +1589,29 @@ pub fn threshold_fit_refusal(spec: &EvalSpec, opts: &ProtocolOptions) -> Option<
     None
 }
 
+/// #1176: the refusal of `--all-members` for these inputs, or `None`. The CLI
+/// reports it as a usage error before any data work.
+pub fn all_members_conflict(front: bool, band_select: bool, threshold_fit: bool, vote: bool, locked_read: bool) -> Option<String> {
+    if !front {
+        return Some("--all-members needs --front: it prices every member of a run's Pareto front".to_string());
+    }
+    if locked_read {
+        return Some("--all-members refuses --locked-test: a locked read reports the sealed candidate only".to_string());
+    }
+    let refused = [(band_select, "--select-band"), (threshold_fit, "--threshold-fit"), (vote, "--policy vote")];
+    refused.iter().find(|(set, _)| *set).map(|(_, flag)| {
+        format!("--all-members refuses {}: it prices every front member with its carried threshold and band and selects none", flag)
+    })
+}
+
+/// #1176: why `--all-members` cannot run with this spec, or `None`.
+pub fn all_members_refusal(spec: &EvalSpec, opts: &ProtocolOptions) -> Option<String> {
+    if !opts.all_members {
+        return None;
+    }
+    all_members_conflict(opts.front.is_some(), spec.band_select, opts.threshold_fit.is_some(), spec.policy == Policy::Vote, opts.final_read)
+}
+
 /// Votes needed for a long row: `ceil(quorum x K)`, at least 1.
 pub fn votes_required(quorum: f64, members: usize) -> usize {
     ((quorum * members as f64 - 1e-9).ceil().max(1.0) as usize).min(members.max(1))
@@ -1646,6 +1695,9 @@ fn validate_windows(spec: &EvalSpec, opts: &ProtocolOptions) -> Result<(), Strin
             return Err(format!("the run carries {} bands for {} candidates", bands.len(), n));
         }
     }
+    if let Some(msg) = all_members_refusal(spec, opts) {
+        return Err(msg);
+    }
     if spec.policy == Policy::TopTercile {
         if let Some(msg) = top_tercile_refusal(spec, opts) {
             return Err(msg);
@@ -1664,7 +1716,7 @@ fn validate_windows(spec: &EvalSpec, opts: &ProtocolOptions) -> Result<(), Strin
     }
     let table_validation = !opts.validation_starts.is_empty()
         && spec.windows.iter().all(|w| opts.validation_starts.iter().any(|(l, _)| *l == w.label));
-    if spec.candidates.len() > 1 && spec.policy != Policy::Vote && spec.validation_frac <= 0.0 && !table_validation {
+    if spec.candidates.len() > 1 && spec.policy != Policy::Vote && spec.validation_frac <= 0.0 && !table_validation && !opts.all_members {
         return Err(
             "multiple --expr candidates need a validation slice (--validation-frac > 0 or a windows \
              table with validation_start): select on a validation slice, never on the test block"
@@ -1808,6 +1860,7 @@ fn table_group_ids(table: &Table, col: usize) -> Vec<u64> {
 // Accumulation
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct RowBase {
     time: f64,
     group: u64,
@@ -1833,6 +1886,8 @@ struct WindowData {
     train_target_n: u64,
     /// Latest stamp of any row that entered training or validation.
     train_max_time: f64,
+    /// #1176: training rows outside the validation slice, scored or not.
+    train_seen: usize,
     dropped: usize,
     /// #1094: the training rows and every candidate's score on them (NaN kept),
     /// the source of a fitted cut in a window without a validation slice.
@@ -1925,6 +1980,7 @@ impl Accum {
                 train_target_sum: 0.0,
                 train_target_n: 0,
                 train_max_time: f64::NEG_INFINITY,
+                train_seen: 0,
                 dropped: 0,
                 keep_train_rows: opts.threshold_fit.is_some() && validation_start.is_none(),
                 train_rows: Vec::new(),
@@ -2027,6 +2083,107 @@ impl Accum {
         Ok(())
     }
 
+    /// #1176: the accumulation a scan of candidate `k` alone would have made:
+    /// the same rows, the scores of `k` and its own dropped-row count.
+    fn member(&self, k: usize) -> Accum {
+        let windows = self
+            .windows
+            .iter()
+            .map(|d| {
+                let test_bad = d.test_rows.iter().zip(&d.test_scores[k]).filter(|(r, s)| !r.target.is_finite() || !s.is_finite()).count();
+                WindowData {
+                    window: d.window.clone(),
+                    validation_start: d.validation_start,
+                    train_scores: vec![d.train_scores[k].clone()],
+                    train_score_max_time: vec![d.train_score_max_time[k]],
+                    validation_rows: d.validation_rows.clone(),
+                    validation_scores: vec![d.validation_scores[k].clone()],
+                    test_rows: d.test_rows.clone(),
+                    test_states: d.test_states.clone(),
+                    test_scores: vec![d.test_scores[k].clone()],
+                    train_target_sum: d.train_target_sum,
+                    train_target_n: d.train_target_n,
+                    train_max_time: d.train_max_time,
+                    train_seen: d.train_seen,
+                    dropped: d.train_seen - d.train_scores[k].len() + test_bad,
+                    keep_train_rows: d.keep_train_rows,
+                    train_rows: d.train_rows.clone(),
+                    train_row_scores: vec![d.train_row_scores[k].clone()],
+                }
+            })
+            .collect();
+        Accum {
+            locked: self.locked.clone(),
+            locked_purge: self.locked_purge,
+            locked_embargo: self.locked_embargo,
+            windows,
+            candidates: 1,
+            scores: vec![0.0],
+            pass: Pass::All,
+            forced: None,
+            test_candidates: Vec::new(),
+            vote: false,
+            threshold_fit: None,
+            gate_plan: self.gate_plan.as_ref().map(|p| GatePlan { switches: vec![p.switches.get(k).copied().flatten()], regimes: Vec::new(), ..p.clone() }),
+            n_states: self.n_states,
+            gate_warm: self.gate_warm.clone(),
+            gate_rows_read: self.gate_rows_read,
+        }
+    }
+
+    /// #1176: every front member priced alone, as `--expr <member>` with the
+    /// member's carried band. The members never enter the selection of the
+    /// parent report; they carry no bootstrap, null or batch section.
+    #[allow(clippy::too_many_arguments)]
+    fn price_members(
+        &self,
+        clock: std::time::Instant,
+        spec: &EvalSpec,
+        opts: &ProtocolOptions,
+        layout: &Layout,
+        source: &str,
+        memory_bound: &str,
+        trees: &[Node],
+    ) -> Result<Vec<Member>, String> {
+        let front = opts.front.as_ref().ok_or_else(|| "--all-members needs --front".to_string())?;
+        let expressions = candidate_expressions(spec);
+        let mut out = Vec::with_capacity(self.candidates);
+        for k in 0..self.candidates {
+            let one = EvalSpec {
+                expression: expressions[k].clone(),
+                candidates: Vec::new(),
+                band_select: false,
+                device_pnl: false,
+                ..spec.clone()
+            };
+            let one_opts = ProtocolOptions {
+                bootstrap_draws: 0,
+                null_draws: 0,
+                batch_pnl: false,
+                run_bands: opts.run_bands.as_ref().map(|b| vec![b[k].clone()]),
+                front: Some(FrontSource { labels: vec![front.labels[k].clone()], ranks: vec![front.ranks[k]], ..front.clone() }),
+                regimes: None,
+                regime_exprs: Vec::new(),
+                period_series: true,
+                emit_series: true,
+                all_members: false,
+                ..opts.clone()
+            };
+            let report = self
+                .member(k)
+                .finish(clock, &one, &one_opts, layout, source, memory_bound, &trees[k..=k])
+                .map_err(|e| format!("{}: {}", front.labels[k], e))?;
+            out.push(Member {
+                archive_rank: front.ranks[k],
+                label: front.labels[k].clone(),
+                complexity: expr::complexity(&trees[k]),
+                constant: crate::trading::is_constant(&trees[k]),
+                report,
+            });
+        }
+        Ok(out)
+    }
+
 
 
     fn finish(
@@ -2039,6 +2196,12 @@ impl Accum {
         memory_bound: &str,
         trees: &[Node],
     ) -> Result<Report, String> {
+        let member_reports = if opts.all_members {
+            Some(self.price_members(clock, spec, opts, layout, source, memory_bound, trees)?)
+        } else {
+            None
+        };
+        let emit_series = opts.emit_series || opts.all_members;
         let cost_side = spec.cost_bps / 10_000.0;
         let mut windows = Vec::with_capacity(self.windows.len());
         let mut pooled_returns: Vec<f64> = Vec::new();
@@ -2084,8 +2247,10 @@ impl Accum {
         let mut period_rows: Vec<usize> = Vec::new();
         let mut empty_periods = 0usize;
         let mut unpriced_target_rows = 0usize;
-        let want_strata = opts.regimes.is_some() || !opts.regime_exprs.is_empty() || opts.period_series;
+        let want_strata = opts.regimes.is_some() || !opts.regime_exprs.is_empty() || opts.period_series || emit_series;
         let mut strata_in = StrataIn::new(opts.regime_exprs.len());
+        let mut entry_times = 0usize;
+        let validated = self.windows.iter().all(|d| d.validation_start.is_some());
         for (window_index, mut d) in self.windows.into_iter().enumerate() {
             // #1199: the target grid, its period width and the rows that define it come from the rows before the gate.
             let grid_source = target_grid.then(|| {
@@ -2297,6 +2462,7 @@ impl Accum {
             pooled_returns.extend(on_grid(&pev.returns));
             pooled_gross.extend(on_grid(&pev.gross_returns));
             pooled_stats.add_assign(&pev.stats);
+            entry_times += pev.entry_times;
             pooled_ppy.push(ppy);
             match &grid {
                 Some(g) => {
@@ -2585,6 +2751,8 @@ impl Accum {
         };
         let selected_on = if vote {
             "none (all members vote; thresholds from validation or train rows)".to_string()
+        } else if expressions.len() > 1 && !validated {
+            "none (--all-members without a validation slice: the report book of every window is the first front member)".to_string()
         } else if expressions.len() > 1 {
             "validation".to_string()
         } else if spec.validation_frac > 0.0 {
@@ -2594,7 +2762,14 @@ impl Accum {
         };
         let (regimes, period_extra) = if want_strata {
             let r = (opts.regimes.is_some() || !opts.regime_exprs.is_empty()).then(|| strata_in.report(&pooled_returns, opts, pooled_ppy));
-            (r, Some(strata_in.extra))
+            let mut extra = strata_in.extra;
+            if emit_series {
+                extra.cost = pooled_gross.iter().zip(&pooled_returns).map(|(g, n)| g - n).collect();
+                extra.entry_stamp = extra.entries.iter().map(|&e| if e > 0.0 { 1.0 } else { 0.0 }).collect();
+                extra.bh_net = bh_all.clone();
+                extra.entry_times = entry_times;
+            }
+            (r, Some(extra))
         } else {
             (None, None)
         };
@@ -2615,6 +2790,8 @@ impl Accum {
             regimes,
             gate: gate_report_json(&plan, gate_rows_read),
             period_extra,
+            emit_series,
+            members: member_reports,
             cost: opts.cost_decl(spec.cost_bps),
             cost_bps: spec.cost_bps,
             threshold_quantile: spec.threshold_quantile,
@@ -2792,6 +2969,7 @@ fn push_scores(
                     dst.push(if score.is_finite() { score } else { f64::NAN });
                 }
             } else {
+                d.train_seen += 1;
                 if d.keep_train_rows {
                     d.train_rows.push(RowBase { time: t, group, target });
                     for (dst, &score) in d.train_row_scores.iter_mut().zip(scores) {
@@ -3052,6 +3230,8 @@ struct WindowEval {
     /// #1175: mean position and entry count of every period.
     exposure: Vec<f64>,
     entries: Vec<f64>,
+    /// #1176: distinct row timestamps with an entry.
+    entry_times: usize,
     book: Option<NullBook>,
     stats: Stats,
     first_positions: HashMap<u64, f64>,
@@ -3185,6 +3365,15 @@ pub struct PeriodExtra {
     pub bh: Vec<f64>,
     /// Bucket start of every period: the instant a calendar row is tested against.
     pub bucket_start: Vec<f64>,
+    /// #1176 (`--emit-series`): `gross - net` of every period, so the net at `m` times
+    /// the cost is `gross - m * cost`, the repricing of the cost ladder.
+    pub cost: Vec<f64>,
+    /// #1176: 1 for a period where at least one row enters a long run, else 0.
+    pub entry_stamp: Vec<f64>,
+    /// #1176: net of the buy-and-hold control on the same rows at the report cost.
+    pub bh_net: Vec<f64>,
+    /// #1176: distinct timestamps at which at least one row enters a long run.
+    pub entry_times: usize,
 }
 
 /// #1175: the pooled per-period series and the regime expression states, window by window.
@@ -3973,6 +4162,10 @@ fn evaluate_window(
     }
     let exposure: Vec<f64> = book_cross.periods.iter().map(|p| p.net_sum / p.count as f64).collect();
     let entries: Vec<f64> = book_cross.periods.iter().map(|p| p.gross_sum).collect();
+    let mut entry_stamps: Vec<f64> = (0..n).filter(|&i| entered[i] > 0.0).map(|i| rows[valid[i]].time).collect();
+    entry_stamps.sort_by(f64::total_cmp);
+    entry_stamps.dedup();
+    let entry_times = entry_stamps.len();
 
     // #310: the control ladder on the same rows, the same cost and the same
     // equal-weight period aggregation. Every control starts flat, like the
@@ -4049,6 +4242,7 @@ fn evaluate_window(
         market,
         exposure,
         entries,
+        entry_times,
         book,
         stats,
         first_positions,
@@ -4618,13 +4812,86 @@ impl WindowResult {
     }
 }
 
+impl Member {
+    /// #1176: one row of `members`: per-window metrics, pooled metrics with the
+    /// cost ladder, and the per-period series on the report's period grid.
+    fn json(&self) -> String {
+        let r = &self.report;
+        let series = |v: &[f64]| v.iter().map(|x| jnum(*x)).collect::<Vec<_>>().join(",");
+        let windows: Vec<String> = r
+            .windows
+            .iter()
+            .map(|w| {
+                format!(
+                    "{{\"label\":{},\"threshold\":{},\"threshold_source\":{},\"train_rows\":{},\"validation_rows\":{},\
+                     \"test_rows\":{},\"dropped_rows\":{},\"in_sample\":{},\"metrics\":{}}}",
+                    jstr(&w.window.label),
+                    jnum(w.threshold),
+                    jstr(&w.threshold_source),
+                    w.train_rows,
+                    w.validation_rows,
+                    w.test_rows,
+                    w.dropped_rows,
+                    w.in_sample,
+                    w.metrics.json()
+                )
+            })
+            .collect();
+        let empty = PeriodExtra::default();
+        let x = r.period_extra.as_ref().unwrap_or(&empty);
+        let e = &r.economics;
+        let mut pooled = r.pooled.json();
+        pooled.pop();
+        pooled.push_str(&format!(
+            ",\"net_mean\":{},\"entry_times\":{},\"seam_cost\":{},\"missing_score_exits\":{},\"unpriced_target_rows\":{},\
+             \"break_even_bps_per_side\":{},\"break_even_status\":{},\"cost_ladder\":{}}}",
+            jnum(r.pooled.mean_return),
+            x.entry_times,
+            jnum(r.seam_cost),
+            r.missing_score_exits,
+            r.unpriced_target_rows,
+            jnum(e.break_even_bps_per_side),
+            jstr(e.break_even_status),
+            e.ladder_json()
+        ));
+        let rows = r.period_grid.as_ref().map_or(String::new(), |g| {
+            format!(",\"period_rows\":[{}]", g.period_rows.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(","))
+        });
+        format!(
+            "{{\"archive_rank\":{},\"label\":{},\"complexity\":{},\"expression\":{},\"constant\":{},\"dropped_rows\":{},\
+             \"windows\":[{}],\"pooled\":{},\"series\":{{\"period_time\":[{}],\"period_net\":[{}],\"period_gross\":[{}],\
+             \"period_cost\":[{}],\"period_exposure\":[{}],\"period_entries\":[{}],\"period_entry_stamp\":[{}],\
+             \"period_bh\":[{}],\"period_bh_net\":[{}]{}}}}}",
+            self.archive_rank,
+            jstr(&self.label),
+            self.complexity,
+            jstr(r.candidates.first().map_or("", String::as_str)),
+            self.constant,
+            r.dropped_rows,
+            windows.join(","),
+            pooled,
+            series(&r.period_time),
+            series(&r.period_net),
+            series(&x.gross),
+            series(&x.cost),
+            series(&x.exposure),
+            series(&x.entries),
+            series(&x.entry_stamp),
+            series(&x.bh),
+            series(&x.bh_net),
+            rows
+        )
+    }
+}
+
 impl Report {
     /// #482: `source`, `run`, `run_sha256` and the candidate labels, with a
     /// leading comma. Empty when the candidates came from `--expr`.
     fn front_json(&self, paths: bool) -> String {
         match &self.front {
             Some(f) => format!(
-                ",\"source\":\"front\"{},\"run_sha256\":{},\"candidate_labels\":[{}]",
+                ",\"source\":\"{}\"{},\"run_sha256\":{},\"candidate_labels\":[{}]",
+                if self.members.is_some() { "front_all_members" } else { "front" },
                 if paths { format!(",\"run\":{}", jstr(&f.run)) } else { String::new() },
                 jstr(&f.run_sha256),
                 f.labels.iter().map(|l| jstr(l)).collect::<Vec<_>>().join(",")
@@ -4668,6 +4935,11 @@ impl Report {
         if let Some(g) = &self.gate {
             s.pop();
             s.push_str(&format!(",\"gate\":{}}}", g));
+        }
+        if let Some(m) = &self.members {
+            s.pop();
+            let items: Vec<String> = m.iter().map(Member::json).collect();
+            s.push_str(&format!(",\"diagnostic\":true,\"members\":[{}]}}", items.join(",")));
         }
         s
     }
@@ -4945,6 +5217,16 @@ impl Report {
                 series(&x.entries),
                 series(&x.bh)
             ));
+            if self.emit_series {
+                s.pop();
+                s.push_str(&format!(
+                    ",\"period_cost\":[{}],\"period_entry_stamp\":[{}],\"period_bh_net\":[{}],\"entry_times\":{}}}",
+                    series(&x.cost),
+                    series(&x.entry_stamp),
+                    series(&x.bh_net),
+                    x.entry_times
+                ));
+            }
         }
         s
     }
