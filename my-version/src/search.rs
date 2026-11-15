@@ -3975,9 +3975,6 @@ fn long_pnl_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
     let Some(book) = cfg.fitness.book() else {
         return Some("the long_pnl fitness book was not rebuilt");
     };
-    if book.is_masked() {
-        return Some("--pnl-mask is priced on the CPU: the device book carries no regime mask");
-    }
     if train.is_multi() {
         return Some("multi-output objective");
     }
