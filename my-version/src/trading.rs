@@ -122,6 +122,99 @@ impl PositionMap {
     }
 }
 
+/// #1203: what a long/flat book does on a row with a finite return and no
+/// finite score. Rows absent from the data and rows with no finite return make
+/// no decision under either rule.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MissingScore {
+    /// The row ends the run of its group: the run pays its exit at its last
+    /// priced row and the next priced row starts flat. The row is not priced.
+    #[default]
+    Flat,
+    /// The row keeps the position of the row before it in its group and earns
+    /// its return, with no cost. The position rule keeps its state across it.
+    Hold,
+}
+
+impl MissingScore {
+    pub fn parse(s: &str) -> Result<MissingScore, String> {
+        match s {
+            "flat" => Ok(MissingScore::Flat),
+            "hold" => Ok(MissingScore::Hold),
+            other => Err(format!("--missing-score needs flat or hold, got '{}'", other)),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            MissingScore::Flat => "flat",
+            MissingScore::Hold => "hold",
+        }
+    }
+}
+
+/// #1203: the runs of rows in book order (each book's rows contiguous and in
+/// time order, every row with a finite return) under a [`MissingScore`] rule.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScoreRuns {
+    /// `None` for a row the book does not price; else the run of the row inside
+    /// its book: 0 continues the position from before the rows, and every
+    /// stretch of rows without a score starts a new run after it.
+    pub run: Vec<Option<u32>>,
+    /// The last priced row of a run that a row without a score ends: its exit
+    /// is a missing-score exit.
+    pub ends_at_missing: Vec<bool>,
+}
+
+/// #1203: the one implementation of the missing-score rule, shared by the
+/// walk-forward book and [`evaluate`]. `books[k]` names the book of row `k`
+/// and `scored[k]` says it has a finite score.
+pub fn score_runs<K: PartialEq>(books: &[K], scored: &[bool], rule: MissingScore) -> ScoreRuns {
+    let n = books.len().min(scored.len());
+    let mut run = vec![Some(0u32); n];
+    let mut ends_at_missing = vec![false; n];
+    if rule == MissingScore::Hold {
+        return ScoreRuns { run, ends_at_missing };
+    }
+    let mut current = 0u32;
+    let mut in_gap = false;
+    let mut last_priced: Option<usize> = None;
+    for k in 0..n {
+        if k == 0 || books[k] != books[k - 1] {
+            current = 0;
+            in_gap = false;
+            last_priced = None;
+        }
+        if scored[k] {
+            run[k] = Some(current);
+            last_priced = Some(k);
+            in_gap = false;
+        } else {
+            run[k] = None;
+            if let Some(j) = last_priced.take() {
+                ends_at_missing[j] = true;
+            }
+            if !in_gap {
+                current += 1;
+                in_gap = true;
+            }
+        }
+    }
+    ScoreRuns { run, ends_at_missing }
+}
+
+/// #1203: under [`MissingScore::Hold`], every row without a score takes the
+/// position of the row before it in its book; a book's leading rows without a
+/// score take `start(book)`. Rows in book order, as for [`score_runs`].
+pub fn hold_positions<K: PartialEq>(books: &[K], scored: &[bool], positions: &mut [f64], mut start: impl FnMut(&K) -> f64) {
+    for k in 0..positions.len().min(books.len()).min(scored.len()) {
+        if scored[k] {
+            continue;
+        }
+        positions[k] = if k > 0 && books[k] == books[k - 1] { positions[k - 1] } else { start(&books[k]) };
+    }
+}
+
 /// #925: how `--band B` is read.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BandUnits {
@@ -389,6 +482,9 @@ pub struct TradingSpec {
     /// group flat, resets the band and minimum-hold state and pays its own final
     /// exit. Empty is one book over all rows.
     pub segment_starts: Vec<f64>,
+    /// #1203: a row with a finite return and no finite score ends its run
+    /// (`Flat`) or keeps the position (`Hold`).
+    pub missing_score: MissingScore,
 }
 
 impl Default for TradingSpec {
@@ -410,6 +506,7 @@ impl Default for TradingSpec {
             periods_per_year: None,
             period_seconds: None,
             segment_starts: Vec::new(),
+            missing_score: MissingScore::Flat,
         }
     }
 }
@@ -694,9 +791,48 @@ struct Ctx {
     groups: usize,
     /// Book segment of every row (`0` without segment starts).
     segment: Vec<usize>,
+    /// #1203: run of every row inside its `(group, segment)` book ([`score_runs`]).
+    run: Vec<u32>,
+    /// #1203: the row has no finite score and holds the position before it.
+    held: Vec<bool>,
 }
 
 impl Ctx {
+    /// #1203: the book of a prediction vector. The rows with a finite return,
+    /// time and funding follow `spec.missing_score`: under `Flat` a row without
+    /// a finite prediction ends the run of its `(group, segment)` book and is
+    /// not priced; under `Hold` it is priced and holds the position before it.
+    fn scored(pred: &[f64], r: &[f64], rows: &TradingRows, spec: &TradingSpec) -> (Ctx, Vec<usize>) {
+        let segment_starts = &spec.segment_starts;
+        let mut cand: Vec<usize> = (0..pred.len()).filter(|&i| usable(i, r, rows)).collect();
+        cand.sort_by(|&a, &b| {
+            rows.group[a]
+                .cmp(&rows.group[b])
+                .then_with(|| rows.time[a].partial_cmp(&rows.time[b]).unwrap_or(std::cmp::Ordering::Equal))
+                .then_with(|| a.cmp(&b))
+        });
+        let books: Vec<(u64, usize)> = cand.iter().map(|&i| (rows.group[i], segment_of(segment_starts, rows.time[i]))).collect();
+        let scored: Vec<bool> = cand.iter().map(|&i| pred[i].is_finite()).collect();
+        let runs = score_runs(&books, &scored, spec.missing_score);
+        let mut at: Vec<Option<(u32, bool)>> = vec![None; pred.len()];
+        for (k, &i) in cand.iter().enumerate() {
+            at[i] = runs.run[k].map(|run| (run, !scored[k]));
+        }
+        let keep: Vec<usize> = (0..pred.len()).filter(|&i| at[i].is_some()).collect();
+        let mut ctx = Ctx::new(&keep, r, rows, spec.cash_return, spec.period_seconds.unwrap_or(0.0), segment_starts);
+        for (k, &i) in keep.iter().enumerate() {
+            let (run, held) = at[i].expect("a kept row is priced");
+            ctx.run[k] = run;
+            ctx.held[k] = held;
+        }
+        (ctx, keep)
+    }
+
+    /// The book of row `i`: its group, segment and run.
+    fn book_of(&self, i: usize) -> (u64, usize, u32) {
+        (self.group[i], self.segment[i], self.run[i])
+    }
+
     fn new(
         keep: &[usize],
         r: &[f64],
@@ -748,6 +884,8 @@ impl Ctx {
             time_order,
             groups,
             segment,
+            run: vec![0; n],
+            held: vec![false; n],
         }
     }
 }
@@ -774,12 +912,12 @@ fn run_book(ctx: &Ctx, positions: &[f64], cost_side: f64) -> Book {
         rows: n,
         ..Default::default()
     };
-    let mut previous: BTreeMap<(u64, usize), f64> = BTreeMap::new();
+    let mut previous: BTreeMap<(u64, usize, u32), f64> = BTreeMap::new();
     let mut funding_paid = 0.0f64;
     let mut abs_delta_with_exit = 0.0f64;
-    let mut last_of_group: BTreeMap<(u64, usize), usize> = BTreeMap::new();
+    let mut last_of_group: BTreeMap<(u64, usize, u32), usize> = BTreeMap::new();
     for &i in &ctx.order {
-        let g = (ctx.group[i], ctx.segment[i]);
+        let g = ctx.book_of(i);
         let pos = positions[i];
         let r = ctx.ret[i];
         let prev = previous.get(&g).copied().unwrap_or(0.0);
@@ -1119,8 +1257,9 @@ pub fn position_of(pred: f64, spec: &TradingSpec) -> f64 {
 
 /// Score a prediction vector against the row returns `r`.
 ///
-/// Rows whose prediction, return or time is non-finite are dropped, the same
-/// shared mask as the walk-forward evaluator.
+/// Rows whose return or time is non-finite are dropped. A row with no finite
+/// prediction follows `spec.missing_score` (#1203), the rule of the
+/// walk-forward evaluator.
 pub fn evaluate(
     pred: &[f64],
     r: &[f64],
@@ -1129,18 +1268,17 @@ pub fn evaluate(
 ) -> Result<PathStats, String> {
     spec.validate()?;
     check_lengths(pred.len(), r, rows)?;
-    let keep: Vec<usize> = (0..pred.len())
-        .filter(|&i| pred[i].is_finite() && usable(i, r, rows))
-        .collect();
-    let ctx = Ctx::new(&keep, r, rows, spec.cash_return, spec.period_seconds.unwrap_or(0.0), &spec.segment_starts);
+    let (ctx, keep) = Ctx::scored(pred, r, rows, spec);
     let positions = positions_of(pred, rows, &keep, &ctx, spec);
     finish(&ctx, &positions, spec)
 }
 
-/// Position of every usable row, in `ctx` row order.
+/// Position of every usable row, in `ctx` row order. A held row (#1203) takes
+/// the position before it in its `(group, segment)` book; the band automaton
+/// does not step on it.
 fn positions_of(pred: &[f64], rows: &TradingRows, keep: &[usize], ctx: &Ctx, spec: &TradingSpec) -> Vec<f64> {
     let scores: Vec<f64> = keep.iter().map(|&i| pred[i]).collect();
-    if spec.position == PositionMap::TopTercile {
+    let mut positions: Vec<f64> = if spec.position == PositionMap::TopTercile {
         let all = top_tercile_positions(pred, &rows.time);
         keep.iter().map(|&i| all[i]).collect()
     } else if spec.min_holding > 1 || spec.band.resolved > 0.0 {
@@ -1152,13 +1290,16 @@ fn positions_of(pred: &[f64], rows: &TradingRows, keep: &[usize], ctx: &Ctx, spe
             min_hold: spec.min_holding,
         };
         let mut positions = vec![0.0f64; keep.len()];
-        let mut current: Option<(u64, usize)> = None;
+        let mut current: Option<(u64, usize, u32)> = None;
         let mut state = trading_gpu::BandState::default();
         for &i in &ctx.order {
-            let key = (ctx.group[i], ctx.segment[i]);
+            let key = ctx.book_of(i);
             if current != Some(key) {
                 current = Some(key);
                 state = trading_gpu::BandState::default();
+            }
+            if ctx.held[i] {
+                continue;
             }
             state = params.next(state, scores[i]);
             positions[i] = if state.long { spec.max_position } else { 0.0 };
@@ -1166,7 +1307,17 @@ fn positions_of(pred: &[f64], rows: &TradingRows, keep: &[usize], ctx: &Ctx, spe
         positions
     } else {
         scores.iter().map(|&s| position_of(s, spec)).collect()
+    };
+    if ctx.held.iter().any(|&h| h) {
+        let books: Vec<(u64, usize)> = ctx.order.iter().map(|&i| (ctx.group[i], ctx.segment[i])).collect();
+        let scored: Vec<bool> = ctx.order.iter().map(|&i| !ctx.held[i]).collect();
+        let mut ordered: Vec<f64> = ctx.order.iter().map(|&i| positions[i]).collect();
+        hold_positions(&books, &scored, &mut ordered, |_| 0.0);
+        for (k, &i) in ctx.order.iter().enumerate() {
+            positions[i] = ordered[k];
+        }
     }
+    positions
 }
 
 /// Per-block alpha of one prediction vector against exposure-matched
@@ -1236,13 +1387,10 @@ fn blocked_alpha_with(
         None => spec,
     };
     check_lengths(pred.len(), r, rows)?;
-    let keep: Vec<usize> = (0..pred.len())
-        .filter(|&i| pred[i].is_finite() && usable(i, r, rows))
-        .collect();
+    let (ctx, keep) = Ctx::scored(pred, r, rows, spec);
     if keep.is_empty() {
         return Err("no usable rows (every prediction or return is non-finite)".to_string());
     }
-    let ctx = Ctx::new(&keep, r, rows, spec.cash_return, spec.period_seconds.unwrap_or(0.0), &spec.segment_starts);
     let positions = positions_of(pred, rows, &keep, &ctx, spec);
     let n = ctx.ret.len();
     let cost_side = spec.per_side_bps() * BP;

@@ -1168,6 +1168,7 @@ pub fn procedure_spec(spec: &crate::walkforward::EvalSpec, o: &crate::walkforwar
             f.min_entry_times, f.blocks, f.lambda
         ));
     }
+    s.push_str(&format!("missing_score={}\n", o.missing_score.name()));
     if o.period_grid != crate::walkforward::PeriodGrid::Score {
         s.push_str(&format!("period_grid={}\n", o.period_grid.as_str()));
     }

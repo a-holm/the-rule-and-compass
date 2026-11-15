@@ -71,6 +71,8 @@ struct Spec {
     fixed: Option<f64>,
     policy: &'static str,
     fit: Option<(u32, u32, f64)>,
+    /// #1203: `book.missing_score`; `None` writes no `book` object.
+    book: Option<&'static str>,
 }
 
 impl Spec {
@@ -85,6 +87,7 @@ impl Spec {
             fixed: None,
             policy: "threshold",
             fit: None,
+            book: None,
         }
     }
 }
@@ -103,11 +106,13 @@ fn write_report(dir: &Path, name: &str, net: &[f64], s: &Spec) -> String {
 \"policy\":{{\"name\":\"{policy}\",\"band_width\":0,\"min_hold\":1}},\
 \"threshold\":{{\"quantile\":{quantile},\"fixed\":{fixed}{fit}}},\
 \"annualization\":{{\"periods_per_year\":{ppy},\"method\":\"explicit\"}},\
+{book}\
 \"pooled\":{{\"periods\":{n},\"entries\":10,\"active_rows\":100,\"period_net\":[{net_text}],\"period_time\":[{time}]}}}}",
         w = s.window,
         policy = s.policy,
         quantile = s.quantile.map_or("null".to_string(), |q| q.to_string()),
         fixed = s.fixed.map_or("null".to_string(), |q| q.to_string()),
+        book = s.book.map_or(String::new(), |r| format!("\"book\":{{\"missing_score\":\"{r}\"}},")),
         fit = s.fit.map_or(String::new(), |(e, b, l)| format!(
             ",\"fit\":\"fitness\",\"fit_method\":\"text\",\"fit_sources\":[\"fixed\"],\"cut_min_entries\":{e},\"cut_blocks\":{b},\"cut_lambda\":{l}"
         )),
@@ -767,4 +772,23 @@ fn trials_common_grid_across_configurations() {
     let o = run(&["trials", "--wf", &target[0], &plain_score, "--draws", "50"]);
     assert_eq!(code(&o), 2, "{}", stderr(&o));
     assert!(stderr(&o).contains("pooled.grid.rule"), "{}", stderr(&o));
+}
+
+#[test]
+fn trials_refuse_mixed_missing_score_rules() {
+    let (_s, dir) = trials_dir();
+    let rule = |name: &str, seed: u32, book: Option<&'static str>| write_report(&dir, name, &noise(N, seed, 0.01), &Spec { book, ..Spec::new(N) });
+    let flat = rule("flat", 1, Some("flat"));
+    let hold = rule("hold", 2, Some("hold"));
+    let carry = rule("carry", 3, None);
+    for other in [&hold, &carry] {
+        for mode in ["--wf", "--compare"] {
+            let o = run(&["trials", mode, &flat, other, "--draws", "50"]);
+            assert_eq!(code(&o), 2, "{mode}: {}", stderr(&o));
+            assert!(stderr(&o).contains("'book.missing_score'") && stderr(&o).contains("--missing-score"), "{mode}: {}", stderr(&o));
+        }
+    }
+    let same = rule("flat2", 4, Some("flat"));
+    let o = run(&["trials", "--wf", &flat, &same, "--draws", "50", "--block-len", "8"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
 }

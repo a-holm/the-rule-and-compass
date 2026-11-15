@@ -218,7 +218,7 @@ fn long_only_matches_the_walkforward_evaluator_bit_for_bit() {
                 r.push(0.02 * (lcg(&mut st) - 0.5));
             }
         }
-        let want = walkforward::reference_metrics(&time, &group, &r, &pred, 0.0, cost_bps * 1e-4, 365.0);
+        let want = walkforward::reference_metrics(&time, &group, &r, &pred, 0.0, cost_bps * 1e-4, 365.0, trading::MissingScore::Flat);
         let got = trading::evaluate(
             &pred,
             &r,

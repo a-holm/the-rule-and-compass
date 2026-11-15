@@ -1108,7 +1108,7 @@ pub fn assemble_cli(args: &[String]) -> Result<(), Fail> {
         let opt = |v: Option<f64>| v.map_or("null".to_string(), jnum);
         let text = format!(
             "{{\"tool\":\"rcsr\",\"version\":{},\"mode\":\"cpcv_path\",\"schema\":{},\"window_definition\":{},\
-\"purge\":{},\"cost_model\":{},\"cost\":{},\"annualization\":{},\"threshold\":{},\"policy\":{},\
+\"purge\":{},\"cost_model\":{},\"cost\":{},\"annualization\":{},\"threshold\":{},\"policy\":{},\"book\":{{\"missing_score\":{}}},\
 \"pooled_seam\":{{\"reset_flat\":true,\"seam_cost\":0,\"seam_trades\":0}},\
 \"cpcv\":{{\"scheme_sha256\":{},\"splits_sha256\":{},\"groups\":{},\"test_groups\":{},\"splits\":{},\"paths\":{},\"path\":{},\
 \"seam_rule\":{},\"segments\":[{}]}},\
@@ -1123,6 +1123,7 @@ pub fn assemble_cli(args: &[String]) -> Result<(), Fail> {
             copy("annualization"),
             copy("threshold"),
             copy("policy"),
+            at(first, crate::trials::MISSING_SCORE).map_or("null".to_string(), to_json),
             jstr(&scheme_sha),
             jstr(&splits_sha),
             n,

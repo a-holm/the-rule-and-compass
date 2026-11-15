@@ -11609,6 +11609,19 @@ OPTIONS:
                              and --cpcv-assemble guard pooled.grid.rule. Use it
                              for CPCV splits and for comparing formulas with
                              different NaN coverage or gates
+  --missing-score flat|hold  what the book does on a row with a finite target
+                             and no finite score (default flat). flat: the row
+                             ends the group's run; the run pays its exit at its
+                             last priced row and the next priced row starts
+                             flat (the band and cooldown state restarts), so a
+                             gap costs a round trip. hold: the row keeps the
+                             position before it and earns its return, with no
+                             cost; the band and cooldown state carries across
+                             it. A row with a finite score and no finite target
+                             is never priced. The report adds book
+                             (missing_score, missing_score_exits,
+                             unpriced_target_rows); rcsr trials and
+                             --cpcv-assemble guard book.missing_score
   --periods-per-year <f>     annualisation override. Default: 31536000 / S, S the
                              label horizon, or the label stride when the
                              spec has a wider stride_seconds (target spec, else
@@ -12126,6 +12139,13 @@ fn run_walkforward(args: &[String]) -> ! {
                 i += 1;
             }
             "--pool-reset-flat" => pool_reset_flat = true,
+            "--missing-score" => {
+                popts.missing_score = rcsr::trading::MissingScore::parse(&need(args, i + 1, "--missing-score")).unwrap_or_else(|e| {
+                    eprintln!("error: {}\n\n{}", e, walkforward_usage());
+                    std::process::exit(EXIT_USAGE);
+                });
+                i += 1;
+            }
             "--period-grid" => {
                 popts.period_grid = walkforward::PeriodGrid::parse(&need(args, i + 1, "--period-grid")).unwrap_or_else(|e| {
                     eprintln!("error: {}\n\n{}", e, walkforward_usage());

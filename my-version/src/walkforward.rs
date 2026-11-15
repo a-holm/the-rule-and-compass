@@ -40,6 +40,7 @@ use crate::data::{self, Table};
 use crate::expr::{self, Node};
 use crate::store::{self, FileStore};
 use crate::trading_gpu::{self, Threshold, ThresholdSource, ValidMask};
+use crate::trading::MissingScore;
 use crate::inference;
 use crate::wf_protocol::NullBook;
 use std::collections::HashMap;
@@ -145,6 +146,9 @@ pub struct ProtocolOptions {
     pub period_series: bool,
     /// #1199: the periods of the pooled series (`--period-grid`).
     pub period_grid: PeriodGrid,
+    /// #1203: what the book does on a row with a finite target and no finite
+    /// score (`--missing-score`).
+    pub missing_score: MissingScore,
 }
 
 /// #1199: which periods the pooled series of a report has. The grid never
@@ -297,6 +301,7 @@ impl Default for ProtocolOptions {
             regime_exprs: Vec::new(),
             period_series: false,
             period_grid: PeriodGrid::Score,
+            missing_score: MissingScore::Flat,
         }
     }
 }
@@ -615,7 +620,8 @@ pub struct BandCheck {
     /// `carry2` for the 2-state band, `cooldown-K` for the K+1-state variant.
     pub carry: String,
     pub groups: usize,
-    /// Additive net from the composed carry (including every final exit).
+    /// Additive net from the composed carry (including every final exit), plus
+    /// the return of the held rows under `--missing-score hold` (#1203).
     pub net: f64,
     /// Scalar evaluator's sum of per-row net returns.
     pub scalar_net: f64,
@@ -779,6 +785,12 @@ pub struct Report {
     pub pool_reset_flat: bool,
     pub seam_cost: f64,
     pub seam_trades: usize,
+    /// #1203: the missing-score rule of the book, the pooled exits it paid at
+    /// the last priced row before a missing score, and the rows with a finite
+    /// score and no finite target inside a run that no earlier return covers.
+    pub missing_score: MissingScore,
+    pub missing_score_exits: usize,
+    pub unpriced_target_rows: usize,
     /// Fold sign test: computed only when folds are independent (no training
     /// interval overlaps another fold's test block). Expanding folds overlap by
     /// construction, so their sign test is reported as not applicable.
@@ -1887,12 +1899,15 @@ impl Accum {
         let mut const_all: Vec<f64> = Vec::new();
         let (mut bh_rows, mut bh_long, mut const_rows, mut const_long) = (0u64, 0u64, 0u64, 0u64);
         let mut cand_cols: Vec<Vec<f64>> = vec![Vec::new(); n_candidates];
+        let want_columns = opts.bootstrap_draws > 0 && !opts.final_read;
+        let (mut column_bh, mut column_const): (Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new());
         let mut books: Vec<crate::wf_protocol::NullBook> = Vec::new();
         let mut batch_in: Vec<crate::wf_batch::WindowScores> = Vec::new();
         let forced = self.forced.as_deref();
         let target_grid = opts.period_grid == PeriodGrid::Target;
         let mut period_rows: Vec<usize> = Vec::new();
         let mut empty_periods = 0usize;
+        let mut unpriced_target_rows = 0usize;
         let want_strata = opts.regimes.is_some() || !opts.regime_exprs.is_empty() || opts.period_series;
         let mut strata_in = StrataIn::new(opts.regime_exprs.len());
         for (window_index, mut d) in self.windows.into_iter().enumerate() {
@@ -1910,6 +1925,8 @@ impl Accum {
                     crate::regime_gate::hysteresis_states(values, &groups, e.gate.band, e.gate.dwell)
                 })
                 .collect();
+            // #1203: the in-report candidate columns sit on the target grid of the rows before the gate.
+            let column_times = (want_columns && !target_grid).then(|| target_times(&d.test_rows));
             if let Some(gate) = &opts.mask {
                 apply_mask(&mut d, gate, window_index);
             }
@@ -2007,6 +2024,7 @@ impl Accum {
                     check_device: spec.device_pnl,
                 }),
                 opts.null_draws > 0,
+                opts.missing_score,
             );
             // Pooled path: carry each group's position across the seam unless
             // the caller asked for the historical flat reset.
@@ -2028,6 +2046,7 @@ impl Accum {
                     false,
                     None,
                     false,
+                    opts.missing_score,
                 )
             } else {
                 if flat_here {
@@ -2048,6 +2067,7 @@ impl Accum {
                     false,
                     None,
                     false,
+                    opts.missing_score,
                 )
             };
             if !spec.pool_reset_flat && opts.mask.is_none() {
@@ -2063,6 +2083,7 @@ impl Accum {
                 }
                 previous_end = Some(ev.end_positions.clone());
             }
+            unpriced_target_rows += unpriced_rows(&d.test_rows, &d.test_scores[candidate], spec.horizon, opts.missing_score);
             let train_rows = d.train_scores[candidate].len()
                 + d.validation_scores[candidate].len();
             dropped += d.dropped;
@@ -2070,6 +2091,10 @@ impl Accum {
                 Some((times, _, _)) => {
                     Some(Grid::new(times, bucket, &pev.times).map_err(|e| format!("window '{}': {}", d.window.label, e))?)
                 }
+                None => None,
+            };
+            let column_grid = match &column_times {
+                Some(times) => Some(Grid::new(times, bucket, &ev.times).map_err(|e| format!("window '{}': {}", d.window.label, e))?),
                 None => None,
             };
             let on_grid = |v: &[f64]| -> Vec<f64> {
@@ -2082,7 +2107,10 @@ impl Accum {
                 let valid: Vec<usize> = match &grid_source {
                     Some((_, _, rows)) => rows.clone(),
                     None => (0..d.test_rows.len())
-                        .filter(|&i| d.test_scores[candidate].get(i).is_some_and(|s| s.is_finite()) && d.test_rows[i].target.is_finite())
+                        .filter(|&i| {
+                            let scored = opts.missing_score == MissingScore::Hold || d.test_scores[candidate].get(i).is_some_and(|s| s.is_finite());
+                            scored && d.test_rows[i].target.is_finite()
+                        })
                         .collect(),
                 };
                 strata_in.add_window(&pev, bucket, opts, &d, &valid, &regime_states, grid.as_ref());
@@ -2111,10 +2139,13 @@ impl Accum {
                 const_rows += cn.rows;
                 const_long += cn.long_rows;
             }
-            if opts.bootstrap_draws > 0 && !opts.final_read {
+            if let Some(cg) = grid.as_ref().or(column_grid.as_ref()).filter(|_| want_columns) {
+                // #1203: every candidate column, the selected one included, sits on the
+                // window's target grid with 0 where the candidate prices no row, and so
+                // do the SPA baselines of the columns.
                 for c in 0..n_candidates {
                     if c == candidate {
-                        cand_cols[c].extend(on_grid(&ev.returns));
+                        cand_cols[c].extend(cg.pad(&ev.returns));
                         continue;
                     }
                     let other = evaluate_window(
@@ -2132,19 +2163,14 @@ impl Accum {
                         false,
                         None,
                         false,
+                        opts.missing_score,
                     );
-                    if let Some(g) = &grid {
-                        let slots = g.slots_of(&other.times).map_err(|e| format!("window '{}': {}", d.window.label, e))?;
-                        cand_cols[c].extend(pad_at(&slots, g.times.len(), &other.returns));
-                        continue;
-                    }
-                    for t in &ev.times {
-                        let v = match other.times.binary_search_by(|x| x.partial_cmp(t).unwrap()) {
-                            Ok(j) => other.returns[j],
-                            Err(_) => 0.0,
-                        };
-                        cand_cols[c].push(v);
-                    }
+                    let slots = cg.slots_of(&other.times).map_err(|e| format!("window '{}': {}", d.window.label, e))?;
+                    cand_cols[c].extend(pad_at(&slots, cg.times.len(), &other.returns));
+                }
+                if let Some(c) = &ev.controls {
+                    column_bh.extend(cg.pad(&c.series[1]));
+                    column_const.extend(cg.pad(&c.series[2]));
                 }
             }
             if let Some(b) = ev.book {
@@ -2263,13 +2289,15 @@ impl Accum {
             constant_exposure: if const_rows == 0 { f64::NAN } else { const_long as f64 / const_rows as f64 },
         });
         let inference_report = if want_inference {
-            let zeros = vec![0.0; fresh_all.len()];
+            let candidates: Vec<Vec<f64>> = if want_columns { cand_cols } else { Vec::new() };
+            // #1203: SPA compares the candidate columns with a baseline on their grid.
+            let (bh, constant) = if candidates.is_empty() { (&bh_all, &const_all) } else { (&column_bh, &column_const) };
+            let zeros = vec![0.0; candidates.first().map_or(fresh_all.len(), Vec::len)];
             let baseline: &[f64] = match economics.best_baseline.as_str() {
-                "buy_and_hold" => &bh_all,
-                "constant_long_flat" => &const_all,
+                "buy_and_hold" => bh,
+                "constant_long_flat" => constant,
                 _ => &zeros,
             };
-            let candidates: Vec<Vec<f64>> = if opts.bootstrap_draws > 0 && !opts.final_read { cand_cols } else { Vec::new() };
             let mut inferred = crate::wf_protocol::infer(&crate::wf_protocol::InferenceInput {
                 draws: opts.bootstrap_draws,
                 null_draws: opts.null_draws,
@@ -2317,6 +2345,7 @@ impl Accum {
                 cost_side,
                 !spec.pool_reset_flat,
                 spec.control_seed,
+                opts.missing_score,
             )?)
         } else {
             None
@@ -2432,6 +2461,9 @@ impl Accum {
             pool_reset_flat: spec.pool_reset_flat,
             seam_cost,
             seam_trades,
+            missing_score: opts.missing_score,
+            missing_score_exits: pooled_stats.missing_score_exits,
+            unpriced_target_rows,
             sign_test,
             source: source.to_string(),
             memory_bound: memory_bound.to_string(),
@@ -2738,6 +2770,8 @@ pub(crate) struct Stats {
     pub(crate) exits: usize,
     /// #309: rule exits (position falls), excluding the final exit.
     pub(crate) rule_exits: usize,
+    /// #1203: final exits of runs that a row without a score ends (`Flat`).
+    pub(crate) missing_score_exits: usize,
     /// #309: row-order sums of `p * r` and of the net row terms.
     pub(crate) gross_sum: f64,
     pub(crate) net_sum: f64,
@@ -2758,6 +2792,7 @@ impl Stats {
         self.entries += other.entries;
         self.exits += other.exits;
         self.rule_exits += other.rule_exits;
+        self.missing_score_exits += other.missing_score_exits;
         self.gross_sum += other.gross_sum;
         self.net_sum += other.net_sum;
     }
@@ -2861,6 +2896,40 @@ fn target_times(rows: &[RowBase]) -> Vec<f64> {
     let mut t: Vec<f64> = rows.iter().filter(|r| r.target.is_finite()).map(|r| r.time).collect();
     t.sort_by(f64::total_cmp);
     t
+}
+
+/// #1203: rows with a finite score and no finite target that lie inside a run
+/// of the book (between two priced rows of one run) where the return of the
+/// run's previous priced row does not cover them (`t >= t_prev + horizon`;
+/// every such row when `horizon` is not positive).
+fn unpriced_rows(rows: &[RowBase], scores: &[f64], horizon: f64, missing: MissingScore) -> usize {
+    let mut idx: Vec<usize> = (0..rows.len()).collect();
+    idx.sort_by(|&a, &b| rows[a].group.cmp(&rows[b].group).then_with(|| rows[a].time.total_cmp(&rows[b].time)).then_with(|| a.cmp(&b)));
+    let (mut count, mut pending) = (0usize, 0usize);
+    let mut last: Option<(u64, f64)> = None;
+    for &i in &idx {
+        let (row, scored) = (&rows[i], scores[i].is_finite());
+        if last.is_some_and(|(g, _)| g != row.group) {
+            last = None;
+            pending = 0;
+        }
+        if row.target.is_finite() {
+            if scored || missing == MissingScore::Hold {
+                if last.is_some() {
+                    count += pending;
+                }
+                last = Some((row.group, row.time));
+            } else {
+                last = None;
+            }
+            pending = 0;
+        } else if let (true, Some((_, t0))) = (scored, last) {
+            if !(horizon > 0.0) || row.time >= t0 + horizon {
+                pending += 1;
+            }
+        }
+    }
+    count
 }
 
 /// #1175: the per-period series of the pooled book beside `period_net`.
@@ -3066,7 +3135,7 @@ pub fn position_for(score: f64, threshold: f64) -> f64 {
 
 /// The scalar long-only evaluator on explicit rows: the reference that
 /// `trading::evaluate` must reproduce bit for bit under the plain threshold
-/// rule.
+/// rule and the same missing-score rule (#1203).
 pub fn reference_metrics(
     time: &[f64],
     group: &[u64],
@@ -3075,6 +3144,7 @@ pub fn reference_metrics(
     threshold: f64,
     cost_side: f64,
     periods_per_year: f64,
+    missing: MissingScore,
 ) -> Metrics {
     let rows: Vec<RowBase> = (0..time.len())
         .map(|i| RowBase {
@@ -3099,6 +3169,7 @@ pub fn reference_metrics(
         false,
         None,
         false,
+        missing,
     )
     .metrics
 }
@@ -3115,6 +3186,7 @@ pub fn reference_cell(
     threshold: f64,
     cost_side: f64,
     previous: &mut HashMap<u64, f64>,
+    missing: MissingScore,
 ) -> trading_gpu::PnlTotals {
     let rows: Vec<RowBase> = (0..time.len())
         .map(|i| RowBase {
@@ -3138,6 +3210,7 @@ pub fn reference_cell(
         false,
         None,
         false,
+        missing,
     );
     let s = &ev.stats;
     trading_gpu::PnlTotals {
@@ -3153,6 +3226,43 @@ pub fn reference_cell(
         turnover: s.total_abs_delta,
         net: s.net_sum,
     }
+}
+
+/// #1203: the book key of every row in book order. Run 0 of a group keeps the
+/// group id, so the carried seam applies to it; every later run gets a key
+/// that no group of the window, no other run and no carried book uses.
+fn run_keys(groups: &[u64], runs: &[u32], rows: &[RowBase], previous: &HashMap<u64, f64>) -> Vec<u64> {
+    if runs.iter().all(|&r| r == 0) {
+        return groups.to_vec();
+    }
+    let mix = |mut x: u64| {
+        x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        x ^ (x >> 31)
+    };
+    let mut used: std::collections::HashSet<u64> = rows.iter().map(|r| r.group).chain(previous.keys().copied()).collect();
+    let mut out = Vec::with_capacity(groups.len());
+    let mut last: Option<(u64, u32, u64)> = None;
+    for (&g, &r) in groups.iter().zip(runs) {
+        if r == 0 {
+            out.push(g);
+            continue;
+        }
+        let key = match last {
+            Some((lg, lr, key)) if lg == g && lr == r => key,
+            _ => {
+                let mut key = mix(g ^ mix(r as u64));
+                while !used.insert(key) {
+                    key = mix(key);
+                }
+                last = Some((g, r, key));
+                key
+            }
+        };
+        out.push(key);
+    }
+    out
 }
 
 /// `previous` carries each group's last position. Pass a fresh map for a
@@ -3172,14 +3282,33 @@ fn evaluate_window(
     device_pnl: bool,
     control_input: Option<ControlInput>,
     keep_book: bool,
+    missing: MissingScore,
 ) -> WindowEval {
     assert_eq!(rows.len(), scores.len());
-    // #305: one shared mask, score and target both finite. `position_for`
+    // #305: one shared mask over the rows with a finite target. `position_for`
     // alone would keep a finite score with a NaN target; that is the six-row
-    // difference documented in docs/walkforward.md.
+    // difference documented in docs/walkforward.md. #1203: a row with a finite
+    // target and no finite score follows `missing` (`trading::score_runs`).
+    let mut labelled: Vec<usize> = (0..rows.len()).filter(|&i| rows[i].target.is_finite()).collect();
+    labelled.sort_by(|&a, &b| {
+        rows[a]
+            .group
+            .cmp(&rows[b].group)
+            .then_with(|| rows[a].time.partial_cmp(&rows[b].time).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| a.cmp(&b))
+    });
+    let lab_groups: Vec<u64> = labelled.iter().map(|&i| rows[i].group).collect();
+    let lab_scored: Vec<bool> = labelled.iter().map(|&i| scores[i].is_finite()).collect();
+    let runs = crate::trading::score_runs(&lab_groups, &lab_scored, missing);
     let mut mask = ValidMask::new(rows.len());
-    for i in 0..rows.len() {
-        mask.set(i, scores[i].is_finite() && rows[i].target.is_finite());
+    let mut row_run = vec![0u32; rows.len()];
+    let mut row_ends = vec![false; rows.len()];
+    for (k, &i) in labelled.iter().enumerate() {
+        if let Some(run) = runs.run[k] {
+            mask.set(i, true);
+            row_run[i] = run;
+            row_ends[i] = runs.ends_at_missing[k];
+        }
     }
     let valid: Vec<usize> = mask.indices().collect();
     let n = valid.len();
@@ -3216,13 +3345,34 @@ fn evaluate_window(
         ord_returns.push(row.target);
         ord_groups.push(row.group);
     }
+    // #1203: the book of every row. Every scan, control, null and bound below
+    // reads these keys, so a run under `Flat` is its own book; `previous`,
+    // `first_positions` and `end_positions` stay keyed by group.
+    let ord_runs: Vec<u32> = order.iter().map(|&i| row_run[valid[i]]).collect();
+    let ord_keys = run_keys(&ord_groups, &ord_runs, rows, previous);
+    let ord_scored: Vec<bool> = ord_scores.iter().map(|s| s.is_finite()).collect();
+    let any_held = ord_scored.iter().any(|&s| !s);
+    // Under `Hold` the band and cooldown scans read the scored rows only, so
+    // their state carries across a held row.
+    let scan_rows: Vec<usize> = (0..n).filter(|&k| ord_scored[k]).collect();
+    let (scan_scores, scan_returns, scan_keys): (Vec<f64>, Vec<f64>, Vec<u64>) = if any_held {
+        (
+            scan_rows.iter().map(|&k| ord_scores[k]).collect(),
+            scan_rows.iter().map(|&k| ord_returns[k]).collect(),
+            scan_rows.iter().map(|&k| ord_keys[k]).collect(),
+        )
+    } else {
+        (Vec::new(), Vec::new(), Vec::new())
+    };
+    let (scan_scores, scan_returns, scan_keys): (&[f64], &[f64], &[u64]) =
+        if any_held { (&scan_scores, &scan_returns, &scan_keys) } else { (&ord_scores, &ord_returns, &ord_keys) };
 
     // #306: the band/cooldown book. `positions` are aligned with `order`;
     // `net` includes the final exit of every group. `dp` deliberately keeps
     // the threshold book: the DP is a bound, not a strategy.
     // One device launch over all rows: a chunk only partitions launches, and a
     // launch only runs the chains of the groups it touches.
-    let device_chunk = ord_returns.len().max(1);
+    let device_chunk = scan_returns.len().max(1);
     type BandBook = (Vec<f64>, f64, usize, String, String, Option<String>);
     let band_scan: Option<BandBook> = if policy == Policy::Band {
         let params = crate::trading_gpu::BandParams {
@@ -3236,9 +3386,9 @@ fn evaluate_window(
                 "cooldown scan",
                 || {
                     crate::trading_gpu::cooldown_scan_device(
-                        &ord_scores,
-                        &ord_returns,
-                        &ord_groups,
+                        scan_scores,
+                        scan_returns,
+                        scan_keys,
                         &params,
                         cost_side,
                         crate::trading_gpu::SCAN_THREADS,
@@ -3247,9 +3397,9 @@ fn evaluate_window(
                 },
                 || {
                     crate::trading_gpu::cooldown_scan(
-                        &ord_scores,
-                        &ord_returns,
-                        &ord_groups,
+                        scan_scores,
+                        scan_returns,
+                        scan_keys,
                         &params,
                         cost_side,
                         65_536,
@@ -3271,9 +3421,9 @@ fn evaluate_window(
                 "band scan",
                 || {
                     crate::trading_gpu::band_scan_device(
-                        &ord_scores,
-                        &ord_returns,
-                        &ord_groups,
+                        scan_scores,
+                        scan_returns,
+                        scan_keys,
                         &params,
                         cost_side,
                         crate::trading_gpu::SCAN_THREADS,
@@ -3282,9 +3432,9 @@ fn evaluate_window(
                 },
                 || {
                     crate::trading_gpu::band_scan(
-                        &ord_scores,
-                        &ord_returns,
-                        &ord_groups,
+                        scan_scores,
+                        scan_returns,
+                        scan_keys,
                         &params,
                         cost_side,
                         65_536,
@@ -3311,22 +3461,51 @@ fn evaluate_window(
         let times: Vec<f64> = rows.iter().map(|r| r.time).collect();
         crate::trading::top_tercile_positions(scores, &times)
     });
+    let mut ord_pos = vec![0.0f64; n];
+    match (&band_scan, &tercile) {
+        (Some((scanned, ..)), _) => {
+            for (j, &k) in scan_rows.iter().enumerate() {
+                ord_pos[k] = scanned[j];
+            }
+        }
+        (None, Some(top)) => {
+            for (k, &i) in order.iter().enumerate() {
+                ord_pos[k] = top[valid[i]];
+            }
+        }
+        // #305: strict `>` and a non-finite score is flat.
+        (None, None) => {
+            for k in 0..n {
+                ord_pos[k] = trading_gpu::long_position(ord_scores[k], threshold) as f64;
+            }
+        }
+    }
+    if any_held {
+        crate::trading::hold_positions(&ord_keys, &ord_scored, &mut ord_pos, |g| previous.get(g).copied().unwrap_or(0.0));
+    }
+    // #1203: a group whose first labelled row has no score has no seam
+    // position: no score decides that row. Under `Flat` the carried position
+    // closed at the earlier block's end; under `Hold` the row keeps it.
+    let mut leading_gap: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for k in 0..labelled.len() {
+        if !lab_scored[k] && (k == 0 || lab_groups[k] != lab_groups[k - 1]) {
+            leading_gap.insert(lab_groups[k]);
+        }
+    }
     for (k, &i) in order.iter().enumerate() {
         let row = &rows[valid[i]];
-        let pos = match (&band_scan, &tercile) {
-            (Some((positions, ..)), _) => positions[k],
-            (None, Some(top)) => top[valid[i]],
-            // #305: strict `>` and a non-finite score is flat.
-            (None, None) => trading_gpu::long_position(scores[valid[i]], threshold) as f64,
-        };
-        let prev = previous.get(&row.group).copied().unwrap_or(0.0);
+        let pos = ord_pos[k];
+        let key = ord_keys[k];
+        let prev = previous.get(&key).copied().unwrap_or(0.0);
         let delta = pos - prev;
         let cost = cost_side * delta.abs();
         positions[i] = pos;
         costs[i] = cost;
         net[i] = pos * row.target - cost;
-        previous.insert(row.group, pos);
-        first_positions.entry(row.group).or_insert(pos);
+        previous.insert(key, pos);
+        if !leading_gap.contains(&row.group) {
+            first_positions.entry(row.group).or_insert(pos);
+        }
 
         stats.total_abs_delta += delta.abs();
         stats.gross_sum += pos * row.target;
@@ -3354,31 +3533,53 @@ fn evaluate_window(
             }
         }
     }
-    let end_positions = previous.clone();
 
-    // #145: charge the final exit. A flat strategy is free; a held position
-    // pays the same per-side cost as its entry.
-    let mut last_of_group: HashMap<u64, usize> = HashMap::new();
-    for (&g, _) in previous.iter() {
-        if let Some((i, _)) = order
-            .iter()
-            .filter(|&&i| rows[valid[i]].group == g)
-            .map(|&i| (i, rows[valid[i]].time))
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-        {
-            last_of_group.insert(g, i);
-        }
+    // #145: charge the final exit of every book (#1203: every run under
+    // `Flat`) at its last row. A flat strategy is free; a held position pays
+    // the same per-side cost as its entry.
+    let mut last_of_key: HashMap<u64, usize> = HashMap::new();
+    for (k, &key) in ord_keys.iter().enumerate() {
+        last_of_key.insert(key, k);
     }
-    for (g, i) in last_of_group {
-        let p = previous.get(&g).copied().unwrap_or(0.0);
+    for (key, k) in last_of_key {
+        let p = previous.get(&key).copied().unwrap_or(0.0);
         if p != 0.0 {
+            let i = order[k];
             let c = cost_side * p.abs();
             net[i] -= c;
             stats.total_cost += c;
             stats.net_sum -= c;
             stats.exits += 1;
+            if row_ends[valid[i]] {
+                stats.missing_score_exits += 1;
+            }
         }
     }
+    // #1203: under `Flat` a group leaves the window with the position of its
+    // last run, flat when a row without a score ends its labelled rows; the
+    // keys of the later runs close here.
+    if lab_scored.iter().any(|&s| !s) && missing == MissingScore::Flat {
+        let mut row_key = vec![0u64; rows.len()];
+        for (k, &i) in order.iter().enumerate() {
+            row_key[valid[i]] = ord_keys[k];
+        }
+        let mut ends: Vec<(u64, f64)> = Vec::new();
+        for k in 0..labelled.len() {
+            if k + 1 == labelled.len() || lab_groups[k + 1] != lab_groups[k] {
+                let end = if lab_scored[k] { previous.get(&row_key[labelled[k]]).copied().unwrap_or(0.0) } else { 0.0 };
+                ends.push((lab_groups[k], end));
+            }
+        }
+        for (k, &key) in ord_keys.iter().enumerate() {
+            if ord_runs[k] > 0 {
+                previous.remove(&key);
+            }
+        }
+        for (g, end) in ends {
+            previous.insert(g, end);
+        }
+    }
+    let end_positions = previous.clone();
 
     // #304: recompute the same long-only book through the fused canonical
     // reduction. Rows are already in `(group, time)` order, which is the
@@ -3386,6 +3587,14 @@ fn evaluate_window(
     // stays the reported authority; this block is a device/canonical check.
     let device = if device_pnl {
         let started = std::time::Instant::now();
+        // #1203: a held row repeats the score of the row before it in its book, so
+        // the threshold reduction holds the same position; a leading held row is flat.
+        let mut dev_scores = ord_scores.clone();
+        for k in 0..n {
+            if !ord_scored[k] {
+                dev_scores[k] = if k > 0 && ord_keys[k] == ord_keys[k - 1] { dev_scores[k - 1] } else { f64::NAN };
+            }
+        }
         let params = crate::trading_gpu::PnlParams {
             threshold,
             per_side_bps: cost_side * 10_000.0,
@@ -3394,9 +3603,9 @@ fn evaluate_window(
         };
         #[cfg(feature = "cuda")]
         let report = crate::trading_gpu::reduce_device(
-            &ord_scores,
+            &dev_scores,
             &ord_returns,
-            &ord_groups,
+            &ord_keys,
             &params,
             256,
             65_536,
@@ -3412,7 +3621,7 @@ fn evaluate_window(
         #[cfg(not(feature = "cuda"))]
         let backend = "cpu-canonical".to_string();
         let host_s = started.elapsed().as_secs_f64();
-        let canonical = crate::trading_gpu::reduce(&ord_scores, &ord_returns, &ord_groups, &params)
+        let canonical = crate::trading_gpu::reduce(&dev_scores, &ord_returns, &ord_keys, &params)
             .unwrap_or_else(|e| panic!("canonical P&L reduction failed: {}", e));
         let report = report.unwrap_or_else(|| canonical.clone());
         let bit_equal = report.strategy.identical(&canonical.strategy);
@@ -3440,13 +3649,15 @@ fn evaluate_window(
             net_delta: report.strategy.net - cpu_net,
             bit_equal,
             counts_equal,
-            f32_flip_rows: crate::trading_gpu::f32_flip_rows(&ord_scores, threshold),
+            f32_flip_rows: crate::trading_gpu::f32_flip_rows(&dev_scores, threshold),
         })
     } else {
         None
     };
 
     let scalar_net = net.iter().sum::<f64>();
+    // #1203: the scan prices the scored rows; the book adds the held rows' return.
+    let held_gross: f64 = (0..n).filter(|&k| !ord_scored[k]).map(|k| ord_pos[k] * ord_returns[k]).sum();
     let band = band_scan.map(
         |(_, band_net, groups, carry, backend, fallback_reason)| BandCheck {
             spec: None,
@@ -3454,7 +3665,7 @@ fn evaluate_window(
             min_hold,
             carry,
             groups,
-            net: band_net,
+            net: if any_held { band_net + held_gross } else { band_net },
             scalar_net,
             backend,
             fallback_reason,
@@ -3470,13 +3681,13 @@ fn evaluate_window(
             || {
                 crate::trading_gpu::dp_scan_device(
                     &ord_returns,
-                    &ord_groups,
+                    &ord_keys,
                     cost_side,
                     crate::trading_gpu::SCAN_THREADS,
                     device_chunk,
                 )
             },
-            || crate::trading_gpu::dp_scan(&ord_returns, &ord_groups, cost_side, 65_536),
+            || crate::trading_gpu::dp_scan(&ord_returns, &ord_keys, cost_side, 65_536),
         );
         let bound = scan.bound(cost_side);
         Some(HindsightBound {
@@ -3538,7 +3749,7 @@ fn evaluate_window(
         crate::baselines::evaluate_controls(
             &ord_positions,
             &ord_returns,
-            &ord_groups,
+            &ord_keys,
             cost_side,
             c.train_mean,
             c.seed,
@@ -3575,7 +3786,7 @@ fn evaluate_window(
         Some(NullBook {
             positions: ord_positions.clone(),
             returns: ord_returns.clone(),
-            groups: ord_groups.clone(),
+            groups: ord_keys.clone(),
             period: group_order.iter().map(|&i| period_of[i]).collect(),
             period_count,
             period_cost: gross_returns.iter().zip(&returns).map(|(g, n)| g - n).collect(),
@@ -4325,6 +4536,7 @@ impl Report {
              \"band_select\":{},\"test_used_for_selection\":{},\
              \"candidate_count\":{}{}{}}},\
              \"pooled_seam\":{{\"reset_flat\":{},\"seam_cost\":{},\"seam_trades\":{}}},\
+             \"book\":{{\"missing_score\":{},\"missing_score_exits\":{},\"unpriced_target_rows\":{}}},\
              \"sign_test\":{{\"positive\":{},\"total\":{},\"applicable\":{},\
              \"p_value\":{},\"method\":{}}},\
              \"lockbox\":{},\
@@ -4385,6 +4597,9 @@ impl Report {
             self.pool_reset_flat,
             jnum(self.seam_cost),
             self.seam_trades,
+            jstr(self.missing_score.name()),
+            self.missing_score_exits,
+            self.unpriced_target_rows,
             self.sign_test.positive,
             self.sign_test.total,
             self.sign_test.applicable,
