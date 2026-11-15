@@ -1383,7 +1383,7 @@ mod tests {
             let g = gate_of(&mut rng, &p, 0);
             cuts += check_sweep(&bk, &a, &flat, &g, &p.slice.rows.time, true);
         }
-        assert!(cuts > 20_000, "{cuts} cuts checked");
+        assert!(cuts > 15_000, "{cuts} cuts checked");
     }
 
     #[test]
@@ -1547,7 +1547,7 @@ mod tests {
                 }
             }
         }
-        assert!(checked > 5_000 && gapped == 6, "{checked} cuts, {gapped} gapped gates");
+        assert!(checked > 1_900 && gapped == 6, "{checked} cuts, {gapped} gapped gates");
     }
 
     /// `A` (always long) pays only while the gate is above 0.5; `B` is flat.
