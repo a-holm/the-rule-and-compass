@@ -1384,3 +1384,10 @@ fn locked_read_under_another_stride_is_refused() {
 fn locked_read_under_other_return_units_is_refused() {
     spec_change_is_refused("units-id", ("simple", 3600.0), ("log", 3600.0));
 }
+
+#[test]
+fn schema_names_the_units_and_width_lines_of_the_procedure() {
+    let (code, out, err) = rcsr(&["schema"]);
+    assert_eq!(code, 0, "{}", err);
+    assert!(out.contains("return_units=log") && out.contains("period_width=<seconds>"));
+}
