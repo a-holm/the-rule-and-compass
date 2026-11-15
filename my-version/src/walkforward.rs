@@ -316,6 +316,7 @@ impl Default for ProtocolOptions {
             threshold_fit: None,
             mask: None,
             regimes: None,
+            regime_exprs: Vec::new(),
             period_series: false,
             period_grid: PeriodGrid::Score,
             switches: Vec::new(),
