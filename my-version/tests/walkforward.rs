@@ -2655,3 +2655,338 @@ fn missing_score_device_pnl_reduction_reads_the_same_book() {
         assert_eq!(d.rows, r.pooled.rows as u64, "{missing:?}: the reduction prices the rows of the book");
     }
 }
+
+/// #1176: `--all-members` and `--emit-series` on a 3-symbol panel and a front of 3 members.
+mod members {
+    use rcsr::devlog::Json;
+    use std::path::{Path, PathBuf};
+
+    use super::scratch::Scratch;
+
+    const COST_BPS: &str = "9.765625";
+    const EXPRS: [&str; 3] = ["x", "0.5 - x", "sqrt(x) - 1"];
+    const W1: &str = "w1,0,1080000,1083600,1620000";
+    const W2: &str = "w2,0,1620000,1623600,2160000";
+    const SPLITS: &str = "split_id,role,start,end\ns1,train,0,1076400\ns1,test,1083600,1400400\ns1,test,1620000,2160000\n";
+    const METRICS: [&str; 22] = [
+        "sharpe", "cagr", "max_drawdown", "sortino", "sortino_mar", "log_growth", "turnover", "exposure", "hit_rate",
+        "break_even_hit_rate", "trades", "entries", "rows", "active_rows", "periods", "periods_per_year", "total_return",
+        "mean_return", "avg_cost_bps", "gross_sharpe", "total_cost", "total_abs_delta",
+    ];
+    const SERIES: [&str; 9] = [
+        "period_time", "period_net", "period_gross", "period_cost", "period_exposure", "period_entries",
+        "period_entry_stamp", "period_bh", "period_bh_net",
+    ];
+    const RUN_HEAD: &str = r#"{"tool":"rcsr","variables":["x"],
+        "target_spec":{"column":"target","name":"target","kind":"forward_return","deprecated":false,
+            "return_column":"target","return_units":"simple","horizon_seconds":3600,"entry_offset_seconds":0,
+            "delay_seconds":0,"entry_price":"next open","exit_price":"close","offset":0.0,
+            "scale":{"kind":"constant","value":1.0},"clip":null,"units":"simple_return","cost_bps":null,
+            "cost_in_label":false,"construction_columns":[],"note":null},
+        "split":{"train_time":[0,716400],"validation_time":[720000,1076400],"required_purge_seconds":3600,"purge_seconds":3600},
+        "objective":{"spec":{"threshold":0,"per_side_bps":9.765625,"max_position":1,"cash_return":0},"finalist":{"expression":"x"}},
+        "pareto":"#;
+
+    struct Fixture {
+        _scratch: Scratch,
+        dir: PathBuf,
+        data: String,
+    }
+
+    /// Three symbols, hourly from 0 to 599 h. Targets are multiples of 2^-12 and the
+    /// per-side cost is 2^-10, so every sum of row returns and costs is exact.
+    fn fixture(tag: &str) -> Fixture {
+        let scratch = Scratch::new(tag);
+        let dir = scratch.path().to_path_buf();
+        let mut csv = String::from("ts,sym,x,target\n");
+        for i in 0..600i64 {
+            for (s, sym) in ["A", "B", "C"].iter().enumerate() {
+                let s = s as i64;
+                let x = ((i * 7 + s * 3) % 11) as f64 - 5.0;
+                let y = (((i * 5 + s * 7) % 13) as f64 - 6.0) / 4096.0;
+                csv.push_str(&format!("{},{},{},{}\n", i * 3600, sym, x, y));
+            }
+        }
+        let data = write(&dir, "panel.csv", &csv);
+        Fixture { _scratch: scratch, dir, data }
+    }
+
+    fn write(dir: &Path, name: &str, text: &str) -> String {
+        let path = dir.join(name);
+        std::fs::write(&path, text).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    fn run_text(members: &[&str]) -> String {
+        let list: Vec<String> = members.iter().map(|e| format!("{{\"expression\":\"{e}\"}}")).collect();
+        format!("{}[{}]}}", RUN_HEAD, list.join(","))
+    }
+
+    fn rcsr(args: &[&str]) -> (i32, String, String) {
+        let out = super::rcsr_cmd::rcsr().args(args).output().unwrap();
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    fn wf_raw(data: &str, args: &[&str]) -> (i32, String, String) {
+        let mut a = vec!["walkforward", "--data", data, "--time", "ts", "--group-by", "sym", "--periods-per-year", "8760", "--json"];
+        a.extend_from_slice(args);
+        rcsr(&a)
+    }
+
+    fn wf(data: &str, args: &[&str]) -> Json {
+        let (code, out, err) = wf_raw(data, args);
+        assert_eq!(code, 0, "{args:?}: {err}");
+        Json::parse(out.trim()).unwrap()
+    }
+
+    fn get<'a>(j: &'a Json, path: &[&str]) -> &'a Json {
+        path.iter().fold(j, |cur, k| cur.get(k).unwrap_or_else(|| panic!("missing {k} in {path:?}")))
+    }
+
+    fn items(j: &Json) -> &[Json] {
+        match j {
+            Json::Arr(a) => a,
+            other => panic!("not an array: {other:?}"),
+        }
+    }
+
+    fn nums(j: &Json, path: &[&str]) -> Vec<f64> {
+        items(get(j, path)).iter().map(|v| v.as_f64().unwrap_or_else(|| panic!("{path:?}: {v:?}"))).collect()
+    }
+
+    fn single(expr: &str) -> Vec<&str> {
+        vec![
+            "--expr", expr, "--threshold-fixed", "0", "--cost-bps", COST_BPS, "--target", "target", "--vars", "x",
+            "--horizon", "3600", "--emit-series",
+        ]
+    }
+
+    fn variants(splits: &str) -> Vec<Vec<&str>> {
+        let win = vec!["--window", W1, "--window", W2, "--validation-frac", "0.3"];
+        vec![
+            win.clone(),
+            [win.clone(), vec!["--period-grid", "target"]].concat(),
+            [win, vec!["--missing-score", "hold"]].concat(),
+            vec!["--windows", splits, "--split-id", "s1", "--period-grid", "target"],
+        ]
+    }
+
+    #[test]
+    fn all_members_equal_single_expr_runs() {
+        let f = fixture("members-equal");
+        let run = write(&f.dir, "run.json", &run_text(&EXPRS));
+        let splits = write(&f.dir, "splits.csv", SPLITS);
+        for variant in variants(&splits) {
+            let all = wf(&f.data, &[vec!["--front", &run, "--all-members"], variant.clone()].concat());
+            assert_eq!(get(&all, &["selection", "source"]).as_str(), Some("front_all_members"), "{variant:?}");
+            assert_eq!(get(&all, &["selection", "test_used_for_selection"]), &Json::Bool(false));
+            assert_eq!(get(&all, &["diagnostic"]), &Json::Bool(true));
+            let plain = wf(&f.data, &[vec!["--front", &run], variant.clone()].concat());
+            for k in ["candidates", "windows", "economics"] {
+                assert_eq!(get(&all, &[k]), get(&plain, &[k]), "{variant:?}: {k}");
+            }
+            for k in METRICS.iter().chain(&["period_net", "period_time"]) {
+                assert_eq!(get(&all, &["pooled", k]), get(&plain, &["pooled", k]), "{variant:?}: pooled.{k}");
+            }
+            let members = items(get(&all, &["members"]));
+            assert_eq!(members.len(), 3, "{variant:?}");
+            let target_grid = variant.contains(&"target");
+            for (k, (m, e)) in members.iter().zip(EXPRS).enumerate() {
+                let at = format!("{variant:?} member {k}");
+                assert_eq!(get(m, &["archive_rank"]).as_f64(), Some((k + 1) as f64), "{at}");
+                assert_eq!(get(m, &["label"]).as_str(), Some(format!("front_rank_{}", k + 1).as_str()), "{at}");
+                assert_eq!(get(m, &["expression"]).as_str(), Some(e), "{at}");
+                assert_eq!(get(m, &["constant"]), &Json::Bool(false), "{at}");
+                let one = wf(&f.data, &[single(e), variant.clone()].concat());
+                for key in METRICS {
+                    assert_eq!(get(m, &["pooled", key]), get(&one, &["pooled", key]), "{at}: pooled.{key}");
+                }
+                assert_eq!(get(m, &["pooled", "net_mean"]), get(&one, &["pooled", "mean_return"]), "{at}");
+                assert_eq!(get(m, &["pooled", "entry_times"]), get(&one, &["pooled", "entry_times"]), "{at}");
+                assert_eq!(get(m, &["pooled", "cost_ladder"]), get(&one, &["economics", "cost_ladder"]), "{at}");
+                assert_eq!(get(m, &["pooled", "break_even_bps_per_side"]), get(&one, &["economics", "break_even_bps_per_side"]), "{at}");
+                assert_eq!(get(m, &["dropped_rows"]), get(&one, &["dropped_rows"]), "{at}");
+                let keys: Vec<&str> = SERIES.iter().copied().chain(target_grid.then_some("period_rows")).collect();
+                for key in keys {
+                    assert_eq!(get(m, &["series", key]), get(&one, &["pooled", key]), "{at}: series.{key}");
+                }
+                let (mw, ow) = (items(get(m, &["windows"])), items(get(&one, &["windows"])));
+                assert_eq!(mw.len(), ow.len(), "{at}");
+                for (a, b) in mw.iter().zip(ow) {
+                    for key in ["label", "threshold", "threshold_source", "train_rows", "validation_rows", "test_rows", "dropped_rows", "metrics"] {
+                        assert_eq!(get(a, &[key]), get(b, &[key]), "{at}: windows[].{key}");
+                    }
+                }
+            }
+            let dropped: Vec<f64> = members.iter().map(|m| get(m, &["dropped_rows"]).as_f64().unwrap()).collect();
+            assert!(dropped[0] == 0.0 && dropped[2] > 0.0, "{variant:?}: only the sqrt member drops rows: {dropped:?}");
+        }
+    }
+
+    /// The series of one book: the pooled block of a report or a member's `series`.
+    fn check_close(at: &str, s: &Json, pooled: &Json, cost_bps: f64, break_even: &Json, ladder: &Json, ppy: f64) {
+        let get_s = |k: &str| nums(s, &[k]);
+        let (time, net, gross, cost) = (get_s("period_time"), get_s("period_net"), get_s("period_gross"), get_s("period_cost"));
+        let (entries, stamp, rows) = (get_s("period_entries"), get_s("period_entry_stamp"), get_s("period_rows"));
+        for k in SERIES.iter().chain(&["period_rows"]) {
+            assert_eq!(get_s(k).len(), time.len(), "{at}: {k}");
+        }
+        assert!(!time.is_empty(), "{at}");
+        for t in 0..time.len() {
+            assert_eq!(cost[t].to_bits(), (gross[t] - net[t]).to_bits(), "{at}: period {t}");
+            assert_eq!((gross[t] - cost[t]).to_bits(), net[t].to_bits(), "{at}: period {t}");
+            assert_eq!(stamp[t], if entries[t] > 0.0 { 1.0 } else { 0.0 }, "{at}: period {t}");
+        }
+        let total = get(pooled, &["total_cost"]).as_f64().unwrap();
+        let weighted: f64 = cost.iter().zip(&rows).map(|(c, n)| c * n).sum();
+        assert!(total > 0.0 && (weighted - total).abs() <= 1e-12 * total, "{at}: {weighted} vs {total}");
+        let (g, c) = (gross.iter().sum::<f64>(), cost.iter().sum::<f64>());
+        assert_eq!(break_even.as_f64().map(f64::to_bits), Some((cost_bps * g / c).to_bits()), "{at}: break-even");
+        for row in items(ladder) {
+            let m = get(row, &["multiplier"]).as_f64().unwrap();
+            let priced: Vec<f64> = gross.iter().zip(&cost).map(|(g, c)| g - m * c).collect();
+            let r = rcsr::risk::risk_stats(&priced, ppy, rcsr::risk::DEFAULT_SORTINO_MAR);
+            assert_eq!(get(row, &["mean_return"]).as_f64().map(f64::to_bits), Some(r.mean.to_bits()), "{at}: ladder {m}");
+            assert_eq!(get(row, &["sharpe"]).as_f64().map(f64::to_bits), Some(r.sharpe.to_bits()), "{at}: ladder {m}");
+        }
+    }
+
+    #[test]
+    fn period_series_close() {
+        let f = fixture("members-close");
+        let run = write(&f.dir, "run.json", &run_text(&EXPRS));
+        let win = ["--window", W1, "--window", W2, "--validation-frac", "0.3", "--period-grid", "target"];
+        let all = wf(&f.data, &[&["--front", run.as_str(), "--all-members"][..], &win].concat());
+        let one = wf(&f.data, &[single("x"), win.to_vec()].concat());
+        let cost_bps: f64 = COST_BPS.parse().unwrap();
+        for (at, j) in [("all-members", &all), ("emit-series", &one)] {
+            let p = get(j, &["pooled"]);
+            check_close(at, p, p, cost_bps, get(j, &["economics", "break_even_bps_per_side"]), get(j, &["economics", "cost_ladder"]), 8760.0);
+        }
+        for (k, m) in items(get(&all, &["members"])).iter().enumerate() {
+            let p = get(m, &["pooled"]);
+            check_close(&format!("member {k}"), get(m, &["series"]), p, cost_bps, get(p, &["break_even_bps_per_side"]), get(p, &["cost_ladder"]), 8760.0);
+        }
+    }
+
+    #[test]
+    fn entry_times_count_stamps_not_rows() {
+        let scratch = Scratch::new("members-stamps");
+        let dir = scratch.path().to_path_buf();
+        // Ten symbols enter together at 20 h; three of them enter again at 30 h.
+        let mut csv = String::from("ts,sym,x,target\n");
+        for i in 0..40i64 {
+            for s in 0..10 {
+                let long = (20..25).contains(&i) || (s < 3 && (30..33).contains(&i));
+                csv.push_str(&format!("{},S{},{},0.0009765625\n", i * 3600, s, if long { 1 } else { -1 }));
+            }
+        }
+        let data = write(&dir, "stamps.csv", &csv);
+        let j = wf(&data, &[single("x"), vec!["--window", "w,0,36000,39600,144000"]].concat());
+        assert_eq!(get(&j, &["pooled", "entries"]).as_f64(), Some(13.0));
+        assert_eq!(get(&j, &["pooled", "entry_times"]).as_f64(), Some(2.0));
+        let (time, entries, stamp) = (nums(&j, &["pooled", "period_time"]), nums(&j, &["pooled", "period_entries"]), nums(&j, &["pooled", "period_entry_stamp"]));
+        let at = |h: f64| time.iter().position(|&t| t == h * 3600.0).unwrap();
+        assert_eq!((entries[at(20.0)], stamp[at(20.0)]), (10.0, 1.0));
+        assert_eq!((entries[at(30.0)], stamp[at(30.0)]), (3.0, 1.0));
+        assert_eq!(stamp.iter().sum::<f64>(), 2.0);
+    }
+
+    /// Buy and hold of the rows the book prices: long on every row of a symbol in a
+    /// window, the entry paid on its first row and the exit on its last.
+    fn buy_and_hold(data: &str, windows: &[(f64, f64)], cost: f64) -> Vec<f64> {
+        let text = std::fs::read_to_string(data).unwrap();
+        let rows: Vec<(f64, String, f64)> = text
+            .lines()
+            .skip(1)
+            .map(|l| {
+                let f: Vec<&str> = l.split(',').collect();
+                (f[0].parse().unwrap(), f[1].to_string(), f[3].parse().unwrap())
+            })
+            .collect();
+        let mut out = Vec::new();
+        for &(start, end) in windows {
+            let inside: Vec<&(f64, String, f64)> = rows.iter().filter(|r| r.0 >= start && r.0 < end).collect();
+            let first = |r: &(f64, String, f64)| !inside.iter().any(|o| o.1 == r.1 && o.0 < r.0);
+            let last = |r: &(f64, String, f64)| !inside.iter().any(|o| o.1 == r.1 && o.0 > r.0);
+            let mut times: Vec<f64> = inside.iter().map(|r| r.0).collect();
+            times.dedup();
+            for t in times {
+                let at: Vec<&&(f64, String, f64)> = inside.iter().filter(|r| r.0 == t).collect();
+                let sum: f64 = at.iter().map(|r| r.2 - if first(r) { cost } else { 0.0 } - if last(r) { cost } else { 0.0 }).sum();
+                out.push(sum / at.len() as f64);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn bh_series_matches_control() {
+        let f = fixture("members-bh");
+        let run = write(&f.dir, "run.json", &run_text(&EXPRS));
+        let win = ["--window", W1, "--window", W2, "--validation-frac", "0.3", "--period-grid", "target"];
+        let want = buy_and_hold(&f.data, &[(1_083_600.0, 1_620_000.0), (1_623_600.0, 2_160_000.0)], 1.0 / 1024.0);
+        let one = wf(&f.data, &[single("x"), win.to_vec()].concat());
+        let all = wf(&f.data, &[&["--front", run.as_str(), "--all-members"][..], &win].concat());
+        let member = &items(get(&all, &["members"]))[0];
+        for (at, s) in [("emit-series", get(&one, &["pooled"])), ("all-members", get(&all, &["pooled"])), ("member x", get(member, &["series"]))] {
+            let got = nums(s, &["period_bh_net"]);
+            assert_eq!(got.len(), want.len(), "{at}");
+            for (t, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert_eq!(g.to_bits(), w.to_bits(), "{at}: period {t}: {g} vs {w}");
+            }
+        }
+        let bh = items(get(&one, &["economics", "benchmarks"])).iter().find(|b| get(b, &["name"]).as_str() == Some("buy_and_hold")).unwrap().clone();
+        let r = rcsr::risk::risk_stats(&nums(&one, &["pooled", "period_bh_net"]), 8760.0, rcsr::risk::DEFAULT_SORTINO_MAR);
+        assert_eq!(get(&bh, &["mean_return"]).as_f64().map(f64::to_bits), Some(r.mean.to_bits()));
+        assert_eq!(get(&bh, &["sharpe"]).as_f64().map(f64::to_bits), Some(r.sharpe.to_bits()));
+    }
+
+    #[test]
+    fn all_members_edge_cases() {
+        let f = fixture("members-edge");
+        let win = ["--window", W1, "--window", W2, "--validation-frac", "0.3"];
+        // A constant member is reported, flat on every period.
+        let run = write(&f.dir, "run.json", &run_text(&["x", "-1"]));
+        let all = wf(&f.data, &[&["--front", run.as_str(), "--all-members"][..], &win].concat());
+        let flat = &items(get(&all, &["members"]))[1];
+        assert_eq!(get(flat, &["constant"]), &Json::Bool(true));
+        assert_eq!(get(flat, &["pooled", "active_rows"]).as_f64(), Some(0.0));
+        assert!(nums(flat, &["series", "period_net"]).iter().all(|&v| v == 0.0));
+        // A front of one member is the run's book: its member equals --from-run bit for bit.
+        let run = write(&f.dir, "one.json", &run_text(&["x"]));
+        let all = wf(&f.data, &[&["--front", run.as_str(), "--all-members"][..], &win].concat());
+        let book = wf(&f.data, &[&["--from-run", run.as_str(), "--emit-series"][..], &win].concat());
+        let member = &items(get(&all, &["members"]))[0];
+        for key in METRICS {
+            assert_eq!(get(member, &["pooled", key]), get(&book, &["pooled", key]), "pooled.{key}");
+        }
+        for key in SERIES {
+            assert_eq!(get(member, &["series", key]), get(&book, &["pooled", key]), "series.{key}");
+        }
+    }
+
+    #[test]
+    fn all_members_refusals() {
+        let f = fixture("members-refuse");
+        let run = write(&f.dir, "run.json", &run_text(&EXPRS));
+        let win = ["--window", W1, "--window", W2, "--validation-frac", "0.3"];
+        let front = ["--front", run.as_str(), "--all-members"];
+        let cases: [(Vec<&str>, &str); 5] = [
+            (vec!["--expr", "x", "--expr", "-x", "--target", "target", "--horizon", "3600", "--all-members"], "--all-members needs --front"),
+            ([&front[..], &["--select-band"]].concat(), "--all-members refuses --select-band"),
+            ([&front[..], &["--threshold-fit", "fitness"]].concat(), "--all-members refuses --threshold-fit"),
+            ([&front[..], &["--policy", "vote", "--quorum", "0.5"]].concat(), "--all-members refuses --policy vote"),
+            ([&front[..], &["--locked-test"]].concat(), "--all-members refuses --locked-test"),
+        ];
+        for (args, want) in cases {
+            let (code, _, err) = wf_raw(&f.data, &[args.clone(), win.to_vec()].concat());
+            assert_eq!(code, 2, "{args:?}: {err}");
+            assert!(err.contains(want), "{args:?}: {err}");
+        }
+    }
+}
