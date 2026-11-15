@@ -52,6 +52,9 @@ pub const DEFAULT_QUANTILE: f64 = 0.70;
 /// Seconds in a (crypto) year, used to turn a time step into periods per year.
 pub const SECONDS_PER_YEAR: f64 = 365.0 * 86_400.0;
 
+/// Gate-state rule `apply_mask` applies; `procedure_spec` names it in the candidate id.
+pub const MASK_STATE_RULE: &str = "window-restart/1";
+
 /// Options of the long-only evaluation protocol. The defaults leave every
 /// existing report value unchanged: the new report sections only add fields,
 /// and the bootstrap and null sections stay off until a draw count is set.

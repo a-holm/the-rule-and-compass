@@ -1237,7 +1237,7 @@ fn masked_run(dir: &Path) -> String {
         "split":{{"train_time":[{a},{b}],"required_purge_seconds":0,"purge_seconds":0}},
         "search":{{"candidates_evaluated":10}},
         "objective":{{"spec":{{"threshold":0,"per_side_bps":5,"max_position":1,"cash_return":0,
-            "pnl_mask":{{"expr":"x","band":0.0,"dwell":1}}}},"finalist":{{"expression":"x"}}}},
+            "pnl_mask":{{"expr":"x","band":0.0,"dwell":1}}}},"finalist":{{"expression":"x","expression_exact":"x"}}}},
         "pareto":[{{"expression":"x"}}]}}"#,
         a = T0,
         b = T0 + 100 * H
