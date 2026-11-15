@@ -4659,7 +4659,8 @@ fn score_tree_checked(tree: &Node, data: &EvalSample, cfg: &Config) -> f64 {
 /// The compiled program and the tile kernel are the ones [`PredBuf::fill`]
 /// uses, and every row value depends on its own row only, so a row range gives
 /// the bits of the full call. The book and the plain metric read the same
-/// buffer through the same functions. A non-finite prediction makes the book
+/// buffer through the same functions. A non-finite prediction (#1244: on a row
+/// inside the regime mask of a masked book) makes the book
 /// score `+inf` (`totals` sets `nonfinite`) and every plain unweighted metric
 /// too (`score_with_constants`). With `min_trades >= 1` and no row above the
 /// threshold the book counts no flip, so the score is `+inf` without it.
@@ -4690,13 +4691,14 @@ fn score_tree_checked_work(tree: &Node, data: &EvalSample, cfg: &Config) -> (f64
         let PredBuf { pred, scratch } = &mut *buf;
         pred.clear();
         pred.resize(s.len(), 0.0);
+        let mask = mask_flags(cfg);
         let mut long = false;
         let mut start = 0;
         while start < s.len() {
             let end = (start + CHECK_CHUNK).min(s.len());
             crate::eval_soa::eval_rows_into(&program, cols, start, end, pred, scratch);
-            for &p in &pred[start..end] {
-                if !p.is_finite() {
+            for (k, &p) in pred[start..end].iter().enumerate() {
+                if !p.is_finite() && decides(mask, start + k) {
                     work.early = 1;
                     work.early_rows = end as u64;
                     return (f64::INFINITY, work);
@@ -4717,11 +4719,23 @@ fn score_tree_checked_work(tree: &Node, data: &EvalSample, cfg: &Config) -> (f64
     })
 }
 
+/// #1244: the flags of a regime-masked fitness book; `None` without a mask.
+fn mask_flags(cfg: &Config) -> Option<&[u8]> {
+    cfg.fitness.book().filter(|b| b.is_masked()).map(|b| b.flags())
+}
+
+/// #1244: whether the prediction of row `i` can decide the score: every row
+/// without a mask, the rows inside the regime mask with one.
+fn decides(mask: Option<&[u8]>, i: usize) -> bool {
+    mask.map_or(true, |f| f.get(i).map_or(true, |&b| b & crate::trading::FITNESS_MASK_OFF == 0))
+}
+
 /// #500/#589: whether a non-finite prediction in the first rows decides the
-/// score. `Some(true)`: the first rows hold one, which makes the full score
-/// `+inf` for the plain metrics and the P&L book. `Some(false)`: the prefix is
-/// finite and the full pass decides. `None`: the score does not follow that
-/// rule (implicit, weighted, multi-output), so the full pass always runs.
+/// score. `Some(true)`: the first rows hold one (#1244: on a row inside the
+/// regime mask of a masked book), which makes the full score `+inf` for the
+/// plain metrics and the P&L book. `Some(false)`: the prefix is finite and the
+/// full pass decides. `None`: the score does not follow that rule (implicit,
+/// weighted, multi-output), so the full pass always runs.
 fn nonfinite_prefix(tree: &Node, data: &EvalSample, cfg: &Config) -> Option<bool> {
     let s = data.sample;
     if s.is_empty()
@@ -4731,15 +4745,16 @@ fn nonfinite_prefix(tree: &Node, data: &EvalSample, cfg: &Config) -> Option<bool
     {
         return None;
     }
+    let mask = mask_flags(cfg);
     let rows = s.x.len().min(INF_PROBE_ROWS);
     if let Some(cols) = &data.cols {
         if let Some(program) = crate::eval_soa::compile(tree) {
             let mut pred = vec![0.0; rows];
             crate::eval_soa::eval_batch(&program, cols, rows, &mut pred);
-            return Some(pred.iter().any(|p| !p.is_finite()));
+            return Some(pred.iter().enumerate().any(|(i, p)| !p.is_finite() && decides(mask, i)));
         }
     }
-    Some(s.x.iter().take(rows).any(|row| !eval(tree, row).is_finite()))
+    Some(s.x.iter().take(rows).enumerate().any(|(i, row)| decides(mask, i) && !eval(tree, row).is_finite()))
 }
 
 /// #500: the prefix decides the score and the run keeps no descriptor
