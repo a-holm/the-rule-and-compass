@@ -742,7 +742,7 @@ The run refuses a setup that would leak or mis-state the book:
 
 The target spec's purge already covers the label horizon between the training, validation and test blocks.
 
-With `--fitness pnl --pnl-blocks K` (2 to 8) the search itself penalises a formula that earns in one regime only: the training rows are cut into `K` contiguous time blocks, each block is scored as its own long/flat book, and the fitness is the mean block regret plus `--pnl-block-lambda` times their sample standard deviation (`docs/optimisation.md`). This is a ranking term on the training period. It does not replace the validation slice, the walk-forward of the front or the lockbox, and it does not refit constants per block.
+With `--fitness pnl --pnl-blocks K` (2 to 64) the search itself penalises a formula that earns in one regime only: the training rows are cut into `K` contiguous time blocks, each block is scored as its own long/flat book, and the fitness is a statistic of the block regrets (`--pnl-stat`: by default the mean plus `--pnl-block-lambda` times their sample standard deviation; a downside semi-deviation or the mean of the worst blocks are the alternatives, `docs/optimisation.md`). This is a ranking term on the training period. It does not replace the validation slice, the walk-forward of the front or the lockbox, and it does not refit constants per block.
 
 ### Robust finalist selection and re-selection
 

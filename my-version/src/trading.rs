@@ -1602,12 +1602,39 @@ impl BlockStat {
 /// operations in the same order.
 pub fn block_stat(stat: BlockStat, r: &[f64], lambda: f64) -> f64 {
     let nb = r.len();
-    let _ = stat;
+    if let BlockStat::Cvar(q) = stat {
+        let m = BlockStat::cvar_count(q, nb);
+        let mut chosen = vec![false; nb];
+        for _ in 0..m {
+            let mut best = usize::MAX;
+            for b in 0..nb {
+                if !chosen[b] && (best == usize::MAX || r[b] > r[best]) {
+                    best = b;
+                }
+            }
+            chosen[best] = true;
+        }
+        let mut sum = 0.0f64;
+        for b in 0..nb {
+            if chosen[b] {
+                sum += r[b];
+            }
+        }
+        return sum / m as f64;
+    }
     let mut sum = 0.0f64;
     for v in r {
         sum += *v;
     }
     let mean = sum / nb as f64;
+    if stat == BlockStat::MeanSemi {
+        let mut ss = 0.0f64;
+        for v in r {
+            let d = if *v > 1.0 { *v - 1.0 } else { 0.0 };
+            ss += d * d;
+        }
+        return mean + lambda * (ss / nb as f64).sqrt();
+    }
     if nb == 1 {
         return r[0];
     }
@@ -1627,8 +1654,8 @@ pub fn block_ids(time: &[f64], blocks: usize) -> Result<Vec<u8>, String> {
     let mut distinct: Vec<f64> = time.to_vec();
     distinct.sort_by(|a, b| a.total_cmp(b));
     distinct.dedup_by(|a, b| a == b);
-    if blocks == 0 || blocks > FITNESS_MAX_BLOCKS {
-        return Err(format!("the block count must be 1 to {}, got {}", FITNESS_MAX_BLOCKS, blocks));
+    if blocks == 0 || blocks > FITNESS_BOOK_MAX_BLOCKS {
+        return Err(format!("the block count must be 1 to {}, got {}", FITNESS_BOOK_MAX_BLOCKS, blocks));
     }
     if distinct.len() < blocks {
         return Err(format!(
@@ -1794,8 +1821,8 @@ impl FitnessBook {
         segment_starts: &[f64],
         mask: Option<BookMask>,
     ) -> Result<Self, String> {
-        if blocks == 0 || blocks > FITNESS_MAX_BLOCKS {
-            return Err(format!("the block count must be 1 to {}, got {}", FITNESS_MAX_BLOCKS, blocks));
+        if blocks == 0 || blocks > FITNESS_BOOK_MAX_BLOCKS {
+            return Err(format!("the block count must be 1 to {}, got {}", FITNESS_BOOK_MAX_BLOCKS, blocks));
         }
         if !lambda.is_finite() || lambda < 0.0 {
             return Err(format!("the block lambda must be finite and >= 0, got {}", lambda));
@@ -2003,6 +2030,14 @@ impl FitnessBook {
         }
         if self.stat != BlockStat::MeanSd {
             return Err("the block statistic of the book is already set".to_string());
+        }
+        if stat != BlockStat::MeanSd {
+            fnv_u64(&mut self.hash, 0x7374_6174_u64);
+            fnv_u64(&mut self.hash, stat.code() as u64);
+            match stat {
+                BlockStat::Cvar(q) => fnv_u64(&mut self.hash, q.to_bits()),
+                _ => fnv_u64(&mut self.hash, self.lambda.to_bits()),
+            }
         }
         self.stat = stat;
         Ok(self)
@@ -3264,7 +3299,12 @@ mod block_tests {
     /// bit for bit.
     #[test]
     fn mean_sd_books_up_to_8_blocks_are_pinned() {
-        const PINNED: [(usize, u64, u64); 4] = [(1, 0, 0), (2, 0, 0), (4, 0, 0), (8, 0, 0)];
+        const PINNED: [(usize, u64, u64); 4] = [
+            (1, 0xa2e2_82a5_0092_fdb4, 0x4004_7b2d_c2fd_d2f4),
+            (2, 0x4267_9a39_8749_ebbb, 0x4004_7d77_c5ba_f68c),
+            (4, 0x5998_0622_5b02_0152, 0x4004_981e_29bd_7172),
+            (8, 0xec7f_2e15_4e3e_38a1, 0x4004_aa52_86fb_34c7),
+        ];
         let s = panel(&[9000, 4000, 1, 7000, 300]);
         let p = pred(s.ret.len());
         let got: Vec<(usize, u64, u64)> = PINNED

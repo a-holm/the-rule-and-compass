@@ -261,8 +261,8 @@ fn switch_refusals_name_their_reason() {
     refused(&["--a", "x1", "--b", "x1", "--gate", "g"], 2, "same book");
     refused(&["--a", "x1", "--b", "flat", "--gate", "g", "--band", "0.1"], 2, "not plain");
     refused(&["--a", "x1", "--b", "flat", "--gate", "g", "--pnl-mask", "g"], 2, "--pnl-mask");
-    refused(&["--a", "x1", "--b", "flat", "--gate", "g", "--pnl-stat", "cvar"], 2, "--pnl-stat");
-    refused(&["--a", "x1", "--b", "flat", "--gate", "g", "--pnl-cvar-q", "0.5"], 2, "--pnl-cvar-q");
+    refused(&["--a", "x1", "--b", "flat", "--gate", "g", "--pnl-stat", "cvar"], 2, "--pnl-stat: the sweep reports the mean-sd block fitness");
+    refused(&["--a", "x1", "--b", "flat", "--gate", "g", "--pnl-cvar-q", "0.5"], 2, "--pnl-cvar-q: the sweep reports the mean-sd block fitness");
     refused(&["--a", "x1", "--b", "flat", "--gate", "g", "--gpu"], 2, "--gpu");
     refused(&["--a", "x1", "--b", "flat", "--gate", "g", "--fitness", "metric"], 2, "--fitness must be pnl");
     refused(&["--a", "x1", "--b", "flat"], 2, "--gate <expr> is required");
