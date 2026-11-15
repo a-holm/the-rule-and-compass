@@ -41,7 +41,15 @@ A difference exits 2 and names the field. A run.json records no data hash, so th
 
 The menu is pre-registered: each gate fixes its expression, band, dwell and codeword, so the menu index is the only free choice. The composite code (`docs/occam-code-v1.json`) registers 8 menu gates, so a menu holds 1 to 8 gates and each codeword is 3 binary digits, distinct; the codeword read as a binary number is the gate's menu index in the code. The menu's sha256 is in `compose.menu`.
 
-The state of a row follows the `--pnl-mask` rule of #1180 (`regime_gate::hysteresis_states`): on above `+band`, off below `-band`, else the previous state; a change waits until the current state has held `dwell` rows of the group; a non-finite value is off. The state starts at each group's first row of the slice, and on the training rows at each training segment. A gate with band 0 and dwell 1 is the expression's own `greater(gate, 0)`.
+The state of a row follows the kernel of `--pnl-mask` (#1180, `regime_gate::hysteresis_states`): on above `+band`, off below `-band`, else the previous state; a change waits until the current state has held `dwell` rows of the group; a non-finite value is off. Band 0 and dwell 1 is the sign of the gate through the same kernel, so a `+inf` gate value is off.
+
+Which rows feed the kernel is the evaluation rule `rcsr-gate-state/1` (#1214), shared by compose, the `--pnl-mask` validation and test books, walk-forward, the ladder, `--reselect-run` and the sealed read:
+
+* The gate rows are every row of the data file with a finite time, per group in file order. The gate reads only its own columns: no label, target or return column, and no row filter (`--filter`, `--exclude`, fill drops, the split, windows, folds) removes a gate row. Rows of a group out of time order are refused (exit 3 in a search or compose, exit 2 in walk-forward).
+* A barrier is a half-open time range whose gate rows are not read. Pricing reads (the test rows, walk-forward windows, ladder folds, the locked read) have one barrier per locked range the command does not open, from its start to its end plus the lookback embargo. Selection reads (the validation rows, `--reselect-run`) add one barrier per test interval of the split, from its start to its end plus the split's embargo (the test block from its first row under a temporal split). A validation row inside a barrier exits 3.
+* The state of a row is the kernel over the readable gate rows of its group from the group's first one, restarting at the first readable row after a barrier. A row's state is a property of the row, the data file and the barrier set, the same in every slice, window and command.
+
+So the validation and test rows start from the state of the whole readable prefix, not from the first row of the slice: with a band the state has unbounded memory, and any shorter warm-up would tie the state at a slice start to the split. The training rows keep the per-segment start of the `--pnl-mask` fitness (#1190); they feed only the pruning bound and the training seam.
 
 Gate columns pass the `--pnl-mask` column checks: a label-family column, the target, its return column or a construction column exits 5, a missing column exits 3, an aggregate or meta operator exits 2. The branch columns pass the same checks.
 
@@ -78,18 +86,34 @@ Only the training and validation rows are read before the finalist is fixed. The
 
 ## Output
 
-The run.json has the fields of a search run that the evaluators read: `target`, `variables` (the gate and branch columns), `split` (of this invocation), `target_spec`, `search.candidates_evaluated`, `objective` (`spec` with threshold 0, `finalist.expression_exact`, `validation`, `test`, `selection_rule` of the robust rule over the composites) and `pareto`: the finalist first, then the other composites whose gate is a row expression, in rank order. `compose` (`rcsr-compose/1`) adds:
+The run.json has the fields of a search run that the evaluators read: `target`, `variables` (the gate and branch columns), `split` (of this invocation), `target_spec`, `search.candidates_evaluated`, `objective` (`spec` with threshold 0, `finalist.expression_exact`, `finalist.switch`, `validation`, `test`, `selection_rule` of the robust rule over the composites) and `pareto`: every composite in rank order, each with `pruned`. `compose` (`rcsr-compose/1`) adds:
 
 * `menu`, `code`, `runs`, `members`, `count` and `candidates_evaluated`;
 * `pruned`, `scored`, `usable` and `rows` (training, validation and test rows);
 * `selection`: rule, blocks, regime condition, number eligible, verdict and the chosen id;
-* `gate`: the finalist's gate, `carried` when it has a band or a dwell;
+* `gate`: the finalist's gate (name, codeword, menu index, expression, band, dwell, columns);
 * `chosen`: the validation and the test book of the finalist with its `regime` block (per state rows, share, net, exposure, `buy_and_hold_net` and alpha; the seam; switches, switches per year and the mean state length in periods; `switch_cost`, the cost of the position changes in the periods where the state changes, against `total_cost`), the seam identity on the training rows (`train_seam`), each branch alone and the best all-weather member on the same rows;
 * `composites`: every composite.
 
-`walkforward --from-run`, `walkforward --front` and `ladder --sr-run` price the composite unchanged. Out of sample the run is one trial; a walk-forward window on rows the composition selected on takes `search.candidates_evaluated` as its trial count (#1027).
+`walkforward --from-run`, `walkforward --front`, `ladder --sr-run`, `--reselect-run`, the seal and the sealed read price every composite. Out of sample the run is one trial; a walk-forward window on rows the composition selected on takes `search.candidates_evaluated` as its trial count (#1027).
 
-A gate with a band or a dwell has state, so its composite is not a row expression. Such a finalist is carried in `compose.gate` (`carried: true`), and every reader of a run.json (walk-forward, ladder, the seal, `--reselect-run` and compose itself) refuses the run: the finalist expression alone would price another book. `objective.test` holds the composite's own test book. The other composites with a stateful gate stay in `compose.composites` and are left out of `pareto`.
+### The switch
+
+A C1 or C2 composite is a switch: its book holds the on branch where the gate state is on and the off branch elsewhere, long where the held branch is above 0. Its gate state is not a row expression, so the run carries the switch beside the expression: `objective.finalist.switch` and `pareto[].switch` of every C1 and C2 (a C0 has none).
+
+```json
+"switch": {"gate": {"schema": "rcsr-gate/1", "expr": "btc_r672", "columns": ["btc_r672"], "band": 0.02, "dwell": 168, "state_rule": "rcsr-gate-state/1"},
+           "on": "(x1) - (0.1)", "off": "-1.0"}
+```
+
+`expression_exact` stays the display form `if(greater(gate, 0), on, off)`; every reader prices the switch, a band-0 dwell-1 gate included. The composite is one book: at a gate flip it pays the cost of the actual position change per symbol, `side * [a != b]`, never the sum of two masked books, `side * (a + b)`. `compose.chosen.validation.regime.start` and `compose.chosen.test.regime.start` state the warm-up each slice starts from: `warmup_rows` (readable gate rows since each group's last restart, before the slice start), `warmup_first_time` and `warmup_last_time` (raw time keys), `groups` (groups that carry a state into the slice), `on_at_start` and `dwell_running_at_start` (groups whose state has held fewer than `dwell` rows). A group whose first readable row is the slice start carries no state.
+
+### Re-selection
+
+`rcsr <the flags of this compose run without --gates, --bull, --bear, --all-weather and --top> --reselect-run composed.run.json --select-rule robust [--select-se z]` reruns the choice (the robust rule plus the per-state alpha condition) over the run's composites on this invocation's rows and writes a composed run.json with `objective.selection_rule.reselected_from`. The menu, the members and the composites come from the run's `compose` block; the run's pruning, bits and code are kept. The split must match the run on the split fields of the table above (exit 2); a `--select-rule` other than robust and a pool or menu flag exit 2.
+
+A run written before the switch block (`compose.gate.carried: true` and no `objective.finalist.switch`) exits 3 in every reader and asks for a new compose run.
+
 
 ## Refusals
 
@@ -98,7 +122,9 @@ A gate with a band or a dwell has state, so its composite is not a row expressio
 | no `--gates`, no `--bull` and no `--bear`, `--top 0`, a bad menu | 2 |
 | input runs that differ in target, target spec, cost or split, from each other or from this invocation | 2 |
 | `--threshold`, `--position`, `--book-target`, `--band`, `--band-units`, `--min-holding`, `--max-position`, `--cash-return`, `--funding`, `--pnl-mask`, `--sample-rows`, `--pnl-excess`, `--pnl-stat`, `--pnl-cvar-q`, `--gpu`, a `--select-rule` other than robust, a `--fitness` other than pnl | 2 |
-| `--lags`, `--lag-set`, `--fill`, `--outlier-iqr`, `--smooth` | 2 |
+| `--lags`, `--lag-set`, `--fill` other than `drop`, `--outlier-iqr`, `--smooth` | 2 |
 | no validation rows, or no composite with a usable validation book | 2 |
 | a gate or branch column of the label family, the target, its return column or a construction column | 5 |
 | an unreadable menu or run, a missing column | 3 |
+| a pool run whose member carries a `switch` (nested switch) | 2 |
+| a composed run with `compose.gate.carried` and no `objective.finalist.switch` | 3 |

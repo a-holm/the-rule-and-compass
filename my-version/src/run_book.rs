@@ -29,6 +29,8 @@ pub struct RunBook {
     pub min_holding: usize,
     /// #1180: the regime gate of `objective.spec.pnl_mask`, when the run priced a masked book.
     pub mask: Option<crate::regime_gate::GateSpec>,
+    /// #1214: `objective.finalist.switch`: the composite's book; `expression` is its display form.
+    pub switch: Option<crate::regime_gate::Switch>,
     /// The finalist reads no variable.
     pub constant: bool,
 }
@@ -158,6 +160,10 @@ impl RunBook {
             .ok_or_else(|| "run.json has no target_spec".to_string())?;
         let spec = target::parse_object(target_spec).map_err(|e| format!("run.json target_spec: {}", e))?;
         let source = cost_source_of(j);
+        let switch = match finalist.get("switch") {
+            None | Some(Json::Null) => None,
+            Some(s) => Some(crate::regime_gate::Switch::parse(s).map_err(|e| format!("run.json objective.finalist.{}", e))?),
+        };
         let constant = finalist
             .get("constant")
             .map(|c| matches!(c, Json::Bool(true)))
@@ -174,6 +180,7 @@ impl RunBook {
             band,
             min_holding,
             mask: mask_of(Some(spec_json))?,
+            switch,
             constant,
         })
     }

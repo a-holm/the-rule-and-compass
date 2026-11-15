@@ -13,16 +13,19 @@
 //! constant -1.
 //!
 //! The choice reads the training and validation rows only; the test rows are
-//! read once the finalist is fixed. A gate with a band or a dwell above one row
-//! has state: its rows take [`regime_gate::hysteresis_states`] (the
-//! `--pnl-mask` rule of #1180) and the run carries the gate in `compose.gate`.
-//! A gate with band 0 and dwell 1 is the expression's own `greater(gate, 0)`.
+//! read once the finalist is fixed. A C1 or C2 composite is a switch
+//! ([`regime_gate::Switch`]): its validation and test rows take the gate states
+//! of the evaluation rule `rcsr-gate-state/1` (warm-up over the full readable
+//! prefix of the data file; the validation rows never read the test intervals),
+//! its training rows the per-segment kernel of the `--pnl-mask` fitness (#1190).
+//! The run carries the switch of every C1 and C2 composite, so every reader
+//! prices the same book.
 
 use crate::data::TradingSlice;
 use crate::devlog::{num, text, Json};
 use crate::expr::{self, Node};
 use crate::occam::{self, CodeSpec};
-use crate::regime_gate::{self, GateSpec};
+use crate::regime_gate::{self, GateSpec, Regime};
 use crate::selection::{RobustMember, RobustMeta, RobustParams, RobustSelection};
 use crate::switch;
 use crate::trading::{self, FitnessBook, PathStats, TradingRows, TradingSpec};
@@ -203,7 +206,16 @@ fn load_run(pool: Pool, path: &str, top: usize, index: usize, members: &mut Vec<
     let flag = pool.flag();
     let body = std::fs::read_to_string(path).map_err(|e| (3, format!("{} '{}': {}", flag, path, e)))?;
     let bad = |e: String| (2, format!("{} '{}': {}", flag, path, e));
-    let run = crate::run_json::RunFile::parse(&body).map_err(bad)?;
+    let run = crate::run_json::RunFile::parse(&body).map_err(|e| {
+        if e.contains(crate::run_json::STALE_COMPOSE_REFUSAL) {
+            (3, format!("{} '{}': {}", flag, path, e))
+        } else {
+            bad(e)
+        }
+    })?;
+    if run.front.iter().any(|m| m.switch.is_some()) {
+        return Err(bad("a member carries a switch (a composed run): a composite cannot be a branch, nested switches are not supported".to_string()));
+    }
     let book = run.band_book().map_err(bad)?;
     if book.position != trading::PositionMap::Threshold {
         return Err(bad("the run priced the top_tercile book; compose composes threshold books".to_string()));
@@ -266,6 +278,8 @@ pub struct Request {
     pub top: usize,
     pub json: bool,
     pub out: Option<String>,
+    /// #1214: `--reselect-run` of a composed run: the choice reruns over the run's composites.
+    pub reselect: Option<Reselect>,
 }
 
 static REQUEST: std::sync::OnceLock<Request> = std::sync::OnceLock::new();
@@ -273,6 +287,161 @@ static REQUEST: std::sync::OnceLock<Request> = std::sync::OnceLock::new();
 /// The `rcsr compose` request of this process, when the command is `compose`.
 pub fn request() -> Option<&'static Request> {
     REQUEST.get()
+}
+
+/// #1214: what a re-selection keeps from the composed run: the bits, the
+/// pruning and the code of every composite, which this invocation's `--ops`
+/// and `--vars` could not reproduce.
+#[derive(Clone, Debug)]
+pub struct Reselect {
+    pub path: String,
+    pub sha256: String,
+    pub member_bits: Vec<(f64, bool)>,
+    pub bits: Vec<f64>,
+    pub pruned: Vec<bool>,
+    pub bound_gain: Vec<Option<f64>>,
+    pub code: String,
+}
+
+/// The `--reselect-run` path of `args` when that run.json has a `compose`
+/// block; a run that cannot be read is left to the search parser.
+pub fn reselect_target(args: &[String]) -> Option<String> {
+    let at = args.iter().position(|a| a == "--reselect-run")?;
+    let path = args.get(at + 1)?;
+    let body = std::fs::read_to_string(path).ok()?;
+    Json::parse(body.trim())?.get("compose")?;
+    Some(path.clone())
+}
+
+/// #1214: `rcsr <compose flags> --reselect-run <composed.run.json>`: compose's
+/// choice over the run's composites on this invocation's rows. The menu, the
+/// members and the composites come from the run; the pool and menu flags exit 2.
+pub fn claim_reselect(args: &[String], path: &str) -> Vec<String> {
+    let mut rest: Vec<String> = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--reselect-run" {
+            i += 2;
+            continue;
+        }
+        rest.push(args[i].clone());
+        i += 1;
+    }
+    claim_with(&rest, Some(path))
+}
+
+/// Compact JSON text of a parsed value.
+fn json_text(j: &Json) -> String {
+    match j {
+        Json::Null => "null".to_string(),
+        Json::Bool(b) => b.to_string(),
+        Json::Num(v) => num(*v),
+        Json::Str(s) => text(s),
+        Json::Arr(a) => format!("[{}]", a.iter().map(json_text).collect::<Vec<_>>().join(",")),
+        Json::Obj(o) => format!("{{{}}}", o.iter().map(|(k, v)| format!("{}:{}", text(k), json_text(v))).collect::<Vec<_>>().join(",")),
+    }
+}
+
+fn from_composed(path: &str) -> Result<Request, Fail> {
+    let body = std::fs::read_to_string(path).map_err(|e| (3, format!("--reselect-run '{}': {}", path, e)))?;
+    let bad = |e: String| (3, format!("--reselect-run '{}': {}", path, e));
+    let doc = Json::parse(body.trim()).ok_or_else(|| bad("not a run.json document".to_string()))?;
+    let c = doc.get("compose").ok_or_else(|| bad("no compose block".to_string()))?;
+    if c.get("schema").and_then(Json::as_str) != Some(SCHEMA) {
+        return Err(bad(format!("compose.schema is not {}", SCHEMA)));
+    }
+    let run = crate::run_json::RunFile::parse(&body).map_err(bad)?;
+    let book = run.band_book().map_err(bad)?;
+    let list = |j: Option<&Json>, what: &str| -> Result<Vec<Json>, Fail> {
+        match j {
+            Some(Json::Arr(a)) => Ok(a.clone()),
+            _ => Err(bad(format!("compose.{} is not a list", what))),
+        }
+    };
+    let menu_j = c.get("menu").ok_or_else(|| bad("no compose.menu".to_string()))?;
+    let mut gates = Vec::new();
+    for (k, g) in list(menu_j.get("gates"), "menu.gates")?.iter().enumerate() {
+        let s = |key: &str| g.get(key).and_then(Json::as_str).map(str::to_string).ok_or_else(|| bad(format!("compose.menu.gates[{}] has no '{}'", k, key)));
+        let n = |key: &str| g.get(key).and_then(Json::as_f64).ok_or_else(|| bad(format!("compose.menu.gates[{}] has no '{}'", k, key)));
+        let gate = GateSpec::parse(&s("expr")?, n("band")?, n("dwell")? as usize).map_err(|e| bad(format!("compose.menu.gates[{}]: {}", k, e)))?;
+        gates.push(MenuGate { name: s("name")?, codeword: s("codeword")?, index: n("index")? as usize, gate });
+    }
+    let menu = Menu {
+        path: menu_j.get("path").and_then(Json::as_str).unwrap_or_default().to_string(),
+        sha256: menu_j.get("sha256").and_then(Json::as_str).unwrap_or_default().to_string(),
+        gates,
+        switch_budget: menu_j.get("switch_budget").and_then(Json::as_usize),
+    };
+    let mut runs = Vec::new();
+    for (k, r) in list(c.get("runs"), "runs")?.iter().enumerate() {
+        let pool = match r.get("pool").and_then(Json::as_str) {
+            Some("bull") => Pool::Bull,
+            Some("bear") => Pool::Bear,
+            Some("all_weather") => Pool::AllWeather,
+            other => return Err(bad(format!("compose.runs[{}].pool {:?}", k, other))),
+        };
+        let mask = match r.get("mask") {
+            Some(m @ Json::Obj(_)) => {
+                let e = m.get("expr").and_then(Json::as_str).unwrap_or_default();
+                let b = m.get("band").and_then(Json::as_f64).unwrap_or(0.0);
+                let d = m.get("dwell").and_then(Json::as_f64).unwrap_or(1.0) as usize;
+                Some(GateSpec::parse(e, b, d).map_err(|e| bad(format!("compose.runs[{}].mask: {}", k, e)))?)
+            }
+            _ => None,
+        };
+        runs.push(PoolRun {
+            pool,
+            path: r.get("path").and_then(Json::as_str).unwrap_or_default().to_string(),
+            sha256: r.get("sha256").and_then(Json::as_str).unwrap_or_default().to_string(),
+            target: doc.get("target").and_then(Json::as_str).map(str::to_string),
+            target_sha: book.spec.sha256(),
+            threshold: r.get("threshold").and_then(Json::as_f64).unwrap_or(0.0),
+            per_side_bps: book.per_side_bps,
+            mask,
+            split: doc.get("split").cloned().unwrap_or(Json::Null),
+            candidates_evaluated: r.get("candidates_evaluated").and_then(Json::as_f64).map(|v| v as u64),
+            front_size: r.get("front_size").and_then(Json::as_usize).unwrap_or(0),
+        });
+    }
+    let mut members = Vec::new();
+    let mut member_bits = Vec::new();
+    for (k, m) in list(c.get("members"), "members")?.iter().enumerate() {
+        let s = |key: &str| m.get(key).and_then(Json::as_str).map(str::to_string).ok_or_else(|| bad(format!("compose.members[{}] has no '{}'", k, key)));
+        let run_index = m.get("run").and_then(Json::as_usize).filter(|&r| r < runs.len()).ok_or_else(|| bad(format!("compose.members[{}].run", k)))?;
+        let expression_exact = s("expression_exact")?;
+        member_bits.push((m.get("bits").and_then(Json::as_f64).unwrap_or(f64::NAN), matches!(m.get("exact_codeword"), Some(Json::Bool(true)))));
+        members.push(Member {
+            run: run_index,
+            archive_rank: m.get("archive_rank").and_then(Json::as_usize).unwrap_or(0),
+            columns: regime_gate::referenced_columns(&expression_exact),
+            expression_exact,
+            branch: s("branch")?,
+        });
+    }
+    let req = Request { menu, runs, members, top: c.get("top").and_then(Json::as_usize).unwrap_or(0), json: false, out: None, reselect: None };
+    let composites = enumerate(&req);
+    let listed = list(c.get("composites"), "composites")?;
+    if listed.len() != composites.len() {
+        return Err(bad(format!("compose.composites holds {} entries; the menu and the members give {}", listed.len(), composites.len())));
+    }
+    let (mut bits, mut pruned, mut bound_gain) = (Vec::new(), Vec::new(), Vec::new());
+    for (k, (j, made)) in listed.iter().zip(&composites).enumerate() {
+        let same = j.get("id").and_then(Json::as_usize) == Some(made.id)
+            && j.get("expression").and_then(Json::as_str) == Some(made.text.as_str())
+            && j.get("type").and_then(Json::as_str) == Some(made.kind.label());
+        if !same {
+            return Err(bad(format!("compose.composites[{}] is not the composite the menu and the members give ('{}')", k, made.text)));
+        }
+        bits.push(j.get("bits").and_then(Json::as_f64).unwrap_or(f64::NAN));
+        pruned.push(matches!(j.get("pruned"), Some(Json::Bool(true))));
+        bound_gain.push(j.get("bound_gain").and_then(Json::as_f64));
+    }
+    let code = c.get("code").map_or_else(|| "null".to_string(), json_text);
+    let sha256 = crate::manifest::sha256_hex(body.as_bytes());
+    Ok(Request {
+        reselect: Some(Reselect { path: path.to_string(), sha256, member_bits, bits, pruned, bound_gain, code }),
+        ..req
+    })
 }
 
 impl Request {
@@ -288,6 +457,11 @@ impl Request {
             out.push((pool.flag(), cols));
         }
         out
+    }
+
+    /// The menu gates, whose `rcsr-gate-state/1` states the validation and test slices carry.
+    pub fn state_gates(&self) -> Vec<GateSpec> {
+        self.menu.gates.iter().map(|g| g.gate.clone()).collect()
     }
 
     /// Every column read, gate columns first, in order of first use.
@@ -326,7 +500,7 @@ USAGE:
                            (the menu index of the composite code); a row is on above
                            +band, off below -band, else its previous state, a change
                            waiting for dwell rows per group (the --pnl-mask rule);
-                           band 0 and dwell 1 is greater(gate, 0). A label-family
+                           a non-finite value is off. A label-family
                            column, the target, its return column or a construction
                            column exits 5; a missing column exits 3
   --bull <run.json>        a bull pool run, repeatable: its members hold the gate-on
@@ -358,10 +532,25 @@ USAGE:
   in switch periods against the total cost, each branch alone and the best
   all-weather member on the same rows.
 
-  A finalist whose gate has a band or a dwell above 1 is carried in compose.gate;
-  walkforward --from-run, ladder --sr-run and the seal refuse such a run. A band,
-  a minimum hold, --threshold, --position, --book-target, --pnl-mask, --pnl-excess,
-  --pnl-stat, --pnl-cvar-q, --sample-rows and --gpu exit 2. See docs/compose.md.
+  Every C1 and C2 composite is a switch: run.json carries objective.finalist.switch
+  and pareto[].switch (gate, on branch, off branch), and pareto lists every
+  composite with pruned. The validation and test rows take the gate states of
+  rcsr-gate-state/1: the kernel over every row of the data file with a finite
+  time, per group from its first readable row, never reading a locked range the
+  command does not open (with its lookback embargo); the validation rows also
+  never read a test interval (with the split's embargo). The training rows keep
+  the per-segment start of the --pnl-mask fitness. compose.chosen.validation.regime
+  and .test.regime carry the warm-up (start). walkforward --from-run and --front,
+  ladder --sr-run, the seal and the locked read price the switch.
+
+  rcsr <these flags without the menu and pool flags> --reselect-run <composed.run.json>
+  reruns the choice over the run's composites on this invocation's rows (the
+  run's pruning, bits and code kept); the split must match the run (exit 2).
+
+  A band, a minimum hold, --threshold, --position, --book-target, --pnl-mask,
+  --sample-rows, --pnl-excess, --pnl-stat, --pnl-cvar-q and --gpu exit 2. A pool run whose
+  member carries a switch exits 2 (nested switch); a run with
+  compose.gate.carried and no switch exits 3. See docs/compose.md.
 "
 }
 
@@ -381,6 +570,10 @@ fn exit_with((code, msg): Fail) -> ! {
 /// `--cpu` added when absent. Usage errors and mismatched runs exit 2, an
 /// unreadable file exits 3.
 pub fn claim(args: &[String]) -> Vec<String> {
+    claim_with(args, None)
+}
+
+fn claim_with(args: &[String], reselect: Option<&str>) -> Vec<String> {
     if args.iter().any(|a| a == "-h" || a == "--help") {
         println!("{}", usage_text());
         std::process::exit(0);
@@ -393,6 +586,9 @@ pub fn claim(args: &[String]) -> Vec<String> {
         let flag = args[i].as_str();
         let value = || -> String { args.get(i + 1).cloned().unwrap_or_else(|| fail(&format!("{} requires a value", flag))) };
         match flag {
+            "--gates" | "--bull" | "--bear" | "--all-weather" | "--top" if reselect.is_some() => {
+                fail(&format!("{} with --reselect-run of a composed run: the menu and the pools come from the run", flag))
+            }
             "--gates" => gates = Some(value()),
             "--bull" => paths.push((Pool::Bull, value())),
             "--bear" => paths.push((Pool::Bear, value())),
@@ -443,20 +639,26 @@ pub fn claim(args: &[String]) -> Vec<String> {
             _ => fail(&format!("--top must be an integer >= 1, got '{}'", k)),
         },
     };
-    let gates = gates.unwrap_or_else(|| fail("--gates <menu.json> is required"));
-    if !paths.iter().any(|(p, _)| *p == Pool::Bull) && !paths.iter().any(|(p, _)| *p == Pool::Bear) {
-        fail("--bull <run.json> or --bear <run.json> is required");
-    }
-    let menu = Menu::load(&gates).unwrap_or_else(|e| exit_with(e));
-    let mut members: Vec<Member> = Vec::new();
-    let mut runs: Vec<PoolRun> = Vec::new();
-    for (pool, path) in &paths {
-        let run = load_run(*pool, path, top, runs.len(), &mut members).unwrap_or_else(|e| exit_with(e));
-        runs.push(run);
-    }
-    if let Err(e) = check_runs_agree(&runs) {
-        exit_with(e);
-    }
+    let req = match reselect {
+        Some(path) => Request { json, out, ..from_composed(path).unwrap_or_else(|e| exit_with(e)) },
+        None => {
+            let gates = gates.unwrap_or_else(|| fail("--gates <menu.json> is required"));
+            if !paths.iter().any(|(p, _)| *p == Pool::Bull) && !paths.iter().any(|(p, _)| *p == Pool::Bear) {
+                fail("--bull <run.json> or --bear <run.json> is required");
+            }
+            let menu = Menu::load(&gates).unwrap_or_else(|e| exit_with(e));
+            let mut members: Vec<Member> = Vec::new();
+            let mut runs: Vec<PoolRun> = Vec::new();
+            for (pool, path) in &paths {
+                let run = load_run(*pool, path, top, runs.len(), &mut members).unwrap_or_else(|e| exit_with(e));
+                runs.push(run);
+            }
+            if let Err(e) = check_runs_agree(&runs) {
+                exit_with(e);
+            }
+            Request { menu, runs, members, top, json, out, reselect: None }
+        }
+    };
     if !rest.iter().any(|a| a == "--fitness") {
         rest.extend(["--fitness".to_string(), "pnl".to_string()]);
     }
@@ -466,7 +668,7 @@ pub fn claim(args: &[String]) -> Vec<String> {
     if !rest.iter().any(|a| a == "--cpu" || a == "--no-gpu") {
         rest.push("--cpu".to_string());
     }
-    let _ = REQUEST.set(Request { menu, runs, members, top, json, out });
+    let _ = REQUEST.set(req);
     rest
 }
 
@@ -590,7 +792,10 @@ fn state_groups(rows: &TradingRows, starts: &[f64]) -> Vec<u64> {
         .collect()
 }
 
-fn slice_vals(req: &Request, columns: &[String], values: &[Vec<f64>], rows: &TradingRows, starts: &[f64]) -> Result<SliceVals, String> {
+/// Branch values and gate states on one slice. `states` holds the gate states of
+/// the evaluation rule per menu gate; without it (the training rows) the kernel
+/// runs over the slice rows, per group and training segment.
+fn slice_vals(req: &Request, columns: &[String], values: &[Vec<f64>], rows: &TradingRows, starts: &[f64], states: Option<&[Vec<bool>]>) -> Result<SliceVals, String> {
     let n = rows.time.len();
     if values.len() != columns.len() || values.iter().any(|v| v.len() != n) {
         return Err(format!("the carried columns do not match the {} rows", n));
@@ -612,6 +817,12 @@ fn slice_vals(req: &Request, columns: &[String], values: &[Vec<f64>], rows: &Tra
             gate[g][i] = expr::eval(t, &row);
         }
     }
+    if let Some(states) = states {
+        if states.len() != gate.len() || states.iter().any(|s| s.len() != n) {
+            return Err(format!("the gate states do not match the {} rows", n));
+        }
+        return Ok(SliceVals { branch, state: states.to_vec() });
+    }
     let groups = state_groups(rows, starts);
     let mut last: HashMap<u64, f64> = HashMap::new();
     for i in 0..n {
@@ -626,7 +837,7 @@ fn slice_vals(req: &Request, columns: &[String], values: &[Vec<f64>], rows: &Tra
         .gates
         .iter()
         .zip(&gate)
-        .map(|(g, v)| if g.pure() { v.iter().map(|&x| x > 0.0).collect() } else { regime_gate::hysteresis_states(v, &groups, g.gate.band, g.gate.dwell) })
+        .map(|(g, v)| regime_gate::hysteresis_states(v, &groups, g.gate.band, g.gate.dwell))
         .collect();
     Ok(SliceVals { branch, state })
 }
@@ -641,139 +852,6 @@ fn pred(c: &Composite, v: &SliceVals) -> Vec<f64> {
 }
 
 // ---------------------------------------------------------------- pricing
-
-/// Net, exposure and buy-and-hold of the rows of one gate state.
-#[derive(Clone, Debug)]
-struct StatePart {
-    rows: usize,
-    net: f64,
-    exposure: f64,
-    bh_net: f64,
-    alpha: f64,
-}
-
-/// The gate-state view of a composite book on one slice.
-#[derive(Clone, Debug)]
-struct Regime {
-    rows: usize,
-    on: StatePart,
-    off: StatePart,
-    seam: f64,
-    switches: regime_gate::Switches,
-    switch_cost: f64,
-    total_cost: f64,
-}
-
-/// A score the book holds flat, and one it holds long.
-fn flat_score(spec: &TradingSpec) -> f64 {
-    spec.threshold - 1.0 - spec.threshold.abs()
-}
-
-fn long_score(spec: &TradingSpec) -> f64 {
-    spec.threshold + 1.0 + spec.threshold.abs()
-}
-
-/// Splits the book of `pred` on `slice` by gate state. The book of a state
-/// holds the composite's score on the rows of that state and a flat score
-/// elsewhere, with the composite's missing scores, priced by the book code;
-/// `seam` is the composite net minus both (`2 side J` of the seam identity). A
-/// state's alpha is its net minus its exposure times the net of the
-/// buy-and-hold book of its rows. A period is in the state most of its priced
-/// rows hold; the switch cost is the cost of the position changes in the
-/// periods where that state changes.
-fn regime(pred: &[f64], on: &[bool], slice: &TradingSlice, spec: &TradingSpec, book: &PathStats) -> Result<Regime, String> {
-    let r = &slice.rows;
-    let mut cand: Vec<usize> = (0..pred.len())
-        .filter(|&i| slice.ret[i].is_finite() && r.time[i].is_finite() && (r.funding.is_empty() || r.funding[i].is_finite()))
-        .collect();
-    cand.sort_by(|&a, &b| r.group[a].cmp(&r.group[b]).then(r.time[a].total_cmp(&r.time[b])).then(a.cmp(&b)));
-    let books: Vec<(u64, usize)> = cand.iter().map(|&i| (r.group[i], spec.segment_starts.partition_point(|s| *s <= r.time[i]))).collect();
-    let scored: Vec<bool> = cand.iter().map(|&i| pred[i].is_finite()).collect();
-    let runs = trading::score_runs(&books, &scored, spec.missing_score);
-    let mut pos: Vec<f64> = cand.iter().map(|&i| if pred[i].is_finite() { trading::position_of(pred[i], spec) } else { 0.0 }).collect();
-    trading::hold_positions(&books, &scored, &mut pos, |_| 0.0);
-    let priced: Vec<usize> = (0..cand.len()).filter(|&k| runs.run[k].is_some()).collect();
-    if priced.is_empty() {
-        return Err("no usable rows".to_string());
-    }
-    let n = priced.len();
-    let (flat, long) = (flat_score(spec), long_score(spec));
-    let part = |state: bool| -> Result<StatePart, String> {
-        let rows = priced.iter().filter(|&&k| on[cand[k]] == state).count();
-        if rows == 0 {
-            return Ok(StatePart { rows: 0, net: 0.0, exposure: f64::NAN, bh_net: 0.0, alpha: 0.0 });
-        }
-        let pick = |v: f64| -> Vec<f64> { (0..pred.len()).map(|i| if !pred[i].is_finite() { pred[i] } else if on[i] == state { if v.is_nan() { pred[i] } else { v } } else { flat }).collect() };
-        let net = trading::evaluate(&pick(f64::NAN), &slice.ret, r, spec)?.net_pnl;
-        let bh_net = trading::evaluate(&pick(long), &slice.ret, r, spec)?.net_pnl;
-        let exposure = priced.iter().filter(|&&k| on[cand[k]] == state).map(|&k| pos[k]).sum::<f64>() / rows as f64;
-        Ok(StatePart { rows, net, exposure, bh_net, alpha: net - exposure * bh_net })
-    };
-    let (on_part, off_part) = (part(true)?, part(false)?);
-    let bucket = spec.period_seconds.filter(|s| *s > 0.0);
-    let key = |t: f64| bucket.map_or(t, |s| (t / s).floor());
-    let row_key: Vec<f64> = priced.iter().map(|&k| key(r.time[cand[k]])).collect();
-    let st: Vec<bool> = priced.iter().map(|&k| on[cand[k]]).collect();
-    let mut period_key = row_key.clone();
-    period_key.sort_by(|a, b| a.total_cmp(b));
-    period_key.dedup_by(|a, b| *a == *b);
-    let (states, _) = crate::regimes::period_states(&row_key, &st, &vec![true; n], &period_key);
-    let switches = regime_gate::switch_stats(&states, book.periods_per_year);
-    let flip_at = |k: f64| {
-        let p = period_key.partition_point(|x| *x < k);
-        p > 0 && p < states.len() && states[p] != states[p - 1]
-    };
-    let side = spec.per_side_bps() * 1e-4;
-    let mut prev: HashMap<(u64, usize, u32), f64> = HashMap::new();
-    let mut switch_cost = 0.0f64;
-    for (j, &k) in priced.iter().enumerate() {
-        let run = runs.run[k].expect("a priced row has a run");
-        let p = prev.insert((books[k].0, books[k].1, run), pos[k]).unwrap_or(0.0);
-        if flip_at(row_key[j]) {
-            switch_cost += side * (pos[k] - p).abs();
-        }
-    }
-    Ok(Regime {
-        rows: n,
-        seam: book.net_pnl - on_part.net - off_part.net,
-        on: on_part,
-        off: off_part,
-        switches,
-        switch_cost,
-        total_cost: book.total_cost,
-    })
-}
-
-fn part_json(p: &StatePart, rows: usize) -> String {
-    format!(
-        "{{\"rows\":{},\"share\":{},\"net\":{},\"exposure\":{},\"buy_and_hold_net\":{},\"alpha\":{}}}",
-        p.rows,
-        num(p.rows as f64 / rows.max(1) as f64),
-        num(p.net),
-        num(p.exposure),
-        num(p.bh_net),
-        num(p.alpha)
-    )
-}
-
-fn regime_json(r: &Regime) -> String {
-    format!(
-        "{{\"rows\":{},\"states\":{{\"on\":{},\"off\":{}}},\"seam\":{},\"switches\":{{\"periods\":{},\"switches\":{},\"per_year\":{},\"mean_on_periods\":{},\"mean_off_periods\":{}}},\
-         \"switch_cost\":{},\"total_cost\":{},\"switch_cost_share\":{}}}",
-        r.rows,
-        part_json(&r.on, r.rows),
-        part_json(&r.off, r.rows),
-        num(r.seam),
-        r.switches.periods,
-        r.switches.switches,
-        num(r.switches.per_year),
-        num(r.switches.mean_on_run),
-        num(r.switches.mean_off_run),
-        num(r.switch_cost),
-        num(r.total_cost),
-        if r.total_cost > 0.0 { num(r.switch_cost / r.total_cost) } else { "null".to_string() }
-    )
-}
 
 fn book_json(s: &Result<PathStats, String>) -> String {
     match s {
@@ -825,6 +903,8 @@ pub struct Slices<'a> {
     pub validation_values: &'a [Vec<f64>],
     pub test: &'a TradingSlice,
     pub test_values: &'a [Vec<f64>],
+    /// #1214: the `rcsr-gate-state/1` states and warm-ups of every menu gate.
+    pub gates: &'a [crate::data::SliceGateStates],
 }
 
 struct Scored {
@@ -833,39 +913,48 @@ struct Scored {
     regime: Option<Result<Regime, String>>,
 }
 
+
 /// The composed run.json and the text summary.
 pub fn compose(req: &Request, book: &FitnessBook, slices: &Slices, ctx: &Context) -> Result<(String, String), Fail> {
     check_against(req, ctx)?;
     let columns = req.columns();
     let code = CodeSpec::v1(ctx.ops, ctx.vars.len());
-    let mut member_bits: Vec<(f64, bool)> = Vec::with_capacity(req.members.len());
-    for m in &req.members {
-        let run = &req.runs[m.run];
-        let tree = expr::parse(&m.expression_exact, ctx.vars).map_err(|e| {
-            (2, format!("{} '{}' archive_rank {}: the branch code reads --vars: {}", run.pool.flag(), run.path, m.archive_rank, e))
-        })?;
-        member_bits.push(tree_bits(&code, &tree).map_err(|e| (2, format!("{} '{}' archive_rank {}: {}", run.pool.flag(), run.path, m.archive_rank, e)))?);
-    }
     let composites = enumerate(req);
     let complexity_model = crate::complexity::ComplexityModel::new();
-    let mut bits: Vec<f64> = Vec::with_capacity(composites.len());
     let mut complexity: Vec<f64> = Vec::with_capacity(composites.len());
     for c in &composites {
         let tree = expr::parse(&c.text, &columns).map_err(|e| (2, format!("composite {}: cannot parse '{}': {}", c.id, c.text, e)))?;
         complexity.push(complexity_model.complexity(&tree));
-        let b = |m: Option<usize>| occam::Branch::Tree(member_bits[m.expect("a branch")].0);
-        let gate = c.gate.map(|g| occam::Gate::Menu(req.menu.gates[g].index));
-        let shape = match c.kind {
-            Kind::C0 => occam::Composite::C0(b(c.on)),
-            Kind::C1On => occam::Composite::C1 { gate: gate.expect("a gate"), branch: b(c.on) },
-            Kind::C1Off => occam::Composite::C1 { gate: gate.expect("a gate"), branch: b(c.off) },
-            Kind::C2 => occam::Composite::C2 { gate: gate.expect("a gate"), on: b(c.on), off: b(c.off) },
-        };
-        bits.push(code.composite_bits(&shape).map_err(|e| (2, format!("composite {}: {}", c.id, e)))?);
     }
+    let (member_bits, bits) = match &req.reselect {
+        Some(r) => (r.member_bits.clone(), r.bits.clone()),
+        None => {
+            let mut member_bits: Vec<(f64, bool)> = Vec::with_capacity(req.members.len());
+            for m in &req.members {
+                let run = &req.runs[m.run];
+                let tree = expr::parse(&m.expression_exact, ctx.vars).map_err(|e| {
+                    (2, format!("{} '{}' archive_rank {}: the branch code reads --vars: {}", run.pool.flag(), run.path, m.archive_rank, e))
+                })?;
+                member_bits.push(tree_bits(&code, &tree).map_err(|e| (2, format!("{} '{}' archive_rank {}: {}", run.pool.flag(), run.path, m.archive_rank, e)))?);
+            }
+            let mut bits: Vec<f64> = Vec::with_capacity(composites.len());
+            for c in &composites {
+                let b = |m: Option<usize>| occam::Branch::Tree(member_bits[m.expect("a branch")].0);
+                let gate = c.gate.map(|g| occam::Gate::Menu(req.menu.gates[g].index));
+                let shape = match c.kind {
+                    Kind::C0 => occam::Composite::C0(b(c.on)),
+                    Kind::C1On => occam::Composite::C1 { gate: gate.expect("a gate"), branch: b(c.on) },
+                    Kind::C1Off => occam::Composite::C1 { gate: gate.expect("a gate"), branch: b(c.off) },
+                    Kind::C2 => occam::Composite::C2 { gate: gate.expect("a gate"), on: b(c.on), off: b(c.off) },
+                };
+                bits.push(code.composite_bits(&shape).map_err(|e| (2, format!("composite {}: {}", c.id, e)))?);
+            }
+            (member_bits, bits)
+        }
+    };
 
-    // Training rows: the pruning bound of each pair.
-    let train = slice_vals(req, &columns, slices.train_values, &slices.train.rows, ctx.train_segments).map_err(|e| (2, format!("training rows: {}", e)))?;
+    // Training rows: the pruning bound of each pair (a re-selection keeps the run's pruning).
+    let train = slice_vals(req, &columns, slices.train_values, &slices.train.rows, ctx.train_segments, None).map_err(|e| (2, format!("training rows: {}", e)))?;
     let n_train = book.len();
     if slices.train.rows.time.len() != n_train {
         return usage(format!("the training book holds {} rows for {} training trading rows", n_train, slices.train.rows.time.len()));
@@ -874,31 +963,39 @@ pub fn compose(req: &Request, book: &FitnessBook, slices: &Slices, ctx: &Context
     let train_long: Vec<Vec<bool>> = train.branch.iter().map(|v| long(v)).collect();
     let flat = vec![false; n_train];
     let all = vec![true; n_train];
-    let train_net: Vec<f64> = train_long.iter().map(|a| switch::net_of(book, &switch::composite_totals(book, a, a, &all))).collect();
     let mut bound_gain: Vec<Option<f64>> = vec![None; composites.len()];
-    if let Some(k) = req.menu.switch_budget {
-        let mut cache: HashMap<(Option<usize>, Option<usize>), f64> = HashMap::new();
-        for c in composites.iter().filter(|c| c.gate.is_some()) {
-            let key = (c.on, c.off);
-            let gain = match cache.get(&key) {
-                Some(g) => *g,
-                None => {
-                    let a = c.on.map_or(&flat, |m| &train_long[m]);
-                    let b = c.off.map_or(&flat, |m| &train_long[m]);
-                    let bound = switch::switch_bound(book, a, b, &slices.train.rows.time, k).map_err(|e| (2, format!("training rows: {}", e)))?;
-                    let value = bound.value(k.min(bound.timestamps.saturating_sub(1)));
-                    let reference = c.on.map_or(0.0, |m| train_net[m]).max(c.off.map_or(0.0, |m| train_net[m]));
-                    cache.insert(key, value - reference);
-                    value - reference
-                }
-            };
-            bound_gain[c.id] = Some(gain);
+    match (&req.reselect, req.menu.switch_budget) {
+        (Some(r), _) => bound_gain = r.bound_gain.clone(),
+        (None, Some(k)) => {
+            let train_net: Vec<f64> = train_long.iter().map(|a| switch::net_of(book, &switch::composite_totals(book, a, a, &all))).collect();
+            let mut cache: HashMap<(Option<usize>, Option<usize>), f64> = HashMap::new();
+            for c in composites.iter().filter(|c| c.gate.is_some()) {
+                let key = (c.on, c.off);
+                let gain = match cache.get(&key) {
+                    Some(g) => *g,
+                    None => {
+                        let a = c.on.map_or(&flat, |m| &train_long[m]);
+                        let b = c.off.map_or(&flat, |m| &train_long[m]);
+                        let bound = switch::switch_bound(book, a, b, &slices.train.rows.time, k).map_err(|e| (2, format!("training rows: {}", e)))?;
+                        let value = bound.value(k.min(bound.timestamps.saturating_sub(1)));
+                        let reference = c.on.map_or(0.0, |m| train_net[m]).max(c.off.map_or(0.0, |m| train_net[m]));
+                        cache.insert(key, value - reference);
+                        value - reference
+                    }
+                };
+                bound_gain[c.id] = Some(gain);
+            }
         }
+        (None, None) => {}
     }
-    let pruned: Vec<bool> = bound_gain.iter().map(|g| g.is_some_and(|g| g <= 0.0)).collect();
+    let pruned: Vec<bool> = match &req.reselect {
+        Some(r) => r.pruned.clone(),
+        None => bound_gain.iter().map(|g| g.is_some_and(|g| g <= 0.0)).collect(),
+    };
 
     // Validation rows: every composite that is not pruned.
-    let val = slice_vals(req, &columns, slices.validation_values, &slices.validation.rows, &[]).map_err(|e| (2, format!("validation rows: {}", e)))?;
+    let validation_states: Vec<Vec<bool>> = slices.gates.iter().map(|g| g.validation.clone().unwrap_or_default()).collect();
+    let val = slice_vals(req, &columns, slices.validation_values, &slices.validation.rows, &[], Some(&validation_states)).map_err(|e| (2, format!("validation rows: {}", e)))?;
     let vspec = TradingSpec { segment_starts: ctx.validation_segments.to_vec(), ..ctx.spec.clone() };
     let mut scored: Vec<Option<Scored>> = Vec::with_capacity(composites.len());
     for c in &composites {
@@ -910,7 +1007,7 @@ pub fn compose(req: &Request, book: &FitnessBook, slices: &Slices, ctx: &Context
         let stats = trading::evaluate(&p, &slices.validation.ret, &slices.validation.rows, &vspec);
         let objective = stats.as_ref().map_or(f64::INFINITY, |s| ctx.objective.score(s, vspec.min_trades));
         let regime = match (c.gate, &stats) {
-            (Some(g), Ok(s)) => Some(regime(&p, &val.state[g], slices.validation, &vspec, s)),
+            (Some(g), Ok(s)) => Some(regime_gate::regime(&p, &val.state[g], slices.validation, &vspec, s)),
             _ => None,
         };
         scored.push(Some(Scored { stats, objective, regime }));
@@ -1000,7 +1097,8 @@ pub fn compose(req: &Request, book: &FitnessBook, slices: &Slices, ctx: &Context
     }
 
     // The test rows, read now that the finalist is fixed.
-    let test = slice_vals(req, &columns, slices.test_values, &slices.test.rows, &[]).map_err(|e| (2, format!("test rows: {}", e)))?;
+    let test_states: Vec<Vec<bool>> = slices.gates.iter().map(|g| g.test.clone()).collect();
+    let test = slice_vals(req, &columns, slices.test_values, &slices.test.rows, &[], Some(&test_states)).map_err(|e| (2, format!("test rows: {}", e)))?;
     let tspec = TradingSpec { segment_starts: ctx.test_segments.to_vec(), ..ctx.spec.clone() };
     let c = &composites[finalist];
     let vpred = pred(c, &val);
@@ -1008,7 +1106,7 @@ pub fn compose(req: &Request, book: &FitnessBook, slices: &Slices, ctx: &Context
     let validation_stats = trading::evaluate(&vpred, &slices.validation.ret, &slices.validation.rows, &vspec);
     let test_stats = trading::evaluate(&tpred, &slices.test.ret, &slices.test.rows, &tspec);
     let test_regime = match (c.gate, &test_stats) {
-        (Some(g), Ok(s)) => Some(regime(&tpred, &test.state[g], slices.test, &tspec, s)),
+        (Some(g), Ok(s)) => Some(regime_gate::regime(&tpred, &test.state[g], slices.test, &tspec, s)),
         _ => None,
     };
     let branch_book = |m: usize, v: &SliceVals, slice: &TradingSlice, spec: &TradingSpec| trading::evaluate(&v.branch[m], &slice.ret, &slice.rows, spec);
@@ -1126,9 +1224,16 @@ pub fn compose(req: &Request, book: &FitnessBook, slices: &Slices, ctx: &Context
             )
         }
     };
-    let regime_or_null = |r: &Option<Result<Regime, String>>| match r {
+    let regime_or_null = |r: &Option<Result<Regime, String>>, start: Option<&regime_gate::WarmUp>| match r {
         None => "null".to_string(),
-        Some(Ok(r)) => regime_json(r),
+        Some(Ok(r)) => {
+            let mut s = regime_gate::regime_json(r);
+            if let Some(w) = start {
+                s.pop();
+                s.push_str(&format!(",\"start\":{}}}", w.json()));
+            }
+            s
+        }
         Some(Err(e)) => format!("{{\"unusable\":{}}}", text(e)),
     };
     let branches_json: Vec<String> = [("on", c.on), ("off", c.off)]
@@ -1180,7 +1285,7 @@ pub fn compose(req: &Request, book: &FitnessBook, slices: &Slices, ctx: &Context
         MENU_SCHEMA,
         req.menu.switch_budget.map_or("null".to_string(), |k| k.to_string()),
         req.menu.gates.iter().map(gate_json).collect::<Vec<_>>().join(","),
-        code.json(),
+        req.reselect.as_ref().map_or_else(|| code.json(), |r| r.code.clone()),
         req.top,
         runs_json.join(","),
         members_json.join(","),
@@ -1203,12 +1308,7 @@ pub fn compose(req: &Request, book: &FitnessBook, slices: &Slices, ctx: &Context
         eligible_count,
         verdict,
         chosen_k.map_or("null".to_string(), |k| ids[k].to_string()),
-        chosen_gate.map_or("null".to_string(), |g| {
-            let mut s = gate_json(g);
-            s.pop();
-            s.push_str(&format!(",\"carried\":{}}}", !g.pure()));
-            s
-        }),
+        chosen_gate.map_or("null".to_string(), gate_json),
         c.id,
         text(c.kind.label()),
         text(c.kind.form()),
@@ -1217,9 +1317,9 @@ pub fn compose(req: &Request, book: &FitnessBook, slices: &Slices, ctx: &Context
         num(complexity[c.id]),
         num(bits[c.id]),
         book_json(&validation_stats),
-        regime_or_null(&scored[c.id].as_ref().and_then(|s| s.regime.clone())),
+        regime_or_null(&scored[c.id].as_ref().and_then(|s| s.regime.clone()), c.gate.and_then(|g| slices.gates[g].validation_start.as_ref())),
         book_json(&test_stats),
-        regime_or_null(&test_regime),
+        regime_or_null(&test_regime, c.gate.map(|g| &slices.gates[g].test_start)),
         seam_json,
         branches_json.join(","),
         best_aw_json,
@@ -1264,26 +1364,27 @@ pub fn compose(req: &Request, book: &FitnessBook, slices: &Slices, ctx: &Context
         search_fitness: None,
         selection: "robust",
         selection_rule,
-        reselected_from: None,
+        reselected_from: req.reselect.as_ref().map(|r| crate::reselect::from_run_json(&r.path, &r.sha256)),
         book_target: None,
         test: test_stats.clone(),
         mask: None,
     };
-    // A composite whose gate has state is not a row expression: only the finalist may carry one.
+    // Every composite, in rank order; a C1 or C2 carries the switch that defines its book.
     let pareto: Vec<String> = order
         .iter()
-        .filter(|&&i| i == finalist || composites[i].gate.map_or(true, |g| req.menu.gates[g].pure()))
         .map(|&i| {
             let k = &composites[i];
             format!(
-                "{{\"archive_rank\":{},\"composite_id\":{},\"type\":{},\"expression\":{},\"expression_exact\":{},\"complexity\":{},\"bits\":{}}}",
+                "{{\"archive_rank\":{},\"composite_id\":{},\"type\":{},\"expression\":{},\"expression_exact\":{},\"complexity\":{},\"bits\":{},\"pruned\":{}{}}}",
                 rank[i],
                 i,
                 text(k.kind.label()),
                 text(&k.text),
                 text(&k.text),
                 num(complexity[i]),
-                num(bits[i])
+                num(bits[i]),
+                pruned[i],
+                switch_of(req, k).map_or(String::new(), |s| format!(",\"switch\":{}", s.json()))
             )
         })
         .collect();
@@ -1301,7 +1402,7 @@ pub fn compose(req: &Request, book: &FitnessBook, slices: &Slices, ctx: &Context
         ctx.split_json,
         ctx.target_spec_json,
         composites.len(),
-        report.json("cpu", None),
+        finalist_with_switch(report.json("cpu", None), switch_of(req, c).as_ref()),
         compose_json,
         pareto.join(",")
     );
@@ -1349,10 +1450,26 @@ pub fn compose(req: &Request, book: &FitnessBook, slices: &Slices, ctx: &Context
     };
     summary.push_str(&line("validation", &validation_stats, scored[c.id].as_ref().and_then(|s| s.regime.as_ref())));
     summary.push_str(&line("test", &test_stats, test_regime.as_ref()));
-    if chosen_gate.is_some_and(|g| !g.pure()) {
-        summary.push_str("the gate has a band or a dwell: it is carried in compose.gate; walkforward --from-run refuses the run\n");
-    }
     Ok((run_json, summary))
+}
+
+/// #1214: the switch of a C1 or C2 composite; `None` for a C0.
+fn switch_of(req: &Request, c: &Composite) -> Option<regime_gate::Switch> {
+    let g = c.gate?;
+    let branch = |m: Option<usize>| m.map_or(FLAT.to_string(), |m| req.members[m].branch.clone());
+    Some(regime_gate::Switch { gate: req.menu.gates[g].gate.clone(), on: branch(c.on), off: branch(c.off) })
+}
+
+/// #1214: the objective block with `finalist.switch` added.
+fn finalist_with_switch(objective: String, sw: Option<&regime_gate::Switch>) -> String {
+    let Some(sw) = sw else { return objective };
+    let close = objective
+        .find("\"validation_objective\":")
+        .and_then(|at| objective[at..].find("},\"validation\":").map(|k| at + k))
+        .expect("the objective block has a finalist followed by validation");
+    let mut out = objective;
+    out.insert_str(close, &format!(",\"switch\":{}", sw.json()));
+    out
 }
 
 /// Bits of a branch tree under the #1184 code, and whether the tree is its own
@@ -1463,6 +1580,7 @@ pub fn start(req: &Request, command: &str, prepared: &crate::data::Prepared, boo
         validation_values: &split.validation_values,
         test: &split.test,
         test_values: &split.test_values,
+        gates: &split.gate_states,
     };
     run(req, book, &slices, &ctx)
 }

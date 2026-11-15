@@ -943,11 +943,16 @@ fn walkforward_carries_the_mask() {
     let recorded = at(&doc, &["objective", "spec", "pnl_mask"]);
     assert_eq!(at(recorded, &["expr"]).as_str(), Some("g"));
     assert_eq!((num(recorded, &["band"]), num(recorded, &["dwell"])), (0.5, 3.0));
+    assert_eq!(at(recorded, &["state_rule"]).as_str(), Some("rcsr-gate-state/1"));
     for (slot, window) in [("validation", validation_window()), ("test", window_arg())] {
         let want = at(&doc, &["objective", slot]);
         assert!(num(want, &["mask", "runs"]) >= 2.0, "{slot}: the mask must cut several runs");
         assert!(num(want, &["trades"]) > 0.0, "{slot}: the book must trade");
         let wf = walk(&dir, &data, &["--from-run", &run, "--window", &window]);
+        // #1214: the walk-forward reads the run's states: one gate pass under rcsr-gate-state/1.
+        assert_eq!(at(&wf, &["gate", "state_rule"]).as_str(), Some("rcsr-gate-state/1"), "{slot}");
+        assert_eq!(at(&wf, &["gate", "source"]).as_str(), Some("objective.spec.pnl_mask"), "{slot}");
+        assert!(num(first_window(&wf), &["gate", "start", "warmup_rows"]) > 0.0, "{slot}: the window starts from the full prefix");
         let m = at(first_window(&wf), &["metrics"]);
         for key in ["trades", "exposure", "total_cost", "rows", "entries"] {
             let (a, b) = (num(m, &[key]), num(want, &[key]));
