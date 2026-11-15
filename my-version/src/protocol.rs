@@ -1160,7 +1160,7 @@ pub fn procedure_spec(spec: &crate::walkforward::EvalSpec, o: &crate::walkforwar
 pub const LEDGER_FAULT_EXIT: i32 = 1;
 
 fn protocol_usage() -> &'static str {
-    "rcsr protocol <windows|seal|verify|candidates|selectors> ...
+    "rcsr protocol <windows|seal|verify|retire|candidates|selectors|cpcv> ...
 
   windows [--purge-seconds N] [--out FILE]
       Write the UTC windows table (default purge 219600 s: 1 h entry + 60 h label).
@@ -1214,8 +1214,11 @@ pub fn run(args: &[String]) -> ! {
         std::process::exit(code)
     };
     if args.is_empty() || args.iter().any(|a| a == "-h" || a == "--help") {
-        print!("{}", protocol_usage());
+        print!("{}{}", protocol_usage(), crate::cpcv::protocol_usage());
         std::process::exit(if args.is_empty() { 2 } else { 0 });
+    }
+    if args[0] == "cpcv" {
+        crate::cpcv::protocol_cli(&args[1..]);
     }
     let mut purge = DEFAULT_PURGE_SECONDS;
     let mut out: Option<String> = None;
