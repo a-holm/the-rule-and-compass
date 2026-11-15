@@ -1293,6 +1293,7 @@ fn masked_and_unmasked_runs_get_different_candidate_ids() {
     let (code, _, err) = run_wf(&data, &l2, &run, &locked, &["--unmasked", "--locked-test", "--sealed", &sealed]);
     assert_eq!(code, 3, "{}", err);
     assert!(err.contains("is not in the sealed list"), "{}", err);
+}
 
 #[path = "common/masked_run.rs"]
 mod masked_run;
