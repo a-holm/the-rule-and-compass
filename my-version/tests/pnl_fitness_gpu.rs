@@ -1630,3 +1630,158 @@ fn a_hold_above_32_exits_2_on_gpu_and_falls_back_in_auto() {
         assert_eq!(s.error.to_bits(), b.regret(&pred).to_bits(), "{}", show(&s.tree));
     }
 }
+
+// ---- #1180: the device book carries no regime mask ----
+
+/// On in alternate 50-row runs of the canonical rows, so every 600-row group of
+/// the search fixture holds six on-runs.
+fn alternate_mask(n: usize) -> Vec<bool> {
+    (0..n).map(|i| (i / 50) % 2 == 0).collect()
+}
+
+fn masked_book(f: &Fixture, on: &[bool]) -> FitnessBook {
+    let mask = rcsr::trading::BookMask { on, identity: "alternate" };
+    FitnessBook::with_segments(&f.slice, &spec(1), 900.0, 1, 1.0, &[], Some(mask)).expect("a profitable masked book")
+}
+
+#[test]
+fn device_mask_book_is_refused_and_an_all_on_mask_scores_as_the_plain_book() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    let f = fixture(&[0, 600, 1200, 1800], 2_400, 17);
+    let masked = masked_book(&f, &alternate_mask(f.n));
+    let all_on = masked_book(&f, &vec![true; f.n]);
+    assert!(masked.is_masked() && !all_on.is_masked());
+    let Some(mut ev) = GpuEvaluator::new(&f.cols, f.n, VARS, &f.y) else {
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
+        return;
+    };
+    let why = ev.set_pnl_book(&masked).expect_err("the device book carries no mask");
+    assert!(why.contains("--pnl-mask"), "{why}");
+    let trees = programs(12, 3);
+    let pop = compiled(&trees);
+    let (prog, off) = pop.programs();
+    let zeros = vec![0; trees.len()];
+    let refused = ev.score_batch(prog, off, ScoreObjective::LongPnl, &zeros);
+    assert!(refused.ms < 0.0, "a refused masked book leaves no book to score");
+    assert!(refused.status.iter().all(|s| *s == ScoreStatus::DeviceError));
+    drop(ev);
+    // The one mask the device admits, every row on, is the plain book.
+    assert_exact(&f, &all_on, &trees);
+    let values = |b: &FitnessBook| {
+        let mut ev = evaluator(&f, b).expect("the device is present");
+        let s = ev.score_batch(prog, off, ScoreObjective::LongPnl, &zeros);
+        assert!(s.ms >= 0.0);
+        s.values.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+    };
+    assert_eq!(values(&all_on), values(&book(&f, 1)));
+}
+
+/// A device search of a masked book (`--pnl-mask` without `--gpu` on a CUDA
+/// build) is scored by the CPU masked book, never by the device's unmasked one.
+#[test]
+fn device_mask_search_scores_the_masked_book_on_the_cpu() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    if !device_present() {
+        return;
+    }
+    let (sample, plain) = search_fixture();
+    let f = fixture(&[0, 600, 1200, 1800], 2_400, 17);
+    let masked = Arc::new(masked_book(&f, &alternate_mask(f.n)));
+    let seen: Archived = Arc::default();
+    let out = search::run_seeded_checked(&config(&masked, &seen), &sample, &sample, &[]).expect("the masked search runs");
+    assert_eq!(out.backend, rcsr::backend::Kind::Cpu);
+    assert_eq!(out.backend_reason.as_deref(), Some("--pnl-mask is priced on the CPU: the device book carries no regime mask"));
+    assert!(out.gpu.as_ref().is_none_or(|g| g.accounting.programs == 0), "the device scored no program");
+    let mut unmasked_differs = 0usize;
+    for (tree, error) in seen.lock().unwrap().iter() {
+        let pred: Vec<f64> = sample.x.iter().map(|r| rcsr::expr::eval(tree, r)).collect();
+        assert_eq!(error.to_bits(), masked.regret(&pred).to_bits(), "{}", show(tree));
+        if plain.regret(&pred).to_bits() != error.to_bits() {
+            unmasked_differs += 1;
+        }
+    }
+    assert!(unmasked_differs > 0, "an unmasked score would differ on this fixture");
+    let cpu = search::run(&Config { gpu: false, front_observer: None, ..config(&masked, &seen) }, &sample, &sample);
+    let key = |o: &search::Outcome| o.archive.items.iter().map(|s| (show(&s.tree), s.error.to_bits())).collect::<Vec<_>>();
+    assert_eq!(key(&out), key(&cpu), "the search is the CPU search");
+}
+
+/// The CLI fixture with `g`, +1 in alternate 60-row runs and -1 between them.
+fn write_gate_fixture() -> (Scratch, String, String) {
+    let (scratch, data, spec) = write_cli_fixture();
+    let text = std::fs::read_to_string(&data).unwrap();
+    let mut out = String::new();
+    for (i, line) in text.lines().enumerate() {
+        let g = match i {
+            0 => "g",
+            _ if ((i - 1) / 60) % 2 == 0 => "1",
+            _ => "-1",
+        };
+        out.push_str(&format!("{line},{g}\n"));
+    }
+    std::fs::write(&data, out).unwrap();
+    (scratch, data, spec)
+}
+
+/// `--pnl-mask` with `--gpu` exits 2 naming the flag before any fitness is
+/// computed; without `--gpu` the device stays visible and the masked book is
+/// scored on the CPU, as the `--cpu` run scores it.
+#[test]
+fn device_mask_cli_refuses_gpu_and_auto_prices_the_mask_on_the_cpu() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    if !device_present() {
+        return;
+    }
+    let (scratch, data, spec) = write_gate_fixture();
+    let args = [
+        "--data", &data, "--target", "y", "--vars", "x1,x2", "--time", "t", "--split", "temporal", "--target-spec",
+        &spec, "--no-dev-log", "--seed", "3", "--generations", "10", "--pop", "48", "--metric", "squared", "--json",
+        "--quiet", "--objective", "pnl", "--cost-bps", "5", "--validation-frac", "0.3", "--fitness", "pnl",
+        "--pnl-mask", "g",
+    ];
+    for device in [&["--gpu"][..], &["--gpu", "--dispatch", "device"]] {
+        let save = scratch.path().join("refused.rcsr");
+        let out = rcsr_cmd::rcsr_on_device()
+            .args(device)
+            .args(args)
+            .args(["--save", &save.to_string_lossy()])
+            .output()
+            .expect("run rcsr");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{device:?}: {err}");
+        assert!(err.contains("--pnl-mask with --gpu"), "{device:?}: {err}");
+        assert!(out.stdout.is_empty(), "{device:?}: no run JSON, so no fitness");
+        assert!(!save.exists(), "{device:?}: no checkpoint");
+    }
+    let run = |cmd: &mut std::process::Command| {
+        let out = cmd.args(args).output().expect("run rcsr");
+        assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+        let text = String::from_utf8_lossy(&out.stdout);
+        rcsr::devlog::Json::parse(text.trim()).unwrap_or_else(|| panic!("stdout is not json: {text}"))
+    };
+    let auto = run(&mut rcsr_cmd::rcsr_on_device());
+    let cpu = run(rcsr_cmd::rcsr().arg("--cpu"));
+    let text = |j: &rcsr::devlog::Json, path: &[&str]| {
+        path.iter().try_fold(j, |j, k| j.get(k)).and_then(|j| j.as_str()).map(str::to_string)
+    };
+    assert_eq!(text(&auto, &["backend"]).as_deref(), Some("cpu"));
+    let why = text(&auto, &["backend_reason"]).unwrap_or_default();
+    assert!(why.contains("--pnl-mask"), "{why}");
+    assert_eq!(text(&auto, &["search_fitness", "scorer_backend"]).as_deref(), Some("cpu"));
+    assert_eq!(text(&auto, &["search_fitness", "scorer_values"]).as_deref(), Some("exact_f64"));
+    let off_rows = auto.get("search_fitness").and_then(|f| f.get("mask")).and_then(|m| m.get("off_rows")).and_then(|v| v.as_f64());
+    assert!(off_rows.is_some_and(|v| v > 0.0), "{off_rows:?}");
+    let members = |j: &rcsr::devlog::Json| {
+        let Some(rcsr::devlog::Json::Arr(front)) = j.get("pareto") else { panic!("no pareto") };
+        front
+            .iter()
+            .map(|m| {
+                let regret = m.get("fitness").and_then(|f| f.get("train_regret")).and_then(|v| v.as_f64()).unwrap();
+                (m.get("expression").and_then(|e| e.as_str()).unwrap().to_string(), regret.to_bits())
+            })
+            .collect::<Vec<_>>()
+    };
+    assert!(!members(&auto).is_empty());
+    assert_eq!(members(&auto), members(&cpu));
+    assert_eq!(auto.get("search_fitness").and_then(|f| f.get("book_hash")), cpu.get("search_fitness").and_then(|f| f.get("book_hash")));
+}
