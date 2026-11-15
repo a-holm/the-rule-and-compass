@@ -1,6 +1,8 @@
 //! #1174: CPCV splits (`rcsr protocol cpcv`) and backtest-path assembly
 //! (`rcsr trials --cpcv-assemble`).
 
+#[path = "common/cpcv_series.rs"]
+mod cpcv_series;
 #[path = "common/rcsr.rs"]
 mod rcsr_cmd;
 #[path = "common/scratch.rs"]
@@ -722,5 +724,151 @@ fn cpcv_assemble_refuses_mixed_missing_score_rules() {
         let o = assemble(&f.table, &r, &out, &summary);
         assert_eq!(code(&o), 2, "{}", stderr(&o));
         assert!(stderr(&o).contains("book.missing_score"), "{}", stderr(&o));
+    }
+}
+
+/// #1236: every path carries each series of the split reports as the concatenation of the
+/// chosen group series, and `pooled.entry_times` as the sum of the chosen groups' window counts.
+#[test]
+fn cpcv_paths_carry_period_series() {
+    let s = Scratch::new("cpcv-series");
+    let dir = s.path();
+    let (table, scheme) = cpcv_series::write_table(dir);
+    assert!(scheme.groups.iter().any(|g| g.pieces.len() == 2), "a group with two pieces");
+    let reports = cpcv_series::write_reports(dir, "wf", &scheme, &|_| cpcv_series::ALL);
+    let paths = dir.join("paths");
+    ok(&assemble(&table, &reports, &paths, &dir.join("summary.json")));
+    let wf: Vec<Json> = reports.iter().map(|r| read_json(Path::new(r))).collect();
+    let assign = cpcv::assignment(&scheme.test_sets, scheme.groups.len());
+    let mut stamp_short = 0;
+    for j in 0..scheme.paths() {
+        let p = read_json(&paths.join(format!("path_{}.json", j + 1)));
+        for &key in ["period_net", "period_time"].iter().chain(cpcv_series::SERIES.iter()) {
+            let want = cpcv_series::path_values(&wf, &scheme, j, key);
+            assert!(!want.is_empty());
+            assert_eq!(bits(&floats(&p, &["pooled", key])), bits(&want), "path {}: pooled.{key}", j + 1);
+        }
+        let segs = arr(&p, &["cpcv", "segments"]);
+        for (g, seg) in segs.iter().enumerate() {
+            let split = assign[g][j];
+            assert_eq!(at(seg, &["split"]).as_str(), Some(scheme.ids[split].as_str()));
+            let want = cpcv_series::group_entry_times(&wf[split], &scheme.groups[g]);
+            assert_eq!(num(seg, &["entry_times"]), want, "path {} group {}", j + 1, g + 1);
+        }
+        let entry_times = cpcv_series::path_entry_times(&wf, &scheme, j);
+        assert_eq!(num(&p, &["pooled", "entry_times"]), entry_times, "path {}", j + 1);
+        let stamps: f64 = floats(&p, &["pooled", "period_entry_stamp"]).iter().sum();
+        if stamps < entry_times {
+            stamp_short += 1;
+        }
+    }
+    assert!(stamp_short > 0, "the window counts are not the entry-stamp sums");
+}
+
+/// #1236: a series on some split reports only, a report without the window counts and a
+/// series one value short exit 2 naming the field and the report.
+#[test]
+fn cpcv_assemble_refuses_mixed_series() {
+    let s = Scratch::new("cpcv-series-mixed");
+    let dir = s.path();
+    let (table, scheme) = cpcv_series::write_table(dir);
+    let paths = dir.join("paths");
+    let summary = dir.join("summary.json");
+    let cases = [
+        (cpcv_series::without("period_bh_net"), "pooled.period_bh_net"),
+        (cpcv_series::Carry { window_entry_times: false, ..cpcv_series::ALL }, "windows[].entry_times"),
+        (cpcv_series::Carry { short: Some("period_cost"), ..cpcv_series::ALL }, "pooled.period_cost"),
+    ];
+    for (odd, field) in cases {
+        let reports = cpcv_series::write_reports(dir, "wf", &scheme, &|s| if s == 3 { odd } else { cpcv_series::ALL });
+        let o = assemble(&table, &reports, &paths, &summary);
+        assert_eq!(code(&o), 2, "{field}: {}", stderr(&o));
+        assert!(stderr(&o).contains(field) && stderr(&o).contains(&reports[3]), "{field}: {}", stderr(&o));
+    }
+    // A report without any entry count among reports with them.
+    let reports = cpcv_series::write_reports(dir, "wf", &scheme, &|s| {
+        if s == 0 {
+            cpcv_series::Carry { pooled_entry_times: false, window_entry_times: false, ..cpcv_series::ALL }
+        } else {
+            cpcv_series::ALL
+        }
+    });
+    let o = assemble(&table, &reports, &paths, &summary);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).contains("pooled.entry_times") && stderr(&o).contains(&reports[0]), "{}", stderr(&o));
+}
+
+/// #1236: split reports without the series give the path files and the summary of the build
+/// before the issue, on the score and the target grid. Paths are relative, so the bytes hold no
+/// scratch directory.
+#[test]
+fn cpcv_path_output_unchanged_without_series() {
+    let s = Scratch::new("cpcv-series-golden");
+    let dir = s.path();
+    let (_, scheme) = cpcv_series::write_table(dir);
+    let mut lines = Vec::new();
+    for (tag, carry) in [("score", cpcv_series::NONE), ("target", cpcv_series::Carry { target: true, ..cpcv_series::NONE })] {
+        let reports = cpcv_series::write_reports(dir, tag, &scheme, &|_| carry);
+        let names: Vec<String> = reports.iter().map(|r| Path::new(r).file_name().unwrap().to_string_lossy().into_owned()).collect();
+        let (out, summary) = (format!("paths_{tag}"), format!("summary_{tag}.json"));
+        let mut args = vec!["trials", "--cpcv-assemble"];
+        args.extend(names.iter().map(String::as_str));
+        args.extend_from_slice(&["--splits", "splits.csv", "--out-dir", &out, "--summary", &summary]);
+        let o = rcsr_cmd::rcsr().current_dir(dir).args(&args).output().expect("run rcsr");
+        ok(&o);
+        for j in 1..=scheme.paths() {
+            let file = format!("{out}/path_{j}.json");
+            lines.push(format!("{file} {}", rcsr::manifest::sha256_hex(&std::fs::read(dir.join(&file)).unwrap())));
+        }
+        lines.push(format!("{summary} {}", rcsr::manifest::sha256_hex(&std::fs::read(dir.join(&summary)).unwrap())));
+    }
+    let all = rcsr::manifest::sha256_hex(lines.join("\n").as_bytes());
+    assert_eq!(all, PINNED_PATHS_WITHOUT_SERIES, "{}", lines.join("\n"));
+}
+
+const PINNED_PATHS_WITHOUT_SERIES: &str = "pinned from the red run";
+
+/// #1236: `rcsr protocol cpcv`, one `walkforward --emit-series` per split, the assembly and the
+/// candidate table with the pilot rule on a 3-symbol panel.
+#[test]
+fn cpcv_emit_series_end_to_end() {
+    let f = synthetic();
+    let data = write_gap_panel(&f.dir, day("2021-01-01"), 8 * 24, (0, 0));
+    let mut reports = Vec::new();
+    for id in &f.scheme.ids {
+        let windows = f.dir.join("t").join(format!("windows_{id}.csv")).to_string_lossy().into_owned();
+        let out = f.dir.join(format!("wf_series_{id}.json")).to_string_lossy().into_owned();
+        ok(&rcsr(&[
+            "walkforward", "--data", &data, "--target", "y", "--time", "ts", "--group-by", "sym", "--expr", "a", "--vars", "a,b",
+            "--windows", &windows, "--pool-reset-flat", "--horizon", "3600", "--threshold-fixed", "0", "--period-grid", "target",
+            "--emit-series", "--json", "--out", &out,
+        ]));
+        let r = read_json(Path::new(&out));
+        let per: f64 = arr(&r, &["windows"]).iter().map(|w| num(w, &["entry_times"])).sum();
+        assert_eq!(per, num(&r, &["pooled", "entry_times"]), "{id}");
+        reports.push(out);
+    }
+    let paths = f.dir.join("series_paths");
+    ok(&assemble(&f.table, &reports, &paths, &f.dir.join("series_summary.json")));
+    let cal = f.dir.join("cal.csv");
+    std::fs::write(&cal, format!("label,start,end\nbull,{},{}\nbear,{},{}\n", day("2021-01-01"), day("2021-01-05"), day("2021-01-05"), day("2021-01-09"))).unwrap();
+    let rule = f.dir.join("rule.json");
+    std::fs::write(&rule, cpcv_series::PILOT_RULE).unwrap();
+    let files: Vec<String> = (1..=3).map(|j| paths.join(format!("path_{j}.json")).to_string_lossy().into_owned()).collect();
+    let (cal, rule) = (cal.to_string_lossy().into_owned(), rule.to_string_lossy().into_owned());
+    let mut args = vec!["trials", "--wf"];
+    args.extend(files.iter().map(String::as_str));
+    args.extend_from_slice(&["--table", "--rule", &rule, "--regimes", &cal, "--draws", "50"]);
+    let o = rcsr(&args);
+    ok(&o);
+    let j = parse(&String::from_utf8_lossy(&o.stdout));
+    let rows = arr(&j, &["rows"]);
+    assert_eq!(rows.len(), 3);
+    for r in rows {
+        for m in cpcv_series::PILOT_METRICS {
+            assert!(num(r, &["metrics", m]).is_finite(), "{m}");
+        }
+        let bear = arr(r, &["strata"]).iter().find(|c| at(c, &["label"]).as_str() == Some("bear")).expect("a bear stratum");
+        assert!(num(bear, &["alpha_bh"]).is_finite(), "alpha_bh:bear");
     }
 }
