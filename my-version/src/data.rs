@@ -5079,6 +5079,7 @@ fn gate_barriers(spec: &SplitSpec, test_start: f64) -> (Vec<crate::regime_gate::
         None if test_start.is_finite() => selection.push(Barrier { start: test_start, end: f64::INFINITY, kind: BarrierKind::Test }),
         None => {}
     }
+    selection.truncate(pricing.len());
     (pricing, selection)
 }
 
