@@ -1504,3 +1504,182 @@ fn schema_names_the_units_and_width_lines_of_the_procedure() {
     assert_eq!(code, 0, "{}", err);
     assert!(out.contains("return_units=log") && out.contains("period_width=<seconds>"));
 }
+
+/// A run.json of a search with --objective: finalist `x`, threshold 0, 10 bp per side, the
+/// one-hour forward return `y`, trained on hours 0..100.
+fn plain_run(dir: &Path, name: &str) -> String {
+    let spec = "{\"column\":\"y\",\"name\":\"y\",\"kind\":\"forward_return\",\"deprecated\":false,\"return_column\":null,\"return_units\":\"simple\",\
+         \"horizon_seconds\":3600,\"entry_offset_seconds\":0,\"delay_seconds\":0,\"entry_price\":\"open\",\"exit_price\":\"close\",\"offset\":0.0,\
+         \"scale\":{\"kind\":\"constant\",\"value\":1.0},\"clip\":null,\"units\":\"return\",\"cost_bps\":null,\"cost_in_label\":false,\"construction_columns\":[],\"note\":null}";
+    let body = format!(
+        "{{\"tool\":\"rcsr\",\"target\":\"y\",\"variables\":[\"x\"],\"split\":{{\"mode\":\"temporal\",\"train_time\":[{},{}],\"required_purge_seconds\":3600}},\
+         \"target_spec\":{spec},\"search\":{{\"candidates_evaluated\":3}},\
+         \"objective\":{{\"spec\":{{\"threshold\":0.0,\"per_side_bps\":10.0,\"max_position\":1.0,\"cash_return\":0.0,\"min_holding\":1}},\"cost\":{{\"source\":\"flag\"}},\
+         \"finalist\":{{\"expression\":\"x\",\"expression_exact\":\"x\"}}}},\
+         \"pareto\":[{{\"archive_rank\":1,\"expression\":\"x\",\"expression_exact\":\"x\",\"complexity\":1}}]}}\n",
+        T0,
+        T0 + 100 * H
+    );
+    let path = dir.join(name);
+    std::fs::write(&path, body).unwrap();
+    s(&path)
+}
+
+/// Path `k` of a CPCV(3, 2) assembly over six daily periods from 2020-01-01 at 10 bp and 365
+/// periods a year (fixture F of tests/trials_table.rs): the population of a frozen pick.
+fn cpcv_path(dir: &Path, k: usize) -> String {
+    const F0: i64 = 1_577_836_800;
+    const DAY: i64 = 86_400;
+    let (s1, s2, s3) = ("1".repeat(64), "2".repeat(64), "3".repeat(64));
+    let (net, segments): ([f64; 6], [(&str, &str); 3]) = if k == 1 {
+        ([0.01, -0.02, 0.03, 0.00, -0.01, 0.02], [("s1", &s1), ("s1", &s1), ("s2", &s2)])
+    } else {
+        ([0.02, 0.01, -0.03, 0.01, 0.00, -0.02], [("s2", &s2), ("s3", &s3), ("s3", &s3)])
+    };
+    let segs: Vec<String> = (0..3)
+        .map(|g| {
+            let (split, sha) = segments[g];
+            let (a, b) = (F0 + 2 * DAY * g as i64, F0 + 2 * DAY * (g as i64 + 1));
+            format!(
+                "{{\"group\":\"G{}\",\"start\":{a},\"end\":{b},\"split\":\"{split}\",\"report\":\"wf_{split}.json\",\"report_sha256\":\"{sha}\",\
+                 \"expression\":[\"x\"],\"periods\":2,\"net\":{}}}",
+                g + 1,
+                net[2 * g] + net[2 * g + 1]
+            )
+        })
+        .collect();
+    let list = |v: &[f64]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",");
+    let time: Vec<f64> = (0..6).map(|d| (F0 + DAY * d) as f64).collect();
+    let (scheme, splits) = ("a".repeat(64), "b".repeat(64));
+    let text = format!(
+        "{{\"tool\":\"rcsr\",\"mode\":\"cpcv_path\",\"schema\":\"rcsr-cpcv-path/1\",\"window_definition\":\"{scheme}\",\
+         \"purge\":{{\"horizon_seconds\":86400,\"embargo_seconds\":0}},\"cost_model\":{{\"per_side_bps\":10,\"round_trip_bps\":20}},\
+         \"cost\":{{\"per_side_bps\":10,\"source\":\"flag\"}},\
+         \"annualization\":{{\"periods_per_year\":365,\"method\":\"explicit\",\"source\":\"explicit\",\"period_seconds\":86400}},\
+         \"threshold\":{{\"quantile\":0.5,\"fixed\":0}},\"policy\":{{\"name\":\"threshold\",\"band_width\":0,\"min_hold\":1}},\
+         \"book\":{{\"missing_score\":\"flat\"}},\"pooled_seam\":{{\"reset_flat\":true,\"seam_cost\":0,\"seam_trades\":0}},\
+         \"cpcv\":{{\"scheme_sha256\":\"{scheme}\",\"splits_sha256\":\"{splits}\",\"groups\":3,\"test_groups\":2,\"splits\":3,\"paths\":2,\
+         \"path\":{k},\"seam_rule\":\"flat\",\"segments\":[{}]}},\
+         \"pooled\":{{\"periods\":6,\"periods_per_year\":365,\"period_net\":[{}],\"period_time\":[{}]}}}}\n",
+        segs.join(","),
+        list(&net),
+        list(&time)
+    );
+    let path = dir.join(format!("path_{k}.json"));
+    std::fs::write(&path, text).unwrap();
+    s(&path)
+}
+
+/// #1238: the sealed-read path end to end on a 3-symbol fixture store with a declared
+/// fixture lock (hours 300..400): a development walk-forward registers the candidate, the
+/// candidate table freezes its thresholds, `protocol freeze` records the table and the two
+/// calendars, the final seal, the locked read with the series and the bootstrap, the
+/// after-read lock calendar, then the verdict.
+#[test]
+fn sealed_read_verdict_end_to_end() {
+    let (_scratch, dir) = scratch("verdict-e2e");
+    let p = |name: &str| s(&dir.join(name));
+    let data = p("panel.csv");
+    let mut csv = String::from("ts,s,x,close,y\n");
+    for i in 0..400i64 {
+        for (k, sym) in ["A", "B", "C"].iter().enumerate() {
+            let k = k as i64;
+            let x = ((i * 37 + k * 11) % 17) as f64 - 8.0;
+            let y = 0.0003 * x + (((i * 13 + k * 5) % 7) as f64 - 3.0) * 0.0004;
+            let close = 100.0 + 0.05 * i as f64 + (((i + 7 * k) % 24) as f64 - 12.0) * 0.1;
+            csv.push_str(&format!("{},{},{},{},{}\n", T0 + i * H, sym, x, close, y));
+        }
+    }
+    std::fs::write(&data, csv).unwrap();
+    lockbox::write_sidecar(&data, &Lockbox { start: T0 + 300 * H, end: T0 + 400 * H }, "test").unwrap();
+    let run = plain_run(&dir, "final.run.json");
+    let l = p("ledger.jsonl");
+    let wf = |extra: &[&str]| {
+        let mut a = vec![
+            "walkforward", "--data", data.as_str(), "--target", "y", "--time", "ts", "--group-by", "s", "--from-run", run.as_str(), "--periods-per-year", "365",
+            "--emit-series", "--json", "--ledger", l.as_str(),
+        ];
+        a.extend_from_slice(extra);
+        rcsr(&a)
+    };
+    let register = p("register.json");
+    let dev = window("dev", 0, 150, 160, 250);
+    let (code, _, err) = wf(&["--window", &dev, "--out", &register]);
+    assert_eq!(code, 0, "{}", err);
+
+    let paths = [cpcv_path(&dir, 1), cpcv_path(&dir, 2)];
+    let rule = p("rule.json");
+    std::fs::write(
+        &rule,
+        "{\"schema\":\"rcsr-trials-rule/1\",\"pick\":1,\"freeze\":{\"cpcv\":[3,2],\"cost_bps\":10,\"s4\":{\"window_days\":3,\"percentile\":10},\
+         \"p1\":{\"window_days\":2,\"percentile\":10},\"drawdown_cap\":{\"window_days\":3,\"percentile\":90,\"floor\":0.2}}}",
+    )
+    .unwrap();
+    let map = p("map.json");
+    std::fs::write(
+        &map,
+        format!(
+            "{{\"schema\":\"rcsr-trials-freeze-map/1\",\"rows\":[{{\"row\":\"{register}\",\"configuration\":\"F\",\"paths\":[\"{}\",\"{}\"],\"run\":\"{run}\"}}]}}",
+            paths[0], paths[1]
+        ),
+    )
+    .unwrap();
+    let table = p("table.json");
+    let (code, _, err) = rcsr(&["trials", "--wf", &register, "--table", "--rule", &rule, "--freeze-map", &map, "--draws", "20", "--out", &table]);
+    assert_eq!(code, 0, "{}", err);
+
+    let (sub, years) = (p("subwindows.csv"), p("years.csv"));
+    let at = |h: i64| T0 + h * H;
+    std::fs::write(&sub, format!("label,start,end\nprior_look,{},{}\npristine,{},{}\n", at(300), at(350), at(350), at(400))).unwrap();
+    std::fs::write(&years, format!("label,start,end\ny1,{},{}\ny2,{},{}\ny3,{},{}\n", at(300), at(334), at(334), at(367), at(367), at(400))).unwrap();
+    for (role, file) in [("thresholds", &table), ("subwindows", &sub), ("years", &years)] {
+        let (code, _, err) = rcsr(&["protocol", "freeze", "--ledger", &l, "--role", role, "--file", file]);
+        assert_eq!(code, 0, "{}: {}", role, err);
+    }
+    let sealed = p("sealed.json");
+    let (code, _, err) = rcsr(&["protocol", "seal", "--final", "--max-reads", "1", "--ledger", &l, "--out", &sealed]);
+    assert_eq!(code, 0, "{}", err);
+    let read_out = p("read.json");
+    let locked = window("locked", 0, 250, 300, 400);
+    let (code, _, err) = wf(&["--locked-test", "--sealed", &sealed, "--window", &locked, "--bootstrap", "200", "--out", &read_out]);
+    assert_eq!(code, 0, "{}", err);
+    let calendar = p("regimes_lock.csv");
+    let (code, _, err) = rcsr(&[
+        "protocol", "regimes", "--data", &data, "--time-col", "ts", "--price-col", "close", "--symbol-col", "s", "--index", "equal-weight", "--after-read",
+        "--ledger", &l, "--sealed", &sealed, "--expect-reads", "1", "--out", &calendar,
+    ]);
+    assert_eq!(code, 0, "{}", err);
+    let out = p("verdict.json");
+    let (code, stdout, err) = rcsr(&[
+        "protocol", "verdict", "--ledger", &l, "--sealed", &sealed, "--thresholds", &table, "--read", &read_out, "--subwindows", &sub, "--pristine-label",
+        "pristine", "--years", &years, "--regimes", &calendar, "--out", &out,
+    ]);
+    assert_eq!(code, 0, "{}{}", stdout, err);
+
+    use rcsr::devlog::Json;
+    let parse = |path: &str| Json::parse(std::fs::read_to_string(path).unwrap().trim()).unwrap();
+    let get = |j: &Json, path: &[&str]| -> Json { path.iter().fold(j.clone(), |cur, k| cur.get(k).unwrap_or_else(|| panic!("{} missing", k)).clone()) };
+    let (v, read, reg) = (parse(&out), parse(&read_out), parse(&register));
+    let c = match v.get("candidates") {
+        Some(Json::Arr(a)) => a[0].clone(),
+        other => panic!("candidates: {:?}", other),
+    };
+    let verdict = get(&c, &["verdict"]);
+    assert!(matches!(verdict.as_str(), Some("good" | "promising" | "not_confirmed" | "falsified")), "{:?}", verdict);
+    let run_sha = rcsr::manifest::sha256_hex(&std::fs::read(&run).unwrap());
+    assert_eq!(get(&read, &["selection", "run_sha256"]).as_str(), Some(run_sha.as_str()));
+    assert_eq!(get(&c, &["run_sha256"]).as_str(), Some(run_sha.as_str()));
+    let id = get(&read, &["protocol", "candidate_id"]);
+    assert_eq!(get(&reg, &["protocol", "candidate_id"]), id, "the register and the read share one candidate id");
+    assert_eq!(get(&c, &["candidate_id"]), id);
+    let p_read = get(&read, &["inference", "bootstrap", "p_mean_positive"]).as_f64().unwrap();
+    assert_eq!(get(&c, &["gates", "S5", "p"]).as_f64(), Some(p_read));
+    let full = match c.get("parts") {
+        Some(Json::Arr(a)) => a[0].clone(),
+        other => panic!("parts: {:?}", other),
+    };
+    assert_eq!(get(&full, &["bootstrap_p"]).as_f64(), Some(p_read), "the full part repeats the read's bootstrap");
+    let dd = get(&c, &["gates", "S3", "max_drawdown"]).as_f64().unwrap();
+    let pooled_dd = get(&read, &["pooled", "max_drawdown"]).as_f64().unwrap();
+    assert!((dd - pooled_dd).abs() <= 1e-12, "S3 {} vs pooled.max_drawdown {}", dd, pooled_dd);
+}

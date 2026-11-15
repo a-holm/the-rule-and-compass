@@ -521,7 +521,7 @@ fn without(j: &Json, drop: &[&str]) -> Json {
 /// #1237: a walk-forward of a composed run states the composite (D19) and nothing else
 /// changes: the same run.json without its compose block gives the same report without the
 /// marker, and a plain run (no compose block, no switch) gives the report of the build
-/// before the marker.
+/// before the marker plus `selection.run_sha256` (#1238).
 #[test]
 fn from_run_of_compose_marks_composite() {
     let p = planted(&BULL, &BEAR);
@@ -556,16 +556,22 @@ fn from_run_of_compose_marks_composite() {
     let switch = report(&unmarked, "wf_unmarked.json");
     assert_eq!(s(&switch, &["gate", "source"]), "objective.finalist.switch");
     assert!(at(&switch, &["selection"]).get("composite").is_none());
-    // `ledger` holds wall-clock timings.
+    // `ledger` holds wall-clock timings; the two run files differ, so do their names and hashes.
     assert_eq!(
-        without(&composed, &["selection.composite", "protocol", "ledger"]),
-        without(&switch, &["protocol", "ledger"]),
+        without(&composed, &["selection.composite", "selection.run", "selection.run_sha256", "protocol", "ledger"]),
+        without(&switch, &["selection.run", "selection.run_sha256", "protocol", "ledger"]),
         "the marker changes nothing else"
     );
-    // A plain run: no marker, no gate, the bytes of the base build.
-    let plain = report(&plain, "wf_plain.json");
-    assert!(plain.get("gate").is_none() && at(&plain, &["selection"]).get("composite").is_none());
-    assert_eq!(s(&plain, &["protocol", "report_sha256"]), PINNED_PLAIN_FROM_RUN);
+    // A plain run: no marker, no gate, the bytes of the base build plus the run file hash.
+    let plain_report = report(&plain, "wf_plain.json");
+    assert!(plain_report.get("gate").is_none() && at(&plain_report, &["selection"]).get("composite").is_none());
+    let sha = |b: &[u8]| rcsr::manifest::sha256_hex(b);
+    assert_eq!(s(&plain_report, &["selection", "run_sha256"]), sha(&std::fs::read(&plain).unwrap()));
+    let text = std::fs::read_to_string(p.dir.join("wf_plain.json")).unwrap();
+    let hashed = rcsr::verdict::hashed_report_text(&text).unwrap();
+    assert_eq!(s(&plain_report, &["protocol", "report_sha256"]), sha(hashed.as_bytes()));
+    let before = rcsr::verdict::remove_member(&hashed, &["selection", "run_sha256"]).unwrap();
+    assert_eq!(sha(before.as_bytes()), PINNED_PLAIN_FROM_RUN);
 }
 
 const PINNED_PLAIN_FROM_RUN: &str = "22e9d27e4d0f59c0e35b4597d6265b71bf343a8cb8a1b0f01309b9437079ebe2";

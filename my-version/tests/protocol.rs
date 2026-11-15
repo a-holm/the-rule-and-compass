@@ -870,3 +870,71 @@ fn a_stat_error_other_than_a_missing_file_refuses_the_output() {
     assert!(!called.get());
     assert_eq!(std::fs::read_dir(&locked).unwrap().count(), 0);
 }
+
+/// #1238: `protocol freeze` appends one line per role with the SHA-256 and byte count of the
+/// file and no path; a second file for a role, a freeze after a seal and a freeze after a
+/// read exit 1 and leave the ledger as it was; `verify` and `seal --final` read the event.
+#[test]
+fn freeze_event_rules() {
+    let (_scratch, dir) = scratch("freeze-events");
+    let ledger = path_str(&dir.join("ledger.jsonl"));
+    let l = Ledger::new(dir.join("ledger.jsonl"));
+    l.add_candidate(&candidate("a")).unwrap();
+    let calendar = |name: &str, text: &str| {
+        let p = dir.join(name);
+        std::fs::write(&p, text).unwrap();
+        path_str(&p)
+    };
+    let sub = calendar("subwindows.csv", "label,start,end\nprior_look,2030-01-01,2030-01-05\npristine,2030-01-05,2030-01-07\n");
+    let other = calendar("other.csv", "label,start,end\nprior_look,2030-01-01,2030-01-06\npristine,2030-01-06,2030-01-07\n");
+    let years = calendar("years.csv", "label,start,end\ny1,2030-01-01,2030-01-04\ny2,2030-01-04,2030-01-07\n");
+    let freeze = |ledger: &str, role: &str, file: &str| rcsr(&["protocol", "freeze", "--ledger", ledger, "--role", role, "--file", file]);
+    let (code, _, err) = freeze(&ledger, "subwindows", &sub);
+    assert_eq!(code, 0, "{err}");
+    let text = std::fs::read_to_string(&ledger).unwrap();
+    assert_eq!(text.lines().count(), 2);
+    let line = text.lines().last().unwrap();
+    let bytes = std::fs::read(&sub).unwrap();
+    assert!(line.contains("\"event\":\"freeze\",\"role\":\"subwindows\""), "{line}");
+    assert!(line.contains(&format!("\"sha256\":\"{}\"", rcsr::manifest::sha256_hex(&bytes))), "{line}");
+    assert!(line.contains(&format!("\"bytes\":{}", bytes.len())), "{line}");
+    assert!(!line.contains("subwindows.csv"), "the event stores no path: {line}");
+    assert_eq!(l.events().unwrap().len(), 2);
+    assert_eq!(l.verify_chain().unwrap(), 2);
+
+    for (role, file, code_want, needle) in [
+        ("subwindows", other.as_str(), 1, "frozen already"),
+        ("subwindows", sub.as_str(), 1, "frozen already"),
+        ("calendar", years.as_str(), 2, "role"),
+        ("thresholds", years.as_str(), 2, "rcsr-trials-table/1"),
+    ] {
+        let (code, _, err) = freeze(&ledger, role, file);
+        assert_eq!(code, code_want, "{role} {file}: {err}");
+        assert!(err.contains(needle), "{role}: {err}");
+        assert_eq!(std::fs::read_to_string(&ledger).unwrap(), text, "a refused freeze leaves the ledger");
+    }
+    let (code, out, err) = rcsr(&["protocol", "verify", "--ledger", &ledger]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("2 line(s)"), "{out}");
+    let (code, _, err) = freeze(&ledger, "years", &years);
+    assert_eq!(code, 0, "{err}");
+    let sealed = path_str(&dir.join("sealed.json"));
+    let (code, _, err) = rcsr(&["protocol", "seal", "--final", "--ledger", &ledger, "--out", &sealed]);
+    assert_eq!(code, 0, "{err}");
+    let sealed_text = std::fs::read_to_string(&ledger).unwrap();
+    let (code, _, err) = freeze(&ledger, "thresholds", &years);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("seal"), "{err}");
+    assert_eq!(std::fs::read_to_string(&ledger).unwrap(), sealed_text);
+
+    let read_ledger = path_str(&dir.join("read.jsonl"));
+    let r = Ledger::new(dir.join("read.jsonl"));
+    let a = candidate("a");
+    r.add_candidate(&a).unwrap();
+    r.record_read(&a.id, "report-a", None).unwrap();
+    let before = std::fs::read_to_string(&read_ledger).unwrap();
+    let (code, _, err) = freeze(&read_ledger, "years", &years);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("read"), "{err}");
+    assert_eq!(std::fs::read_to_string(&read_ledger).unwrap(), before);
+}
