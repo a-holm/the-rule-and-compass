@@ -1923,9 +1923,6 @@ impl GpuEvaluator {
         if injected_fault("pnl_book") {
             return Err(format!("{}the long_pnl fitness book", INJECTED_REFUSAL));
         }
-        if book.is_masked() {
-            return Err("the long_pnl fitness book has a regime mask (--pnl-mask) and the device book carries none".to_string());
-        }
         if book.len() as u64 != self.n_rows {
             return Err(format!(
                 "the long_pnl fitness book has {} rows, the device sample {}",
