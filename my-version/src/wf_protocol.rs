@@ -22,7 +22,7 @@ pub struct NullBook {
     pub groups: Vec<u64>,
     /// Period index of each row.
     pub period: Vec<u32>,
-    /// Rows per period.
+    /// Rows per period; 0 for an empty period of `--period-grid target`, which books 0.
     pub period_count: Vec<u32>,
     /// Observed cost per period (`gross - net`), held fixed under the nulls.
     pub period_cost: Vec<f64>,
@@ -454,7 +454,7 @@ fn shifted_stats(
             bins[book.period[row] as usize] += v;
         }
         for k in 0..periods {
-            r_stat.push(bins[k] / book.period_count[k] as f64);
+            r_stat.push(if book.period_count[k] == 0 { 0.0 } else { bins[k] / book.period_count[k] as f64 });
         }
     }
     Ok((r_stat.mean(), r_stat.sharpe()))
@@ -494,7 +494,7 @@ fn run_nulls(i: &InferenceInput) -> Result<NullTests, String> {
                 }
             }
             for k in 0..periods {
-                p_stat.push(sum[k] / book.period_count[k] as f64 - book.period_cost[k]);
+                p_stat.push(if book.period_count[k] == 0 { 0.0 } else { sum[k] / book.period_count[k] as f64 - book.period_cost[k] });
             }
         }
         perm_mean.push(p_stat.mean());

@@ -2129,3 +2129,157 @@ fn flat_gaps_reset_the_pooled_path_only_at_gaps() {
     s.pool_reset_flat = true;
     assert_eq!(run(&s, true).pooled.trades, 3, "every window is a book");
 }
+
+/// #1199: three symbols at t = 0..400. `z` is `x` with every symbol NaN on
+/// `[120, 220)`, `zo` is 1 where `z` is finite, `o` is 1 everywhere and the
+/// gate `g` is off on the same stretch.
+fn grid_table() -> data::Table {
+    let frac = |v: f64| v - v.floor();
+    let mut s = String::from("ts,sym,x,z,o,zo,g,target\n");
+    for i in 0..400usize {
+        for (k, sym) in ["A", "B", "C"].iter().enumerate() {
+            let f = i as f64 + 0.37 * k as f64;
+            let x = frac(f * 0.618_033_988_749_894_9) - 0.5;
+            let y = 0.01 * (frac(f * 0.754_877_666_246_692_7) - 0.5) + 0.002 * x;
+            let gap = (120..220).contains(&i);
+            let z = if gap { String::new() } else { x.to_string() };
+            let (zo, g) = if gap { ("", "-1") } else { ("1", "1") };
+            s.push_str(&format!("{i},{sym},{x},{z},1,{zo},{g},{y}\n"));
+        }
+    }
+    data::parse_table(&s).unwrap()
+}
+
+const GRID_GAP: std::ops::Range<f64> = 120.0..220.0;
+
+fn grid_run(t: &data::Table, expr: &str, grid: walkforward::PeriodGrid, reset: bool, gate: bool) -> walkforward::Report {
+    let mut s = spec(expr, vec![window("w1", 0.0, 100.0, 100.0, 250.0), window("w2", 0.0, 250.0, 250.0, 400.0)]);
+    s.vars = ["x", "z", "o", "zo"].map(String::from).to_vec();
+    s.group = Some("sym".to_string());
+    s.threshold_fixed = Some(0.0);
+    s.periods_per_year = Some(8760.0);
+    s.pool_reset_flat = reset;
+    let opts = walkforward::ProtocolOptions {
+        period_grid: grid,
+        mask: gate.then(|| rcsr::regime_gate::GateSpec::parse("g", 0.0, 1).unwrap()),
+        ..walkforward::ProtocolOptions::default()
+    };
+    walkforward::run_table_with(t, &s, "test", &opts).unwrap()
+}
+
+fn bits(v: &[f64]) -> Vec<u64> {
+    v.iter().map(|x| x.to_bits()).collect()
+}
+
+#[test]
+fn period_grid_target_is_formula_free() {
+    use walkforward::PeriodGrid::{Score, Target};
+    let t = grid_table();
+    let x = grid_run(&t, "x", Target, true, false);
+    let z = grid_run(&t, "z", Target, true, false);
+    assert_eq!(x.period_time.len(), 300, "every timestamp of the two test windows");
+    assert_eq!(bits(&x.period_time), bits(&z.period_time), "one grid for both formulas");
+    let zg = z.period_grid.as_ref().expect("pooled.grid under --period-grid target");
+    assert_eq!(zg.rule, Target);
+    assert_eq!(zg.empty_periods, 100);
+    assert_eq!(x.period_grid.as_ref().unwrap().empty_periods, 0);
+    assert_eq!(z.pooled.periods, 300);
+    for (k, &tm) in z.period_time.iter().enumerate() {
+        let gap = GRID_GAP.contains(&tm);
+        assert_eq!(zg.period_rows[k] == 0, gap, "period {tm}");
+        if gap {
+            assert_eq!(z.period_net[k].to_bits(), 0f64.to_bits(), "an empty period books net 0 at {tm}");
+        } else {
+            assert_eq!(zg.period_rows[k], 3);
+        }
+    }
+    let j = z.json();
+    assert!(j.contains("\"grid\":{\"rule\":\"target\",\"periods\":300,\"empty_periods\":100}"), "{j}");
+    // Under the score grid the stretch has no period, so the two grids differ.
+    let zs = grid_run(&t, "z", Score, true, false);
+    assert_eq!(zs.period_time.len(), 200);
+    assert!(zs.period_grid.is_none());
+    assert!(!zs.json().contains("\"grid\":"), "a score report has no grid field");
+}
+
+#[test]
+fn period_grid_target_inserts_only_zeros() {
+    use walkforward::PeriodGrid::{Score, Target};
+    let t = grid_table();
+    for reset in [false, true] {
+        let s = grid_run(&t, "z", Score, reset, false);
+        let g = grid_run(&t, "z", Target, reset, false);
+        let rows = &g.period_grid.as_ref().unwrap().period_rows;
+        let kept = |v: &[f64]| -> Vec<u64> { v.iter().zip(rows).filter(|(_, &r)| r > 0).map(|(x, _)| x.to_bits()).collect() };
+        assert_eq!(kept(&g.period_net), bits(&s.period_net), "reset {reset}: the priced periods are the score series bit for bit");
+        assert_eq!(kept(&g.period_time), bits(&s.period_time));
+        let sum = |v: &[f64]| v.iter().sum::<f64>().to_bits();
+        assert_eq!(sum(&g.period_net), sum(&s.period_net));
+        let (a, b) = (&g.pooled, &s.pooled);
+        assert_eq!(a.total_cost.to_bits(), b.total_cost.to_bits(), "reset {reset}: cost");
+        assert_eq!(a.total_abs_delta.to_bits(), b.total_abs_delta.to_bits(), "reset {reset}: traded notional");
+        assert_eq!(a.total_return.to_bits(), b.total_return.to_bits());
+        assert_eq!(a.max_drawdown.to_bits(), b.max_drawdown.to_bits());
+        assert_eq!((a.trades, a.entries, a.rows, a.active_rows), (b.trades, b.entries, b.rows, b.active_rows));
+        assert_eq!(g.seam_cost.to_bits(), s.seam_cost.to_bits());
+        assert_eq!((a.periods, b.periods), (300, 200));
+    }
+}
+
+#[test]
+fn period_grid_target_inference_runs_on_the_grid() {
+    let t = grid_table();
+    let mut s = spec("z", vec![window("w1", 0.0, 100.0, 100.0, 250.0), window("w2", 0.0, 250.0, 250.0, 400.0)]);
+    s.vars = ["x", "z", "o", "zo"].map(String::from).to_vec();
+    s.group = Some("sym".to_string());
+    s.threshold_fixed = Some(0.0);
+    s.periods_per_year = Some(8760.0);
+    s.pool_reset_flat = true;
+    let opts = walkforward::ProtocolOptions {
+        period_grid: walkforward::PeriodGrid::Target,
+        bootstrap_draws: 100,
+        null_draws: 30,
+        ..walkforward::ProtocolOptions::default()
+    };
+    let r = walkforward::run_table_with(&t, &s, "test", &opts).unwrap();
+    let inf = r.inference.as_ref().unwrap();
+    assert_eq!(inf.bootstrap.as_ref().unwrap().n, 300);
+    let nulls = inf.nulls.as_ref().unwrap();
+    assert_eq!(nulls.periods, 300, "the nulls see the grid of the observed series");
+    assert!(nulls.observed_mean.is_finite() && nulls.observed_sharpe.is_finite());
+    for p in [nulls.block_permutation.p_mean, nulls.block_permutation.p_sharpe, nulls.matched_exposure_random.p_mean] {
+        assert!((0.0..=1.0).contains(&p), "{p}");
+    }
+    let m = inf.multiple.as_ref().unwrap();
+    assert!(m.psr.dsr.is_finite(), "{:?}", m.psr);
+}
+
+#[test]
+fn period_grid_gap_rule_carries_a_missing_score_and_closes_at_a_gate() {
+    use walkforward::PeriodGrid::{Score, Target};
+    let t = grid_table();
+    // No score on the stretch: the position open before it carries, earns nothing and
+    // trades nothing there; window w1 has one entry and one final exit per symbol.
+    let carry = grid_run(&t, "zo", Target, true, false);
+    let w1 = &carry.windows[0].metrics;
+    assert_eq!((w1.entries, w1.trades), (3, 3), "no exit or re-entry at the stretch");
+    assert!((w1.total_cost - 0.006).abs() < 1e-15, "3 entries and 3 final exits at 10 bp: {}", w1.total_cost);
+    // The gate off on the stretch: every on-run is its own book (#1180), so w1 has two
+    // entries and two paid exits per symbol.
+    let gated = grid_run(&t, "o", Target, true, true);
+    let g1 = &gated.windows[0].metrics;
+    assert_eq!((g1.entries, g1.trades), (6, 6), "flat after the gate turns off");
+    let ungated = grid_run(&t, "o", Target, true, false);
+    assert_eq!(bits(&gated.period_time), bits(&ungated.period_time), "a gated and an ungated book share the grid");
+    assert_eq!(bits(&gated.period_time), bits(&carry.period_time));
+    for r in [&carry, &gated] {
+        let rows = &r.period_grid.as_ref().unwrap().period_rows;
+        for (k, &tm) in r.period_time.iter().enumerate() {
+            if GRID_GAP.contains(&tm) {
+                assert_eq!((rows[k], r.period_net[k].to_bits()), (0, 0f64.to_bits()), "net 0 and no cost at {tm}");
+            }
+        }
+    }
+    assert_eq!(gated.period_grid.as_ref().unwrap().empty_periods, 100);
+    assert_eq!(grid_run(&t, "o", Score, true, true).period_time.len(), 200, "the score grid drops the gate-off stretch");
+}

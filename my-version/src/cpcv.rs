@@ -18,6 +18,8 @@
 //! of one configuration into the paths. Seam rule: every group of a path is one
 //! book segment that starts flat and pays its final exit, whichever split it
 //! comes from, so the split reports must be priced with `--pool-reset-flat`.
+//! The splits that test a group usually hold different formulas; priced with
+//! `--period-grid target` (#1199) they give the group one period grid.
 
 use crate::devlog::Json;
 use crate::intervals::{self, Declared, EmbargoSource, IntervalSplit, Role};
@@ -529,7 +531,11 @@ pub fn protocol_usage() -> &'static str {
       --data or --lockbox (as for a search) are holes [start - P, end + max(embargo,
       P)) widened to midnights; an interval that still reaches one exits 3.
       K >= N, a group with no time left after the holes, purge and embargo, or a
-      non-midnight START or END exits 2.
+      non-midnight START or END exits 2. Then one search per split, one
+      `rcsr walkforward --windows DIR/windows_<id>.csv --pool-reset-flat
+      --period-grid target` per split (the splits of a group share its period
+      grid whatever NaN coverage or gate their formulas have) and
+      `rcsr trials --cpcv-assemble`.
 "
 }
 
@@ -810,6 +816,8 @@ struct SplitReport {
     windows: Vec<Window>,
     time: Vec<f64>,
     net: Vec<f64>,
+    /// #1199: `pooled.period_rows` of a target-grid report; `None` for the score grid.
+    rows: Option<Vec<f64>>,
 }
 
 fn whole(x: Option<f64>) -> Option<i64> {
@@ -824,6 +832,15 @@ fn load_report(path: &str) -> Result<SplitReport, Fail> {
     if net.len() != time.len() {
         return usage(format!("field 'pooled.period_time' has {} values but 'pooled.period_net' has {} in {}", time.len(), net.len(), path));
     }
+    let rows = if at(&json, crate::trials::GRID_RULE).and_then(Json::as_str) == Some("target") {
+        let rows = series(&json, &["pooled", "period_rows"], path)?;
+        if rows.len() != time.len() {
+            return usage(format!("field 'pooled.period_rows' has {} values but 'pooled.period_time' has {} in {}", rows.len(), time.len(), path));
+        }
+        Some(rows)
+    } else {
+        None
+    };
     let Some(Json::Arr(defs)) = json.get("window_definition") else {
         return usage(format!("field 'window_definition' is not a list of windows in {}", path));
     };
@@ -844,7 +861,7 @@ fn load_report(path: &str) -> Result<SplitReport, Fail> {
             expression: w.and_then(|w| w.get("expression")).and_then(Json::as_str).map(str::to_string),
         });
     }
-    Ok(SplitReport { path: path.to_string(), sha256: crate::manifest::sha256_hex(text.as_bytes()), json, windows, time, net })
+    Ok(SplitReport { path: path.to_string(), sha256: crate::manifest::sha256_hex(text.as_bytes()), json, windows, time, net, rows })
 }
 
 /// The guarded fields of `rcsr trials`, without `window_definition` (it differs per split by design).
@@ -876,6 +893,9 @@ struct BuiltPath {
     group_periods: Vec<usize>,
     entries: Option<f64>,
     active_rows: Option<f64>,
+    /// #1199: priced rows per period and empty periods per group, for target-grid reports.
+    rows: Vec<f64>,
+    group_empty: Vec<usize>,
 }
 
 fn sum(x: &[f64]) -> f64 {
@@ -1029,7 +1049,7 @@ pub fn assemble_cli(args: &[String]) -> Result<(), Fail> {
     let phi = scheme.paths();
     let paths: Vec<BuiltPath> = (0..phi)
         .map(|j| {
-            let mut p = BuiltPath { splits: Vec::with_capacity(n), time: Vec::new(), net: Vec::new(), group_net: Vec::new(), group_periods: Vec::new(), entries: Some(0.0), active_rows: Some(0.0) };
+            let mut p = BuiltPath { splits: Vec::with_capacity(n), time: Vec::new(), net: Vec::new(), group_net: Vec::new(), group_periods: Vec::new(), entries: Some(0.0), active_rows: Some(0.0), rows: Vec::new(), group_empty: Vec::new() };
             for g in 0..n {
                 let s = assign[g][j];
                 p.splits.push(s);
@@ -1038,6 +1058,11 @@ pub fn assemble_cli(args: &[String]) -> Result<(), Fail> {
                 p.time.extend(idx.iter().map(|&i| reports[s].time[i]));
                 p.group_net.push(sum(&net));
                 p.group_periods.push(net.len());
+                if let Some(rows) = &reports[s].rows {
+                    let r: Vec<f64> = idx.iter().map(|&i| rows[i]).collect();
+                    p.group_empty.push(r.iter().filter(|&&v| v == 0.0).count());
+                    p.rows.extend(r);
+                }
                 p.net.extend(net);
                 p.entries = p.entries.zip(window_sum(s, g, |w| w.entries)).map(|(a, b)| a + b);
                 p.active_rows = p.active_rows.zip(window_sum(s, g, |w| w.active_rows)).map(|(a, b)| a + b);
@@ -1054,6 +1079,7 @@ pub fn assemble_cli(args: &[String]) -> Result<(), Fail> {
     let ann = ppy.max(0.0).sqrt();
     let first = &reports[0].json;
     let copy = |k: &str| first.get(k).map_or("null".to_string(), to_json);
+    let target = reports[0].rows.is_some();
     for (j, p) in paths.iter().enumerate() {
         let segments: Vec<String> = (0..n)
             .map(|g| {
@@ -1087,7 +1113,7 @@ pub fn assemble_cli(args: &[String]) -> Result<(), Fail> {
 \"cpcv\":{{\"scheme_sha256\":{},\"splits_sha256\":{},\"groups\":{},\"test_groups\":{},\"splits\":{},\"paths\":{},\"path\":{},\
 \"seam_rule\":{},\"segments\":[{}]}},\
 \"pooled\":{{\"sharpe\":{},\"max_drawdown\":{},\"net\":{},\"mean_return\":{},\"periods\":{},\"periods_per_year\":{},\
-\"entries\":{},\"active_rows\":{},\"period_net\":[{}],\"period_time\":[{}]}}}}\n",
+\"entries\":{},\"active_rows\":{},\"period_net\":[{}],\"period_time\":[{}]{}}}}}\n",
             jstr(env!("CARGO_PKG_VERSION")),
             jstr(PATH_SCHEMA),
             jstr(&scheme_sha),
@@ -1115,7 +1141,17 @@ pub fn assemble_cli(args: &[String]) -> Result<(), Fail> {
             opt(p.entries),
             opt(p.active_rows),
             nums(&p.net),
-            nums(&p.time)
+            nums(&p.time),
+            if target {
+                format!(
+                    ",\"grid\":{{\"rule\":\"target\",\"periods\":{},\"empty_periods\":{}}},\"period_rows\":[{}]",
+                    p.net.len(),
+                    p.group_empty.iter().sum::<usize>(),
+                    nums(&p.rows)
+                )
+            } else {
+                String::new()
+            }
         );
         crate::atomic::write_text_atomic(dir.join(&files[j]), &text).map_err(|e| (3, e))?;
     }
@@ -1129,7 +1165,7 @@ pub fn assemble_cli(args: &[String]) -> Result<(), Fail> {
         .map(|(j, p)| {
             format!(
                 "{{\"path\":{},\"file\":{},\"periods\":{},\"net\":{},\"net_annual\":{},\"sharpe_annual\":{},\"max_drawdown\":{},\
-\"splits\":[{}],\"group_net\":[{}]}}",
+\"splits\":[{}],\"group_net\":[{}]{}}}",
                 j + 1,
                 jstr(&files[j]),
                 p.net.len(),
@@ -1138,7 +1174,8 @@ pub fn assemble_cli(args: &[String]) -> Result<(), Fail> {
                 jnum(sharpe[j]),
                 jnum(dd[j]),
                 p.splits.iter().map(|&s| jstr(&scheme.ids[s])).collect::<Vec<_>>().join(","),
-                nums(&p.group_net)
+                nums(&p.group_net),
+                if target { format!(",\"empty_periods\":{}", p.group_empty.iter().sum::<usize>()) } else { String::new() }
             )
         })
         .collect();
@@ -1146,7 +1183,7 @@ pub fn assemble_cli(args: &[String]) -> Result<(), Fail> {
         .map(|g| {
             let v: Vec<f64> = paths.iter().map(|p| p.group_net[g]).collect();
             format!(
-                "{{\"group\":{},\"start\":{},\"end\":{},\"splits\":[{}],\"net\":[{}],\"net_mean\":{},\"net_min\":{},\"positive_share\":{}}}",
+                "{{\"group\":{},\"start\":{},\"end\":{},\"splits\":[{}],\"net\":[{}],\"net_mean\":{},\"net_min\":{},\"positive_share\":{}{}}}",
                 jstr(&label(g)),
                 jstr(&stamp_text(scheme.groups[g].start())),
                 jstr(&stamp_text(scheme.groups[g].end())),
@@ -1154,13 +1191,18 @@ pub fn assemble_cli(args: &[String]) -> Result<(), Fail> {
                 nums(&v),
                 jnum(crate::inference::mean(&v)),
                 jnum(finite_min(&v)),
-                jnum(positive(&v))
+                jnum(positive(&v)),
+                if target {
+                    format!(",\"empty_periods\":[{}]", paths.iter().map(|p| p.group_empty[g].to_string()).collect::<Vec<_>>().join(","))
+                } else {
+                    String::new()
+                }
             )
         })
         .collect();
     let summary = format!(
         "{{\"schema\":{},\"scheme_sha256\":{},\"splits_sha256\":{},\"groups\":{},\"test_groups\":{},\"splits\":{},\"paths\":{},\
-\"seam_rule\":{},\"cost_per_side_bps\":{},\"periods_per_year\":{},\"out_dir\":{},\
+\"seam_rule\":{},{}\"cost_per_side_bps\":{},\"periods_per_year\":{},\"out_dir\":{},\
 \"sharpe\":{{\"values\":[{}],\"mean\":{},\"sd\":{},\"min\":{},\"median\":{},\"max\":{}}},\
 \"net\":{{\"values\":[{}],\"mean\":{},\"median\":{},\"min\":{},\"max\":{},\"positive_share\":{}}},\
 \"max_drawdown\":{{\"values\":[{}],\"worst\":{}}},\
@@ -1174,6 +1216,7 @@ pub fn assemble_cli(args: &[String]) -> Result<(), Fail> {
         count,
         phi,
         jstr(SEAM_RULE),
+        if target { "\"grid\":{\"rule\":\"target\"},".to_string() } else { String::new() },
         at(first, &["cost_model", "per_side_bps"]).map_or("null".to_string(), to_json),
         jnum(ppy),
         jstr(&a.out_dir),

@@ -143,6 +143,47 @@ pub struct ProtocolOptions {
     pub regime_exprs: Vec<crate::regimes::ExprSpec>,
     /// #1175: emit exposure, entries, gross and buy-and-hold per period with the strata.
     pub period_series: bool,
+    /// #1199: the periods of the pooled series (`--period-grid`).
+    pub period_grid: PeriodGrid,
+}
+
+/// #1199: which periods the pooled series of a report has. The grid never
+/// changes the book: positions, costs and exits are the same under both rules.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PeriodGrid {
+    /// A period where some row has a finite score and a finite target.
+    #[default]
+    Score,
+    /// A period where some test row of the window has a finite target before
+    /// the gate; a period where the book prices no row books net 0.
+    Target,
+}
+
+impl PeriodGrid {
+    pub fn parse(s: &str) -> Result<PeriodGrid, String> {
+        match s {
+            "score" => Ok(PeriodGrid::Score),
+            "target" => Ok(PeriodGrid::Target),
+            other => Err(format!("--period-grid needs score or target, got '{}'", other)),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PeriodGrid::Score => "score",
+            PeriodGrid::Target => "target",
+        }
+    }
+}
+
+/// #1199: the grid of the pooled series under `--period-grid target`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GridSummary {
+    pub rule: PeriodGrid,
+    /// Periods with no priced row (no finite score, or the gate off): net 0.
+    pub empty_periods: usize,
+    /// Priced rows of every period of the pooled series; 0 marks an empty period.
+    pub period_rows: Vec<usize>,
 }
 
 /// #1094: the rule of `--threshold-fit fitness`: the cut with the lowest block
@@ -255,6 +296,7 @@ impl Default for ProtocolOptions {
             regimes: None,
             regime_exprs: Vec::new(),
             period_series: false,
+            period_grid: PeriodGrid::Score,
         }
     }
 }
@@ -683,6 +725,8 @@ pub struct Report {
     /// stamps, in the order of the pooled series.
     pub period_net: Vec<f64>,
     pub period_time: Vec<f64>,
+    /// #1199: `Some` under `--period-grid target`; `None` is the score grid.
+    pub period_grid: Option<GridSummary>,
     /// #1175: the strata of the pooled periods; `None` without `--regimes`, `--regime-expr` or `--period-series`.
     pub regimes: Option<crate::regimes::RegimeReport>,
     /// #1175: per-period exposure, entries, gross and buy-and-hold beside `period_net`.
@@ -1846,9 +1890,17 @@ impl Accum {
         let mut books: Vec<crate::wf_protocol::NullBook> = Vec::new();
         let mut batch_in: Vec<crate::wf_batch::WindowScores> = Vec::new();
         let forced = self.forced.as_deref();
+        let target_grid = opts.period_grid == PeriodGrid::Target;
+        let mut period_rows: Vec<usize> = Vec::new();
+        let mut empty_periods = 0usize;
         let want_strata = opts.regimes.is_some() || !opts.regime_exprs.is_empty() || opts.period_series;
         let mut strata_in = StrataIn::new(opts.regime_exprs.len());
         for (window_index, mut d) in self.windows.into_iter().enumerate() {
+            // #1199: the target grid, its period width and the rows that define it come from the rows before the gate.
+            let grid_source = target_grid.then(|| {
+                let rows: Vec<usize> = (0..d.test_rows.len()).filter(|&i| d.test_rows[i].target.is_finite()).collect();
+                (target_times(&d.test_rows), window_period(spec, opts, &d.test_rows), rows)
+            });
             let regime_states: Vec<Vec<bool>> = opts
                 .regime_exprs
                 .iter()
@@ -1926,7 +1978,10 @@ impl Accum {
             } else {
                 ThresholdSource::TrainType7
             };
-            let (ppy, inferred_dt, bucket, source) = window_period(spec, opts, &d.test_rows);
+            let (ppy, inferred_dt, bucket, source) = match &grid_source {
+                Some((_, period, _)) => *period,
+                None => window_period(spec, opts, &d.test_rows),
+            };
             period_source = Some(source);
             let mut fresh_previous: HashMap<u64, f64> = HashMap::new();
             let ev = evaluate_window(
@@ -2011,22 +2066,44 @@ impl Accum {
             let train_rows = d.train_scores[candidate].len()
                 + d.validation_scores[candidate].len();
             dropped += d.dropped;
+            let grid = match &grid_source {
+                Some((times, _, _)) => {
+                    Some(Grid::new(times, bucket, &pev.times).map_err(|e| format!("window '{}': {}", d.window.label, e))?)
+                }
+                None => None,
+            };
+            let on_grid = |v: &[f64]| -> Vec<f64> {
+                match &grid {
+                    Some(g) => g.pad(v),
+                    None => v.to_vec(),
+                }
+            };
             if want_strata {
-                let valid: Vec<usize> = (0..d.test_rows.len())
-                    .filter(|&i| d.test_scores[candidate].get(i).is_some_and(|s| s.is_finite()) && d.test_rows[i].target.is_finite())
-                    .collect();
-                strata_in.add_window(&pev, bucket, opts, &d, &valid, &regime_states);
+                let valid: Vec<usize> = match &grid_source {
+                    Some((_, _, rows)) => rows.clone(),
+                    None => (0..d.test_rows.len())
+                        .filter(|&i| d.test_scores[candidate].get(i).is_some_and(|s| s.is_finite()) && d.test_rows[i].target.is_finite())
+                        .collect(),
+                };
+                strata_in.add_window(&pev, bucket, opts, &d, &valid, &regime_states, grid.as_ref());
             }
-            pooled_returns.extend_from_slice(&pev.returns);
-            pooled_gross.extend_from_slice(&pev.gross_returns);
+            pooled_returns.extend(on_grid(&pev.returns));
+            pooled_gross.extend(on_grid(&pev.gross_returns));
             pooled_stats.add_assign(&pev.stats);
             pooled_ppy.push(ppy);
-            pooled_times.extend_from_slice(&pev.times);
-            fresh_all.extend_from_slice(&ev.returns);
-            market_all.extend_from_slice(&ev.market);
+            match &grid {
+                Some(g) => {
+                    pooled_times.extend_from_slice(&g.times);
+                    period_rows.extend(g.pad_counts(&pev.counts));
+                    empty_periods += g.times.len() - g.slots.len();
+                }
+                None => pooled_times.extend_from_slice(&pev.times),
+            }
+            fresh_all.extend(on_grid(&ev.returns));
+            market_all.extend(on_grid(&ev.market));
             if let Some(c) = &ev.controls {
-                bh_all.extend_from_slice(&c.series[1]);
-                const_all.extend_from_slice(&c.series[2]);
+                bh_all.extend(on_grid(&c.series[1]));
+                const_all.extend(on_grid(&c.series[2]));
                 let bh = &c.get(crate::baselines::ControlKind::BuyAndHold).totals;
                 let cn = &c.get(crate::baselines::ControlKind::Constant).totals;
                 bh_rows += bh.rows;
@@ -2037,7 +2114,7 @@ impl Accum {
             if opts.bootstrap_draws > 0 && !opts.final_read {
                 for c in 0..n_candidates {
                     if c == candidate {
-                        cand_cols[c].extend_from_slice(&ev.returns);
+                        cand_cols[c].extend(on_grid(&ev.returns));
                         continue;
                     }
                     let other = evaluate_window(
@@ -2056,6 +2133,11 @@ impl Accum {
                         None,
                         false,
                     );
+                    if let Some(g) = &grid {
+                        let slots = g.slots_of(&other.times).map_err(|e| format!("window '{}': {}", d.window.label, e))?;
+                        cand_cols[c].extend(pad_at(&slots, g.times.len(), &other.returns));
+                        continue;
+                    }
                     for t in &ev.times {
                         let v = match other.times.binary_search_by(|x| x.partial_cmp(t).unwrap()) {
                             Ok(j) => other.returns[j],
@@ -2066,7 +2148,10 @@ impl Accum {
                 }
             }
             if let Some(b) = ev.book {
-                books.push(b);
+                books.push(match &grid {
+                    Some(g) => g.book(b),
+                    None => b,
+                });
             }
             if opts.batch_pnl {
                 batch_in.push(crate::wf_batch::WindowScores {
@@ -2315,6 +2400,7 @@ impl Accum {
             pooled,
             period_net: pooled_returns,
             period_time: pooled_times,
+            period_grid: target_grid.then(|| GridSummary { rule: PeriodGrid::Target, empty_periods, period_rows }),
             regimes,
             period_extra,
             cost: opts.cost_decl(spec.cost_bps),
@@ -2696,6 +2782,85 @@ struct WindowEval {
     band: Option<BandCheck>,
     hindsight_bound: Option<HindsightBound>,
     controls: Option<crate::baselines::ControlSet>,
+    /// Priced rows of every period of `returns`.
+    counts: Vec<usize>,
+}
+
+/// #1199: the periods of one window under `--period-grid target` and the grid
+/// period of every period the book priced.
+struct Grid {
+    cross: CrossSection,
+    times: Vec<f64>,
+    slots: Vec<usize>,
+}
+
+impl Grid {
+    /// `target_times`: the ascending stamps of the rows with a finite target
+    /// before the gate; `priced`: the period stamps of the book.
+    fn new(target_times: &[f64], bucket: f64, priced: &[f64]) -> Result<Grid, String> {
+        let mut cross = CrossSection::with_bucket(bucket);
+        for &t in target_times {
+            cross.add(t, 0.0, 0.0);
+        }
+        let times = cross.periods.iter().map(|p| p.time).collect();
+        let mut grid = Grid { cross, times, slots: Vec::new() };
+        grid.slots = grid.slots_of(priced)?;
+        Ok(grid)
+    }
+
+    /// The grid period of every stamp of `times` (ascending).
+    fn slots_of(&self, times: &[f64]) -> Result<Vec<usize>, String> {
+        let mut out = Vec::with_capacity(times.len());
+        let mut j = 0usize;
+        for &t in times {
+            let key = self.cross.key(t);
+            while j < self.times.len() && self.cross.key(self.times[j]) < key {
+                j += 1;
+            }
+            if j == self.times.len() || self.cross.key(self.times[j]) != key {
+                return Err(format!("the priced period at {} has no row with a finite target", jnum(t)));
+            }
+            out.push(j);
+        }
+        Ok(out)
+    }
+
+    fn pad(&self, v: &[f64]) -> Vec<f64> {
+        pad_at(&self.slots, self.times.len(), v)
+    }
+
+    fn pad_counts(&self, v: &[usize]) -> Vec<usize> {
+        let mut out = vec![0usize; self.times.len()];
+        for (k, &s) in self.slots.iter().enumerate() {
+            out[s] = v[k];
+        }
+        out
+    }
+
+    /// The null book on the grid: an empty period has no row and no cost.
+    fn book(&self, b: NullBook) -> NullBook {
+        let mut period_count = vec![0u32; self.times.len()];
+        let mut period_cost = vec![0.0f64; self.times.len()];
+        for (k, &s) in self.slots.iter().enumerate() {
+            period_count[s] = b.period_count[k];
+            period_cost[s] = b.period_cost[k];
+        }
+        NullBook { period: b.period.iter().map(|&p| self.slots[p as usize] as u32).collect(), period_count, period_cost, ..b }
+    }
+}
+
+fn pad_at(slots: &[usize], len: usize, v: &[f64]) -> Vec<f64> {
+    let mut out = vec![0.0f64; len];
+    for (k, &s) in slots.iter().enumerate() {
+        out[s] = v[k];
+    }
+    out
+}
+
+fn target_times(rows: &[RowBase]) -> Vec<f64> {
+    let mut t: Vec<f64> = rows.iter().filter(|r| r.target.is_finite()).map(|r| r.time).collect();
+    t.sort_by(f64::total_cmp);
+    t
 }
 
 /// #1175: the per-period series of the pooled book beside `period_net`.
@@ -2722,14 +2887,25 @@ impl StrataIn {
         StrataIn { extra: PeriodExtra::default(), states: vec![Vec::new(); exprs], counts: vec![Default::default(); exprs] }
     }
 
-    fn add_window(&mut self, pev: &WindowEval, bucket: f64, opts: &ProtocolOptions, d: &WindowData, valid: &[usize], regime_states: &[Vec<bool>]) {
+    /// `valid` are the rows behind the period states: the priced rows, or under the #1199 target grid
+    /// the rows with a finite target before the gate. On the grid every series has the grid's length
+    /// and an empty period has no gross, exposure, entry or buy-and-hold return.
+    #[allow(clippy::too_many_arguments)]
+    fn add_window(&mut self, pev: &WindowEval, bucket: f64, opts: &ProtocolOptions, d: &WindowData, valid: &[usize], regime_states: &[Vec<bool>], grid: Option<&Grid>) {
         let key = |t: f64| if bucket > 0.0 { (t / bucket).floor() } else { t };
-        self.extra.gross.extend_from_slice(&pev.gross_returns);
-        self.extra.exposure.extend_from_slice(&pev.exposure);
-        self.extra.entries.extend_from_slice(&pev.entries);
-        self.extra.bh.extend_from_slice(&pev.market);
-        self.extra.bucket_start.extend(pev.times.iter().map(|&t| if bucket > 0.0 { key(t) * bucket } else { t }));
-        let period_keys: Vec<f64> = pev.times.iter().map(|&t| key(t)).collect();
+        let pad = |v: &[f64]| -> Vec<f64> {
+            match grid {
+                Some(g) => g.pad(v),
+                None => v.to_vec(),
+            }
+        };
+        let times: &[f64] = grid.map_or(&pev.times, |g| &g.times);
+        self.extra.gross.extend(pad(&pev.gross_returns));
+        self.extra.exposure.extend(pad(&pev.exposure));
+        self.extra.entries.extend(pad(&pev.entries));
+        self.extra.bh.extend(pad(&pev.market));
+        self.extra.bucket_start.extend(times.iter().map(|&t| if bucket > 0.0 { key(t) * bucket } else { t }));
+        let period_keys: Vec<f64> = times.iter().map(|&t| key(t)).collect();
         let row_keys: Vec<f64> = valid.iter().map(|&i| key(d.test_rows[i].time)).collect();
         for k in 0..opts.regime_exprs.len() {
             let on: Vec<bool> = valid.iter().map(|&i| regime_states[k][i]).collect();
@@ -3374,6 +3550,7 @@ fn evaluate_window(
     });
 
     let times: Vec<f64> = cross.periods.iter().map(|p| p.time).collect();
+    let counts: Vec<usize> = cross.periods.iter().map(|p| p.count).collect();
     let mut market_cross = CrossSection::with_bucket(bucket);
     for &i in &time_order {
         let row = &rows[valid[i]];
@@ -3414,6 +3591,7 @@ fn evaluate_window(
         returns,
         gross_returns,
         times,
+        counts,
         market,
         exposure,
         entries,
@@ -4277,10 +4455,20 @@ impl Report {
         let series = |v: &[f64]| v.iter().map(|x| jnum(*x)).collect::<Vec<_>>().join(",");
         let mut s = self.pooled.json();
         s.pop();
+        let grid = self.period_grid.as_ref().map_or(String::new(), |g| {
+            format!(
+                ",\"grid\":{{\"rule\":{},\"periods\":{},\"empty_periods\":{}}},\"period_rows\":[{}]",
+                jstr(g.rule.as_str()),
+                g.period_rows.len(),
+                g.empty_periods,
+                g.period_rows.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(",")
+            )
+        });
         s.push_str(&format!(
-            ",\"period_net\":[{}],\"period_time\":[{}]}}",
+            ",\"period_net\":[{}],\"period_time\":[{}]{}}}",
             series(&self.period_net),
-            series(&self.period_time)
+            series(&self.period_time),
+            grid
         ));
         if let Some(x) = &self.period_extra {
             s.pop();
@@ -4558,6 +4746,14 @@ impl Report {
             self.seam_trades,
             md_num(p.total_abs_delta)
         ));
+        if let Some(g) = &self.period_grid {
+            s.push_str(&format!(
+                "\nPeriod grid: {} (every period with a finite target before the gate); {} of {} periods have no priced row and book net 0.\n",
+                g.rule.as_str(),
+                g.empty_periods,
+                g.period_rows.len()
+            ));
+        }
         if self.sign_test.applicable {
             s.push_str(&format!(
                 "\nFold sign test: {}/{} positive, one-sided p = {}. {}\n",

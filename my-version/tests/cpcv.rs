@@ -621,3 +621,84 @@ fn cpcv_assemble_guards_fields() {
     assert_eq!(code(&o), 2);
     assert!(stderr(&o).contains("match no split"), "{}", stderr(&o));
 }
+
+/// #1199: hourly rows of three symbols from `t0`; `b` is `a` with every symbol NaN on hours
+/// `[gap.0, gap.1)`.
+fn write_gap_panel(dir: &Path, t0: i64, hours: usize, gap: (usize, usize)) -> String {
+    let mut text = String::from("ts,sym,a,b,y\n");
+    for i in 0..hours {
+        for g in 0..3 {
+            let f = i as f64 + 0.37 * g as f64;
+            let a = frac(f * 0.618_033_988_749_894_9) - 0.5;
+            let y = 0.01 * (frac(f * 0.754_877_666_246_692_7) - 0.5) + 0.002 * a;
+            let b = if (gap.0..gap.1).contains(&i) { String::new() } else { a.to_string() };
+            text.push_str(&format!("{},S{},{},{},{}\n", t0 + H * i as i64, g, a, b, y));
+        }
+    }
+    let path = dir.join("gap_panel.csv");
+    std::fs::write(&path, text).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+#[test]
+fn cpcv_assemble_common_grid() {
+    // CPCV(4, 2) over 8 days: G2 is hours 48..96 and is tested by s01, s04 and s05. Split s04
+    // prices a formula with no score on hours 60..90; the other splits price one with full coverage.
+    let f = synthetic();
+    let data = write_gap_panel(&f.dir, day("2021-01-01"), 8 * 24, (60, 90));
+    let wf = |id: &str, expr: &str, grid: &[&str]| -> String {
+        let windows = f.dir.join("t").join(format!("windows_{id}.csv")).to_string_lossy().into_owned();
+        let tag = grid.last().copied().unwrap_or("default");
+        let out = f.dir.join(format!("wf_{tag}_{id}.json")).to_string_lossy().into_owned();
+        let mut args = vec![
+            "walkforward", "--data", &data, "--target", "y", "--time", "ts", "--group-by", "sym", "--expr", expr, "--vars", "a,b",
+            "--windows", &windows, "--pool-reset-flat", "--horizon", "3600", "--threshold-fixed", "0", "--json", "--out", &out,
+        ];
+        args.extend_from_slice(grid);
+        let o = rcsr(&args);
+        ok(&o);
+        out
+    };
+    let reports = |grid: &[&str]| -> Vec<String> {
+        f.scheme.ids.iter().map(|id| wf(id, if id == "s04" { "b" } else { "a" }, grid)).collect()
+    };
+    let out = f.dir.join("grid_paths");
+    let summary = f.dir.join("grid_summary.json");
+    let score = reports(&["--period-grid", "score"]);
+    let o = assemble(&f.table, &score, &out, &summary);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).contains("'pooled.period_time' on group G2"), "{}", stderr(&o));
+    let target = reports(&["--period-grid", "target"]);
+    ok(&assemble(&f.table, &target, &out, &summary));
+    // G2 of path j comes from the j-th of s01, s04, s05: path 2 holds the 30 empty hours.
+    let want_empty = [0.0, 30.0, 0.0];
+    let first = floats(&read_json(&out.join("path_1.json")), &["pooled", "period_time"]);
+    for (j, want) in want_empty.iter().enumerate() {
+        let p = read_json(&out.join(format!("path_{}.json", j + 1)));
+        assert_eq!(at(&p, &["pooled", "grid", "rule"]).as_str(), Some("target"));
+        assert_eq!(num(&p, &["pooled", "grid", "empty_periods"]), *want, "path {}", j + 1);
+        let time = floats(&p, &["pooled", "period_time"]);
+        assert_eq!(num(&p, &["pooled", "grid", "periods"]), time.len() as f64);
+        assert_eq!(floats(&p, &["pooled", "period_rows"]).len(), time.len());
+        assert_eq!(bits(&time), bits(&first), "every path has the same grid");
+    }
+    let sm = read_json(&summary);
+    assert_eq!(at(&sm, &["grid", "rule"]).as_str(), Some("target"));
+    let per_path: Vec<f64> = arr(&sm, &["per_path"]).iter().map(|p| num(p, &["empty_periods"])).collect();
+    assert_eq!(per_path, want_empty);
+    assert_eq!(floats(&arr(&sm, &["per_group"])[1], &["empty_periods"]), want_empty, "G2 on each path");
+    assert_eq!(floats(&arr(&sm, &["per_group"])[0], &["empty_periods"]), [0.0; 3]);
+    // A score report among target reports: the grid rule is a guarded field.
+    let mut mixed = target.clone();
+    mixed[5] = score[5].clone();
+    let o = assemble(&f.table, &mixed, &out, &summary);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).contains("pooled.grid.rule"), "{}", stderr(&o));
+    let o = rcsr(&["walkforward", "--data", &data, "--period-grid", "formula"]);
+    assert_eq!(code(&o), 2);
+    assert!(stderr(&o).contains("--period-grid needs score or target"), "{}", stderr(&o));
+}
+
+fn bits(v: &[f64]) -> Vec<u64> {
+    v.iter().map(|x| x.to_bits()).collect()
+}
