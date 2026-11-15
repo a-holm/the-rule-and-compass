@@ -348,7 +348,8 @@ fn trials_regimes_adds_strata_and_nothing_else() {
     let base = ["trials", "--wf", &a, &b, "--draws", "50", "--block-len", "8"];
     let plain = run(&base);
     let mut with = base.to_vec();
-    with.extend(["--regimes", &s(&cal)]);
+    let cal_path = s(&cal);
+    with.extend(["--regimes", &cal_path]);
     let with = run(&with);
     let (jp, jw) = (json_of(&plain), json_of(&with));
     assert!(!stdout(&plain).contains("regimes"));
