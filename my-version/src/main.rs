@@ -237,6 +237,10 @@ USAGE:
                --bear <run.json>... [--all-weather <run.json>...] [--out <run.json>]
                               regime-switching composites of the pools from a
                               pre-registered gate menu, chosen on validation rows
+  rcsr enumerate <--fitness pnl run flags> --vars <v,...> --ops <op,...> [--max-size N]
+                 [--null-shifts R] [--compare-run <run.json>] [--emit-seeds <file>]
+                              every expression up to N nodes scored exactly on the
+                              training book: class optimum, gap, family null
   rcsr audit --data <file> --target <col> [--time <col>] [--horizon N] [--json]
              [--lockbox <START,END|none>]
              [--target-spec <file>]
@@ -2817,6 +2821,8 @@ fn main() {
     let args: Vec<String> = if args.first().map(|s| s.as_str()) == Some("switch") { rcsr::switch::claim(&args[1..]) } else { args };
     // #1181: `rcsr compose` builds the rows of a --fitness pnl run and stops before the search.
     let args: Vec<String> = if args.first().map(|s| s.as_str()) == Some("compose") { rcsr::compose::claim(&args[1..]) } else { args };
+    // #1183: `rcsr enumerate` builds the training book of a --fitness pnl run and stops before the search.
+    let args: Vec<String> = if args.first().map(|s| s.as_str()) == Some("enumerate") { rcsr::enumerate::claim(&args[1..]) } else { args };
     // #124: a reusable Rust walk-forward evaluator over the column store.
     if matches!(
         args.first().map(|s| s.as_str()),
@@ -6434,6 +6440,41 @@ fn main() {
             ops: &cfg.ops,
             vars: &vars,
             book_target: book_resolved.is_some(),
+        });
+    }
+    // #1183: `rcsr enumerate` scores its class on the book's training rows and exits before the search.
+    if let Some(en) = rcsr::enumerate::request() {
+        let segments = |f: fn(&rcsr::intervals::IntervalSplit) -> Vec<f64>| interval_split.as_ref().map_or_else(Vec::new, f);
+        rcsr::enumerate::start(en, &rcsr::enumerate::Inputs {
+            target: &target_names[0],
+            vars: &vars,
+            ops: &cfg.ops,
+            train: prepared.book.as_ref().map_or(&prepared.train, |b| &b.train),
+            validation: prepared.book.as_ref().map_or(prepared.validation.as_ref(), |b| b.validation.as_ref()),
+            trading: prepared.trading.as_ref(),
+            means: &prepared.means,
+            stds: &prepared.stds,
+            book: fitness_book.as_deref(),
+            spec: trading_spec.as_ref(),
+            objective,
+            horizon_seconds: target_horizon,
+            blocks: pnl_blocks,
+            lambda: pnl_lambda,
+            stat: pnl_stat,
+            train_segments: segments(|s| s.segment_starts()),
+            validation_segments: segments(|s| s.validation_segment_starts()),
+            split_json: format!(
+                "{{\"mode\":{},\"train_rows\":{}{},\"test_rows\":{}{}{}{}}}",
+                jstr(prepared.report.mode),
+                prepared.train.len(),
+                if prepared.report.validation_rows > 0 { format!(",\"validation_rows\":{}", prepared.report.validation_rows) } else { String::new() },
+                prepared.test.len(),
+                target::split_purge_json(&prepared.report),
+                split_time_json(prepared.keys.as_ref()),
+                interval_split.as_ref().map_or_else(String::new, |s| s.json_fields(&split_table_sha))
+            ),
+            seed: cfg.seed,
+            threads,
         });
     }
 
