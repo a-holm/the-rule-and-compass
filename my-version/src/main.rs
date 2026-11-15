@@ -379,7 +379,11 @@ INPUT:
                              > 0. Rows outside are flat; every run of on rows
                              of a group starts flat and pays its exit; the
                              hindsight bound is taken on those runs. The
-                             validation and test books apply the same mask.
+                             validation and test books apply the same mask with
+                             the gate state of rcsr-gate-state/1: the kernel
+                             over every row of the data file from each group's
+                             first row (never a label or a row filter); the
+                             validation rows never read a test interval.
                              --gpu scores it on the device, except with
                              --band-units sd (exit 2). Needs --fitness pnl;
                              the book hash covers it, so a resume needs the
@@ -1296,7 +1300,11 @@ CHECKPOINTS:
   --reselect-run <run.json>  the same from a run.json front (expression_exact);
                              with --select-rule occam it reads pareto[].occam_tree
                              (exit 2 if absent);
-                             split and train rows must match the data
+                             split and train rows must match the data. A run.json
+                             with a compose block (rcsr compose) reruns compose's
+                             choice over its composites on these rows (pass the
+                             compose flags without --gates and the pools; see
+                             docs/compose.md)
 
 RUN INTEGRITY (#140):
   --run-manifest <file>      atomically write a JSON manifest with the build
@@ -2818,6 +2826,11 @@ fn main() {
     let args: Vec<String> = if args.first().map(|s| s.as_str()) == Some("switch") { rcsr::switch::claim(&args[1..]) } else { args };
     // #1181: `rcsr compose` builds the rows of a --fitness pnl run and stops before the search.
     let args: Vec<String> = if args.first().map(|s| s.as_str()) == Some("compose") { rcsr::compose::claim(&args[1..]) } else { args };
+    // #1214: `--reselect-run` of a composed run reruns compose's choice over the run's composites.
+    let args: Vec<String> = match rcsr::compose::reselect_target(&args).filter(|_| rcsr::compose::request().is_none() && args.first().is_some_and(|a| a.starts_with("--"))) {
+        Some(path) => rcsr::compose::claim_reselect(&args, &path),
+        None => args,
+    };
     // #124: a reusable Rust walk-forward evaluator over the column store.
     if matches!(
         args.first().map(|s| s.as_str()),
@@ -4690,8 +4703,8 @@ fn main() {
     }
     // #1181: the gate and branch columns of `rcsr compose` pass the same checks.
     if let Some(cp) = rcsr::compose::request() {
-        if lags > 0 || lag_set_src.is_some() || fill != data::FillMethod::None || outlier_iqr.is_some() || smooth > 0 {
-            trading_usage("rcsr compose reads the raw columns of the rows: --lags, --lag-set, --fill, --outlier-iqr and --smooth would change them");
+        if lags > 0 || lag_set_src.is_some() || !matches!(fill, data::FillMethod::None | data::FillMethod::Drop) || outlier_iqr.is_some() || smooth > 0 {
+            trading_usage("rcsr compose reads the raw columns of the rows: --lags, --lag-set, --fill other than drop, --outlier-iqr and --smooth would change them");
         }
         let specs: Vec<&target::TargetSpec> = target_resolved.iter().chain(book_resolved.iter()).map(|r| &r.spec).collect();
         for (flag, columns) in cp.column_sets() {
@@ -5713,6 +5726,7 @@ fn main() {
             mask: gate_spec.clone(),
             train_values: rcsr::switch::request().map(|sw| sw.columns()).or_else(|| rcsr::compose::request().map(|cp| cp.columns())).unwrap_or_default(),
             slice_values: rcsr::compose::request().is_some(), // #1181
+            state_gates: rcsr::compose::request().map_or_else(Vec::new, |cp| cp.state_gates()), // #1214
         });
         if gate_spec.is_some() && top_tercile {
             trading_usage("--pnl-mask prices the long/flat threshold book: it cannot combine with --position top_tercile");
@@ -9899,31 +9913,9 @@ fn normalise_inputs(n: &expr::Node, means: &[f64], stds: &[f64]) -> expr::Node {
 /// the target, its return column or a construction column would leak the future
 /// into the mask (D13, exit 5).
 fn enforce_gate_columns(flag: &str, columns: &[String], specs: &[&target::TargetSpec], target_names: &[String], allow_structure: bool) {
-    let refuse = |why: String| -> ! {
+    if let Some(why) = rcsr::regime_gate::gate_column_leak(columns, specs, target_names, allow_structure) {
         eprintln!("error: {}: {}", flag, why);
         std::process::exit(EXIT_LEAKAGE);
-    };
-    for c in columns {
-        if target_names.iter().any(|t| t == c) {
-            refuse(format!("D13a: target '{}' is a mask column", c));
-        }
-        if rcsr::registry::lookup(c).is_some_and(|r| r.family == "label") {
-            refuse(format!("D13a: label-family column '{}' reads bars after the decision time", c));
-        }
-    }
-    for spec in specs {
-        match target::check(spec, columns, allow_structure) {
-            Ok(check) if !check.construction_in_vars.is_empty() => refuse(format!(
-                "D13: construction column(s) of target '{}' are mask columns: {}",
-                spec.column,
-                check.construction_in_vars.join(", ")
-            )),
-            Ok(_) => {}
-            Err(report) => {
-                let why = report.result().err().map_or_else(|| "D13 finding".to_string(), |f| f.to_string());
-                refuse(why)
-            }
-        }
     }
 }
 
@@ -11689,7 +11681,18 @@ OPTIONS:
                              threshold as the reference cut
                              The expression is objective.finalist.expression_exact,
                              else the 4-decimal expression (expression_source
-                             rounded); --locked-test refuses a rounded source (exit 3)
+                             rounded); --locked-test refuses a rounded source (exit 3).
+                             A composed run (rcsr compose) is priced as its switch
+                             (objective.finalist.switch; --front: pareto[].switch):
+                             the held branch's score under the gate state of
+                             rcsr-gate-state/1 (one pass over every row of the data
+                             before the last window end; windows[].gate.start and
+                             .regime). --device-pnl, --batch-pnl, --threshold-fit,
+                             --select-band, a --policy other than threshold and a
+                             band exit 2; a label, target, return or construction
+                             gate column exits 5. Such a run writes
+                             selection.composite: source, type, form and gate of its
+                             compose.chosen (#1237); other reports carry no marker
   --threshold-quantile <q>   exact type-7 training/validation score quantile
                              (default {DEFAULT_QUANTILE}); selected by order-preserving
                              radix count, so theta is bit-identical to numpy
@@ -11856,7 +11859,9 @@ OPTIONS:
                              are on. Reports the on and off strata and the switches,
                              switches per year and mean state duration. Aggregates exit
                              2; a label, target, return or construction column exits 5
-                             (D13). Needs the data to hold the columns
+                             (D13). Needs the data to hold the columns. The state
+                             of a row comes from one gate pass over the data
+                             (rcsr-gate-state/1), never from the window rows alone
   --regime-name <name>       name of the preceding --regime-expr (default r1, r2, ...)
   --regime-band <h>          hysteresis of every --regime-expr (default 0, >= 0)
   --regime-dwell <D>         minimum rows per state of every --regime-expr (default 1)
@@ -12567,6 +12572,8 @@ fn run_walkforward(args: &[String]) -> ! {
             usage_fail("--unmasked: the run priced no regime mask");
         }
         popts.mask = if unmasked { None } else { book.mask.clone() };
+        // #1214: a composed C1 or C2 finalist is priced as its switch.
+        popts.switches = book.switch.iter().map(|s| Some(walkforward::SwitchCandidate { switch: s.clone(), source: "objective.finalist.switch".to_string() })).collect();
         expressions.push(book.expression.clone());
         popts.expression_source = Some(book.expression_source);
         if locked_test && book.expression_source == rcsr::run_json::ExpressionSource::Rounded {
@@ -12596,6 +12603,7 @@ fn run_walkforward(args: &[String]) -> ! {
         }
         run_cost = Some((book.per_side_bps, book.source));
         cost_spec = Some(book.spec);
+        popts.composite = run.composite.clone();
         front_run = Some(run);
     } else if let Some(path) = &front_path {
         if !expressions.is_empty() {
@@ -12626,6 +12634,9 @@ fn run_walkforward(args: &[String]) -> ! {
             usage_fail("--unmasked: the run priced no regime mask");
         }
         popts.mask = if unmasked { None } else { run.mask.clone() };
+        if run.front.iter().any(|m| m.switch.is_some()) {
+            popts.switches = run.front.iter().enumerate().map(|(k, m)| m.switch.clone().map(|s| walkforward::SwitchCandidate { switch: s, source: format!("pareto[{}].switch", k) })).collect();
+        }
         popts.expression_source = Some(run.front_source);
         if locked_test && run.front_source == rcsr::run_json::ExpressionSource::Rounded {
             input_fail(&rcsr::run_json::rounded_refusal(path));
@@ -12685,6 +12696,7 @@ fn run_walkforward(args: &[String]) -> ! {
             run_cost = Some((bps, run.cost_source()));
             cost_spec = run.target_spec();
         }
+        popts.composite = run.composite.clone();
         front_run = Some(run);
     } else if let Some(path) = &target_spec_path {
         let text = std::fs::read_to_string(path).unwrap_or_else(|e| input_fail(&format!("{}: {}", path, e)));
@@ -12697,6 +12709,18 @@ fn run_walkforward(args: &[String]) -> ! {
     }
     if unmasked && from_run_path.is_none() && front_path.is_none() {
         usage_fail("--unmasked needs --from-run or --front of a run that priced a regime mask");
+    }
+    if popts.switches.iter().any(Option::is_some) {
+        let refused = [
+            (device_pnl, "--device-pnl"),
+            (popts.batch_pnl, "--batch-pnl"),
+            (threshold_fit, "--threshold-fit"),
+            (band_select, "--select-band"),
+            (policy != walkforward::Policy::Threshold, "--policy, --band and --min-hold"),
+        ];
+        if let Some((_, flag)) = refused.iter().find(|(on, _)| *on) {
+            usage_fail(&format!("{} conflicts with the run's switch (rcsr compose): the composite is the long/flat book at threshold 0 under its gate states, priced on the CPU test rows", flag));
+        }
     }
     if popts.mask.is_some() {
         let refused = [
@@ -12804,6 +12828,18 @@ fn run_walkforward(args: &[String]) -> ! {
         names.extend(cost_spec.iter().map(|s| s.column.clone()));
         enforce_gate_columns("--regime-expr", &gate.columns, &specs, &names, false);
         popts.regime_exprs.push(rcsr::regimes::ExprSpec { name, gate });
+    }
+    // #1214: a switch or mask gate column of the label family, the target, its return column or a construction column exits 5.
+    {
+        let specs: Vec<&target::TargetSpec> = cost_spec.iter().collect();
+        let mut names: Vec<String> = target.iter().cloned().collect();
+        names.extend(cost_spec.iter().map(|s| s.column.clone()));
+        for c in popts.switches.iter().flatten() {
+            enforce_gate_columns(&c.source, &c.switch.gate.columns, &specs, &names, false);
+        }
+        if let Some(g) = &popts.mask {
+            enforce_gate_columns("objective.spec.pnl_mask", &g.columns, &specs, &names, false);
+        }
     }
     popts.emit_series = emit_series || all_members;
     popts.all_members = all_members;
@@ -13187,7 +13223,7 @@ fn run_walkforward(args: &[String]) -> ! {
         Ok(r) => r,
         Err(e) => {
             eprintln!("error: {}", e);
-            std::process::exit(if e.contains("overlapping returns") || e.contains("purge gap") || e.starts_with("--periods-per-year") || e.starts_with("missing stride_seconds") || e.starts_with("stride_seconds") { EXIT_USAGE } else { EXIT_INPUT });
+            std::process::exit(if e.contains("overlapping returns") || e.contains("purge gap") || e.contains("are not in time order") || e.starts_with("--periods-per-year") || e.starts_with("missing stride_seconds") || e.starts_with("stride_seconds") { EXIT_USAGE } else { EXIT_INPUT });
         }
     };
     if spec.threshold_fixed.is_none() {

@@ -6,7 +6,9 @@
 //! the gates; the Pareto front ranks the passers; the average rank orders them
 //! inside a front; a walk in that order picks rows whose net series correlates
 //! below the cap with every earlier pick. A picked row gets its deflation at
-//! the trial count of the whole table.
+//! the trial count of the whole table. With `max_composites` (#1237, D8) the
+//! walk skips a composite row once the picks hold that many; with `freeze`
+//! every pick gets the sealed-read thresholds of [`crate::trials_freeze`].
 //!
 //! The table reads development reports only. A report with a locked read, or
 //! with a period or test window inside a locked range, exits 2.
@@ -15,6 +17,7 @@ use crate::devlog::Json;
 use crate::inference;
 use crate::regimes::{Calendar, UNDATED};
 use crate::trials::{self, Options, Wf};
+use crate::trials_freeze::{self, FreezeMap, FreezeRule};
 use crate::walkforward::{jnum, jstr};
 
 type Res<T> = Result<T, (i32, String)>;
@@ -40,6 +43,7 @@ pub const FLAGS: &[&str] = &[
     "--markdown",
     "--locked-test",
     "--occam",
+    "--freeze-map",
 ];
 
 /// Metrics every row has (null where the series is too short or flat).
@@ -156,6 +160,10 @@ pub struct Rule {
     pub diversity_rho: f64,
     /// 0: every front is kept.
     pub min_front: usize,
+    /// #1237 (D8): at most this many composite rows are picked.
+    pub max_composites: Option<usize>,
+    /// #1237: the sealed-read thresholds frozen per pick.
+    pub freeze: Option<FreezeRule>,
 }
 
 impl Default for Rule {
@@ -169,6 +177,8 @@ impl Default for Rule {
             pick: 0,
             diversity_rho: 1.0,
             min_front: 0,
+            max_composites: None,
+            freeze: None,
         }
     }
 }
@@ -183,7 +193,23 @@ fn dirs_json(d: &[(String, Dir)]) -> String {
 
 impl Rule {
     /// The rule as canonical JSON; its SHA-256 is the rule hash of a flag-built rule.
+    /// `max_composites` and `freeze` appear only when set, so a rule without them keeps its hash.
     pub fn json(&self) -> String {
+        let mut s = self.base_json();
+        if self.max_composites.is_some() || self.freeze.is_some() {
+            s.pop();
+            if let Some(m) = self.max_composites {
+                s.push_str(&format!(",\"max_composites\":{}", m));
+            }
+            if let Some(f) = &self.freeze {
+                s.push_str(&format!(",\"freeze\":{}", f.json()));
+            }
+            s.push('}');
+        }
+        s
+    }
+
+    fn base_json(&self) -> String {
         format!(
             "{{\"schema\":{},\"cost_multiples\":[{}],\"gates\":{},\"relaxed_gates\":{},\"pareto\":{},\"rank\":{},\"pick\":{},\
 \"diversity_rho\":{},\"min_front\":{}}}",
@@ -330,6 +356,8 @@ fn rule_from_file(path: &str) -> Res<(Rule, String)> {
             "pick" => r.pick = whole(v, "pick", &src)?,
             "min_front" => r.min_front = whole(v, "min_front", &src)?,
             "diversity_rho" => r.diversity_rho = v.as_f64().map_or_else(|| usage(format!("{}: diversity_rho must be a number", src)), Ok)?,
+            "max_composites" => r.max_composites = Some(whole(v, "max_composites", &src)?),
+            "freeze" => r.freeze = Some(FreezeRule::parse(v, &src)?),
             other => return usage(format!("{}: unknown key '{}'", src, other)),
         }
     }
@@ -357,6 +385,7 @@ struct TableArgs {
     markdown: Option<String>,
     locked: Vec<(f64, f64)>,
     occam: Vec<String>,
+    freeze_map: Option<String>,
 }
 
 fn value(args: &[String], i: &mut usize, flag: &str) -> Res<String> {
@@ -402,6 +431,7 @@ fn split_args(args: &[String]) -> Res<(TableArgs, Vec<String>)> {
             "--alpha" => t.alpha = Some(number(a, &value(args, &mut i, a)?)?),
             "--markdown" => t.markdown = Some(value(args, &mut i, a)?),
             "--occam" => t.occam = files(args, &mut i, a)?,
+            "--freeze-map" => t.freeze_map = Some(value(args, &mut i, a)?),
             "--locked-test" => {
                 let v = value(args, &mut i, a)?;
                 let parsed = v.split_once(',').and_then(|(s, e)| Some((crate::data::parse_time(s)?, crate::data::parse_time(e)?)));
@@ -480,6 +510,9 @@ struct Entry {
     expression: Option<String>,
     archive_rank: Option<f64>,
     run_sha256: Option<String>,
+    /// #1237 (D19): the compose marker of the report, `composite` of a CPCV path or
+    /// `selection.composite` of a walk-forward report.
+    composite: Option<Json>,
 }
 
 /// Why a report reads locked data, or `None` for a development report. The
@@ -606,15 +639,22 @@ fn entry(j: &Json, root: &Json, prefix: &'static str, path: String, label: Strin
         expression: root.get("expression").and_then(Json::as_str).map(str::to_string),
         archive_rank: num_at(root, &["archive_rank"]),
         run_sha256: j.get("run_sha256").and_then(Json::as_str).map(str::to_string),
+        composite: j.get("composite").or_else(|| at(j, &["selection", "composite"])).cloned(),
         wf,
     })
 }
 
+/// Exit 2 for a report `path` that reads locked data.
+pub(crate) fn refuse_locked(j: &Json, path: &str, locked: &[(f64, f64)]) -> Res<()> {
+    match locked_reason(j, locked) {
+        Some(why) => usage(format!("{} reads locked data: {}; the table reads development reports only", path, why)),
+        None => Ok(()),
+    }
+}
+
 fn read_checked(path: &str, locked: &[(f64, f64)]) -> Res<Json> {
     let j = trials::read_report(path)?;
-    if let Some(why) = locked_reason(&j, locked) {
-        return usage(format!("{} reads locked data: {}; the table reads development reports only", path, why));
-    }
+    refuse_locked(&j, path, locked)?;
     Ok(j)
 }
 
@@ -1106,6 +1146,15 @@ struct Out {
     markdown: String,
 }
 
+/// Why the walk passed over a kept row.
+#[derive(Clone, Copy, Debug)]
+enum Skip {
+    /// The row's net series correlates at `diversity_rho` or more with this picked row.
+    Diversity(usize, f64),
+    /// #1237 (D8): the picks already hold `max_composites` composite rows.
+    Composites(usize),
+}
+
 fn opt_json(v: Option<f64>) -> String {
     v.map_or("null".to_string(), jnum)
 }
@@ -1131,6 +1180,7 @@ fn metric_cell(name: &str, v: &Val) -> String {
 }
 
 fn table(o: &Options, t: &TableArgs, rule: &Rule, rule_sha: &str, rule_source: &str) -> Res<Out> {
+    let map: Option<FreezeMap> = t.freeze_map.as_deref().map(trials_freeze::load_map).transpose()?;
     let entries = load_entries(o, &t.locked)?;
     let first = &entries[0];
     let n = first.wf.net.len();
@@ -1347,25 +1397,51 @@ fn table(o: &Options, t: &TableArgs, rule: &Rule, rule_sha: &str, rule_source: &
     }
     let mut picks: Vec<usize> = Vec::new();
     let mut pick_of: Vec<Option<usize>> = vec![None; rows_n];
-    let mut skip_of: Vec<Option<(usize, f64)>> = vec![None; rows_n];
+    let mut skip_of: Vec<Option<Skip>> = vec![None; rows_n];
     if rule.pick == 0 {
         notes.push("no pick count in the rule: no row is picked".to_string());
     }
+    let mut composites = 0usize;
     for &r in &order {
         if picks.len() >= rule.pick {
             break;
         }
+        let composite = entries[r].composite.is_some();
+        if let Some(limit) = rule.max_composites.filter(|&l| composite && composites >= l) {
+            skip_of[r] = Some(Skip::Composites(limit));
+            continue;
+        }
         let hit = picks.iter().map(|&p| (p, pearson(&entries[r].wf.net, &entries[p].wf.net))).find(|(_, c)| *c >= rule.diversity_rho);
         match hit {
-            Some(h) => skip_of[r] = Some(h),
+            Some((p, c)) => skip_of[r] = Some(Skip::Diversity(p, c)),
             None => {
                 picks.push(r);
                 pick_of[r] = Some(picks.len());
+                composites += usize::from(composite);
             }
         }
     }
     if rule.pick > 0 && picks.len() < rule.pick {
         notes.push(format!("{} of {} picks: the kept rows ran out", picks.len(), rule.pick));
+    }
+
+    // #1237: the sealed-read thresholds of every pick, frozen before any family test runs.
+    let mut frozen: Vec<trials_freeze::Frozen> = Vec::new();
+    if let (Some(fr), Some(m)) = (&rule.freeze, &map) {
+        for (k, &r) in picks.iter().enumerate() {
+            let e = &entries[r];
+            let Some(row) = m.row(&e.wf.path) else {
+                return usage(format!(
+                    "pick {} (row {}, label '{}', report {}) has no entry in --freeze-map {}: rows[].row names the report as given to --wf",
+                    k + 1,
+                    r,
+                    e.wf.label,
+                    e.wf.path,
+                    m.path
+                ));
+            };
+            frozen.push(trials_freeze::freeze_pick(row, fr, m, &t.locked)?);
+        }
     }
 
     // Family tests against the benchmark: the --baseline best rung, else cash at 0.
@@ -1498,6 +1574,20 @@ fn table(o: &Options, t: &TableArgs, rule: &Rule, rule_sha: &str, rule_source: &
             )
         })
         .collect();
+    let marker = |r: usize| entries[r].composite.as_ref().map_or("null".to_string(), crate::cpcv::to_json);
+    let pick_json: Vec<String> = pick_json
+        .into_iter()
+        .enumerate()
+        .map(|(k, mut s)| {
+            s.pop();
+            s.push_str(&format!(",\"composite\":{}", marker(picks[k])));
+            if let Some(f) = frozen.get(k) {
+                s.push_str(&format!(",\"freeze\":{}", f.json));
+            }
+            s.push('}');
+            s
+        })
+        .collect();
 
     if constant_books > 0 {
         notes.push(format!("{} constant series counted as one cluster each and left out of clustering, SPA, StepM and PBO", constant_books));
@@ -1550,8 +1640,8 @@ fn table(o: &Options, t: &TableArgs, rule: &Rule, rule_sha: &str, rule_source: &
             let occam_obj = if t.occam.is_empty() { String::new() } else { format!(",\"occam\":{}", occam_cell(e, &occam)) };
             format!(
                 "{{\"row\":{},\"label\":{},\"report\":{},\"book\":{},\"cluster\":{},\"archive_rank\":{},\"complexity\":{},\"trades\":{},\
-\"expression\":{},\"metrics\":{{{}}},\"unavailable\":[{}]{}{},\"gates\":{}{},\"passes\":{},\"front\":{},\"avg_rank\":{},\"order\":{},\
-\"pick\":{},\"skipped\":{}}}",
+\"expression\":{},\"composite\":{},\"metrics\":{{{}}},\"unavailable\":[{}]{}{},\"gates\":{}{},\"passes\":{},\"front\":{},\"avg_rank\":{},\
+\"order\":{},\"pick\":{},\"skipped\":{}}}",
                 i,
                 jstr(&e.wf.label),
                 jstr(&e.wf.path),
@@ -1561,6 +1651,7 @@ fn table(o: &Options, t: &TableArgs, rule: &Rule, rule_sha: &str, rule_source: &
                 opt_json(e.complexity),
                 opt_json(e.trades),
                 e.expression.as_deref().map_or("null".to_string(), jstr),
+                marker(i),
                 metrics.join(","),
                 unavailable.join(","),
                 strata,
@@ -1572,12 +1663,15 @@ fn table(o: &Options, t: &TableArgs, rule: &Rule, rule_sha: &str, rule_source: &
                 opt_json(avg_rank[i]),
                 order_of[i].map_or("null".to_string(), |k| k.to_string()),
                 pick_of[i].map_or("null".to_string(), |k| k.to_string()),
-                skip_of[i].map_or("null".to_string(), |(p, c)| format!(
-                    "{{\"row\":{},\"label\":{},\"rho\":{}}}",
-                    p,
-                    jstr(&entries[p].wf.label),
-                    jnum(c)
-                ))
+                skip_of[i].map_or("null".to_string(), |s| match s {
+                    Skip::Diversity(p, c) => format!(
+                        "{{\"reason\":\"diversity\",\"row\":{},\"label\":{},\"rho\":{}}}",
+                        p,
+                        jstr(&entries[p].wf.label),
+                        jnum(c)
+                    ),
+                    Skip::Composites(limit) => format!("{{\"reason\":\"max_composites\",\"limit\":{}}}", limit),
+                })
             )
         })
         .collect();
@@ -1593,8 +1687,12 @@ fn table(o: &Options, t: &TableArgs, rule: &Rule, rule_sha: &str, rule_source: &
     let mut rule_obj = rule.json();
     rule_obj.pop();
     rule_obj.push_str(&format!(",\"source\":{},\"sha256\":{}}}", jstr(rule_source), jstr(rule_sha)));
+    let freeze_obj = match (&map, &rule.freeze) {
+        (Some(m), Some(_)) => format!(",\"freeze\":{}", trials_freeze::top_json(rule_sha, m)),
+        _ => String::new(),
+    };
     let json = format!(
-        "{{\"schema\":{},\"rule\":{},\"inputs\":{{\"reports\":[{}],\"members\":{},\"null_reports\":{},\"null_sharpes\":[{}],\"calendar\":{},\
+        "{{\"schema\":{},\"rule\":{}{},\"inputs\":{{\"reports\":[{}],\"members\":{},\"null_reports\":{},\"null_sharpes\":[{}],\"calendar\":{},\
 \"baseline\":{},\"occam_runs\":{},\"locked_test\":[{}]}},\
 \"trials\":{{\"nominal\":{},\"prior_trials\":{},\"nominal_with_prior\":{},\"distinct_books\":{},\"constant_books\":{},\"n_eff\":{},\
 \"cluster_rho\":{},\"participation_ratio\":{}}},\
@@ -1603,6 +1701,7 @@ fn table(o: &Options, t: &TableArgs, rule: &Rule, rule_sha: &str, rule_source: &
 \"notes\":[{}],\"rows\":[{}]}}\n",
         jstr(SCHEMA),
         rule_obj,
+        freeze_obj,
         o.wf.iter().map(|p| jstr(p)).collect::<Vec<_>>().join(","),
         jstr(if o.all_members { "all" } else { "selected" }),
         t.null_wf.len(),
@@ -1691,7 +1790,8 @@ Gate set: {}, {} of {} rows pass. Benchmark: {}.\n\n",
         };
         let pick = match (pick_of[i], skip_of[i]) {
             (Some(k), _) => k.to_string(),
-            (None, Some((p, c))) => format!("skip (rho {} with row {})", cell(c), p),
+            (None, Some(Skip::Diversity(p, c))) => format!("skip (rho {} with row {})", cell(c), p),
+            (None, Some(Skip::Composites(limit))) => format!("skip (max_composites {})", limit),
             _ => "-".to_string(),
         };
         md.push_str(&format!(
@@ -1759,6 +1859,42 @@ Gate set: {}, {} of {} rows pass. Benchmark: {}.\n\n",
         }
         md.push('\n');
     }
+    if let (Some(fr), Some(m)) = (&rule.freeze, &map) {
+        md.push_str(&format!(
+            "## Frozen thresholds\n\nRule sha256 `{}`, map `{}` sha256 `{}`. Nearest-rank percentiles over the rolling windows of every \
+CPCV({}, {}) path of the pick's configuration at {} bp: S4 floor P{} of {}-day annualised nets, P1 floor P{} of {}-day annualised nets, \
+D9 cap max({}, P{} of {}-day max drawdowns).\n\n",
+            rule_sha,
+            m.path,
+            m.sha256,
+            fr.groups,
+            fr.test_groups,
+            jnum(fr.cost_bps),
+            fr.s4.percentile,
+            fr.s4.days,
+            fr.p1.percentile,
+            fr.p1.days,
+            jnum(fr.cap_floor),
+            fr.cap.percentile,
+            fr.cap.days
+        ));
+        md.push_str("| pick | row | label | configuration | paths | S4 floor | P1 floor | D9 cap | run sha256 |\n|---|---|---|---|---|---|---|---|---|\n");
+        for (k, (&r, f)) in picks.iter().zip(&frozen).enumerate() {
+            md.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                k + 1,
+                r,
+                entries[r].wf.label,
+                f.configuration,
+                f.paths,
+                cell(f.s4_floor),
+                cell(f.p1_floor),
+                cell(f.drawdown_cap),
+                f.run_sha256.as_deref().unwrap_or("-")
+            ));
+        }
+        md.push('\n');
+    }
     let tests_line = format!(
         "SPA against {}: {}. StepM at alpha {}: {}. BH-FDR at q {}: {}. PBO: {}.\n\n",
         bench_name,
@@ -1787,6 +1923,11 @@ pub fn cli(args: &[String]) -> Res<()> {
         return usage("--table needs --wf, not --compare");
     }
     let (rule, sha, source) = build_rule(&t)?;
+    match (&rule.freeze, &t.freeze_map) {
+        (Some(_), None) => return usage("the rule has freeze: give --freeze-map <map.json> (rcsr-trials-freeze-map/1) with the CPCV paths of every row that may be picked"),
+        (None, Some(_)) => return usage("--freeze-map needs a rule with freeze (a --rule file with the freeze key)"),
+        _ => {}
+    }
     let out = table(&o, &t, &rule, &sha, &source)?;
     match &o.out {
         Some(path) => std::fs::write(path, &out.json).map_err(|e| (3, format!("{}: {}", path, e)))?,

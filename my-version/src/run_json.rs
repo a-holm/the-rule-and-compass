@@ -47,6 +47,8 @@ pub struct FrontMember {
     pub rank: usize,
     pub expression: String,
     pub source: ExpressionSource,
+    /// #1214: the switch of a composed C1 or C2 member; its book is not `expression`.
+    pub switch: Option<crate::regime_gate::Switch>,
     /// #946: `validation_book.band_resolved` and `band_sd`, written under sd units.
     pub band_resolved: Option<f64>,
     pub band_sd: Option<f64>,
@@ -55,9 +57,40 @@ pub struct FrontMember {
 /// #855: the refusal for a run.json written by an `--interim-chunk` run.
 pub const INTERIM_REFUSAL: &str = "run.json comes from an --interim-chunk run: it holds no report; use the run.json of the last chunk";
 
-/// #1181: the refusal for a composed run whose finalist gate has a band or a dwell.
-pub const CARRIED_GATE_REFUSAL: &str = "run.json comes from rcsr compose with a finalist gate that has a band or a dwell (compose.gate.carried): \
-     its gate state is not a row expression, so the finalist expression would price another book; objective.test holds the composite's own test book";
+/// #1214: the refusal for a composed run written before the switch block: its
+/// finalist gate state is carried in `compose.gate` only.
+pub const STALE_COMPOSE_REFUSAL: &str = "run.json comes from rcsr compose with a carried finalist gate (compose.gate.carried) and no objective.finalist.switch: \
+     it was written before the switch block; run rcsr compose again";
+
+/// #1237 (D19): the compose provenance of a run's finalist, `compose.chosen` of an `rcsr compose` run.json.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CompositeMarker {
+    /// `compose.chosen.type`: C0 to C3.
+    pub kind: String,
+    /// `compose.chosen.form`, e.g. `if(gate, f, cash)`.
+    pub form: Option<String>,
+    /// `compose.chosen.gate`: the menu gate name, `None` for C0.
+    pub gate: Option<String>,
+}
+
+impl CompositeMarker {
+    /// The marker a walk-forward report writes as `selection.composite`.
+    pub fn json(&self) -> String {
+        let text = |v: &Option<String>| v.as_deref().map_or("null".to_string(), crate::walkforward::jstr);
+        format!(
+            "{{\"source\":\"rcsr compose\",\"type\":{},\"form\":{},\"gate\":{}}}",
+            crate::walkforward::jstr(&self.kind),
+            text(&self.form),
+            text(&self.gate)
+        )
+    }
+
+    fn of(j: &Json) -> Option<CompositeMarker> {
+        let chosen = j.get("compose")?.get("chosen")?;
+        let text = |k: &str| chosen.get(k).and_then(Json::as_str).map(str::to_string);
+        Some(CompositeMarker { kind: text("type")?, form: text("form"), gate: text("gate") })
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct RunFile {
@@ -96,6 +129,8 @@ pub struct RunFile {
     pub elapsed_seconds: Option<f64>,
     /// `search.cumulative.elapsed_seconds` when the block is complete (#923).
     pub cumulative_elapsed_seconds: Option<f64>,
+    /// #1237: `compose.chosen` of a composed run; `None` for every other run.
+    pub composite: Option<CompositeMarker>,
     /// The parsed document, for views such as `RunFile::book`.
     doc: Json,
 }
@@ -130,8 +165,9 @@ impl RunFile {
         if matches!(j.get("interim"), Some(Json::Bool(true))) {
             return Err(INTERIM_REFUSAL.to_string());
         }
-        if matches!(j.get("compose").and_then(|c| c.get("gate")).and_then(|g| g.get("carried")), Some(Json::Bool(true))) {
-            return Err(CARRIED_GATE_REFUSAL.to_string());
+        let carried = matches!(j.get("compose").and_then(|c| c.get("gate")).and_then(|g| g.get("carried")), Some(Json::Bool(true)));
+        if carried && j.get("objective").and_then(|o| o.get("finalist")).and_then(|f| f.get("switch")).is_none() {
+            return Err(STALE_COMPOSE_REFUSAL.to_string());
         }
         let variables = match j.get("variables") {
             Some(Json::Arr(a)) => a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
@@ -141,14 +177,21 @@ impl RunFile {
             Some(Json::Arr(a)) => a
                 .iter()
                 .enumerate()
-                .filter_map(|(k, m)| {
-                    ExpressionSource::pick(m)
+                .map(|(k, m)| -> Result<Option<FrontMember>, String> {
+                    let switch = match m.get("switch") {
+                        None | Some(Json::Null) => None,
+                        Some(s) => Some(crate::regime_gate::Switch::parse(s).map_err(|e| format!("pareto[{}].{}", k, e))?),
+                    };
+                    Ok(ExpressionSource::pick(m)
                         .map(|(expression, source)| {
                         let vb = m.get("validation_book");
                         let at = |key: &str| vb.and_then(|b| b.get(key)).and_then(Json::as_f64);
-                        FrontMember { rank: k + 1, expression, source, band_resolved: at("band_resolved"), band_sd: at("band_sd") }
-                    })
+                        FrontMember { rank: k + 1, expression, source, band_resolved: at("band_resolved"), band_sd: at("band_sd"), switch: switch.clone() }
+                    }))
                 })
+                .collect::<Result<Vec<_>, String>>()?
+                .into_iter()
+                .flatten()
                 .collect(),
             _ => return Err("no 'pareto' array (not a single-target run.json)".to_string()),
         };
@@ -192,6 +235,7 @@ impl RunFile {
                 .filter(|c| c.get("complete").map_or(false, |v| matches!(v, Json::Bool(true))))
                 .and_then(|c| c.get("elapsed_seconds"))
                 .and_then(Json::as_f64),
+            composite: CompositeMarker::of(&j),
             doc: j.clone(),
         })
     }

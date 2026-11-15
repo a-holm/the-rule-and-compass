@@ -278,28 +278,49 @@ fn hysteresis_gate_is_carried() {
     let plain = write_menu(&p.dir, "plain.json", &[("h", "011", "h", 0.0, 1)], None);
     let out = p.dir.join("composed.json").to_string_lossy().into_owned();
     let j = json(&compose(&p.data, &p.spec, &["--gates", &band, "--bull", &masked, "--bear", &p.bear, "--top", "2", "--json", "--out", &out]));
-    let gate = at(&j, &["compose", "gate"]);
-    assert_eq!(at(gate, &["carried"]), &Json::Bool(true));
-    assert_eq!((num(gate, &["band"]), num(gate, &["dwell"])), (0.02, 3.0));
-    // The validation states are the --pnl-mask states of the same gate.
+    // #1214: the finalist and every C1 and C2 carry their switch; no gate is carried.
+    assert!(at(&j, &["compose", "gate"]).get("carried").is_none());
+    let sw = at(&j, &["objective", "finalist", "switch"]);
+    assert_eq!((s(sw, &["gate", "expr"]), num(sw, &["gate", "band"]), num(sw, &["gate", "dwell"])), ("h", 0.02, 3.0));
+    assert_eq!(s(sw, &["gate", "state_rule"]), "rcsr-gate-state/1");
+    let pareto = arr(&j, &["pareto"]);
+    assert_eq!(pareto.len() as f64, num(&j, &["compose", "count", "composites"]), "pareto holds every composite");
+    for m in pareto {
+        assert_eq!(m.get("switch").is_some(), s(m, &["type"]) != "C0", "{}", s(m, &["expression"]));
+        assert!(matches!(at(m, &["pruned"]), Json::Bool(_)));
+    }
+    assert!(at(&j, &["compose", "chosen", "validation", "regime", "start"]).get("warmup_rows").is_some());
+    // The validation states are the --pnl-mask states of the same gate under the same rule.
     let mask = Json::parse(std::fs::read_to_string(&masked).unwrap().trim()).unwrap();
+    assert_eq!(s(&mask, &["objective", "spec", "pnl_mask", "state_rule"]), "rcsr-gate-state/1");
     let mask_share = num(&mask, &["objective", "validation", "mask", "on_share"]);
     let share = num(&j, &["compose", "chosen", "validation", "regime", "states", "on", "share"]);
     assert_eq!(share, mask_share, "compose and --pnl-mask give the same gate states");
     let pure = json(&compose(&p.data, &p.spec, &["--gates", &plain, "--bull", &masked, "--bear", &p.bear, "--top", "2", "--json"]));
     assert_ne!(num(&pure, &["compose", "chosen", "validation", "regime", "states", "on", "share"]), share, "the band and the dwell change the states");
-    assert_eq!(at(&pure, &["compose", "gate", "carried"]), &Json::Bool(false));
-    // Only the finalist carries the stateful gate into pareto, and no evaluator prices its expression alone.
-    assert_eq!(arr(&j, &["pareto"]).len(), 1);
-    let w = format!("t,{},{},{},{}", T0, T0 + STEP * 100, T0 + STEP * 400, T0 + STEP * STAMPS as i64);
-    for flag in ["--from-run", "--front"] {
-        let wf = rcsr(&["walkforward", "--data", &p.data, "--target", "y", flag, &out, "--time", "t", "--group-by", "s", "--window", &w, "--json"]);
-        assert_ne!(code(&wf), 0, "{flag}");
-        assert!(stderr(&wf).contains("compose.gate.carried"), "{flag}: {}", stderr(&wf));
-    }
+    // walkforward --from-run prices the stateful composite on its test rows.
+    let test_rows = num(&j, &["test_rows"]) as i64;
+    let k_test = STAMPS as i64 - test_rows / SYMBOLS.len() as i64;
+    let first_val = num(&arr(&j, &["split", "validation_time"])[0], &[]) as i64;
+    let w = format!("t,{},{},{},{}", T0, first_val, T0 + STEP * k_test, T0 + STEP * STAMPS as i64);
+    let priced = |run: &str| {
+        let wf = rcsr(&["walkforward", "--data", &p.data, "--target", "y", "--from-run", run, "--time", "t", "--group-by", "s", "--window", &w, "--json"]);
+        assert_eq!(code(&wf), 0, "{run}: {}", stderr(&wf));
+        let r = Json::parse(String::from_utf8_lossy(&wf.stdout).trim()).unwrap();
+        let m = at(&arr(&r, &["windows"])[0], &["metrics"]).clone();
+        (m, r)
+    };
+    let (m, r) = priced(&out);
+    let net = num(&m, &["mean_return"]) * num(&m, &["periods"]) * SYMBOLS.len() as f64;
+    let want = num(&j, &["objective", "test", "net_pnl"]);
+    assert!((net - want).abs() <= 1e-12, "walkforward {net} vs objective.test {want}");
+    assert_eq!(s(&r, &["gate", "source"]), "objective.finalist.switch");
+    let wf = rcsr(&["walkforward", "--data", &p.data, "--target", "y", "--front", &out, "--time", "t", "--group-by", "s", "--window", &w, "--validation-frac", "0.3", "--json"]);
+    assert_eq!(code(&wf), 0, "--front: {}", stderr(&wf));
+    // A composed run cannot be a pool: nested switches exit 2.
     let again = compose(&p.data, &p.spec, &["--gates", &plain, "--bull", &out, "--bear", &p.bear, "--json"]);
     assert_eq!(code(&again), 2, "{}", stderr(&again));
-    assert!(stderr(&again).contains("compose.gate.carried"), "{}", stderr(&again));
+    assert!(stderr(&again).contains("nested switches"), "{}", stderr(&again));
 }
 
 #[test]
@@ -482,3 +503,69 @@ fn compose_help_lists_its_options() {
     let top = rcsr(&["--help"]);
     assert!(String::from_utf8_lossy(&top.stdout).contains("rcsr compose"));
 }
+
+/// `j` without the fields `drop` (top-level keys, or `parent.key`).
+fn without(j: &Json, drop: &[&str]) -> Json {
+    let Json::Obj(fields) = j else { panic!("an object") };
+    let kept = fields
+        .iter()
+        .filter(|(k, _)| !drop.contains(&k.as_str()))
+        .map(|(k, v)| {
+            let inner: Vec<&str> = drop.iter().filter_map(|d| d.strip_prefix(&format!("{k}."))).collect();
+            (k.clone(), if inner.is_empty() { v.clone() } else { without(v, &inner) })
+        })
+        .collect();
+    Json::Obj(kept)
+}
+
+/// #1237: a walk-forward of a composed run states the composite (D19) and nothing else
+/// changes: the same run.json without its compose block gives the same report without the
+/// marker, and a plain run (no compose block, no switch) gives the report of the build
+/// before the marker.
+#[test]
+fn from_run_of_compose_marks_composite() {
+    let p = planted(&BULL, &BEAR);
+    let menu = write_menu(&p.dir, "menu.json", &[("g", "000", "g", 0.0, 1)], None);
+    let out = p.dir.join("composed.json").to_string_lossy().into_owned();
+    let j = json(&compose(&p.data, &p.spec, &["--gates", &menu, "--bull", &p.bull, "--top", "3", "--json", "--out", &out]));
+    assert_eq!(s(&j, &["compose", "chosen", "type"]), "C1");
+    let write = |name: &str, doc: &Json| -> String {
+        let path = p.dir.join(name).to_string_lossy().into_owned();
+        std::fs::write(&path, format!("{}\n", rcsr::cpcv::to_json(doc))).unwrap();
+        path
+    };
+    let unmarked = write("unmarked.json", &without(&j, &["compose"]));
+    let plain = write("plain.json", &without(&j, &["compose", "objective.finalist.switch"]));
+    let test_rows = num(&j, &["test_rows"]) as i64;
+    let k_test = STAMPS as i64 - test_rows / SYMBOLS.len() as i64;
+    let first_val = num(&arr(&j, &["split", "validation_time"])[0], &[]) as i64;
+    let w = format!("t,{},{},{},{}", T0, first_val, T0 + STEP * k_test, T0 + STEP * STAMPS as i64);
+    let report = |run: &str, name: &str| -> Json {
+        let path = p.dir.join(name).to_string_lossy().into_owned();
+        let o = rcsr(&["walkforward", "--data", &p.data, "--target", "y", "--from-run", run, "--time", "t", "--group-by", "s", "--window", &w, "--out", &path]);
+        assert_eq!(code(&o), 0, "{}", stderr(&o));
+        Json::parse(std::fs::read_to_string(&path).unwrap().trim()).unwrap()
+    };
+    let composed = report(&out, "wf_composed.json");
+    let m = at(&composed, &["selection", "composite"]);
+    assert_eq!(s(m, &["source"]), "rcsr compose");
+    assert_eq!(s(m, &["type"]), "C1");
+    assert_eq!(s(m, &["form"]), s(&j, &["compose", "chosen", "form"]));
+    assert_eq!(s(m, &["gate"]), "g");
+    // The switch prices both runs; the marker is the only difference.
+    let switch = report(&unmarked, "wf_unmarked.json");
+    assert_eq!(s(&switch, &["gate", "source"]), "objective.finalist.switch");
+    assert!(at(&switch, &["selection"]).get("composite").is_none());
+    // `ledger` holds wall-clock timings.
+    assert_eq!(
+        without(&composed, &["selection.composite", "protocol", "ledger"]),
+        without(&switch, &["protocol", "ledger"]),
+        "the marker changes nothing else"
+    );
+    // A plain run: no marker, no gate, the bytes of the base build.
+    let plain = report(&plain, "wf_plain.json");
+    assert!(plain.get("gate").is_none() && at(&plain, &["selection"]).get("composite").is_none());
+    assert_eq!(s(&plain, &["protocol", "report_sha256"]), PINNED_PLAIN_FROM_RUN);
+}
+
+const PINNED_PLAIN_FROM_RUN: &str = "22e9d27e4d0f59c0e35b4597d6265b71bf343a8cb8a1b0f01309b9437079ebe2";

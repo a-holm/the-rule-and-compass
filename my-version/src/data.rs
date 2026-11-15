@@ -1768,6 +1768,19 @@ pub struct TradingColumns {
     /// #1181: the same columns also travel with the validation and test rows
     /// (`rcsr compose`).
     pub slice_values: bool,
+    /// #1214: gates whose `rcsr-gate-state/1` states the validation and test
+    /// slices carry in [`TradingSplit::gate_states`] (`rcsr compose`).
+    pub state_gates: Vec<crate::regime_gate::GateSpec>,
+}
+
+/// #1214: the `rcsr-gate-state/1` states of one gate on the validation and test
+/// rows, and the warm-up each slice starts from.
+#[derive(Clone, Debug, Default)]
+pub struct SliceGateStates {
+    pub validation: Option<Vec<bool>>,
+    pub test: Vec<bool>,
+    pub validation_start: Option<crate::regime_gate::WarmUp>,
+    pub test_start: crate::regime_gate::WarmUp,
 }
 
 /// #1180: the regime mask of each slice, aligned with its trading rows.
@@ -1836,6 +1849,8 @@ pub struct TradingSplit {
     /// [`TradingColumns::slice_values`]; empty otherwise.
     pub validation_values: Vec<Vec<f64>>,
     pub test_values: Vec<Vec<f64>>,
+    /// #1214: one entry per [`TradingColumns::state_gates`] gate.
+    pub gate_states: Vec<SliceGateStates>,
 }
 
 /// Feature rows (as in [`Sample::x`]) and trading rows of a cross-section context.
@@ -3787,6 +3802,7 @@ fn prepare_full_targets_weighted_inner(
             cols,
             spec,
             filtered,
+            (t, &keep_row),
             match &book_idx {
                 Some(b) => (&b.train[..], &b.validation[..], &b.test[..]),
                 None => (&train_idx[..], &validation_idx[..], &test_idx[..]),
@@ -4916,10 +4932,12 @@ fn book_return(spec: &SplitSpec, t: &Table) -> Option<Vec<f64>> {
 }
 
 /// Time, group, return and funding of the validation and test rows (#263).
+#[allow(clippy::too_many_arguments)]
 fn build_trading(
     cols: &TradingColumns,
     spec: &SplitSpec,
     filtered: &Table,
+    gate_rows: (&Table, &[bool]),
     (train_idx, validation_idx, test_idx): (&[usize], &[usize], &[usize]),
     (train, validation, test): (&Sample, Option<&Sample>, &Sample),
     validation_context: (&[usize], Option<&Sample>),
@@ -4993,13 +5011,20 @@ fn build_trading(
                 let t: Vec<f64> = idx.iter().map(|&i| time[i]).collect();
                 crate::regime_gate::gate_states(gate, &g, &t, &selected)
             };
+            // #1214: the validation and test books read the evaluation rule.
+            let eval = evaluation_states(gate, spec, gate_rows, validation.is_some().then_some(validation_idx), test_idx)?;
             Some(TradingMasks {
                 train: if cols.train { Some(states(train_idx, true)?) } else { None },
-                validation: if validation.is_some() { Some(states(validation_idx, false)?) } else { None },
-                test: states(test_idx, false)?,
+                validation: eval.validation,
+                test: eval.test,
             })
         }
     };
+    let gate_states = cols
+        .state_gates
+        .iter()
+        .map(|g| evaluation_states(g, spec, gate_rows, validation.is_some().then_some(validation_idx), test_idx))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut train_values = Vec::with_capacity(cols.train_values.len());
     if cols.train {
         for name in &cols.train_values {
@@ -5022,12 +5047,110 @@ fn build_trading(
         train_values,
         validation_values,
         test_values,
+        gate_states,
         train: cols.train.then(|| slice(train_idx, train)),
         validation: validation.map(|v| slice(validation_idx, v)),
         test: slice(test_idx, test),
         validation_context: validation_context.1.map(|s| TradingContext { x: s.x.clone(), slice: slice(validation_context.0, s) }),
         test_context: test_context.1.map(|s| TradingContext { x: s.x.clone(), slice: slice(test_context.0, s) }),
     })
+}
+
+/// #1214: the barriers of `rcsr-gate-state/1` for the search slices. The test
+/// slice is priced: each declared locked range with its lookback embargo. The
+/// validation slice is a selection read: the same plus every test interval of a
+/// split table with the split's embargo, or the test block from its first row.
+fn gate_barriers(spec: &SplitSpec, test_start: f64) -> (Vec<crate::regime_gate::Barrier>, Vec<crate::regime_gate::Barrier>) {
+    use crate::regime_gate::{Barrier, BarrierKind};
+    let mut pricing = Vec::new();
+    if let Some(d) = &spec.declared_lockbox {
+        let floored = label_floored(d, spec);
+        for range in std::iter::once(d.lockbox).chain(d.also) {
+            pricing.push(Barrier { start: range.start as f64, end: (range.end + floored.embargo.seconds) as f64, kind: BarrierKind::Locked });
+        }
+    }
+    let mut selection = pricing.clone();
+    match &spec.intervals {
+        Some(iv) => {
+            for &(s, e) in &iv.declared.test {
+                selection.push(Barrier { start: s as f64, end: (e + iv.embargo) as f64, kind: BarrierKind::Test });
+            }
+        }
+        None if test_start.is_finite() => selection.push(Barrier { start: test_start, end: f64::INFINITY, kind: BarrierKind::Test }),
+        None => {}
+    }
+    (pricing, selection)
+}
+
+/// #1214: the `rcsr-gate-state/1` states of `gate` on the validation rows
+/// (selection barriers) and the test rows (pricing barriers). The gate rows are
+/// every row of the data file (`gate_rows.0`, before any row filter) with a
+/// finite time; `gate_rows.1` marks the rows the filtered table kept, so slice
+/// row `i` is the `i`-th kept row.
+fn evaluation_states(
+    gate: &crate::regime_gate::GateSpec,
+    spec: &SplitSpec,
+    (table, keep): (&Table, &[bool]),
+    validation_idx: Option<&[usize]>,
+    test_idx: &[usize],
+) -> Result<SliceGateStates, String> {
+    use crate::regime_gate::GateTape;
+    let tc = spec.time_col.ok_or("the gate state needs a time column (--time <col>)")?;
+    let n = table.len();
+    let time = time_keys(table, tc).to_f64();
+    let group: Vec<u64> = match spec.group_col {
+        Some(gc) => group_ids(table, gc).0.into_iter().map(|g| g as u64).collect(),
+        None => vec![0u64; n],
+    };
+    let mut cols: Vec<&[f64]> = Vec::with_capacity(gate.columns.len());
+    for name in &gate.columns {
+        let j = table.index_of(name).map_err(|e| format!("mask column: {}", e))?;
+        if !table.numeric[j] {
+            return Err(format!("mask column '{}' is not numeric", name));
+        }
+        cols.push(table.col(j));
+    }
+    let kept: Vec<usize> = (0..n).filter(|&r| keep.get(r).copied().unwrap_or(true)).collect();
+    let first = |idx: &[usize]| idx.iter().map(|&i| time[kept[i]]).fold(f64::INFINITY, f64::min);
+    let (pricing, selection) = gate_barriers(spec, first(test_idx));
+    let run = |barriers: &[crate::regime_gate::Barrier], idx: &[usize], what: &str| -> Result<(Vec<bool>, crate::regime_gate::WarmUp), String> {
+        let mut tape = GateTape::with_starts(gate, barriers.to_vec(), &[first(idx)]);
+        let mut state: Vec<u8> = vec![2; n];
+        let mut row = vec![0.0f64; cols.len()];
+        for r in 0..n {
+            let s = tape.step_with(group[r], time[r], || {
+                for (k, c) in cols.iter().enumerate() {
+                    row[k] = c[r];
+                }
+                crate::expr::eval(&gate.tree, &row)
+            })?;
+            if let Some(on) = s {
+                state[r] = u8::from(on);
+            }
+        }
+        let on = idx
+            .iter()
+            .map(|&i| match state[kept[i]] {
+                2 => Err(format!(
+                    "the {} row at time {} lies inside a gate barrier: the gate state rule {} needs every validation row before the test rows (a temporal split or a split table) and no slice row inside a locked range",
+                    what,
+                    time[kept[i]],
+                    crate::regime_gate::STATE_RULE
+                )),
+                s => Ok(s == 1),
+            })
+            .collect::<Result<Vec<bool>, String>>()?;
+        Ok((on, tape.warm_ups()[0]))
+    };
+    let (test, test_start) = run(&pricing, test_idx, "test")?;
+    let (validation, validation_start) = match validation_idx {
+        Some(idx) => {
+            let (v, w) = run(&selection, idx, "validation")?;
+            (Some(v), Some(w))
+        }
+        None => (None, None),
+    };
+    Ok(SliceGateStates { validation, test, validation_start, test_start })
 }
 
 /// Comparable ordering key for every row of a time column.
@@ -6272,6 +6395,7 @@ mod tests {
                 mask: None,
                 train_values: Vec::new(),
                 slice_values: false,
+                state_gates: Vec::new(),
             }),
             canonical_train_order: canonical,
             ..Default::default()
