@@ -18,6 +18,7 @@
 //! * Null p-values use `(1 + #{null >= observed}) / (B + 1)`.
 //! * The SPA test is Hansen (2005) with a joint circular block bootstrap, the
 //!   studentised statistic and the three recentering variants.
+//! * StepM is Romano and Wolf (2005) on the SPA resampler.
 //! * DSR is Bailey and Lopez de Prado (2014); PBO is the CSCV procedure of
 //!   Bailey, Borwein, Lopez de Prado and Zhu (2017).
 
@@ -946,4 +947,114 @@ pub fn bh_fdr(p: &[f64], q: f64) -> Bh {
         adjusted,
         n_rejected: cutoff,
     }
+}
+
+// ---------------------------------------------------------------------------
+// StepM
+// ---------------------------------------------------------------------------
+
+/// Result of the Romano and Wolf (2005) StepM.
+#[derive(Clone, Debug)]
+pub struct StepM {
+    pub models: usize,
+    pub n: usize,
+    pub block_len: usize,
+    pub draws: usize,
+    pub seed: u32,
+    pub alpha: f64,
+    /// Studentised `sqrt(n) dbar_k / omega_k` of every model.
+    pub statistic: Vec<f64>,
+    /// One-sided bootstrap p of `mean d_k > 0`, `(1 + count) / (B + 1)`.
+    pub p_values: Vec<f64>,
+    pub rejected: Vec<bool>,
+    /// The critical value of every step.
+    pub critical: Vec<f64>,
+}
+
+/// StepM of Romano and Wolf (2005). `d[k][t]` is model `k`'s performance minus
+/// the benchmark's at period `t`; model `k` beats the benchmark when its mean
+/// is positive. One joint circular block bootstrap (the resampler of
+/// [`spa_test`]) gives the centred studentised draws. Each step rejects every
+/// model left whose statistic exceeds the `1 - alpha` quantile of the largest
+/// draw over the models left, until a step rejects none; the family-wise error
+/// rate is `alpha` asymptotically.
+pub fn stepm(d: &[Vec<f64>], block: usize, draws: usize, seed: u32, alpha: f64) -> Result<StepM, String> {
+    let k = d.len();
+    if k == 0 {
+        return Err("StepM needs at least one model".to_string());
+    }
+    if draws < 2 {
+        return Err("StepM needs at least 2 draws".to_string());
+    }
+    if !(alpha > 0.0 && alpha < 1.0) {
+        return Err("StepM needs alpha in (0, 1)".to_string());
+    }
+    let n = d.iter().map(|c| c.len()).min().unwrap_or(0);
+    if n < 3 {
+        return Err("StepM needs at least 3 periods".to_string());
+    }
+    let block = block.clamp(1, n);
+    let nf = n as f64;
+    let dbar: Vec<f64> = d.iter().map(|c| mean(&c[..n])).collect();
+    let mut prefix = vec![vec![0.0f64; 2 * n + 1]; k];
+    for (c, col) in d.iter().enumerate() {
+        for i in 0..2 * n {
+            prefix[c][i + 1] = prefix[c][i] + (col[i % n] - dbar[c]);
+        }
+    }
+    let mut rng = Mt::new(seed);
+    let mut star = vec![vec![0.0f64; k]; draws];
+    let mut starts: Vec<(usize, usize)> = Vec::new();
+    for row in star.iter_mut() {
+        starts.clear();
+        let mut remaining = n;
+        while remaining > 0 {
+            let len = block.min(remaining);
+            starts.push((rng.usize_below(n), len));
+            remaining -= len;
+        }
+        for c in 0..k {
+            let s: f64 = starts.iter().map(|&(s, len)| prefix[c][s + len] - prefix[c][s]).sum();
+            row[c] = s / nf;
+        }
+    }
+    let omega: Vec<f64> = (0..k)
+        .map(|c| {
+            let v: Vec<f64> = star.iter().map(|r| r[c]).collect();
+            nf.sqrt() * sample_sd(&v)
+        })
+        .collect();
+    let statistic: Vec<f64> = (0..k)
+        .map(|c| {
+            if omega[c] > 0.0 {
+                nf.sqrt() * dbar[c] / omega[c]
+            } else if dbar[c] > 0.0 {
+                f64::INFINITY
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let z = |row: &[f64], c: usize| if omega[c] > 0.0 { nf.sqrt() * row[c] / omega[c] } else { 0.0 };
+    let p_values: Vec<f64> = (0..k).map(|c| null_p_count(star.iter().filter(|r| z(r, c) >= statistic[c]).count(), draws)).collect();
+    let mut rejected = vec![false; k];
+    let mut critical = Vec::new();
+    loop {
+        let left: Vec<usize> = (0..k).filter(|&c| !rejected[c]).collect();
+        if left.is_empty() {
+            break;
+        }
+        let mut maxes: Vec<f64> = star.iter().map(|r| left.iter().map(|&c| z(r, c)).fold(f64::NEG_INFINITY, f64::max)).collect();
+        maxes.sort_by(|a, b| a.total_cmp(b));
+        let cv = quantile_sorted(&maxes, 1.0 - alpha);
+        critical.push(cv);
+        let new: Vec<usize> = left.into_iter().filter(|&c| statistic[c] > cv).collect();
+        if new.is_empty() {
+            break;
+        }
+        for c in new {
+            rejected[c] = true;
+        }
+    }
+    Ok(StepM { models: k, n, block_len: block, draws, seed, alpha, statistic, p_values, rejected, critical })
 }

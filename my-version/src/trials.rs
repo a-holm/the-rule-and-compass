@@ -39,6 +39,7 @@ pub fn usage() -> &'static str {
     "usage: rcsr trials --wf <report.json>... [--baseline <ladder.json>] [options]\n\
 \x20      rcsr trials --compare <A> <B> [options]\n\
 \x20      rcsr trials --cpcv-assemble <report.json>... --splits <csv> --out-dir <dir> [--summary <file>]\n\
+\x20      rcsr trials --wf <report.json>... --table [--rule <rule.json>] [options]\n\
 \n\
 Campaign trial accounting from walk-forward reports (pooled.period_net), or a paired\n\
 comparison of two runs. A and B are each one report or a comma-separated list (one per seed).\n\
@@ -78,6 +79,40 @@ Campaign (--wf):\n\
                          (--draws, --seed, --block-len). With pooled.period_gross, period_exposure, period_entries and\n\
                          period_bh in the reports (walkforward --period-series) it also reports net at twice the cost,\n\
                          exposure, entries, buy-and-hold and the alpha over exposure-matched buy-and-hold\n\
+\n\
+Candidate table (--table, #1177): one row per --wf series, with the campaign options above. Rows pass the gates,\n\
+the Pareto front ranks the passers, the average rank orders them inside a front, and a walk in the order front,\n\
+average rank, complexity, trades, input order picks rows below the diversity cap. Every picked row gets PSR, DSR\n\
+at N_eff, 10 N_eff and the nominal N (every row of the table, plus --prior-trials), MinBTL, the Harvey-Liu haircut\n\
+(Bonferroni, Holm, BHY over the rows) and its StepM and BH-FDR verdicts; SPA, StepM, BH-FDR and PBO run over the\n\
+distinct varying rows against the --baseline best rung, else cash at 0. Output rcsr-trials-table/1.\n\
+  --rule <file>          rcsr-trials-rule/1 JSON with cost_multiples, gates, relaxed_gates (apply when no row passes\n\
+                         gates), pareto, rank, pick, diversity_rho and min_front; its sha256 is in the output; it\n\
+                         excludes --gates, --pareto, --rank, --pick, --diversity-rho, --min-front, --cost-multiples\n\
+  --gates <file>         JSON object {metric: [op, value]}, op >, >=, <, <=, or [\"between\", lo, hi]; all must hold;\n\
+                         a NaN value fails; every failed gate is listed per row\n\
+  --pareto <m[:dir],...> Pareto metrics over the gate passers, dir max (default) or min; NaN is the worst value\n\
+  --rank <m[:dir],...>   average rank over the gate passers (1 = best, ties share the mean place) and the Friedman\n\
+                         chi2 over rows x metrics\n\
+  --pick <K>             pick K rows (default 0: none)\n\
+  --diversity-rho <R>    skip a row whose net series correlates at R or more with a picked row (default 1)\n\
+  --min-front <M>        keep the first fronts until at least M rows remain (default 0: every front)\n\
+  --cost-multiples <m,..> net<bps> metrics at m x cost_model.per_side_bps (default 1,2: net10 and net20 at 10 bp)\n\
+  --null-wf <files...>   null walk-forward reports; null_q = share of their annual Sharpes below the row's\n\
+  --prior-trials <N0>    add N0 earlier trials to the nominal N of the picked rows' DSR\n\
+  --alpha <a>            family error rate of StepM and q of BH-FDR (default 0.05)\n\
+  --locked-test <S,E>    refuse a report with a period or test window in [S, E) (repeatable)\n\
+  --occam <files...>     run.json of a --select-rule occam re-selection or of rcsr compose: bits, p_occam and\n\
+                         bit_budget per row (report only), matched by the report's run_sha256 and archive rank\n\
+  --markdown <file>      also write the table as Markdown\n\
+  Metrics: net<bps> (annualised mean net over cash at 0), sharpe, sortino (MAR 0), calmar (net at the report cost\n\
+  over |max_drawdown|), max_drawdown, exposure, entry_times, alpha_bh (mean of net - exposure x period_bh_net,\n\
+  annualised), psr, groups and groups_pos (test windows or CPCV groups with positive net); with --regimes\n\
+  bull_net, bear_excess (net minus buy-and-hold net in bear), worst_stratum (lowest stratum net), net:<label>,\n\
+  excess:<label>, alpha_bh:<label> and a strata block per row; null_q with --null-wf; baseline_excess with\n\
+  --baseline. A rule metric a report cannot give exits 2 naming the field and the report. A report with a locked\n\
+  read (protocol.test_read, protocol.lockbox.rows, evaluated or read_marker) or a period or test window inside a\n\
+  locked range (protocol.lockbox, its declared and also ranges, lockbox, --locked-test) exits 2 naming it.\n\
 \n\
 Comparison (--compare): d_t = A_t - B_t, with X_t the mean of the side's seeds\n\
   --bootstrap <kind>     stationary (default) | circular\n\
@@ -133,30 +168,30 @@ pub(crate) const FIT_GUARDS: &[&[&str]] = &[
     &["threshold", "cut_lambda"],
 ];
 
-struct Wf {
-    label: String,
-    path: String,
+pub(crate) struct Wf {
+    pub(crate) label: String,
+    pub(crate) path: String,
     /// `pooled`, or `series` for a `members[]` entry (#1176).
-    prefix: &'static str,
-    net: Vec<f64>,
+    pub(crate) prefix: &'static str,
+    pub(crate) net: Vec<f64>,
     /// #1175: the per-period series a walkforward report carries with `--period-series`.
-    gross: Option<Vec<f64>>,
-    exposure: Option<Vec<f64>>,
+    pub(crate) gross: Option<Vec<f64>>,
+    pub(crate) exposure: Option<Vec<f64>>,
     entries: Option<Vec<f64>>,
     bh: Option<Vec<f64>>,
-    time: Vec<f64>,
-    ppy: f64,
+    pub(crate) time: Vec<f64>,
+    pub(crate) ppy: f64,
     guards: Vec<Json>,
     fit_guards: Vec<Json>,
     rule: String,
-    default_block: usize,
+    pub(crate) default_block: usize,
 }
 
 fn at<'a>(j: &'a Json, path: &[&str]) -> Option<&'a Json> {
     path.iter().try_fold(j, |cur, k| cur.get(k))
 }
 
-fn series(j: &Json, path: &[&str], file: &str) -> Res<Vec<f64>> {
+pub(crate) fn series(j: &Json, path: &[&str], file: &str) -> Res<Vec<f64>> {
     let name = path.join(".");
     let Some(Json::Arr(items)) = at(j, path) else {
         return usage_err(format!(
@@ -174,7 +209,7 @@ fn series(j: &Json, path: &[&str], file: &str) -> Res<Vec<f64>> {
     Ok(out)
 }
 
-fn label_of(path: &str) -> String {
+pub(crate) fn label_of(path: &str) -> String {
     std::path::Path::new(path)
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -190,7 +225,7 @@ fn median_step(time: &[f64]) -> f64 {
     d[d.len() / 2]
 }
 
-fn read_report(path: &str) -> Res<Json> {
+pub(crate) fn read_report(path: &str) -> Res<Json> {
     let text = std::fs::read_to_string(path).or_else(|e| input_err(format!("{}: {}", path, e)))?;
     Json::parse(text.trim()).map_or_else(|| input_err(format!("{}: not a JSON report", path)), Ok)
 }
@@ -222,7 +257,7 @@ fn load_members(path: &str) -> Res<Vec<Wf>> {
 
 /// `root.<prefix>` holds the series; the guards, the annualisation and the rule come
 /// from the report `j`, the hold length from `root.pooled`.
-fn wf_entry(j: &Json, root: &Json, prefix: &'static str, path: &str, label: String) -> Res<Wf> {
+pub(crate) fn wf_entry(j: &Json, root: &Json, prefix: &'static str, path: &str, label: String) -> Res<Wf> {
     let net = series(root, &[prefix, "period_net"], path)?;
     let time = series(root, &[prefix, "period_time"], path)?;
     if net.len() != time.len() {
@@ -290,7 +325,7 @@ fn threshold_rule(j: &Json) -> String {
 }
 
 /// `arms`: the fit paths may differ (`--threshold-arms`).
-fn require_same(a: &Wf, b: &Wf, arms: bool) -> Res<()> {
+pub(crate) fn require_same(a: &Wf, b: &Wf, arms: bool) -> Res<()> {
     let fit = FIT_GUARDS.iter().zip(a.fit_guards.iter().zip(&b.fit_guards)).filter(|_| !arms);
     let all = GUARDS.iter().zip(a.guards.iter().zip(&b.guards)).chain(fit);
     for (g, (x, y)) in all {
@@ -359,27 +394,27 @@ fn default_block(wfs: &[Wf]) -> usize {
 // Options
 // ---------------------------------------------------------------------------
 
-struct Options {
-    wf: Vec<String>,
-    compare: Option<(String, String)>,
-    baseline: Option<String>,
-    baseline_rung: Option<String>,
-    rho: f64,
-    pbo_blocks: usize,
+pub(crate) struct Options {
+    pub(crate) wf: Vec<String>,
+    pub(crate) compare: Option<(String, String)>,
+    pub(crate) baseline: Option<String>,
+    pub(crate) baseline_rung: Option<String>,
+    pub(crate) rho: f64,
+    pub(crate) pbo_blocks: usize,
     bootstrap: String,
     level: f64,
     s_seed: Option<f64>,
-    block_len: Option<usize>,
-    draws: usize,
-    seed: u32,
-    out: Option<String>,
-    threshold_arms: bool,
+    pub(crate) block_len: Option<usize>,
+    pub(crate) draws: usize,
+    pub(crate) seed: u32,
+    pub(crate) out: Option<String>,
+    pub(crate) threshold_arms: bool,
     /// #1176: `--members all`: one series per `members[]` row.
-    all_members: bool,
-    regimes: Option<String>,
+    pub(crate) all_members: bool,
+    pub(crate) regimes: Option<String>,
 }
 
-fn parse_args(args: &[String]) -> Res<Options> {
+pub(crate) fn parse_args(args: &[String]) -> Res<Options> {
     let mut o = Options {
         wf: Vec::new(),
         compare: None,
@@ -450,6 +485,7 @@ fn parse_args(args: &[String]) -> Res<Options> {
                 };
             }
             "--regimes" => o.regimes = Some(val(&mut i)?),
+            other if crate::trials_table::FLAGS.contains(&other) => return usage_err(format!("{} needs --table", other)),
             other => return usage_err(format!("unknown argument '{}'", other)),
         }
         given.push(a);
@@ -504,7 +540,7 @@ fn parse_args(args: &[String]) -> Res<Options> {
 // Campaign accounting
 // ---------------------------------------------------------------------------
 
-fn book_hash(x: &[f64]) -> String {
+pub(crate) fn book_hash(x: &[f64]) -> String {
     let mut bytes = Vec::with_capacity(x.len() * 8);
     for v in x {
         bytes.extend_from_slice(&((v * BOOK_RESOLUTION).round() as i64).to_le_bytes());
@@ -512,7 +548,7 @@ fn book_hash(x: &[f64]) -> String {
     crate::manifest::sha256_hex(&bytes)
 }
 
-fn is_constant(x: &[f64]) -> bool {
+pub(crate) fn is_constant(x: &[f64]) -> bool {
     x.first().map_or(true, |&f| x.iter().all(|&v| v == f))
 }
 
@@ -522,7 +558,7 @@ fn is_baseline_name(name: &str) -> bool {
     matches!(name, "cash" | "buy_and_hold" | "constant_long_flat" | "best_single_feature") || name.starts_with("trend")
 }
 
-fn load_baseline(path: &str, rung: Option<&str>, time: &[f64]) -> Res<(String, Vec<f64>)> {
+pub(crate) fn load_baseline(path: &str, rung: Option<&str>, time: &[f64]) -> Res<(String, Vec<f64>)> {
     let text = std::fs::read_to_string(path).or_else(|e| input_err(format!("{}: {}", path, e)))?;
     let j = Json::parse(text.trim()).map_or_else(|| input_err(format!("{}: not a JSON report", path)), Ok)?;
     let Some(s) = j.get("series") else {
@@ -566,7 +602,7 @@ fn load_baseline(path: &str, rung: Option<&str>, time: &[f64]) -> Res<(String, V
     )
 }
 
-fn dsr_json(d: &inference::Dsr, n_eff: f64) -> String {
+pub(crate) fn dsr_json(d: &inference::Dsr, n_eff: f64) -> String {
     format!(
         "{{\"n_eff\":{},\"sharpe_per_period\":{},\"t\":{},\"skew\":{},\"kurtosis\":{},\"var_sr\":{},\"sr0\":{},\"value\":{}}}",
         jnum(n_eff),
@@ -933,6 +969,9 @@ fn run_inner(args: &[String]) -> Res<()> {
     }
     if args.iter().any(|a| a == "--cpcv-assemble") {
         return crate::cpcv::assemble_cli(args);
+    }
+    if args.iter().any(|a| a == "--table") {
+        return crate::trials_table::cli(args);
     }
     let o = parse_args(args)?;
     let text = if o.compare.is_some() { compare(&o)? } else { campaign(&o)? };
