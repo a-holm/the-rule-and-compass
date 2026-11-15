@@ -1224,3 +1224,73 @@ fn threshold_fit_binds_the_sealed_read() {
     assert_eq!(code, 0, "{}", err);
     assert_eq!(test_reads(&l), 1);
 }
+
+fn masked_run(dir: &Path) -> String {
+    let h = 5 * H;
+    let run = format!(
+        r#"{{"tool":"rcsr","variables":["x"],
+        "target_spec":{{"column":"y","name":"y","kind":"forward_return","deprecated":false,
+            "return_column":"y","return_units":"log","horizon_seconds":{h},"entry_offset_seconds":0,
+            "delay_seconds":0,"entry_price":"next open","exit_price":"close","offset":0.0,
+            "scale":{{"kind":"constant","value":1.0}},"clip":null,"units":"log_return","cost_bps":null,
+            "cost_in_label":false,"construction_columns":[],"note":null}},
+        "split":{{"train_time":[{a},{b}],"required_purge_seconds":0,"purge_seconds":0}},
+        "search":{{"candidates_evaluated":10}},
+        "objective":{{"spec":{{"threshold":0,"per_side_bps":5,"max_position":1,"cash_return":0,
+            "pnl_mask":{{"expr":"x","band":0.0,"dwell":1}}}},"finalist":{{"expression":"x"}}}},
+        "pareto":[{{"expression":"x"}}]}}"#,
+        a = T0,
+        b = T0 + 100 * H
+    );
+    let path = dir.join("masked.run.json");
+    std::fs::write(&path, run).unwrap();
+    s(&path)
+}
+
+fn run_wf(data: &str, ledger: &str, run: &str, window: &str, extra: &[&str]) -> (i32, String, String) {
+    let mut a = vec![
+        "walkforward", "--data", data, "--time", "ts", "--from-run", run, "--periods-per-year", "365", "--json",
+        "--ledger", ledger, "--window", window,
+    ];
+    a.extend_from_slice(extra);
+    rcsr(&a)
+}
+
+fn event_field(ledger: &str, event: &str, key: &str) -> Vec<String> {
+    let pat = format!("\"{}\":\"", key);
+    std::fs::read_to_string(ledger)
+        .unwrap()
+        .lines()
+        .filter(|l| l.contains(&format!("\"event\":\"{}\"", event)))
+        .map(|l| l.split(&pat).nth(1).unwrap().split('"').next().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn masked_and_unmasked_runs_get_different_candidate_ids() {
+    let (_scratch, dir) = scratch("maskid");
+    let data = store(&dir, "d.csv");
+    let run = masked_run(&dir);
+    let dev_window = window("dev", 0, 150, 160, 250);
+    let locked = window("locked", 0, 250, 300, 400);
+
+    let l = s(&dir.join("both.jsonl"));
+    let (code, _, err) = run_wf(&data, &l, &run, &dev_window, &[]);
+    assert_eq!(code, 0, "{}", err);
+    let (code, _, err) = run_wf(&data, &l, &run, &dev_window, &["--unmasked"]);
+    assert_eq!(code, 0, "{}", err);
+    let ids = event_field(&l, "candidate", "id");
+    let specs = event_field(&l, "candidate", "spec_sha256");
+    assert_eq!((ids.len(), specs.len()), (2, 2), "{:?}", ids);
+    assert_ne!(ids[0], ids[1]);
+    assert_ne!(specs[0], specs[1]);
+
+    let (l2, sealed) = (s(&dir.join("masked.jsonl")), s(&dir.join("sealed.json")));
+    let (code, _, err) = run_wf(&data, &l2, &run, &dev_window, &[]);
+    assert_eq!(code, 0, "{}", err);
+    let (code, _, err) = rcsr(&["protocol", "seal", "--final", "--ledger", &l2, "--out", &sealed]);
+    assert_eq!(code, 0, "{}", err);
+    let (code, _, err) = run_wf(&data, &l2, &run, &locked, &["--unmasked", "--locked-test", "--sealed", &sealed]);
+    assert_eq!(code, 3, "{}", err);
+    assert!(err.contains("is not in the sealed list"), "{}", err);
+}
