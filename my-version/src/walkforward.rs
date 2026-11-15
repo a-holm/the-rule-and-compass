@@ -52,8 +52,8 @@ pub const DEFAULT_QUANTILE: f64 = 0.70;
 /// Seconds in a (crypto) year, used to turn a time step into periods per year.
 pub const SECONDS_PER_YEAR: f64 = 365.0 * 86_400.0;
 
-/// Gate-state rule `apply_mask` applies; `procedure_spec` names it in the candidate id.
-pub const MASK_STATE_RULE: &str = "window-restart/1";
+/// Gate-state rule `apply_mask` reads (#1214: the states of the gate pass); `procedure_spec` names it in the candidate id.
+pub const MASK_STATE_RULE: &str = crate::regime_gate::STATE_RULE;
 
 /// Options of the long-only evaluation protocol. The defaults leave every
 /// existing report value unchanged: the new report sections only add fields,
@@ -151,6 +151,9 @@ pub struct ProtocolOptions {
     pub period_series: bool,
     /// #1199: the periods of the pooled series (`--period-grid`).
     pub period_grid: PeriodGrid,
+    /// #1214: per candidate, the switch that defines its book (`--from-run` or
+    /// `--front` of a composed run); empty when no candidate is a switch.
+    pub switches: Vec<Option<SwitchCandidate>>,
     /// #1203: what the book does on a row with a finite target and no finite
     /// score (`--missing-score`).
     pub missing_score: MissingScore,
@@ -160,6 +163,13 @@ pub struct ProtocolOptions {
     /// #1176: `--all-members`: every candidate of `--front` is also priced alone,
     /// with its own carried threshold and band, into `members`. Reporting only.
     pub all_members: bool,
+}
+
+/// #1214: a candidate whose book is a switch, and the run field it came from.
+#[derive(Clone, Debug)]
+pub struct SwitchCandidate {
+    pub switch: crate::regime_gate::Switch,
+    pub source: String,
 }
 
 /// #1199: which periods the pooled series of a report has. The grid never
@@ -315,6 +325,7 @@ impl Default for ProtocolOptions {
             regime_exprs: Vec::new(),
             period_series: false,
             period_grid: PeriodGrid::Score,
+            switches: Vec::new(),
             missing_score: MissingScore::Flat,
             emit_series: false,
             all_members: false,
@@ -629,6 +640,9 @@ pub struct WindowResult {
     /// #1236: under `--emit-series`, the distinct entry stamps of the window's pooled
     /// book; the windows of a report sum to `pooled.entry_times`.
     pub entry_times: Option<usize>,
+    /// #1214: the `gate` block of the window: the warm-up of the gate of the
+    /// selected candidate's book at the test start and, for a switch, its regime view.
+    pub gate: Option<String>,
 }
 
 /// #306: the band/cooldown book and its associative carry.
@@ -754,6 +768,9 @@ pub struct Report {
     pub period_grid: Option<GridSummary>,
     /// #1175: the strata of the pooled periods; `None` without `--regimes`, `--regime-expr` or `--period-series`.
     pub regimes: Option<crate::regimes::RegimeReport>,
+    /// #1214: the gate pass: the rule, the gate rows read, the barriers and the
+    /// gates of the books (the run's mask, the switches); `None` without one.
+    pub gate: Option<String>,
     /// #1175: per-period exposure, entries, gross and buy-and-hold beside `period_net`.
     pub period_extra: Option<PeriodExtra>,
     /// #1176: print the `--emit-series` fields of `period_extra`.
@@ -951,22 +968,35 @@ fn run_table_clocked(
     opts: &ProtocolOptions,
     clock: std::time::Instant,
 ) -> Result<Report, String> {
-    let mut layout = resolve_layout(spec, &table.names, &table.numeric)?;
-    add_mask_columns(&mut layout, &table.names, &table.numeric, opts)?;
-    add_regime_columns(&mut layout, &table.names, &table.numeric, opts)?;
-    let trees = parse_expressions(spec, &layout)?;
+    let layout = resolve_layout(spec, &table.names, &table.numeric)?;
+    let plan = gate_plan(spec, opts, &table.names, &table.numeric)?;
+    let trees = parse_expressions(spec, opts, &layout, plan.as_ref())?;
     validate_windows(spec, opts)?;
 
     let times = data::time_keys(table, layout.time);
     let group_ids = layout.group.map(|g| table_group_ids(table, g));
     let t_pnl = std::time::Instant::now();
     let mut acc = Accum::new(spec, opts, trees.len())?;
-    acc.gate_base = layout.vars.len();
-    acc.set_regimes(&layout);
+    let states = match &plan {
+        Some(p) => {
+            let mut pass = GatePass::new(p, &acc);
+            let mut row = Vec::new();
+            for r in 0..table.len() {
+                let g = group_ids.as_ref().map_or(0, |ids| ids[r]);
+                pass.step(0, times.value(r), g, |k| {
+                    row.clear();
+                    row.extend(p.gates[k].cols.iter().map(|&c| table.value(r, c)));
+                    expr::eval(&p.gates[k].spec.tree, &row)
+                })?;
+            }
+            Some(pass.finish(p, &mut acc))
+        }
+        None => None,
+    };
     if opts.final_read {
         acc.pass = Pass::TrainOnly;
     }
-    let mut features = Vec::with_capacity(layout.vars.len());
+    let mut features = Vec::with_capacity(layout.vars.len() + acc.n_states);
     for pass in 0..(if opts.final_read { 2 } else { 1 }) {
         if pass == 1 {
             acc.begin_test_pass(spec, &trees)?;
@@ -977,8 +1007,12 @@ fn run_table_clocked(
             continue;
         }
         features.clear();
-        for &c in layout.vars.iter().chain(&layout.mask_cols).chain(&layout.regime_cols) {
+        for &c in &layout.vars {
             features.push(table.value(r, c));
+        }
+        if let Some(s) = &states {
+            features.resize(layout.vars.len() + s.width(), f64::NAN);
+            s.write_row(&mut features[layout.vars.len()..], 0, r);
         }
         let g = group_ids.as_ref().map_or(0, |ids| ids[r]);
         acc.add(t, g, &features, ret_in(opts, table.value(r, layout.target)), &trees);
@@ -1051,17 +1085,11 @@ fn run_store_clocked(
     let numeric = fs.header().numeric();
     let mut layout = resolve_layout(spec, &names, &numeric)?;
     layout.time_i64 = fs.header().dtypes()[layout.time] == store::DType::I64;
-    add_mask_columns(&mut layout, &names, &numeric, opts)?;
-    add_regime_columns(&mut layout, &names, &numeric, opts)?;
-    let trees = parse_expressions(spec, &layout)?;
+    let plan = gate_plan(spec, opts, &names, &numeric)?;
+    let trees = parse_expressions(spec, opts, &layout, plan.as_ref())?;
     validate_windows(spec, opts)?;
 
     let mut acc = Accum::new(spec, opts, trees.len())?;
-    acc.gate_base = layout.vars.len();
-    acc.set_regimes(&layout);
-    if opts.final_read {
-        acc.pass = Pass::TrainOnly;
-    }
     let header = fs.header();
     let t_pnl = std::time::Instant::now();
     let mut io_s = 0.0f64;
@@ -1076,9 +1104,78 @@ fn run_store_clocked(
     named.retain(|&p| p < layout.vars.len());
     let time_f64 = layout.time_numeric && !layout.time_i64;
     let group_f64 = layout.group.filter(|&g| numeric[g]);
+    let time_levels = header.levels(layout.time);
+    let time_of_code = |code: u32| -> f64 {
+        time_levels
+            .and_then(|l| l.get(code as usize))
+            .and_then(|s| data::parse_time(s))
+            .unwrap_or(f64::NAN)
+    };
+    // The time and group of row `r` of store group `group`, from the columns read for it.
+    let row_time = |r: usize, ints: &Option<Vec<i64>>, codes: &Option<Vec<u32>>, f64_time: Option<&[f64]>| -> f64 {
+        match (ints, codes) {
+            (Some(ints), _) => ints.get(r).copied().unwrap_or(i64::MIN) as f64,
+            (None, None) => f64_time.map_or(f64::NAN, |c| c[r]),
+            (None, Some(codes)) => time_of_code(codes.get(r).copied().unwrap_or(0)),
+        }
+    };
+    let row_group = |r: usize, codes: &Option<Vec<u32>>, f64_group: Option<&[f64]>| -> u64 {
+        match (layout.group, codes) {
+            (None, _) => 0,
+            (Some(_), Some(codes)) => {
+                let code = codes.get(r).copied().unwrap_or(0) as usize;
+                group_ids.get(code).copied().unwrap_or(label_group_id(""))
+            }
+            (Some(_), None) => group_key(f64_group.map_or(f64::NAN, |c| c[r])),
+        }
+    };
+    // #1214: the gate pass reads the time, the group and the gate columns of every row before the last window end.
+    let states = match &plan {
+        Some(p) => {
+            let t_io = std::time::Instant::now();
+            let mut needed: Vec<usize> = p.gates.iter().flat_map(|g| g.cols.iter().copied()).collect();
+            if time_f64 {
+                needed.push(layout.time);
+            }
+            needed.extend(group_f64);
+            needed.sort_unstable();
+            needed.dedup();
+            let projection = store::Projection::from_indices(&fs, &needed)?;
+            let at = |index: usize| -> usize { projection.columns().iter().position(|c| c.index == index).expect("projected column") };
+            let gate_at: Vec<Vec<usize>> = p.gates.iter().map(|g| g.cols.iter().map(|&c| at(c)).collect()).collect();
+            let mut pass = GatePass::new(p, &acc);
+            let mut pg = store::ProjectedGroup::new();
+            let mut row = Vec::new();
+            for group in 0..fs.n_groups() {
+                let len = header.group_len(group);
+                let ints = if layout.time_i64 { Some(fs.read_i64(group, layout.time)?) } else { None };
+                let codes = if layout.time_numeric || layout.time_i64 { None } else { Some(fs.read_codes(group, layout.time)?) };
+                fs.read_group_projected(group, &projection, &mut pg)?;
+                let group_codes = match layout.group {
+                    Some(c) if !numeric[c] => Some(fs.read_codes(group, c)?),
+                    _ => None,
+                };
+                let f64_time = time_f64.then(|| pg.col(at(layout.time)));
+                let f64_group = group_f64.map(|g| pg.col(at(g)));
+                for r in 0..len {
+                    let t = row_time(r, &ints, &codes, f64_time);
+                    let g = row_group(r, &group_codes, f64_group);
+                    pass.step(group, t, g, |k| {
+                        row.clear();
+                        row.extend(gate_at[k].iter().map(|&c| pg.col(c)[r]));
+                        expr::eval(&p.gates[k].spec.tree, &row)
+                    })?;
+                }
+            }
+            io_s += t_io.elapsed().as_secs_f64();
+            Some(pass.finish(p, &mut acc))
+        }
+        None => None,
+    };
+    if opts.final_read {
+        acc.pass = Pass::TrainOnly;
+    }
     let mut needed: Vec<usize> = named.iter().map(|&p| layout.vars[p]).collect();
-    needed.extend(layout.mask_cols.iter().copied());
-    needed.extend(layout.regime_cols.iter().copied());
     needed.push(layout.target);
     if time_f64 {
         needed.push(layout.time);
@@ -1088,13 +1185,7 @@ fn run_store_clocked(
     let at = |index: usize| -> usize {
         projection.columns().iter().position(|c| c.index == index).expect("projected column")
     };
-    let mut var_at: Vec<(usize, usize)> = named.iter().map(|&p| (p, at(layout.vars[p]))).collect();
-    for (k, &c) in layout.mask_cols.iter().enumerate() {
-        var_at.push((layout.vars.len() + k, at(c)));
-    }
-    for (k, &c) in layout.regime_cols.iter().enumerate() {
-        var_at.push((layout.vars.len() + layout.mask_cols.len() + k, at(c)));
-    }
+    let var_at: Vec<(usize, usize)> = named.iter().map(|&p| (p, at(layout.vars[p]))).collect();
     let target_at = at(layout.target);
     let time_at = time_f64.then(|| at(layout.time));
     let group_at = group_f64.map(at);
@@ -1106,14 +1197,7 @@ fn run_store_clocked(
     };
     let mut pg = store::ProjectedGroup::new();
     // Positions no candidate names stay 0.0: `expr::eval` reads a row only at `Input` nodes.
-    let mut features = vec![0.0f64; layout.vars.len() + layout.mask_cols.len() + layout.regime_cols.len()];
-    let time_levels = header.levels(layout.time);
-    let time_of_code = |code: u32| -> f64 {
-        time_levels
-            .and_then(|l| l.get(code as usize))
-            .and_then(|s| data::parse_time(s))
-            .unwrap_or(f64::NAN)
-    };
+    let mut features = vec![0.0f64; layout.vars.len() + acc.n_states];
     for pass in 0..(if opts.final_read { 2 } else { 1 }) {
         if pass == 1 {
             acc.begin_test_pass(spec, &trees)?;
@@ -1152,26 +1236,20 @@ fn run_store_clocked(
         io_s += t_io.elapsed().as_secs_f64();
         let var_cols: Vec<(usize, &[f64])> = var_at.iter().map(|&(p, c)| (p, pg.col(c))).collect();
         let target_col = pg.col(target_at);
+        let f64_time = time_at.map(|c| pg.col(c));
+        let f64_group = group_at.map(|c| pg.col(c));
         for r in 0..len {
-            let t = match (&time_i64, &time_codes) {
-                (Some(ints), _) => ints.get(r).copied().unwrap_or(i64::MIN) as f64,
-                (None, None) => pg.col(time_at.expect("f64 time"))[r],
-                (None, Some(codes)) => time_of_code(codes.get(r).copied().unwrap_or(0)),
-            };
+            let t = row_time(r, &time_i64, &time_codes, f64_time);
             if !acc.wants(t) {
                 continue;
             }
             for &(p, col) in &var_cols {
                 features[p] = col[r];
             }
-            let g = match (layout.group, &group_codes) {
-                (None, _) => 0,
-                (Some(_), Some(codes)) => {
-                    let code = codes.get(r).copied().unwrap_or(0) as usize;
-                    group_ids.get(code).copied().unwrap_or(label_group_id(""))
-                }
-                (Some(_), None) => group_key(pg.col(group_at.expect("numeric group"))[r]),
-            };
+            if let Some(s) = &states {
+                s.write_row(&mut features[layout.vars.len()..], group, r);
+            }
+            let g = row_group(r, &group_codes, f64_group);
             let y = ret_in(opts, target_col[r]);
             acc.add(t, g, &features, y, &trees);
         }
@@ -1204,54 +1282,176 @@ struct Layout {
     /// The store keeps the time column as `i64`; read it exactly rather than
     /// through the `f64` value block (which is absent).
     time_i64: bool,
-    /// #1180: columns of the regime gate, read after the variables in every
-    /// feature vector.
-    mask_cols: Vec<usize>,
-    /// #1175: the union of the columns of the regime expressions, read after the mask
-    /// columns, and for every expression the position of each of its columns in it.
-    regime_cols: Vec<usize>,
-    regime_slots: Vec<Vec<usize>>,
 }
 
-/// #1175: the table columns of the regime expressions of `opts.regime_exprs`.
-fn add_regime_columns(layout: &mut Layout, names: &[String], numeric: &[bool], opts: &ProtocolOptions) -> Result<(), String> {
-    for e in &opts.regime_exprs {
-        let mut slots = Vec::new();
-        for name in &e.gate.columns {
-            let j = names
-                .iter()
-                .position(|n| n == name)
-                .ok_or_else(|| format!("the regime expression {} reads column '{}', which is not in the data", e.name, name))?;
+/// #1214: one gate the windows read: its spec, the run field or flag it came
+/// from and the data columns of its inputs.
+#[derive(Clone, Debug)]
+struct PlanGate {
+    spec: crate::regime_gate::GateSpec,
+    source: String,
+    cols: Vec<usize>,
+}
+
+/// #1214: the gates of a walk-forward under `rcsr-gate-state/1` and the reader
+/// of each: the run's mask (#1180), the regime expressions (#1175) and the
+/// switch of each candidate. Equal gates share one entry. The state of gate `k`
+/// is feature `vars.len() + k` of every row.
+#[derive(Clone, Debug, Default)]
+struct GatePlan {
+    gates: Vec<PlanGate>,
+    mask: Option<usize>,
+    regimes: Vec<usize>,
+    switches: Vec<Option<usize>>,
+    /// The locked ranges this run does not open, each up to its lookback embargo.
+    barriers: Vec<crate::regime_gate::Barrier>,
+}
+
+fn gate_plan(spec: &EvalSpec, opts: &ProtocolOptions, names: &[String], numeric: &[bool]) -> Result<Option<GatePlan>, String> {
+    if opts.mask.is_none() && opts.regime_exprs.is_empty() && opts.switches.iter().all(Option::is_none) {
+        return Ok(None);
+    }
+    let mut plan = GatePlan {
+        barriers: opts
+            .locked_reach(spec)
+            .into_iter()
+            .map(|(s, _, _, reach)| crate::regime_gate::Barrier { start: s, end: reach, kind: crate::regime_gate::BarrierKind::Locked })
+            .collect(),
+        ..GatePlan::default()
+    };
+    let mut add = |gate: &crate::regime_gate::GateSpec, source: String, missing: &dyn Fn(&str) -> String, text: &dyn Fn(&str) -> String| -> Result<usize, String> {
+        if let Some(k) = plan.gates.iter().position(|g| g.spec.identity() == gate.identity()) {
+            return Ok(k);
+        }
+        let mut cols = Vec::with_capacity(gate.columns.len());
+        for name in &gate.columns {
+            let j = names.iter().position(|n| n == name).ok_or_else(|| missing(name))?;
             if !numeric.get(j).copied().unwrap_or(false) {
-                return Err(format!("the regime expression {} column '{}' must be numeric", e.name, name));
+                return Err(text(name));
             }
-            slots.push(match layout.regime_cols.iter().position(|&c| c == j) {
-                Some(s) => s,
-                None => {
-                    layout.regime_cols.push(j);
-                    layout.regime_cols.len() - 1
-                }
+            cols.push(j);
+        }
+        plan.gates.push(PlanGate { spec: gate.clone(), source, cols });
+        Ok(plan.gates.len() - 1)
+    };
+    let mask = match &opts.mask {
+        Some(g) => Some(add(
+            g,
+            "objective.spec.pnl_mask".to_string(),
+            &|n| format!("the run's regime mask reads column '{}', which is not in the data (pass --unmasked to price the raw formula)", n),
+            &|n| format!("the run's regime mask column '{}' must be numeric", n),
+        )?),
+        None => None,
+    };
+    let mut regimes = Vec::with_capacity(opts.regime_exprs.len());
+    for e in &opts.regime_exprs {
+        regimes.push(add(
+            &e.gate,
+            format!("--regime-expr {}", e.name),
+            &|n| format!("the regime expression {} reads column '{}', which is not in the data", e.name, n),
+            &|n| format!("the regime expression {} column '{}' must be numeric", e.name, n),
+        )?);
+    }
+    let mut switches = Vec::with_capacity(opts.switches.len());
+    for c in &opts.switches {
+        switches.push(match c {
+            Some(c) => Some(add(
+                &c.switch.gate,
+                c.source.clone(),
+                &|n| format!("the switch gate of {} reads column '{}', which is not in the data", c.source, n),
+                &|n| format!("the switch gate of {} column '{}' must be numeric", c.source, n),
+            )?),
+            None => None,
+        });
+    }
+    plan.mask = mask;
+    plan.regimes = regimes;
+    plan.switches = switches;
+    Ok(Some(plan))
+}
+
+/// #1214: the gate pass. One tape per gate reads every gate row of the data in
+/// file order up to the last window end and records the state of each row and
+/// the warm-up at each window's test start.
+struct GatePass {
+    tapes: Vec<crate::regime_gate::GateTape>,
+    /// `[gate][chunk][row]`: 1 on, 0 off, 3 off on a non-finite value, 2 not a readable gate row.
+    codes: Vec<Vec<Vec<u8>>>,
+    end: f64,
+}
+
+impl GatePass {
+    fn new(plan: &GatePlan, acc: &Accum) -> GatePass {
+        let starts: Vec<f64> = acc.windows.iter().map(|d| d.window.test_start).collect();
+        let end = acc.windows.iter().map(|d| d.window.test_end.max(d.window.train_end)).fold(f64::NEG_INFINITY, f64::max);
+        GatePass {
+            tapes: plan.gates.iter().map(|g| crate::regime_gate::GateTape::with_starts(&g.spec, plan.barriers.clone(), &starts)).collect(),
+            codes: vec![Vec::new(); plan.gates.len()],
+            end,
+        }
+    }
+
+    /// Row `r` of `chunk` (rows in file order); `value(k)` is the value of gate `k` on the row.
+    fn step(&mut self, chunk: usize, t: f64, group: u64, mut value: impl FnMut(usize) -> f64) -> Result<(), String> {
+        for (k, tape) in self.tapes.iter_mut().enumerate() {
+            let mut finite = true;
+            let state = if t < self.end {
+                tape.step_with(group, t, || {
+                    let v = value(k);
+                    finite = v.is_finite();
+                    v
+                })?
+            } else {
+                None
+            };
+            let codes = &mut self.codes[k];
+            if codes.len() <= chunk {
+                codes.resize(chunk + 1, Vec::new());
+            }
+            codes[chunk].push(match state {
+                Some(true) => 1,
+                Some(false) if finite => 0,
+                Some(false) => 3,
+                None => 2,
             });
         }
-        layout.regime_slots.push(slots);
+        Ok(())
     }
-    Ok(())
+
+    fn finish(self, plan: &GatePlan, acc: &mut Accum) -> GateStates {
+        acc.n_states = plan.gates.len();
+        for d in &mut acc.windows {
+            d.test_states = vec![Vec::new(); plan.gates.len()];
+        }
+        acc.gate_plan = Some(plan.clone());
+        acc.gate_warm = self.tapes.iter().map(|t| t.warm_ups()).collect();
+        acc.gate_rows_read = self.tapes.first().map_or(0, |t| t.rows_read());
+        GateStates { codes: self.codes }
+    }
 }
 
-/// #1180: the table columns of the gate of `opts.mask`.
-fn add_mask_columns(layout: &mut Layout, names: &[String], numeric: &[bool], opts: &ProtocolOptions) -> Result<(), String> {
-    let Some(gate) = &opts.mask else { return Ok(()) };
-    for name in &gate.columns {
-        let j = names
-            .iter()
-            .position(|n| n == name)
-            .ok_or_else(|| format!("the run's regime mask reads column '{}', which is not in the data (pass --unmasked to price the raw formula)", name))?;
-        if !numeric.get(j).copied().unwrap_or(false) {
-            return Err(format!("the run's regime mask column '{}' must be numeric", name));
-        }
-        layout.mask_cols.push(j);
+/// #1214: the state of every gate on every row the gate pass read.
+struct GateStates {
+    codes: Vec<Vec<Vec<u8>>>,
+}
+
+impl GateStates {
+    fn width(&self) -> usize {
+        self.codes.len()
     }
-    Ok(())
+
+    /// Writes the state of every gate on row `r` of `chunk`: 1 on, 0 off, -1 off on a non-finite
+    /// gate value, NaN for a row the pass did not read.
+    fn write_row(&self, out: &mut [f64], chunk: usize, r: usize) {
+        for (k, codes) in self.codes.iter().enumerate() {
+            out[k] = match codes.get(chunk).and_then(|c| c.get(r)) {
+                Some(1) => 1.0,
+                Some(0) => 0.0,
+                Some(3) => -1.0,
+                _ => f64::NAN,
+            };
+        }
+    }
 }
 
 fn resolve_layout(spec: &EvalSpec, names: &[String], numeric: &[bool]) -> Result<Layout, String> {
@@ -1306,17 +1506,14 @@ fn resolve_layout(spec: &EvalSpec, names: &[String], numeric: &[bool]) -> Result
         vars,
         var_names,
         time_i64: false,
-        mask_cols: Vec::new(),
-        regime_cols: Vec::new(),
-        regime_slots: Vec::new(),
     })
 }
 
-fn parse_expressions(spec: &EvalSpec, layout: &Layout) -> Result<Vec<Node>, String> {
-    let mut out = Vec::new();
-    for src in candidate_expressions(spec) {
-        let tree = expr::parse(&src, &layout.var_names)
-            .map_err(|e| format!("cannot parse expression '{}': {}", src, e))?;
+/// The tree of every candidate. A switch candidate is `if(state, on, off)` over
+/// the state feature of its gate: its score on a row is the held branch's score.
+fn parse_expressions(spec: &EvalSpec, opts: &ProtocolOptions, layout: &Layout, plan: Option<&GatePlan>) -> Result<Vec<Node>, String> {
+    let parse = |src: &str| -> Result<Node, String> {
+        let tree = expr::parse(src, &layout.var_names).map_err(|e| format!("cannot parse expression '{}': {}", src, e))?;
         if has_dataset_op(&tree) {
             return Err(
                 "walk-forward expressions cannot use dataset aggregates or meta operators; \
@@ -1324,7 +1521,18 @@ fn parse_expressions(spec: &EvalSpec, layout: &Layout) -> Result<Vec<Node>, Stri
                     .to_string(),
             );
         }
-        out.push(tree);
+        Ok(tree)
+    };
+    let mut out = Vec::new();
+    for (c, src) in candidate_expressions(spec).iter().enumerate() {
+        let gate = plan.and_then(|p| p.switches.get(c).copied().flatten());
+        match (opts.switches.get(c).and_then(Option::as_ref), gate) {
+            (Some(sw), Some(k)) => {
+                let state = expr::input(layout.vars.len() + k);
+                out.push(expr::node(expr::Op::If, vec![state, parse(&sw.switch.on)?, parse(&sw.switch.off)?]));
+            }
+            _ => out.push(parse(src)?),
+        }
     }
     Ok(out)
 }
@@ -1681,10 +1889,8 @@ struct WindowData {
     validation_rows: Vec<RowBase>,
     validation_scores: Vec<Vec<f64>>,
     test_rows: Vec<RowBase>,
-    /// #1180: the gate value of every test row (NaN without a mask).
-    test_gate: Vec<f64>,
-    /// #1175: the value of every regime expression on every test row, one vector per expression.
-    test_regime: Vec<Vec<f64>>,
+    /// #1214: the state of every plan gate on every test row (1, 0, NaN), one vector per gate.
+    test_states: Vec<Vec<f64>>,
     test_scores: Vec<Vec<f64>>,
     /// Sum and count of the finite training-interval targets (#310 constant
     /// control).
@@ -1730,14 +1936,12 @@ struct Accum {
     /// `--policy vote`: the final read scores every member on the test rows.
     vote: bool,
     threshold_fit: Option<CutFit>,
-    /// #1180: the regime gate and the feature index of its first column.
-    gate: Option<crate::regime_gate::GateSpec>,
-    gate_base: usize,
-    /// #1175: the regime expressions, the position of their columns among the regime
-    /// columns and the feature index of the first one.
-    regime_exprs: Vec<crate::regimes::ExprSpec>,
-    regime_slots: Vec<Vec<usize>>,
-    regime_base: usize,
+    /// #1214: the gate plan, the states' first feature index and count, the warm-up
+    /// of every gate at every window start and the gate rows the pass read.
+    gate_plan: Option<GatePlan>,
+    n_states: usize,
+    gate_warm: Vec<Vec<crate::regime_gate::WarmUp>>,
+    gate_rows_read: usize,
 }
 
 impl Accum {
@@ -1783,8 +1987,7 @@ impl Accum {
                 validation_rows: Vec::new(),
                 validation_scores: vec![Vec::new(); candidates],
                 test_rows: Vec::new(),
-                test_gate: Vec::new(),
-                test_regime: vec![Vec::new(); opts.regime_exprs.len()],
+                test_states: Vec::new(),
                 test_scores: vec![Vec::new(); candidates],
                 train_target_sum: 0.0,
                 train_target_n: 0,
@@ -1808,17 +2011,11 @@ impl Accum {
             test_candidates: Vec::new(),
             vote: spec.policy == Policy::Vote,
             threshold_fit: opts.threshold_fit,
-            gate: opts.mask.clone(),
-            gate_base: 0,
-            regime_exprs: opts.regime_exprs.clone(),
-            regime_slots: Vec::new(),
-            regime_base: 0,
+            gate_plan: None,
+            n_states: 0,
+            gate_warm: Vec::new(),
+            gate_rows_read: 0,
         })
-    }
-
-    fn set_regimes(&mut self, layout: &Layout) {
-        self.regime_slots = layout.regime_slots.clone();
-        self.regime_base = layout.vars.len() + layout.mask_cols.len();
     }
 
     fn wants(&self, t: f64) -> bool {
@@ -1842,51 +2039,27 @@ impl Accum {
 
     fn add(&mut self, t: f64, group: u64, features: &[f64], target: f64, trees: &[Node]) {
         debug_assert_eq!(trees.len(), self.candidates);
-        if !self.regime_exprs.is_empty() && self.pass != Pass::TrainOnly {
-            let values: Vec<f64> = self
-                .regime_exprs
-                .iter()
-                .zip(&self.regime_slots)
-                .map(|(e, slots)| {
-                    let row: Vec<f64> = slots.iter().map(|&s| features[self.regime_base + s]).collect();
-                    expr::eval(&e.gate.tree, &row)
-                })
-                .collect();
-            for d in &mut self.windows {
-                if t >= d.window.test_start && t < d.window.test_end {
-                    for (dst, &v) in d.test_regime.iter_mut().zip(&values) {
-                        dst.push(v);
-                    }
-                }
-            }
-        }
-        let gate = match &self.gate {
-            Some(g) => {
-                let row: Vec<f64> = (0..g.columns.len()).map(|k| features[self.gate_base + k]).collect();
-                expr::eval(&g.tree, &row)
-            }
-            None => f64::NAN,
-        };
+        let states = &features[features.len() - self.n_states..];
         match self.pass {
             Pass::All | Pass::TrainOnly => {
                 for (s, tree) in self.scores.iter_mut().zip(trees) {
                     *s = expr::eval(tree, features);
                 }
-                push_scores(&mut self.windows, t, group, (target, gate), &self.scores, self.pass == Pass::All);
+                push_scores(&mut self.windows, t, group, (target, states), &self.scores, self.pass == Pass::All);
             }
             Pass::TestOnly => {
                 if self.vote {
                     for (s, tree) in self.scores.iter_mut().zip(trees) {
                         *s = expr::eval(tree, features);
                     }
-                    push_all_test(&mut self.windows, t, group, (target, gate), &self.scores);
+                    push_all_test(&mut self.windows, t, group, (target, states), &self.scores);
                     return;
                 }
                 for &c in &self.test_candidates {
                     self.scores[c] = expr::eval(&trees[c], features);
                 }
                 let forced = self.forced.as_deref().expect("the test pass follows the selection");
-                push_selected_test(&mut self.windows, forced, t, group, (target, gate), &self.scores);
+                push_selected_test(&mut self.windows, forced, t, group, (target, states), &self.scores);
             }
         }
     }
@@ -1938,8 +2111,7 @@ impl Accum {
                     validation_rows: d.validation_rows.clone(),
                     validation_scores: vec![d.validation_scores[k].clone()],
                     test_rows: d.test_rows.clone(),
-                    test_gate: d.test_gate.clone(),
-                    test_regime: Vec::new(),
+                    test_states: d.test_states.clone(),
                     test_scores: vec![d.test_scores[k].clone()],
                     train_target_sum: d.train_target_sum,
                     train_target_n: d.train_target_n,
@@ -1964,11 +2136,10 @@ impl Accum {
             test_candidates: Vec::new(),
             vote: false,
             threshold_fit: None,
-            gate: self.gate.clone(),
-            gate_base: self.gate_base,
-            regime_exprs: Vec::new(),
-            regime_slots: Vec::new(),
-            regime_base: self.regime_base,
+            gate_plan: self.gate_plan.as_ref().map(|p| GatePlan { switches: vec![p.switches.get(k).copied().flatten()], regimes: Vec::new(), ..p.clone() }),
+            n_states: self.n_states,
+            gate_warm: self.gate_warm.clone(),
+            gate_rows_read: self.gate_rows_read,
         }
     }
 
@@ -2081,6 +2252,9 @@ impl Accum {
         let mut books: Vec<crate::wf_protocol::NullBook> = Vec::new();
         let mut batch_in: Vec<crate::wf_batch::WindowScores> = Vec::new();
         let forced = self.forced.as_deref();
+        let plan = self.gate_plan.unwrap_or_default();
+        let gate_warm = self.gate_warm;
+        let gate_rows_read = self.gate_rows_read;
         let target_grid = opts.period_grid == PeriodGrid::Target;
         let mut period_rows: Vec<usize> = Vec::new();
         let mut empty_periods = 0usize;
@@ -2095,19 +2269,13 @@ impl Accum {
                 let rows: Vec<usize> = (0..d.test_rows.len()).filter(|&i| d.test_rows[i].target.is_finite()).collect();
                 (target_times(&d.test_rows), window_period(spec, opts, &d.test_rows), rows)
             });
-            let regime_states: Vec<Vec<bool>> = opts
-                .regime_exprs
-                .iter()
-                .zip(&d.test_regime)
-                .map(|(e, values)| {
-                    let groups: Vec<u64> = d.test_rows.iter().map(|r| r.group).collect();
-                    crate::regime_gate::hysteresis_states(values, &groups, e.gate.band, e.gate.dwell)
-                })
-                .collect();
+            // #1214: every gate state comes from the gate pass (rcsr-gate-state/1).
+            let regime_values: Vec<Vec<f64>> = plan.regimes.iter().map(|&k| d.test_states[k].clone()).collect();
+            let regime_states: Vec<Vec<bool>> = regime_values.iter().map(|v| v.iter().map(|&s| s > 0.5).collect()).collect();
             // #1203: the in-report candidate columns sit on the target grid of the rows before the gate.
             let column_times = (want_columns && !target_grid).then(|| target_times(&d.test_rows));
-            if let Some(gate) = &opts.mask {
-                apply_mask(&mut d, gate, window_index);
+            if let Some(k) = plan.mask {
+                apply_mask(&mut d, k, window_index);
             }
             {
                 let labelled = d.test_rows.iter().filter(|r| r.target.is_finite());
@@ -2263,6 +2431,15 @@ impl Accum {
                 previous_end = Some(ev.end_positions.clone());
             }
             unpriced_target_rows += unpriced_rows(&d.test_rows, &d.test_scores[candidate], spec.horizon, opts.missing_score);
+            let book_gate = plan.switches.get(candidate).copied().flatten().filter(|_| !vote);
+            let gate_json = book_gate.or(plan.mask).map(|k| {
+                let mut s = format!("{{\"source\":{},\"start\":{}", jstr(&plan.gates[k].source), gate_warm[k][window_index].json());
+                if book_gate.is_some() {
+                    s.push_str(&format!(",\"regime\":{}", switch_regime_json(&d, candidate, k, threshold, spec, opts, bucket, ppy)));
+                }
+                s.push('}');
+                s
+            });
             let train_rows = d.train_scores[candidate].len()
                 + d.validation_scores[candidate].len();
             dropped += d.dropped;
@@ -2292,7 +2469,7 @@ impl Accum {
                         })
                         .collect(),
                 };
-                strata_in.add_window(&pev, bucket, opts, &d, &valid, &regime_states, grid.as_ref());
+                strata_in.add_window(&pev, bucket, opts, &d, &valid, (&regime_states, &regime_values), grid.as_ref());
             }
             pooled_returns.extend(on_grid(&pev.returns));
             pooled_gross.extend(on_grid(&pev.gross_returns));
@@ -2384,6 +2561,8 @@ impl Accum {
                 window: d.window,
                 expression: if vote {
                     format!("vote {}/{}: {}", need, members, expressions.join(" ; "))
+                } else if plan.switches.get(candidate).copied().flatten().is_some() {
+                    expressions[candidate].clone()
                 } else {
                     expr::to_string(&trees[candidate], &layout.var_names)
                 },
@@ -2407,6 +2586,7 @@ impl Accum {
                 band_selection,
                 cut,
                 entry_times: emit_series.then_some(pev.entry_times),
+                gate: gate_json,
             });
         }
 
@@ -2621,6 +2801,7 @@ impl Accum {
             period_time: pooled_times,
             period_grid: target_grid.then(|| GridSummary { rule: PeriodGrid::Target, empty_periods, period_rows }),
             regimes,
+            gate: gate_report_json(&plan, gate_rows_read),
             period_extra,
             emit_series,
             members: member_reports,
@@ -2677,22 +2858,15 @@ impl Accum {
     }
 }
 
-/// #1180: price the test rows of a window under the regime gate. The gate
-/// state is read over the labelled rows in file order, per group from the
-/// group's first row of the window, exactly as the search read its test slice.
-/// Every on-run becomes its own group (a flat start and a paid exit, unique
-/// across windows, so no position carries over a seam) and the target of every
-/// off row becomes NaN, which drops the row from the book.
-fn apply_mask(d: &mut WindowData, gate: &crate::regime_gate::GateSpec, window_index: usize) {
+/// #1180: price the test rows of a window under the regime gate `k` of the
+/// plan. The state of a row is its `rcsr-gate-state/1` state from the gate pass
+/// (#1214), the same in every window and command. Every on-run of the labelled
+/// rows becomes its own group (a flat start and a paid exit, unique across
+/// windows, so no position carries over a seam) and the target of every off row
+/// becomes NaN, which drops the row from the book.
+fn apply_mask(d: &mut WindowData, k: usize, window_index: usize) {
     let n = d.test_rows.len();
-    let labelled: Vec<usize> = (0..n).filter(|&i| d.test_rows[i].target.is_finite()).collect();
-    let values: Vec<f64> = labelled.iter().map(|&i| d.test_gate[i]).collect();
-    let groups: Vec<u64> = labelled.iter().map(|&i| d.test_rows[i].group).collect();
-    let on_labelled = crate::regime_gate::hysteresis_states(&values, &groups, gate.band, gate.dwell);
-    let mut on = vec![false; n];
-    for (k, &i) in labelled.iter().enumerate() {
-        on[i] = on_labelled[k];
-    }
+    let on: Vec<bool> = (0..n).map(|i| d.test_rows[i].target.is_finite() && d.test_states[k][i] > 0.5).collect();
     let all_groups: Vec<u64> = d.test_rows.iter().map(|r| r.group).collect();
     let ids = crate::regime_gate::run_ids(&all_groups, &on);
     let base = (window_index as u64 + 1) << 40;
@@ -2702,6 +2876,67 @@ fn apply_mask(d: &mut WindowData, gate: &crate::regime_gate::GateSpec, window_in
             d.test_rows[i].target = f64::NAN;
         }
     }
+}
+
+/// #1214: the gate-state view of a switch book on a window's test rows: the
+/// object compose writes for its validation and test books (`regime_gate::regime`).
+#[allow(clippy::too_many_arguments)]
+fn switch_regime_json(d: &WindowData, candidate: usize, k: usize, threshold: f64, spec: &EvalSpec, opts: &ProtocolOptions, bucket: f64, ppy: f64) -> String {
+    let slice = crate::data::TradingSlice {
+        rows: crate::trading::TradingRows {
+            time: d.test_rows.iter().map(|r| r.time).collect(),
+            group: d.test_rows.iter().map(|r| r.group).collect(),
+            funding: Vec::new(),
+        },
+        ret: d.test_rows.iter().map(|r| r.target).collect(),
+    };
+    let tspec = crate::trading::TradingSpec {
+        cost_bps: spec.cost_bps,
+        threshold,
+        periods_per_year: Some(ppy),
+        period_seconds: (bucket > 0.0).then_some(bucket),
+        missing_score: opts.missing_score,
+        ..crate::trading::TradingSpec::default()
+    };
+    let pred = &d.test_scores[candidate];
+    let on: Vec<bool> = d.test_states[k].iter().map(|&s| s > 0.5).collect();
+    match crate::trading::evaluate(pred, &slice.ret, &slice.rows, &tspec).and_then(|book| crate::regime_gate::regime(pred, &on, &slice, &tspec, &book)) {
+        Ok(r) => crate::regime_gate::regime_json(&r),
+        Err(e) => format!("{{\"unusable\":{}}}", jstr(&e)),
+    }
+}
+
+/// #1214: the report's `gate` block: the gates of the books (the run's mask and
+/// the switches; the regime expressions are strata, reported under `regimes`),
+/// the state rule, the gate rows the pass read and the barriers. With one book
+/// gate its fields also stand at the top of the block.
+fn gate_report_json(plan: &GatePlan, rows_read: usize) -> Option<String> {
+    let mut book: Vec<usize> = plan.mask.into_iter().chain(plan.switches.iter().flatten().copied()).collect();
+    book.sort_unstable();
+    book.dedup();
+    if book.is_empty() {
+        return None;
+    }
+    let gate = |k: usize| {
+        let g = &plan.gates[k];
+        format!(
+            "\"source\":{},\"expr\":{},\"columns\":[{}],\"band\":{},\"dwell\":{}",
+            jstr(&g.source),
+            jstr(&g.spec.source),
+            g.spec.columns.iter().map(|c| jstr(c)).collect::<Vec<_>>().join(","),
+            jnum(g.spec.band),
+            g.spec.dwell
+        )
+    };
+    let single = if book.len() == 1 { format!("{},", gate(book[0])) } else { String::new() };
+    Some(format!(
+        "{{{}\"state_rule\":\"{}\",\"gate_rows_read\":{},\"barriers\":[{}],\"gates\":[{}]}}",
+        single,
+        crate::regime_gate::STATE_RULE,
+        rows_read,
+        plan.barriers.iter().map(|b| b.json()).collect::<Vec<_>>().join(","),
+        book.iter().map(|&k| format!("{{{}}}", gate(k))).collect::<Vec<_>>().join(",")
+    ))
 }
 
 /// #925: the band of candidate `c` in window `d`: `multiple` in score units, or
@@ -2723,7 +2958,7 @@ fn push_scores(
     windows: &mut [WindowData],
     t: f64,
     group: u64,
-    (target, gate): (f64, f64),
+    (target, states): (f64, &[f64]),
     scores: &[f64],
     with_test: bool,
 ) {
@@ -2773,7 +3008,9 @@ fn push_scores(
                 group,
                 target,
             });
-            d.test_gate.push(gate);
+            for (dst, &s) in d.test_states.iter_mut().zip(states) {
+                dst.push(s);
+            }
             let bad = !target.is_finite() || scores.iter().any(|s| !s.is_finite());
             for (dst, &score) in d.test_scores.iter_mut().zip(scores) {
                 dst.push(score);
@@ -2786,11 +3023,13 @@ fn push_scores(
 }
 
 /// Final read of a vote book: a test row with the score of every member.
-fn push_all_test(windows: &mut [WindowData], t: f64, group: u64, (target, gate): (f64, f64), scores: &[f64]) {
+fn push_all_test(windows: &mut [WindowData], t: f64, group: u64, (target, states): (f64, &[f64]), scores: &[f64]) {
     for d in windows {
         if t >= d.window.test_start && t < d.window.test_end {
             d.test_rows.push(RowBase { time: t, group, target });
-            d.test_gate.push(gate);
+            for (dst, &s) in d.test_states.iter_mut().zip(states) {
+                dst.push(s);
+            }
             for (dst, &score) in d.test_scores.iter_mut().zip(scores) {
                 dst.push(score);
             }
@@ -2809,13 +3048,15 @@ fn push_selected_test(
     chosen: &[usize],
     t: f64,
     group: u64,
-    (target, gate): (f64, f64),
+    (target, states): (f64, &[f64]),
     scores: &[f64],
 ) {
     for (d, &c) in windows.iter_mut().zip(chosen) {
         if t >= d.window.test_start && t < d.window.test_end {
             d.test_rows.push(RowBase { time: t, group, target });
-            d.test_gate.push(gate);
+            for (dst, &s) in d.test_states.iter_mut().zip(states) {
+                dst.push(s);
+            }
             d.test_scores[c].push(scores[c]);
             if !target.is_finite() || !scores[c].is_finite() {
                 d.dropped += 1;
@@ -3165,7 +3406,7 @@ impl StrataIn {
     /// the rows with a finite target before the gate. On the grid every series has the grid's length
     /// and an empty period has no gross, exposure, entry or buy-and-hold return.
     #[allow(clippy::too_many_arguments)]
-    fn add_window(&mut self, pev: &WindowEval, bucket: f64, opts: &ProtocolOptions, d: &WindowData, valid: &[usize], regime_states: &[Vec<bool>], grid: Option<&Grid>) {
+    fn add_window(&mut self, pev: &WindowEval, bucket: f64, opts: &ProtocolOptions, d: &WindowData, valid: &[usize], (regime_states, regime_values): (&[Vec<bool>], &[Vec<f64>]), grid: Option<&Grid>) {
         let key = |t: f64| if bucket > 0.0 { (t / bucket).floor() } else { t };
         let pad = |v: &[f64]| -> Vec<f64> {
             match grid {
@@ -3183,7 +3424,7 @@ impl StrataIn {
         let row_keys: Vec<f64> = valid.iter().map(|&i| key(d.test_rows[i].time)).collect();
         for k in 0..opts.regime_exprs.len() {
             let on: Vec<bool> = valid.iter().map(|&i| regime_states[k][i]).collect();
-            let finite: Vec<bool> = valid.iter().map(|&i| d.test_regime[k][i].is_finite()).collect();
+            let finite: Vec<bool> = valid.iter().map(|&i| regime_values[k][i] >= 0.0).collect();
             let (st, c) = crate::regimes::period_states(&row_keys, &on, &finite, &period_keys);
             self.states[k].extend(st);
             self.counts[k].add(c);
@@ -4581,6 +4822,10 @@ impl WindowResult {
             s.pop();
             s.push_str(&format!(",\"entry_times\":{}}}", n));
         }
+        if let Some(g) = &self.gate {
+            s.pop();
+            s.push_str(&format!(",\"gate\":{}}}", g));
+        }
         s
     }
 }
@@ -4709,6 +4954,10 @@ impl Report {
         if let Some(r) = &self.regimes {
             s.pop();
             s.push_str(&format!(",\"regimes\":{}}}", r.json()));
+        }
+        if let Some(g) = &self.gate {
+            s.pop();
+            s.push_str(&format!(",\"gate\":{}}}", g));
         }
         if let Some(m) = &self.members {
             s.pop();
