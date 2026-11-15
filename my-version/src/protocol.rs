@@ -1175,6 +1175,14 @@ pub fn procedure_spec(spec: &crate::walkforward::EvalSpec, o: &crate::walkforwar
     if let Some(g) = &o.mask {
         s.push_str(&format!("pnl_mask={}|rule={}\n", g.identity(), crate::walkforward::MASK_STATE_RULE));
     }
+    if o.cost.as_ref().is_some_and(|c| c.log_returns()) {
+        s.push_str("return_units=log\n");
+    }
+    if let Some((width, _)) = crate::walkforward::declared_period(spec, o) {
+        if width != spec.horizon {
+            s.push_str(&format!("period_width={:?}\n", width));
+        }
+    }
     s
 }
 
