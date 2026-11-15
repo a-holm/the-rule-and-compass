@@ -805,7 +805,7 @@ pub fn claim(args: &[String]) -> Vec<String> {
             "--pnl-mask" | "--pnl-mask-band" | "--pnl-mask-dwell" => {
                 fail(&format!("{}: the sweep prices the unmasked book; the gate is the mask", flag))
             }
-            "--pnl-excess" if false => fail("--pnl-excess: the sweep prices the absolute book that walkforward --expr reproduces"),
+            "--pnl-excess" => fail("--pnl-excess: the sweep prices the absolute book that walkforward --expr reproduces"),
             _ => {
                 rest.push(args[i].clone());
                 i += 1;

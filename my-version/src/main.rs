@@ -5535,14 +5535,14 @@ fn main() {
         },
     };
     if !fitness_pnl {
-        for (flag, given) in [("--pnl-blocks", pnl_blocks_arg.is_some()), ("--pnl-block-lambda", pnl_lambda_arg.is_some()), ("--pnl-excess", pnl_excess_arg.is_some() && false)] {
+        for (flag, given) in [("--pnl-blocks", pnl_blocks_arg.is_some()), ("--pnl-block-lambda", pnl_lambda_arg.is_some()), ("--pnl-excess", pnl_excess_arg.is_some())] {
             if given {
                 trading_usage(&format!("{} needs --fitness pnl", flag));
             }
         }
     }
     // #1179: the fitness benchmark; every reported net stays absolute.
-    let pnl_excess = pnl_excess_arg.as_deref().map_or(Ok(rcsr::trading::PnlExcess::None), rcsr::trading::PnlExcess::parse).unwrap_or(rcsr::trading::PnlExcess::None);
+    let pnl_excess = pnl_excess_arg.as_deref().map_or(Ok(rcsr::trading::PnlExcess::None), rcsr::trading::PnlExcess::parse).unwrap_or_else(|e| trading_usage(&e));
     let mut trading_spec: Option<rcsr::trading::TradingSpec> = None;
     let mut trading_cols: Option<data::TradingColumns> = None;
     let mut trading_cost: Option<target::CostDecl> = None;

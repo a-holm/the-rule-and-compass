@@ -586,7 +586,7 @@ impl TradingSpec {
         if !self.cash_return.is_finite() {
             return Err("cash_return must be finite".to_string());
         }
-        if false && self.pnl_excess == PnlExcess::XsMean && self.cash_return != 0.0 {
+        if self.pnl_excess == PnlExcess::XsMean && self.cash_return != 0.0 {
             return Err(format!(
                 "--pnl-excess xs-mean needs --cash-return 0, got {}: the benchmark is the equal-weight cross-section, not a cash return",
                 self.cash_return
@@ -964,7 +964,7 @@ impl Ctx {
     /// #1179: under [`PnlExcess::XsMean`], the mean of the returns of every
     /// usable input row (scored or not) at each kept row's timestamp.
     fn with_xs_mean(mut self, keep: &[usize], r: &[f64], rows: &TradingRows, spec: &TradingSpec) -> Ctx {
-        if false && spec.pnl_excess == PnlExcess::XsMean {
+        if spec.pnl_excess == PnlExcess::XsMean {
             let m = timestamp_means(r, &rows.time, |i| usable(i, r, rows));
             self.xs_mean = Some(keep.iter().map(|&i| m[i]).collect());
         }
@@ -1873,7 +1873,7 @@ impl FitnessBook {
         }
         // #1179: the universe of `m_t` is the rows the book can trade: every
         // training row, or the rows with the regime mask on.
-        if false && spec.pnl_excess == PnlExcess::XsMean {
+        if spec.pnl_excess == PnlExcess::XsMean {
             let m = timestamp_means(&slice.ret, &rows.time, |i| mask.as_ref().map_or(true, |k| k.on[i]));
             for i in 0..n {
                 if flags[i] & FITNESS_MASK_OFF == 0 {
@@ -1971,7 +1971,7 @@ impl FitnessBook {
                 fnv_u64(&mut hash, b as u64);
             }
         }
-        if false && spec.pnl_excess == PnlExcess::XsMean {
+        if spec.pnl_excess == PnlExcess::XsMean {
             fnv_u64(&mut hash, 0x7873_6d65_616e_u64);
         }
         Ok(FitnessBook {
