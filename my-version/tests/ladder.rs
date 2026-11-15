@@ -999,3 +999,59 @@ fn ladder_stride_wider_than_step_refused() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.starts_with("error: stride_seconds 86400") && err.contains("3600"), "{err}");
 }
+
+#[path = "common/masked_run.rs"]
+mod masked_run;
+
+/// #1216: `--sr-run` of a run that priced `--pnl-mask` is refused, because the rung prices the raw formula.
+#[test]
+fn ladder_refuses_a_masked_run() {
+    const START: f64 = 1_600_000_000.0;
+    let (_scratch, dir) = scratch("masked-run");
+    let mut csv = String::from("t,f1,f2,r,y\n");
+    for i in 0..600 {
+        let f = i as f64;
+        let f1 = (f * 0.618_033_988_749_894_9).fract() - 0.5;
+        let f2 = (f * 0.754_877_666_246_692_7).fract() - 0.5;
+        let r = 0.01 * f1 + 0.0005 * ((f * 0.324_717_957_244_746).fract() - 0.5);
+        csv.push_str(&format!("{},{},{},{},{}\n", START as i64 + 900 * i, f1, f2, r, r));
+    }
+    let data = dir.join("d.csv");
+    std::fs::write(&data, csv).unwrap();
+    let iso = |i: i64| protocol::iso(START + 900.0 * i as f64);
+    let windows = dir.join("w.csv");
+    std::fs::write(
+        &windows,
+        format!(
+            "scheme,label,train_start,train_end,validation_start,test_start,test_end\nexpanding,late,{},{},{},{},{}\n",
+            iso(0),
+            iso(250),
+            iso(200),
+            iso(400),
+            iso(600)
+        ),
+    )
+    .unwrap();
+    let go = |masked: bool, out: &str| {
+        let run = dir.join(if masked { "masked.run.json" } else { "plain.run.json" });
+        std::fs::write(&run, masked_run::run_json(masked, START, START + 300.0 * 900.0)).unwrap();
+        rcsr_cmd::rcsr()
+            .args([
+                "ladder", "--data", data.to_str().unwrap(), "--target", "y", "--return-col", "r", "--time", "t",
+                "--features", "f1,f2", "--windows", windows.to_str().unwrap(), "--purge-seconds", "1800", "--draws", "50",
+                "--gbm-trees", "10", "--sr-run", run.to_str().unwrap(), "--out", out,
+            ])
+            .output()
+            .expect("run rcsr ladder")
+    };
+    let out = dir.join("masked.ladder.json");
+    let refused = go(true, out.to_str().unwrap());
+    let err = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(refused.status.code(), Some(2), "{err}");
+    assert!(err.contains("pnl_mask"), "{err}");
+    assert!(!out.exists(), "a refused run writes no report");
+    let plain = dir.join("plain.ladder.json");
+    let ok = go(false, plain.to_str().unwrap());
+    assert_eq!(ok.status.code(), Some(0), "{}", String::from_utf8_lossy(&ok.stderr));
+    assert!(std::fs::read_to_string(&plain).unwrap().contains("\"sr_run\""));
+}
