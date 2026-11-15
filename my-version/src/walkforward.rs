@@ -634,6 +634,9 @@ pub struct WindowResult {
     pub train_last_time: Option<f64>,
     /// #1094: the fitted cut under `--threshold-fit fitness`.
     pub cut: Option<CutReport>,
+    /// #1236: under `--emit-series`, the distinct entry stamps of the window's pooled
+    /// book; the windows of a report sum to `pooled.entry_times`.
+    pub entry_times: Option<usize>,
     /// #1214: the `gate` block of the window: the warm-up of the gate of the
     /// selected candidate's book at the test start and, for a switch, its regime view.
     pub gate: Option<String>,
@@ -2577,6 +2580,7 @@ impl Accum {
                 hindsight_bound: ev.hindsight_bound,
                 band_selection,
                 cut,
+                entry_times: emit_series.then_some(pev.entry_times),
                 gate: gate_json,
             });
         }
@@ -4807,6 +4811,10 @@ impl WindowResult {
         if self.in_sample {
             s.pop();
             s.push_str(",\"in_sample\":true}");
+        }
+        if let Some(n) = self.entry_times {
+            s.pop();
+            s.push_str(&format!(",\"entry_times\":{}}}", n));
         }
         if let Some(g) = &self.gate {
             s.pop();

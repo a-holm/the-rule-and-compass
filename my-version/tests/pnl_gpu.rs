@@ -2500,3 +2500,177 @@ mod device_band_dp {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// #1203: device scans and the fused reduction on rows with no score
+// ---------------------------------------------------------------------------
+
+/// Three symbols at t = 0..239 with rows that have a finite target and no score
+/// (an empty `x`): A on 150..159, inside a cooldown hold that enters at 148, and
+/// at 200; B on the first and the last row of each test window; C on 10..19 and
+/// on every row of the second test window.
+fn missing_score_table() -> data::Table {
+    let mut s = String::from("ts,sym,x,target\n");
+    for t in 0..240usize {
+        for (k, sym) in ["A", "B", "C"].iter().enumerate() {
+            let missing = match k {
+                0 => (150..160).contains(&t) || t == 200,
+                1 => [120, 179, 180, 239].contains(&t),
+                _ => (10..20).contains(&t) || t >= 180,
+            };
+            let x = match (k, t) {
+                _ if missing => String::new(),
+                (0, 147) => "-1".to_string(),
+                (0, 148) | (0, 149) => "1".to_string(),
+                _ => ((((t * 37 + k * 11) % 101) as f64) / 50.0 - 1.0).to_string(),
+            };
+            let y = (((t * 13 + k * 7) % 29) as f64) / 1000.0 - 0.0135;
+            s.push_str(&format!("{t},{sym},{x},{y}\n"));
+        }
+    }
+    data::parse_table(&s).unwrap()
+}
+
+/// Rows of the two test windows of [`missing_score_table`] with no score.
+const MISSING_TEST_ROWS: usize = 75;
+
+fn missing_score_spec(policy: walkforward::Policy, band_width: f64, min_hold: usize) -> EvalSpec {
+    let mut s = spec("x", vec![window("w1", 0.0, 120.0, 120.0, 180.0), window("w2", 0.0, 180.0, 180.0, 240.0)]);
+    s.group = Some("sym".to_string());
+    s.threshold_fixed = Some(0.0);
+    s.cost_bps = 10.0;
+    s.policy = policy;
+    s.band_width = band_width;
+    s.min_hold = min_hold;
+    s
+}
+
+fn missing_score_run(spec: &EvalSpec, missing: rcsr::trading::MissingScore) -> walkforward::Report {
+    let opts = walkforward::ProtocolOptions { missing_score: missing, ..walkforward::ProtocolOptions::default() };
+    walkforward::run_table_with(&missing_score_table(), spec, "test", &opts).unwrap()
+}
+
+/// The fixture of the device tests below holds missing-score rows in both test
+/// windows: `hold` prices them and `flat` drops them, ends runs and pays exits.
+#[test]
+fn missing_score_fixture_has_rows_without_a_score_in_both_windows() {
+    use rcsr::trading::MissingScore;
+    let band = missing_score_spec(walkforward::Policy::Band, 0.05, 3);
+    let flat = missing_score_run(&band, MissingScore::Flat);
+    let held = missing_score_run(&band, MissingScore::Hold);
+    assert_eq!(held.pooled.rows - flat.pooled.rows, MISSING_TEST_ROWS);
+    assert!(flat.missing_score_exits >= 1, "the long of A at t = 148 and 149 exits at t = 149");
+    let groups = |r: &walkforward::Report, w: usize| r.windows[w].band.as_ref().expect("the cooldown scan").groups;
+    // flat: A splits into two runs and B keeps its run after t = 120; hold: one book per symbol,
+    // and C has no scored row in w2.
+    assert_eq!((groups(&flat, 0), groups(&held, 0)), (4, 3));
+    assert_eq!(groups(&held, 1), 2);
+}
+
+#[cfg(feature = "cuda")]
+mod device_missing_score {
+    use super::*;
+    use rcsr::trading::MissingScore;
+    use rcsr::trading_gpu::device_available;
+
+    /// Every reported number of the `--gpu` band, cooldown and DP report has the
+    /// bits of the CPU report; returns the cases that differ.
+    fn scan_mismatches(missing: MissingScore) -> Vec<String> {
+        let mut bad = Vec::new();
+        for (policy, band_width, min_hold) in [
+            (walkforward::Policy::Band, 0.1, 1usize),
+            (walkforward::Policy::Band, 0.05, 3),
+            (walkforward::Policy::Dp, 0.0, 1),
+        ] {
+            let cpu = missing_score_spec(policy, band_width, min_hold);
+            let gpu = EvalSpec { gpu: true, ..cpu.clone() };
+            let c = missing_score_run(&cpu, missing);
+            let g = missing_score_run(&gpu, missing);
+            let what = format!("{missing:?} {policy:?} band {band_width} hold {min_hold}");
+            for (w, (cw, gw)) in c.windows.iter().zip(&g.windows).enumerate() {
+                let (cpu_net, gpu_net, backend, fallback) = match policy {
+                    walkforward::Policy::Dp => {
+                        let (ch, gh) = (cw.hindsight_bound.as_ref().unwrap(), gw.hindsight_bound.as_ref().unwrap());
+                        (ch.net, gh.net, gh.backend.clone(), gh.fallback_reason.clone())
+                    }
+                    _ => {
+                        let (cb, gb) = (cw.band.as_ref().unwrap(), gw.band.as_ref().unwrap());
+                        if (gb.net - gb.scalar_net).abs() > 1e-12 {
+                            bad.push(format!("{what} w{w}: device scan net {} against its book {}", gb.net, gb.scalar_net));
+                        }
+                        (cb.net, gb.net, gb.backend.clone(), gb.fallback_reason.clone())
+                    }
+                };
+                if backend != "cuda" || fallback.is_some() {
+                    bad.push(format!("{what} w{w}: backend {backend}, fallback {fallback:?}"));
+                }
+                if cpu_net.to_bits() != gpu_net.to_bits() {
+                    bad.push(format!("{what} w{w}: cpu net {cpu_net:e}, device net {gpu_net:e}"));
+                }
+            }
+            let normalised = g.json().replace("\"backend\":\"cuda\"", "\"backend\":\"cpu\"").replace("\"gpu\":true", "\"gpu\":false");
+            let cj = c.json();
+            if cj != normalised {
+                let at = cj.bytes().zip(normalised.bytes()).position(|(a, b)| a != b).unwrap_or(cj.len().min(normalised.len()));
+                let lo = at.saturating_sub(80);
+                bad.push(format!(
+                    "{what}: reports differ at byte {at}: cpu ..{}.. device ..{}..",
+                    &cj[lo..(at + 80).min(cj.len())],
+                    &normalised[lo..(at + 80).min(normalised.len())]
+                ));
+            }
+        }
+        bad
+    }
+
+    #[test]
+    fn device_band_cooldown_and_dp_scans_equal_the_cpu_under_missing_score_flat() {
+        if !device_available() {
+            rcsr::backend::skip_without_device("skipped: no CUDA device");
+            return;
+        }
+        let bad = scan_mismatches(MissingScore::Flat);
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
+
+    #[test]
+    fn device_band_cooldown_and_dp_scans_equal_the_cpu_under_missing_score_hold() {
+        if !device_available() {
+            rcsr::backend::skip_without_device("skipped: no CUDA device");
+            return;
+        }
+        let bad = scan_mismatches(MissingScore::Hold);
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
+
+    /// The fused `--device-pnl` reduction and the control ladder run on the
+    /// device over the run keys (flat) and the held scores (hold) and equal the
+    /// canonical CPU reduction bit for bit, counts included.
+    #[test]
+    fn device_pnl_reduction_equals_the_canonical_book_under_both_missing_score_rules() {
+        if !device_available() {
+            rcsr::backend::skip_without_device("skipped: no CUDA device");
+            return;
+        }
+        let mut bad = Vec::new();
+        for missing in [MissingScore::Flat, MissingScore::Hold] {
+            let s = EvalSpec { device_pnl: true, ..missing_score_spec(walkforward::Policy::Threshold, 0.0, 1) };
+            let r = missing_score_run(&s, missing);
+            let d = r.device_pnl.as_ref().expect("the --device-pnl summary");
+            let summary = (d.windows, d.device_windows, d.bit_mismatch_windows, d.count_mismatch_windows);
+            if summary != (2, 2, 0, 0) || d.max_abs_net_delta >= 1e-12 || d.rows != r.pooled.rows as u64 {
+                bad.push(format!(
+                    "{missing:?}: (windows, device, bit mismatch, count mismatch) {summary:?}, max net delta {:e}, rows {} of {}",
+                    d.max_abs_net_delta, d.rows, r.pooled.rows
+                ));
+            }
+            for w in &r.windows {
+                let dc = w.controls.as_ref().and_then(|c| c.device.as_ref()).expect("the device control check");
+                if dc.backend != "cuda" || !dc.counts_equal {
+                    bad.push(format!("{missing:?} {}: controls backend {}, counts equal {}", w.window.label, dc.backend, dc.counts_equal));
+                }
+            }
+        }
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
+}
