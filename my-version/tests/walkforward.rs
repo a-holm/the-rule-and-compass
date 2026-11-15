@@ -2081,6 +2081,8 @@ mod fitted_cut {
         assert!(!base.contains("pnl_mask"), "{base}");
         let text = rcsr::protocol::procedure_spec(&s, &with(gate("x", 0.0, 1)));
         assert!(text.starts_with(&base) && text.contains("pnl_mask="), "{text}");
+        // #1214: the mask line names the rule its states follow.
+        assert!(text.ends_with("|rule=rcsr-gate-state/1\n"), "{text}");
         assert_ne!(text, base);
         let mut seen = vec![base, text];
         for g in [gate("-x", 0.0, 1), gate("x", 0.5, 1), gate("x", 0.0, 3)] {
