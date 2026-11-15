@@ -628,6 +628,17 @@ Each row has `train_end = test_start - purge_seconds` (219600 s: 1 h entry plus 
 
 The table's `validation_start` is the validation slice of every window: it sets the threshold and selects among repeated `--expr` candidates, `--front` members and `--select-band` (`selection.selected_on` is `validation`). `--validation-frac` together with the table exits 2 (`mutually exclusive`); repeated `--expr` with neither exits 3.
 
+### Regime strata (`--regimes`, `--regime-expr`, #1175)
+
+`--regimes calendar.csv` splits the pooled out-of-fold periods by a regime calendar. `--regime-expr <expr>` (repeatable, with `--regime-name`, `--regime-band`, `--regime-dwell`) adds causal on/off strata: the expression reads only columns of the row, goes through the hysteresis and dwell gate of `regime_gate`, and a period is on when more than half of its priced rows are on. Non-finite values are off and counted. A column of the label family, the target, its return column or a construction column is refused (exit 5).
+
+The report gains a `regimes` object (JSON and `--markdown`). Per stratum: periods, years, net mean (annualised, at the report cost and at twice it), Sharpe, Sortino, max drawdown, exposure, entries, alpha against the cost-free equal-weight `market` series (no risk-free rate), and a circular block bootstrap interval of the mean with `--bootstrap`. Expression strata add the switch count and switches per year. A calendar stratum is assigned by the bucket start of each period. Periods outside every calendar row are `undated`. A stratum with too few periods keeps its counts and null statistics. Without any regime flag the report is byte-identical to the report of an earlier build. `--period-series` also writes `pooled.period_gross`, `period_exposure`, `period_entries` and `period_bh`, which `rcsr trials --regimes` reads.
+
+```sh
+rcsr protocol regimes --data prices.csv --time time --out calendar.csv
+rcsr walkforward ... --regimes calendar.csv --regime-expr 'close > sma_200' --regime-name above200
+```
+
 ### Overlapping returns
 
 The book earns the per-row forward return on every long row and charges one cost per position change. With rows closer than `--horizon` in one group, a long run earns the same price move several times. `rcsr walkforward` therefore refuses (exit 2, `overlapping returns`) any window whose test rows have two rows of one group less than `--horizon` seconds apart; a step equal to the horizon passes, a gap passes, equal timestamps are skipped. Rows without a finite return (for example the off-stride rows of a `stride=h` label) do not count. `--horizon 0` skips the check. The report carries `split.min_group_step_seconds`, the smallest positive step. `rcsr ladder` and `rcsr ablation score` apply the same check to the test rows of every fold (horizon from the target spec, or `--horizon-seconds` for the ladder), refuse with exit 2 and the same message, and report `min_group_step_seconds`.

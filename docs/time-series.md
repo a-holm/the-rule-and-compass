@@ -534,6 +534,16 @@ done
 **What fails.** One profitable symbol can carry the mean while the model loses
 on every other symbol. The per-group spread, not the pooled mean, is the result.
 
+### Regime strata (#1175)
+
+A pooled mean hides regimes. Report the strategy per regime with `rcsr walkforward --regimes calendar.csv` or `rcsr trials --regimes calendar.csv`. `rcsr protocol regimes` writes the calendar: bull, bear and sideways (at least 60 days inside a 25 % band).
+
+* The default dating is ex-post: it uses the whole range, so it labels the past with later closes. It is a reporting tool, never a feature.
+* `--mode causal` dates a day from closes at or before it. A planted look-ahead test pins this.
+* Rows of a locked range (purge before, embargo after) are dropped before their price is parsed and written as `not_dated`. Dating the sealed range needs `--after-read` with `--ledger`, `--sealed` and `--expect-reads`: the ledger must hold every read the final seal allows. The ledger records a `regime_dating` event with the calendar hash.
+* Any label set works as a calendar: rows `label,start,end`, UTC half-open, no overlap.
+* An always-long book has zero alpha against the equal-weight benchmark in every stratum. A positive alpha in one stratum and a negative one in another is the result to read, not the pooled mean.
+
 ### Cross-sectional context is a PIT join, not a survivor list
 
 `rcsr enrich --features cross` produces equal-weight market state, breadth,

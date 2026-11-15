@@ -4626,7 +4626,7 @@ fn main() {
                 Err(e) => trading_usage(&format!("--pnl-mask: {}", e)),
             };
             let specs: Vec<&target::TargetSpec> = target_resolved.iter().chain(book_resolved.iter()).map(|r| &r.spec).collect();
-            enforce_gate_columns(&spec.columns, &specs, &target_names, allow_target_structure);
+            enforce_gate_columns("--pnl-mask", &spec.columns, &specs, &target_names, allow_target_structure);
             Some(spec)
         }
     };
@@ -9731,9 +9731,9 @@ fn normalise_inputs(n: &expr::Node, means: &[f64], stds: &[f64]) -> expr::Node {
 /// #1180: the columns of a regime gate are inputs of the decision: a label,
 /// the target, its return column or a construction column would leak the future
 /// into the mask (D13, exit 5).
-fn enforce_gate_columns(columns: &[String], specs: &[&target::TargetSpec], target_names: &[String], allow_structure: bool) {
+fn enforce_gate_columns(flag: &str, columns: &[String], specs: &[&target::TargetSpec], target_names: &[String], allow_structure: bool) {
     let refuse = |why: String| -> ! {
-        eprintln!("error: --pnl-mask: {}", why);
+        eprintln!("error: {}: {}", flag, why);
         std::process::exit(EXIT_LEAKAGE);
     };
     for c in columns {
@@ -11658,6 +11658,32 @@ OPTIONS:
                              bootstrap, effective n, DSR at N_eff and 10 N_eff,
                              PBO (CSCV), SPA against the best long/flat baseline
                              and BH-FDR over the candidates
+  --regimes <calendar.csv>   #1175: per-stratum report of the pooled periods by a regime
+                             calendar (rows label,start,end, UTC half-open, no overlap,
+                             any label set; `rcsr protocol regimes` writes one). A period
+                             belongs to the row that contains its bucket start; periods
+                             outside every row are `undated`. Adds `regimes` to the report
+                             (JSON and --markdown): periods, years, net mean and annualised
+                             at the report cost and at twice it, Sharpe, Sortino, max
+                             drawdown of the stratum periods concatenated, exposure,
+                             entries, buy-and-hold and alpha over exposure-matched
+                             buy-and-hold, and a block-bootstrap interval of the mean
+                             with --bootstrap. A reporting input only: no search reads it.
+                             Without any regime flag the report is unchanged
+  --regime-expr <expr>       causal regime expression of columns of the row (repeatable);
+                             a row is on when the value is > 0 (non-finite is off and
+                             counted), a period is on when more than half of its rows
+                             are on. Reports the on and off strata and the switches,
+                             switches per year and mean state duration. Aggregates exit
+                             2; a label, target, return or construction column exits 5
+                             (D13). Needs the data to hold the columns
+  --regime-name <name>       name of the preceding --regime-expr (default r1, r2, ...)
+  --regime-band <h>          hysteresis of every --regime-expr (default 0, >= 0)
+  --regime-dwell <D>         minimum rows per state of every --regime-expr (default 1)
+  --period-series            also write pooled.period_gross, period_exposure,
+                             period_entries and period_bh, so `rcsr trials --regimes`
+                             reports exposure and alpha per stratum (implied by the
+                             regime flags above)
   --block-len <L>            block length in periods (default
                              max(h, hold, n^(1/3))); must be >= max(h, hold)
   --null-draws <B>           draws of the hour-block permutation null and the
@@ -11879,6 +11905,11 @@ fn run_walkforward(args: &[String]) -> ! {
     let mut expect_hash: Option<String> = None;
     let mut front_path: Option<String> = None;
     let mut allow_in_sample = false;
+    let mut regimes_path: Option<String> = None;
+    let mut regime_exprs_src: Vec<(String, Option<String>)> = Vec::new();
+    let mut regime_band_arg: Option<String> = None;
+    let mut regime_dwell_arg: Option<String> = None;
+    let mut period_series = false;
 
     let need = |args: &[String], i: usize, flag: &str| -> String {
         match args.get(i) {
@@ -11973,6 +12004,34 @@ fn run_walkforward(args: &[String]) -> ! {
                 i += 1;
             }
             "--allow-in-sample-windows" => allow_in_sample = true,
+            "--regimes" => {
+                regimes_path = Some(need(args, i + 1, "--regimes"));
+                i += 1;
+            }
+            "--regime-expr" => {
+                regime_exprs_src.push((need(args, i + 1, "--regime-expr"), None));
+                i += 1;
+            }
+            "--regime-name" => {
+                let name = need(args, i + 1, "--regime-name");
+                match regime_exprs_src.last_mut() {
+                    Some(last) if last.1.is_none() => last.1 = Some(name),
+                    _ => {
+                        eprintln!("error: --regime-name follows a --regime-expr and names it once");
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+                i += 1;
+            }
+            "--regime-band" => {
+                regime_band_arg = Some(need(args, i + 1, "--regime-band"));
+                i += 1;
+            }
+            "--regime-dwell" => {
+                regime_dwell_arg = Some(need(args, i + 1, "--regime-dwell"));
+                i += 1;
+            }
+            "--period-series" => period_series = true,
             "--threshold-quantile" => {
                 quantile = number(
                     need(args, i + 1, "--threshold-quantile"),
@@ -12496,6 +12555,43 @@ fn run_walkforward(args: &[String]) -> ! {
     } else if cost_source == rcsr::target::CostSource::Flag {
         popts.cost = Some(rcsr::target::CostDecl::new(None, cost_bps, cost_source));
     }
+    if let Some(path) = &regimes_path {
+        popts.regimes = Some(rcsr::regimes::Calendar::load(path).unwrap_or_else(|e| usage_fail(&format!("--regimes {}", e))));
+    }
+    if regime_exprs_src.is_empty() {
+        for (flag, given) in [("--regime-band", regime_band_arg.is_some()), ("--regime-dwell", regime_dwell_arg.is_some())] {
+            if given {
+                usage_fail(&format!("{} needs --regime-expr", flag));
+            }
+        }
+    }
+    let regime_band = match regime_band_arg.as_deref() {
+        None => 0.0,
+        Some(t) => match t.trim().parse::<f64>() {
+            Ok(b) if b.is_finite() && b >= 0.0 => b,
+            _ => usage_fail(&format!("--regime-band must be a finite number >= 0, got '{}'", t)),
+        },
+    };
+    let regime_dwell = match regime_dwell_arg.as_deref() {
+        None => 1,
+        Some(t) => match t.trim().parse::<usize>() {
+            Ok(d) if d >= 1 => d,
+            _ => usage_fail(&format!("--regime-dwell must be an integer >= 1, got '{}'", t)),
+        },
+    };
+    for (k, (src, name)) in regime_exprs_src.iter().enumerate() {
+        let gate = rcsr::regime_gate::GateSpec::parse(src, regime_band, regime_dwell).unwrap_or_else(|e| usage_fail(&format!("--regime-expr: {}", e)));
+        let name = name.clone().unwrap_or_else(|| format!("r{}", k + 1));
+        if popts.regime_exprs.iter().any(|e| e.name == name) {
+            usage_fail(&format!("--regime-name '{}' is used twice", name));
+        }
+        let specs: Vec<&target::TargetSpec> = cost_spec.iter().collect();
+        let mut names: Vec<String> = target.iter().cloned().collect();
+        names.extend(cost_spec.iter().map(|s| s.column.clone()));
+        enforce_gate_columns("--regime-expr", &gate.columns, &specs, &names, false);
+        popts.regime_exprs.push(rcsr::regimes::ExprSpec { name, gate });
+    }
+    popts.period_series = period_series;
     let horizon = horizon.unwrap_or(0.0);
     let target = target.unwrap_or_else(|| {
         eprintln!("error: walkforward needs --target\n\n{}", walkforward_usage());

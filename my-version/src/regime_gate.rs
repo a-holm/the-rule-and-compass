@@ -212,6 +212,48 @@ pub fn run_count(group: &[u64], on: &[bool]) -> (usize, usize) {
     (rows, seen.len())
 }
 
+/// State changes of a state series and the length of its runs.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Switches {
+    pub periods: usize,
+    pub switches: usize,
+    /// `switches` per year of the `periods - 1` intervals between the states.
+    pub per_year: f64,
+    pub mean_on_run: f64,
+    pub mean_off_run: f64,
+}
+
+/// Switch statistics of a period state series in time order. The observation
+/// span is the `periods - 1` intervals between the states, so a gate that
+/// flips every 24 hourly periods over 8760 intervals switches 365 times a year.
+pub fn switch_stats(states: &[bool], periods_per_year: f64) -> Switches {
+    let n = states.len();
+    let switches = states.windows(2).filter(|w| w[0] != w[1]).count();
+    let per_year = if n >= 2 && periods_per_year > 0.0 {
+        switches as f64 * periods_per_year / (n - 1) as f64
+    } else {
+        f64::NAN
+    };
+    let (mut on_runs, mut on_len, mut off_runs, mut off_len) = (0usize, 0usize, 0usize, 0usize);
+    let mut i = 0;
+    while i < n {
+        let mut j = i;
+        while j < n && states[j] == states[i] {
+            j += 1;
+        }
+        if states[i] {
+            on_runs += 1;
+            on_len += j - i;
+        } else {
+            off_runs += 1;
+            off_len += j - i;
+        }
+        i = j;
+    }
+    let mean = |len: usize, runs: usize| if runs == 0 { f64::NAN } else { len as f64 / runs as f64 };
+    Switches { periods: n, switches, per_year, mean_on_run: mean(on_len, on_runs), mean_off_run: mean(off_len, off_runs) }
+}
+
 /// The slice priced under a mask: every on-run is its own group (flat start,
 /// exit paid at the run's last row) and the return of an off row is NaN, so the
 /// pricing drops it as an unusable row.
@@ -310,5 +352,18 @@ mod tests {
         assert_ne!(ids[3], ids[4]);
         assert_eq!(ids[4], ids[5]);
         assert_eq!(run_count(&g, &on), (5, 3));
+    }
+
+    #[test]
+    fn switch_count_of_a_daily_flip() {
+        let states: Vec<bool> = (0..=24 * 365).map(|i| (i / 24) % 2 == 0).collect();
+        let s = switch_stats(&states, 8760.0);
+        assert_eq!(s.switches, 365);
+        assert!((s.per_year - 365.0).abs() < 1e-9, "{}", s.per_year);
+        assert!((s.mean_on_run - 24.0).abs() < 0.2 && (s.mean_off_run - 24.0).abs() < 0.2);
+        let flat = switch_stats(&[true, true, true], 8760.0);
+        assert_eq!((flat.switches, flat.per_year), (0, 0.0));
+        assert!(flat.mean_off_run.is_nan());
+        assert!(switch_stats(&[true], 8760.0).per_year.is_nan());
     }
 }
