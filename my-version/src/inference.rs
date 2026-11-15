@@ -947,3 +947,13 @@ pub fn bh_fdr(p: &[f64], q: f64) -> Bh {
         n_rejected: cutoff,
     }
 }
+
+/// #1177 WIP stub.
+pub struct StepM {
+    pub rejected: Vec<bool>,
+}
+
+/// #1177 WIP stub.
+pub fn stepm(_d: &[Vec<f64>], _block: usize, _draws: usize, _seed: u32, _alpha: f64) -> Result<StepM, String> {
+    Err("not implemented".to_string())
+}
