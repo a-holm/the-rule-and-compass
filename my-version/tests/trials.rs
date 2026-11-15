@@ -686,3 +686,85 @@ fn trials_without_the_flag_keep_the_old_reports_matching() {
     assert!(j.get("threshold_arms").is_none());
     assert!(!String::from_utf8_lossy(&run(&["trials", "--wf", &a, &b, "--draws", "50", "--block-len", "8"]).stdout).contains("threshold_rule"));
 }
+
+/// #1199: one walk-forward report of two symbols, hourly over 600 hours; the gate `g` is off
+/// for both symbols on hours 300..380 of the test window.
+fn grid_report(dir: &Path, expr: &str, gate: bool, grid: rcsr::walkforward::PeriodGrid) -> String {
+    use rcsr::walkforward::{self, EvalSpec, Policy, ProtocolOptions, Window};
+    let mut text = String::from("t,sym,x1,x2,g,y\n");
+    for i in 0..600usize {
+        for (k, sym) in ["A", "B"].iter().enumerate() {
+            let f = i as f64 + 0.37 * k as f64;
+            let x1 = frac(f * 0.618_033_988_749_894_9) - 0.5;
+            let x2 = frac(f * 0.754_877_666_246_692_7) - 0.5;
+            let y = 0.01 * (frac(f * 0.324_717_957_244_746) - 0.5) + 0.002 * x1;
+            let g = if (300..380).contains(&i) { -1 } else { 1 };
+            text.push_str(&format!("{},{sym},{x1},{x2},{g},{y}\n", T0 + STEP * i as i64));
+        }
+    }
+    let table = rcsr::data::parse_table(&text).unwrap();
+    let at = |h: i64| (T0 + STEP * h) as f64;
+    let spec = EvalSpec {
+        expression: expr.to_string(),
+        vars: vec!["x1".to_string(), "x2".to_string()],
+        target: "y".to_string(),
+        time: "t".to_string(),
+        group: Some("sym".to_string()),
+        windows: vec![Window { label: "w".to_string(), train_start: at(0), train_end: at(200), test_start: at(200), test_end: at(600) }],
+        horizon: 0.0,
+        embargo: None,
+        cost_bps: 10.0,
+        threshold_quantile: 0.7,
+        threshold_fixed: Some(0.0),
+        validation_frac: 0.0,
+        periods_per_year: Some(PPY),
+        candidates: Vec::new(),
+        band_select: false,
+        pool_reset_flat: true,
+        allow_lockbox: false,
+        device_pnl: false,
+        control_seed: 0,
+        policy: Policy::Threshold,
+        band_width: 0.0,
+        min_hold: 1,
+        gpu: false,
+    };
+    let opts = ProtocolOptions {
+        period_grid: grid,
+        mask: gate.then(|| rcsr::regime_gate::GateSpec::parse("g", 0.0, 1).unwrap()),
+        ..ProtocolOptions::default()
+    };
+    let r = walkforward::run_table_with(&table, &spec, "test", &opts).unwrap();
+    let name = format!("{}-{}-{}.json", expr, if gate { "gated" } else { "plain" }, grid.as_str());
+    let path = dir.join(name);
+    std::fs::write(&path, r.json()).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+#[test]
+fn trials_common_grid_across_configurations() {
+    use rcsr::walkforward::PeriodGrid::{Score, Target};
+    let (_s, dir) = trials_dir();
+    let target: Vec<String> = [("x1", false), ("x2", false), ("x1", true), ("x2", true)]
+        .iter()
+        .map(|&(e, gate)| grid_report(&dir, e, gate, Target))
+        .collect();
+    let mut args = vec!["trials", "--wf"];
+    args.extend(target.iter().map(String::as_str));
+    args.extend_from_slice(&["--draws", "100", "--pbo-blocks", "4"]);
+    let j = stdout_json(&run(&args));
+    assert_eq!(num(&j, &["series"]), 4.0);
+    assert_eq!(num(&j, &["periods"]), 400.0, "every hour of the test window, gate on or off");
+    let pbo = num(&j, &["pbo", "value"]);
+    assert!((0.0..=1.0).contains(&pbo), "{pbo}");
+    // Today's grid: the gated book has no period while the gate is off.
+    let gated_score = grid_report(&dir, "x1", true, Score);
+    let plain_score = grid_report(&dir, "x1", false, Score);
+    let o = run(&["trials", "--wf", &plain_score, &gated_score, "--draws", "50"]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).contains("pooled.period_time"), "{}", stderr(&o));
+    // A score report and a target report never mix.
+    let o = run(&["trials", "--wf", &target[0], &plain_score, "--draws", "50"]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).contains("pooled.grid.rule"), "{}", stderr(&o));
+}
