@@ -1518,6 +1518,24 @@ Why the constants keep the metric fit. A fixed linear structure (`[1, tanh z24, 
 
 The P&L-aligned fits raise train net but not validation net. Turnover is set by the structure, not by the constants, so the leverage is in ranking structures by exact P&L.
 
+#### `--pnl-excess xs-mean`: the excess over the cross-section (#1179)
+
+The long/flat net pays for market beta. With `p_i` the position and `e_i` the excess return, `sum p e = n (mean(p) mean(e) + cov(p, e))`: in a rising training sample a book earns the first term by being long, with no timing skill. `--cash-return m` removes a constant drift; it cannot remove a market that rises in one block and falls in the next. `--pnl-excess none|xs-mean` (default `none`, the book above bit for bit) chooses the benchmark of the fitness excess:
+
+```text
+none     e_i = r_i - funding_i - cash_return
+xs-mean  e_i = (r_i - m_t) - funding_i      m_t = mean of r_j over the book's rows j with t_j = t_i
+```
+
+* `m_t` is the equal-weight mean of the finite returns of the training rows at the row's timestamp (exact time equality), summed in row order: the return of the equal-weight universe the book can trade. Under `--pnl-mask` the universe is the rows with the gate on, in the training book and in the masked validation and test books alike. A timestamp with one row gives that row a relative return of exactly 0 (its excess is `-funding`).
+* A book that holds every symbol or none at each timestamp earns no gross under `xs-mean`, so a pure market-timing tree never scores below 1 (`xs_mean_removes_common_drift`); a symbol that beats its cross-section scores its relative edge (`xs_mean_rewards_relative_edge`).
+* The hindsight bound, every `--pnl-blocks` block bound, the interval segments of `--split temporal-intervals` and the mask on-runs are all taken on the same excess (`xs_mean_bound_matches_brute_force`, `xs_mean_composes_with_the_mask_and_interval_segments`). A training slice or block with no profitable path exits 2, for example a panel with one symbol, where every relative return is 0.
+* Needs `--fitness pnl` and `--cash-return 0` (exit 2 otherwise): the benchmark is the cross-section, never a cash or interest rate. `rcsr switch` and `rcsr compose` exit 2 on the flag: they price the absolute book.
+* The fitness alone changes. The validation and test books, `--select-rule robust`, the finalist choice and walk-forward keep the absolute net; `walkforward --from-run` of an `xs-mean` run reproduces `objective.test.net_pnl` (`xs_mean_reports_absolute_net`). The positions stay long-only.
+* `objective.validation` and `objective.test` gain `xs_excess_net` beside `net_pnl`: the net minus `sum_t p_t m_t`, with `m_t` the timestamp mean of the usable rows of that slice (a row without a score still counts in the mean). Under the missing-score rule of the book it is the net of the same book on `r - m` (`xs_excess_net_is_the_net_over_the_timestamp_mean`); on training rows it equals the fitness net.
+* The device scores the excess the CPU built and uploaded, so a `--gpu` run ranks on the same excess; `device_xs_mean_parity` checks the totals and the regret bit for bit on the device's own `f32` predictions.
+* The mode enters the book hash: a resume with another `--pnl-excess` exits 2. `--json`: `search_fitness.excess` and `objective.spec.pnl_excess` (`xs_mean`), and `xs_excess_net`; all are omitted under `none`, so a run without the flag is byte-identical.
+
 #### The seam identity of a two-branch gate (`rcsr switch`, #1185)
 
 A composite `if(greater(g, c), A, B)` of two fixed books holds `A` on the rows whose gate value is above `c` and `B` on the others. Let `masked_a` be the book that holds `A` on the rows in state `A` and is flat elsewhere, every run of those rows starting flat and paying its exit (the `--pnl-mask` book of `A` under that state), and `masked_b` likewise for `B`. The gross terms add up. At a row pair of one book run whose state changes, with `a` the position of the row in state `A` and `b` that of the row in state `B`, the masked books pay `side (a + b)` and the composite pays `side [a != b] = side (a + b - 2 a b)`. Every other pair costs the same in both. Hence
