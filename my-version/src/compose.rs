@@ -662,46 +662,56 @@ struct Regime {
     total_cost: f64,
 }
 
-/// Splits the book of `pred` on `slice` by gate state. Each state part is the
-/// book that holds the composite's position on the rows of that state and is
-/// flat elsewhere, priced by the book code; `seam` is the composite net minus
-/// both parts (`2 side J` of the seam identity). A state's alpha is its net
-/// minus its exposure times the buy-and-hold book of its rows. A period is in
-/// the state most of its rows hold; the switch cost is the cost of the
-/// position changes in the periods where that state changes.
+/// A score the book holds flat, and one it holds long.
+fn flat_score(spec: &TradingSpec) -> f64 {
+    spec.threshold - 1.0 - spec.threshold.abs()
+}
+
+fn long_score(spec: &TradingSpec) -> f64 {
+    spec.threshold + 1.0 + spec.threshold.abs()
+}
+
+/// Splits the book of `pred` on `slice` by gate state. The book of a state
+/// holds the composite's score on the rows of that state and a flat score
+/// elsewhere, with the composite's missing scores, priced by the book code;
+/// `seam` is the composite net minus both (`2 side J` of the seam identity). A
+/// state's alpha is its net minus its exposure times the net of the
+/// buy-and-hold book of its rows. A period is in the state most of its priced
+/// rows hold; the switch cost is the cost of the position changes in the
+/// periods where that state changes.
 fn regime(pred: &[f64], on: &[bool], slice: &TradingSlice, spec: &TradingSpec, book: &PathStats) -> Result<Regime, String> {
     let r = &slice.rows;
-    let keep: Vec<usize> = (0..pred.len())
-        .filter(|&i| pred[i].is_finite() && slice.ret[i].is_finite() && r.time[i].is_finite() && (r.funding.is_empty() || r.funding[i].is_finite()))
+    let mut cand: Vec<usize> = (0..pred.len())
+        .filter(|&i| slice.ret[i].is_finite() && r.time[i].is_finite() && (r.funding.is_empty() || r.funding[i].is_finite()))
         .collect();
-    if keep.is_empty() {
+    cand.sort_by(|&a, &b| r.group[a].cmp(&r.group[b]).then(r.time[a].total_cmp(&r.time[b])).then(a.cmp(&b)));
+    let books: Vec<(u64, usize)> = cand.iter().map(|&i| (r.group[i], spec.segment_starts.partition_point(|s| *s <= r.time[i]))).collect();
+    let scored: Vec<bool> = cand.iter().map(|&i| pred[i].is_finite()).collect();
+    let runs = trading::score_runs(&books, &scored, spec.missing_score);
+    let mut pos: Vec<f64> = cand.iter().map(|&i| if pred[i].is_finite() { trading::position_of(pred[i], spec) } else { 0.0 }).collect();
+    trading::hold_positions(&books, &scored, &mut pos, |_| 0.0);
+    let priced: Vec<usize> = (0..cand.len()).filter(|&k| runs.run[k].is_some()).collect();
+    if priced.is_empty() {
         return Err("no usable rows".to_string());
     }
-    let rows = TradingRows {
-        time: keep.iter().map(|&i| r.time[i]).collect(),
-        group: keep.iter().map(|&i| r.group[i]).collect(),
-        funding: if r.funding.is_empty() { Vec::new() } else { keep.iter().map(|&i| r.funding[i]).collect() },
-    };
-    let ret: Vec<f64> = keep.iter().map(|&i| slice.ret[i]).collect();
-    let pos: Vec<f64> = keep.iter().map(|&i| trading::position_of(pred[i], spec)).collect();
-    let st: Vec<bool> = keep.iter().map(|&i| on[i]).collect();
-    let n = keep.len();
+    let n = priced.len();
+    let (flat, long) = (flat_score(spec), long_score(spec));
     let part = |state: bool| -> Result<StatePart, String> {
-        let mine: Vec<f64> = (0..n).map(|k| if st[k] == state { pos[k] } else { 0.0 }).collect();
-        let held: Vec<f64> = (0..n).map(|k| if st[k] == state { 1.0 } else { 0.0 }).collect();
-        let count = st.iter().filter(|&&s| s == state).count();
-        if count == 0 {
+        let rows = priced.iter().filter(|&&k| on[cand[k]] == state).count();
+        if rows == 0 {
             return Ok(StatePart { rows: 0, net: 0.0, exposure: f64::NAN, bh_net: 0.0, alpha: 0.0 });
         }
-        let net = trading::evaluate_positions(&mine, &ret, &rows, spec)?.net_pnl;
-        let bh_net = trading::evaluate_positions(&held, &ret, &rows, spec)?.net_pnl;
-        let exposure = mine.iter().sum::<f64>() / count as f64;
-        Ok(StatePart { rows: count, net, exposure, bh_net, alpha: net - exposure * bh_net })
+        let pick = |v: f64| -> Vec<f64> { (0..pred.len()).map(|i| if !pred[i].is_finite() { pred[i] } else if on[i] == state { if v.is_nan() { pred[i] } else { v } } else { flat }).collect() };
+        let net = trading::evaluate(&pick(f64::NAN), &slice.ret, r, spec)?.net_pnl;
+        let bh_net = trading::evaluate(&pick(long), &slice.ret, r, spec)?.net_pnl;
+        let exposure = priced.iter().filter(|&&k| on[cand[k]] == state).map(|&k| pos[k]).sum::<f64>() / rows as f64;
+        Ok(StatePart { rows, net, exposure, bh_net, alpha: net - exposure * bh_net })
     };
     let (on_part, off_part) = (part(true)?, part(false)?);
     let bucket = spec.period_seconds.filter(|s| *s > 0.0);
     let key = |t: f64| bucket.map_or(t, |s| (t / s).floor());
-    let row_key: Vec<f64> = rows.time.iter().map(|&t| key(t)).collect();
+    let row_key: Vec<f64> = priced.iter().map(|&k| key(r.time[cand[k]])).collect();
+    let st: Vec<bool> = priced.iter().map(|&k| on[cand[k]]).collect();
     let mut period_key = row_key.clone();
     period_key.sort_by(|a, b| a.total_cmp(b));
     period_key.dedup_by(|a, b| *a == *b);
@@ -711,15 +721,13 @@ fn regime(pred: &[f64], on: &[bool], slice: &TradingSlice, spec: &TradingSpec, b
         let p = period_key.partition_point(|x| *x < k);
         p > 0 && p < states.len() && states[p] != states[p - 1]
     };
-    let mut order: Vec<usize> = (0..n).collect();
-    let seg = |k: usize| spec.segment_starts.partition_point(|s| *s <= rows.time[k]);
-    order.sort_by(|&a, &b| rows.group[a].cmp(&rows.group[b]).then(seg(a).cmp(&seg(b))).then(rows.time[a].total_cmp(&rows.time[b])).then(a.cmp(&b)));
     let side = spec.per_side_bps() * 1e-4;
-    let mut prev: HashMap<(u64, usize), f64> = HashMap::new();
+    let mut prev: HashMap<(u64, usize, u32), f64> = HashMap::new();
     let mut switch_cost = 0.0f64;
-    for &k in &order {
-        let p = prev.insert((rows.group[k], seg(k)), pos[k]).unwrap_or(0.0);
-        if flip_at(row_key[k]) {
+    for (j, &k) in priced.iter().enumerate() {
+        let run = runs.run[k].expect("a priced row has a run");
+        let p = prev.insert((books[k].0, books[k].1, run), pos[k]).unwrap_or(0.0);
+        if flip_at(row_key[j]) {
             switch_cost += side * (pos[k] - p).abs();
         }
     }
