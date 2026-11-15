@@ -539,7 +539,7 @@ fn block_flags_name_their_reason() {
     let spec = write_spec(&dir);
     usage_error(&run(&data, &spec, &["--pnl-blocks", "4"]), "--pnl-blocks needs --fitness pnl");
     usage_error(&run(&data, &spec, &["--pnl-block-lambda", "2"]), "--pnl-block-lambda needs --fitness pnl");
-    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-blocks", "9"]), "--pnl-blocks must be");
+    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-blocks", "65"]), "--pnl-blocks must be");
     usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-blocks", "0"]), "--pnl-blocks must be");
     usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-block-lambda", "-1"]), "--pnl-block-lambda must be");
     usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-block-lambda", "nan"]), "--pnl-block-lambda must be");
@@ -559,6 +559,133 @@ fn resume_needs_the_same_blocks() {
     assert_eq!(members(&straight), members(&resumed));
     let other = run(&data, &spec, &["--fitness", "pnl", "--pnl-blocks", "4", "--generations", "20", "--resume", &cp]);
     usage_error(&other, "fitness");
+}
+
+// ---- #1178: up to 64 blocks and the block statistic ----
+
+fn block_regrets(m: &Json) -> Vec<f64> {
+    match at(m, &["fitness", "block_regret"]) {
+        Json::Arr(a) => a.iter().map(|v| v.as_f64().unwrap()).collect(),
+        _ => panic!("block_regret is not an array"),
+    }
+}
+
+#[test]
+fn block_stat_flags_name_their_reason() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, 900);
+    let spec = write_spec(&dir);
+    usage_error(&run(&data, &spec, &["--pnl-stat", "cvar"]), "--pnl-stat needs --fitness pnl");
+    usage_error(&run(&data, &spec, &["--pnl-cvar-q", "0.5"]), "--pnl-cvar-q needs --fitness pnl");
+    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-stat", "median"]), "--pnl-stat must be mean-sd, mean-semi or cvar");
+    for q in ["0", "-0.1", "1.5", "nan", "x"] {
+        usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-stat", "cvar", "--pnl-cvar-q", q]), "--pnl-cvar-q must be");
+    }
+    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-cvar-q", "0.5"]), "--pnl-cvar-q needs --pnl-stat cvar");
+    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-stat", "mean-semi", "--pnl-cvar-q", "0.5"]), "--pnl-cvar-q needs --pnl-stat cvar");
+    usage_error(
+        &run(&data, &spec, &["--fitness", "pnl", "--pnl-stat", "cvar", "--pnl-block-lambda", "2"]),
+        "--pnl-block-lambda has no effect under --pnl-stat cvar",
+    );
+    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-blocks", "65"]), "--pnl-blocks must be an integer from 1 to 64");
+    // 80 rows leave fewer than 64 distinct training timestamps.
+    let short = write_csv_rows(&dir, 900, 80);
+    usage_error(&run(&short, &spec, &["--fitness", "pnl", "--pnl-blocks", "64"]), "distinct training timestamps");
+}
+
+/// The acceptance run: 48 blocks, 20 generations, `search_fitness.stat`, and
+/// every member's fitness is the statistic of its 48 block regrets.
+#[test]
+fn k48_search_writes_the_stat() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv_rows(&dir, 900, 2000);
+    let spec = write_spec(&dir);
+    for (extra, stat) in [
+        (&["--pnl-blocks", "48"][..], "mean-sd"),
+        (&["--pnl-blocks", "48", "--pnl-stat", "mean-semi", "--pnl-block-lambda", "2"][..], "mean-semi"),
+        (&["--pnl-blocks", "48", "--pnl-stat", "cvar", "--pnl-cvar-q", "0.25"][..], "cvar"),
+    ] {
+        let j = json(&run(&data, &spec, &[&["--fitness", "pnl"][..], extra].concat()));
+        assert_eq!(num(&j, &["generations_run"]), 20.0, "{stat}");
+        let f = at(&j, &["search_fitness"]);
+        assert_eq!(f.get("stat").and_then(Json::as_str), Some(stat));
+        assert_eq!(num(f, &["blocks"]), 48.0);
+        match at(f, &["block_bounds"]) {
+            Json::Arr(a) => assert!(a.len() == 48 && a.iter().all(|v| v.as_f64().unwrap() > 0.0)),
+            _ => panic!("block_bounds is not an array"),
+        }
+        assert_eq!(f.get("cvar_q").and_then(Json::as_f64), (stat == "cvar").then_some(0.25), "{stat}");
+        let lambda = num(f, &["lambda"]);
+        let mut finite = 0;
+        for m in pareto(&j) {
+            let r = block_regrets(m);
+            assert_eq!(r.len(), 48);
+            let fit = num(m, &["fitness", "train_regret"]);
+            let mean = r.iter().sum::<f64>() / 48.0;
+            let want = match stat {
+                "mean-sd" => mean + lambda * (r.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / 47.0).sqrt(),
+                "mean-semi" => mean + lambda * (r.iter().map(|v| (v - 1.0).max(0.0).powi(2)).sum::<f64>() / 48.0).sqrt(),
+                _ => {
+                    let mut s = r.clone();
+                    s.sort_by(|a, b| b.total_cmp(a));
+                    s[..12].iter().sum::<f64>() / 12.0
+                }
+            };
+            assert!((fit - want).abs() <= 1e-9, "{stat}: {fit} vs {want}");
+            finite += 1;
+        }
+        assert!(finite > 0, "{stat}: an empty front");
+    }
+}
+
+#[test]
+fn block_stat_search_is_thread_invariant() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv_rows(&dir, 900, 2000);
+    let spec = write_spec(&dir);
+    let args = ["--fitness", "pnl", "--pnl-blocks", "20", "--pnl-stat", "cvar", "--pnl-cvar-q", "0.3"];
+    let one = json(&run(&data, &spec, &[&args[..], &["--threads", "1"]].concat()));
+    let four = json(&run(&data, &spec, &[&args[..], &["--threads", "4"]].concat()));
+    assert_eq!(members(&one), members(&four));
+}
+
+/// A run without the new flags reports no `stat`, and `--pnl-stat mean-sd`
+/// spelled out is that run.
+#[test]
+fn explicit_mean_sd_is_the_default_run() {
+    let (_scratch, dir) = scratch();
+    let data = write_regime_csv(&dir);
+    let spec = write_spec(&dir);
+    for blocks in ["1", "4", "8"] {
+        let plain = run(&data, &spec, &["--fitness", "pnl", "--pnl-blocks", blocks]);
+        let spelled = run(&data, &spec, &["--fitness", "pnl", "--pnl-blocks", blocks, "--pnl-stat", "mean-sd"]);
+        let (a, b) = (json(&plain), json(&spelled));
+        assert_eq!(members(&a), members(&b), "{blocks} blocks");
+        let (fa, fb) = (at(&a, &["search_fitness"]), at(&b, &["search_fitness"]));
+        assert_eq!(fa.get("book_hash"), fb.get("book_hash"));
+        assert!(fa.get("stat").is_none() && fa.get("cvar_q").is_none(), "{blocks} blocks");
+        assert_eq!(without_digits(&plain), without_digits(&spelled), "{blocks} blocks");
+    }
+}
+
+/// A resume with another block count, statistic or q exits 2.
+#[test]
+fn book_hash_covers_block_stat() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv_rows(&dir, 900, 2000);
+    let spec = write_spec(&dir);
+    let cp = dir.join("stat.rcsr").to_string_lossy().into_owned();
+    let saved = ["--fitness", "pnl", "--pnl-blocks", "12", "--pnl-stat", "cvar", "--pnl-cvar-q", "0.25"];
+    let first = run(&data, &spec, &[&saved[..], &["--generations", "10", "--save", &cp]].concat());
+    assert_eq!(code(&first), 0, "{}", stderr(&first));
+    let straight = json(&run(&data, &spec, &[&saved[..], &["--generations", "20"]].concat()));
+    let resumed = json(&run(&data, &spec, &[&saved[..], &["--generations", "20", "--resume", &cp]].concat()));
+    assert_eq!(members(&straight), members(&resumed));
+    let resume = |extra: &[&str]| run(&data, &spec, &[&["--fitness", "pnl", "--generations", "20", "--resume", &cp][..], extra].concat());
+    usage_error(&resume(&["--pnl-blocks", "10", "--pnl-stat", "cvar", "--pnl-cvar-q", "0.25"]), "fitness");
+    usage_error(&resume(&["--pnl-blocks", "12", "--pnl-stat", "mean-semi"]), "fitness");
+    usage_error(&resume(&["--pnl-blocks", "12", "--pnl-stat", "cvar", "--pnl-cvar-q", "0.5"]), "fitness");
+    usage_error(&resume(&["--pnl-blocks", "12"]), "fitness");
 }
 
 #[test]

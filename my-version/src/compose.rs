@@ -548,9 +548,9 @@ USAGE:
   run's pruning, bits and code kept); the split must match the run (exit 2).
 
   A band, a minimum hold, --threshold, --position, --book-target, --pnl-mask,
-  --pnl-excess and --gpu exit 2. A pool run whose member carries a switch exits
-  2 (nested switch); a run with compose.gate.carried and no switch exits 3. See
-  docs/compose.md.
+  --pnl-excess, --pnl-stat, --pnl-cvar-q and --gpu exit 2. A pool run whose
+  member carries a switch exits 2 (nested switch); a run with
+  compose.gate.carried and no switch exits 3. See docs/compose.md.
 "
 }
 
@@ -619,6 +619,7 @@ fn claim_with(args: &[String], reselect: Option<&str>) -> Vec<String> {
                 fail(&format!("{}: a composite prices the unmasked branches under its own gate; the masks belong to the pool searches", flag))
             }
             "--pnl-excess" => fail("--pnl-excess: a composite is priced on the absolute long/flat book"),
+            "--pnl-stat" | "--pnl-cvar-q" => fail(&format!("{}: a composite is priced on the net of its long/flat book, not on a block statistic", flag)),
             "--threshold" | "--position" | "--book-target" | "--band" | "--band-units" | "--min-holding" | "--max-position" | "--cash-return" | "--funding" => fail(&format!(
                 "{}: a composite is the unit long/flat book at threshold 0; each branch carries its run's threshold",
                 flag

@@ -1458,23 +1458,36 @@ every group, and every --pnl-blocks block, starts flat; the final exit of a run 
 
 #### `--pnl-blocks K`: a time-block consistency term
 
-`--pnl-blocks K` (1 to 8, default 1 = off) and `--pnl-block-lambda L` (finite, `>= 0`, default 1.0) need `--fitness pnl` and exit 2 without it. With `K = 1` the fitness is the regret above bit for bit: the book, the archive and `run.json` do not change.
+`--pnl-blocks K` (1 to 64, default 1 = off) and `--pnl-block-lambda L` (finite, `>= 0`, default 1.0) need `--fitness pnl` and exit 2 without it. With `K = 1` and the default statistic the fitness is the regret above bit for bit: the book, the archive and `run.json` do not change.
 
 With `K > 1` the sorted distinct training timestamps are cut into `K` runs of equal count (the last takes the remainder), so equal timestamps never straddle a cut. Every `(group, block)` run is its own long/flat book: the first row of a block inside a group starts flat, its last row pays the exit. Per block `k`:
 
 ```text
 net_k     = gross_k - c_side * (flips_k + exits_k)
 B_k       = hindsight DP bound on the rows of block k (runs are (group, block))
-regret_k  = (B_k - net_k) / B_k
-fitness   = mean_k(regret_k) + L * sd_k(regret_k)       (sample sd, ddof 1)
+regret_k  = (B_k - net_k) / B_k = 1 - c_k        (c_k = net_k / B_k, the capture of block k)
+fitness   = stat_k(regret_k)                      (--pnl-stat, below)
 ```
 
+`--pnl-stat` (#1178, default `mean-sd`) picks the statistic of the block regrets:
+
+| `--pnl-stat` | fitness | reads |
+|---|---|---|
+| `mean-sd` | `mean(r) + L * sd(r)` (sample sd, ddof 1; one block is the plain regret) | dispersion of the captures, a Sharpe-like trade-off |
+| `mean-semi` | `mean(r) + L * sqrt(mean_k(max(r_k - 1, 0)^2))` | only blocks that lose against cash (`c_k < 0`) cost, a Sortino-like trade-off |
+| `cvar` | the mean of the `m = ceil(q K)` largest `r_k` (`--pnl-cvar-q q`, default 0.25) | the worst captures, a CVaR of the blocks |
+
 * A formula that earns everything in one block and loses in the others scores worse than one that wins moderately everywhere. `L = 0` is the equal-weight mean of the block regrets.
+* `mean-semi` with no losing block is `mean(r)` exactly. Its downside term is taken on the regrets, `max(r_k - 1, 0) = -min(c_k, 0)`.
+* `cvar` chooses the `m` largest regrets with ties to the lower block index and sums them in block order, so `q = 1` is the mean bit for bit (`cvar_q1_is_the_mean`). `q K` within `1e-9` of an integer counts as that integer (`q = 0.3` of 10 blocks is 3), and `m >= 1`. `--pnl-cvar-q` outside `(0, 1]` or without `--pnl-stat cvar`, and `--pnl-block-lambda` under `cvar`, exit 2. A pure worst-block statistic (`m = 1`) has a degenerate optimum for a long-only book: the flat book scores 0 capture in every block, so prefer a share of several blocks.
+* The statistics apply to any `K` from 1 to 64; with one block `cvar` is the regret and `mean-semi` the regret plus `L * max(r - 1, 0)`.
+* **Many blocks and lambda.** `mean-sd` beats the all-flat fitness 1 exactly when `mean(c) > L * sd(c)`, that is when the one-sample t statistic of the block captures `sqrt(K) mean(c) / sd(c)` exceeds `L sqrt(K)`. So `--pnl-blocks 48 --pnl-block-lambda 1` asks for `t > 6.9`, a much stricter test than `--pnl-blocks 4 --pnl-block-lambda 1` (`t > 2`), not a finer version of it. `L = t / sqrt(K)` keeps the test level `t` across block counts: about `2 / sqrt(K)` (`0.29` at 48 blocks, `0.25` at 64). The same statistic is the chi-square distributionally robust mean over block weights (Duchi and Namkoong, "Variance-based regularization with convex objectives", JMLR 20, 2019), so `L` also sets the radius of the block-weight uncertainty.
 * A block with `B_k <= 0`, fewer distinct timestamps than blocks, or an invalid flag exits 2 with the reason. A group absent from a block adds nothing to it.
-* A non-finite prediction, a non-finite block regret, or fewer than `--min-trades` flips summed over the blocks scores `+inf`.
-* Each block keeps the fixed 8,192-row segment, 32-lane, 8-warp tree for its own `gross`. The device runs the same trees per block (counts from ballots restricted to the block's rows) and computes the fitness with `_rn` intrinsics in the order above, so it equals the CPU on the device's own `f32` predictions bit for bit. Results do not depend on `--threads`.
-* The block count, `L` and every `B_k` enter the book hash; resuming with other values exits 2.
-* `--json` `search_fitness` gains `blocks`, `lambda` and `block_bounds` (only when `K > 1`), and each Pareto member's `fitness` gains `block_regret` (the regret of each block; `train_regret` is the fitness, `train_net`, `train_flips` and `train_exits` sum the blocks).
+* A non-finite prediction, a non-finite block regret, or fewer than `--min-trades` flips summed over the blocks scores `+inf` under every statistic (`inf_rules_hold_under_every_statistic`). The search book prices no missing score: `--missing-score` belongs to the walk-forward book.
+* Each block keeps the fixed 8,192-row segment, 32-lane, 8-warp tree for its own `gross`. Up to 8 blocks the block id sits in the flags byte; with more, the book keeps one id byte per row beside the flags (`FitnessBook::block_ids`). The device runs the same trees per block (counts from ballots restricted to the block's rows) and computes the statistic with `_rn` intrinsics in the CPU order (`trading::block_stat`), so it equals the CPU on the device's own `f32` predictions bit for bit for every `K` and statistic (`device_block_stat_parity`). Results do not depend on `--threads`.
+* Interval segments (`--split-table`) and `--pnl-mask` compose with any block count: every block of a segmented or masked book equals its rows priced as a separate book with the same segments and mask (`wide_blocks_compose_with_segments_and_a_mask`).
+* The block count, `L`, every `B_k`, the block ids above 8 blocks, the statistic and its `q` enter the book hash; resuming with other values exits 2 (`book_hash_covers_block_stat`).
+* `--json` `search_fitness` gains `blocks`, `lambda` and `block_bounds` when `K > 1` or the statistic is not `mean-sd`, and `stat` (and `cvar_q` under `cvar`) when the statistic is not `mean-sd` or `K > 8`; a run without `--pnl-stat` and with at most 8 blocks reports exactly what it did before. Each Pareto member's `fitness` gains `block_regret` (the regret of each block; `train_regret` is the fitness, `train_net`, `train_flips` and `train_exits` sum the blocks) under the same condition as `blocks`.
 * The blocks are a ranking term inside one training period. They do not refit constants per block; the walk-forward of the front is the out-of-sample test.
 
 #### `--pnl-mask`: regime-masked fitness for specialists
