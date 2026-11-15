@@ -57,7 +57,13 @@ A missing or extra split report, a report of no split, reset_flat not true, or r
 in cost, purge, annualization, threshold rule, policy, period grid rule (pooled.grid.rule), missing-score rule\n\
 (book.missing_score) or a group's\n\
 period grid exit 2 naming the split or field. Target-grid reports add pooled.grid and pooled.period_rows\n\
-to every path and the empty periods per path and per group to the summary.\n\
+to every path and the empty periods per path and per group to the summary. Each of pooled.period_gross,\n\
+period_exposure, period_entries, period_bh, period_cost, period_entry_stamp and period_bh_net that the reports\n\
+carry (walkforward --period-series or --emit-series, #1236) goes into every path as the concatenation of the\n\
+chosen group series, and pooled.entry_times as the sum of the chosen groups' windows[].entry_times, so --table\n\
+gates paths on net at m x cost, exposure, entry_times and alpha_bh. A field on some reports only, a series of\n\
+another length than period_net or with a non-finite value, pooled.entry_times without windows[].entry_times, or\n\
+window counts that do not sum to pooled.entry_times exit 2 naming the field and the report.\n\
 \n\
 Campaign (--wf):\n\
   --wf <files...>        walk-forward --json reports with identical windows, cost, threshold rule (threshold.quantile, threshold.fixed,\n\

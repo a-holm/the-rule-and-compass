@@ -802,11 +802,18 @@ fn series(j: &Json, path: &[&str], file: &str) -> Result<Vec<f64>, Fail> {
         .collect()
 }
 
+/// #1236: the per-period series a path carries from its split reports, in the order of the
+/// walk-forward pooled block.
+const PATH_SERIES: [&str; 7] =
+    ["period_gross", "period_exposure", "period_entries", "period_bh", "period_cost", "period_entry_stamp", "period_bh_net"];
+
 struct Window {
     test: (i64, i64),
     entries: Option<f64>,
     active_rows: Option<f64>,
     expression: Option<String>,
+    /// #1236: `windows[].entry_times` of `walkforward --emit-series`.
+    entry_times: Option<f64>,
 }
 
 struct SplitReport {
@@ -818,6 +825,10 @@ struct SplitReport {
     net: Vec<f64>,
     /// #1199: `pooled.period_rows` of a target-grid report; `None` for the score grid.
     rows: Option<Vec<f64>>,
+    /// #1236: `pooled.<PATH_SERIES[k]>` when the report has it, as long as `net`.
+    extra: Vec<Option<Vec<f64>>>,
+    /// #1236: `pooled.entry_times`; the window counts sum to it.
+    entry_times: Option<f64>,
 }
 
 fn whole(x: Option<f64>) -> Option<i64> {
@@ -854,14 +865,92 @@ fn load_report(path: &str) -> Result<SplitReport, Fail> {
             return usage(format!("field 'window_definition'[{}] has no whole-second test_start and test_end in {}", i, path));
         };
         let w = per.get(i);
+        let entry_times = match w.and_then(|w| w.get("entry_times")) {
+            None => None,
+            Some(v) => match v.as_f64() {
+                Some(x) if x.is_finite() => Some(x),
+                _ => return usage(format!("field 'windows[].entry_times' of window {} is not a finite number in {}", i, path)),
+            },
+        };
         windows.push(Window {
             test: (a, b),
             entries: w.and_then(|w| at(w, &["metrics", "entries"])).and_then(Json::as_f64),
             active_rows: w.and_then(|w| at(w, &["metrics", "active_rows"])).and_then(Json::as_f64),
             expression: w.and_then(|w| w.get("expression")).and_then(Json::as_str).map(str::to_string),
+            entry_times,
         });
     }
-    Ok(SplitReport { path: path.to_string(), sha256: crate::manifest::sha256_hex(text.as_bytes()), json, windows, time, net, rows })
+    let mut extra = Vec::with_capacity(PATH_SERIES.len());
+    for key in PATH_SERIES {
+        if at(&json, &["pooled", key]).is_none() {
+            extra.push(None);
+            continue;
+        }
+        let v = series(&json, &["pooled", key], path)?;
+        if v.len() != net.len() {
+            return usage(format!("field 'pooled.{}' has {} values but 'pooled.period_net' has {} in {}", key, v.len(), net.len(), path));
+        }
+        extra.push(Some(v));
+    }
+    let entry_times = entry_count(&json, &windows, path)?;
+    Ok(SplitReport { path: path.to_string(), sha256: crate::manifest::sha256_hex(text.as_bytes()), json, windows, time, net, rows, extra, entry_times })
+}
+
+/// #1236: `pooled.entry_times` of a report. A report with it gives every window its count
+/// (`windows[].entry_times`) and the counts sum to it; a report without it has no window count.
+fn entry_count(json: &Json, windows: &[Window], path: &str) -> Result<Option<f64>, Fail> {
+    let total = match at(json, &["pooled", "entry_times"]) {
+        None => None,
+        Some(v) => match v.as_f64() {
+            Some(x) if x.is_finite() => Some(x),
+            _ => return usage(format!("field 'pooled.entry_times' is not a finite number in {}", path)),
+        },
+    };
+    let Some(total) = total else {
+        if windows.iter().any(|w| w.entry_times.is_some()) {
+            return usage(format!("field 'pooled.entry_times' is missing in {} although its windows carry windows[].entry_times", path));
+        }
+        return Ok(None);
+    };
+    if let Some(i) = windows.iter().position(|w| w.entry_times.is_none()) {
+        return usage(format!(
+            "field 'windows[].entry_times' is missing on window {} in {}, which has pooled.entry_times: a path splits the count by group \
+(rerun walkforward --emit-series with this build)",
+            i, path
+        ));
+    }
+    let sum: f64 = windows.iter().filter_map(|w| w.entry_times).sum();
+    if sum != total {
+        return usage(format!("field 'windows[].entry_times' sums to {} but 'pooled.entry_times' is {} in {}", jnum(sum), jnum(total), path));
+    }
+    Ok(Some(total))
+}
+
+/// The first index that holds a field and the first that lacks it, when both exist.
+fn mixed(has: &[bool]) -> Option<(usize, usize)> {
+    Some((has.iter().position(|&h| h)?, has.iter().position(|&h| !h)?))
+}
+
+/// #1236: a carried field comes from every split report or from none, so no path holds a series
+/// on part of its groups.
+fn require_all_or_none(reports: &[SplitReport]) -> Result<(), Fail> {
+    let series = PATH_SERIES.iter().enumerate().map(|(k, key)| (format!("pooled.{}", key), reports.iter().map(|r| r.extra[k].is_some()).collect::<Vec<_>>()));
+    let count = std::iter::once(("pooled.entry_times".to_string(), reports.iter().map(|r| r.entry_times.is_some()).collect::<Vec<_>>()));
+    for (field, has) in series.chain(count) {
+        if let Some((a, b)) = mixed(&has) {
+            return usage(format!(
+                "field '{}' is in {} but missing in {}: the split reports of one assembly carry it in every report or in none \
+(price every split with the same walkforward --period-series or --emit-series)",
+                field, reports[a].path, reports[b].path
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `v` at the indices `idx`, in order.
+fn take(v: &[f64], idx: &[usize]) -> Vec<f64> {
+    idx.iter().map(|&i| v[i]).collect()
 }
 
 /// The guarded fields of `rcsr trials`, without `window_definition` (it differs per split by design).
@@ -896,6 +985,26 @@ struct BuiltPath {
     /// #1199: priced rows per period and empty periods per group, for target-grid reports.
     rows: Vec<f64>,
     group_empty: Vec<usize>,
+    /// #1236: the carried series (`PATH_SERIES[k]`), `None` when the reports lack it.
+    extra: Vec<Option<Vec<f64>>>,
+    /// #1236: entry times of the path and of each group, when the reports carry them.
+    entry_times: Option<f64>,
+    group_entry_times: Vec<Option<f64>>,
+}
+
+/// #1236: the carried series and `entry_times` of a path, in the order of the walk-forward
+/// pooled block; empty when the split reports carry none.
+fn path_series_json(p: &BuiltPath) -> String {
+    let mut s = String::new();
+    for (key, v) in PATH_SERIES.iter().zip(&p.extra) {
+        if let Some(v) = v {
+            s.push_str(&format!(",\"{}\":[{}]", key, nums(v)));
+        }
+    }
+    if let Some(n) = p.entry_times {
+        s.push_str(&format!(",\"entry_times\":{}", jnum(n)));
+    }
+    s
 }
 
 fn sum(x: &[f64]) -> f64 {
@@ -1008,6 +1117,7 @@ pub fn assemble_cli(args: &[String]) -> Result<(), Fail> {
         }
         require_same(&reports[0], r)?;
     }
+    require_all_or_none(&reports)?;
     let ppy = at(&reports[0].json, &["annualization", "periods_per_year"]).and_then(Json::as_f64).unwrap_or(f64::NAN);
     // Group series of every split, as index lists into its pooled series.
     let mut parts: Vec<Vec<Vec<usize>>> = Vec::with_capacity(count);
@@ -1049,7 +1159,20 @@ pub fn assemble_cli(args: &[String]) -> Result<(), Fail> {
     let phi = scheme.paths();
     let paths: Vec<BuiltPath> = (0..phi)
         .map(|j| {
-            let mut p = BuiltPath { splits: Vec::with_capacity(n), time: Vec::new(), net: Vec::new(), group_net: Vec::new(), group_periods: Vec::new(), entries: Some(0.0), active_rows: Some(0.0), rows: Vec::new(), group_empty: Vec::new() };
+            let mut p = BuiltPath {
+                splits: Vec::with_capacity(n),
+                time: Vec::new(),
+                net: Vec::new(),
+                group_net: Vec::new(),
+                group_periods: Vec::new(),
+                entries: Some(0.0),
+                active_rows: Some(0.0),
+                rows: Vec::new(),
+                group_empty: Vec::new(),
+                extra: reports[0].extra.iter().map(|x| x.as_ref().map(|_| Vec::new())).collect(),
+                entry_times: reports[0].entry_times.map(|_| 0.0),
+                group_entry_times: Vec::with_capacity(n),
+            };
             for g in 0..n {
                 let s = assign[g][j];
                 p.splits.push(s);
@@ -1066,6 +1189,14 @@ pub fn assemble_cli(args: &[String]) -> Result<(), Fail> {
                 p.net.extend(net);
                 p.entries = p.entries.zip(window_sum(s, g, |w| w.entries)).map(|(a, b)| a + b);
                 p.active_rows = p.active_rows.zip(window_sum(s, g, |w| w.active_rows)).map(|(a, b)| a + b);
+                for (e, v) in p.extra.iter_mut().zip(&reports[s].extra) {
+                    if let (Some(e), Some(v)) = (e, v) {
+                        e.extend(take(v, idx));
+                    }
+                }
+                let times = p.entry_times.and(window_sum(s, g, |w| w.entry_times));
+                p.entry_times = p.entry_times.zip(times).map(|(a, b)| a + b);
+                p.group_entry_times.push(times);
             }
             p
         })
@@ -1092,7 +1223,7 @@ pub fn assemble_cli(args: &[String]) -> Result<(), Fail> {
                     .filter_map(|w| w.expression.as_deref().map(jstr))
                     .collect();
                 format!(
-                    "{{\"group\":{},\"start\":{},\"end\":{},\"split\":{},\"report\":{},\"report_sha256\":{},\"expression\":[{}],\"periods\":{},\"net\":{}}}",
+                    "{{\"group\":{},\"start\":{},\"end\":{},\"split\":{},\"report\":{},\"report_sha256\":{},\"expression\":[{}],\"periods\":{},\"net\":{}{}}}",
                     jstr(&label(g)),
                     scheme.groups[g].start(),
                     scheme.groups[g].end(),
@@ -1101,11 +1232,22 @@ pub fn assemble_cli(args: &[String]) -> Result<(), Fail> {
                     jstr(&r.sha256),
                     exprs.join(","),
                     p.group_periods[g],
-                    jnum(p.group_net[g])
+                    jnum(p.group_net[g]),
+                    p.group_entry_times[g].map_or(String::new(), |v| format!(",\"entry_times\":{}", jnum(v)))
                 )
             })
             .collect();
         let opt = |v: Option<f64>| v.map_or("null".to_string(), jnum);
+        let grid = if target {
+            format!(
+                ",\"grid\":{{\"rule\":\"target\",\"periods\":{},\"empty_periods\":{}}},\"period_rows\":[{}]",
+                p.net.len(),
+                p.group_empty.iter().sum::<usize>(),
+                nums(&p.rows)
+            )
+        } else {
+            String::new()
+        };
         let text = format!(
             "{{\"tool\":\"rcsr\",\"version\":{},\"mode\":\"cpcv_path\",\"schema\":{},\"window_definition\":{},\
 \"purge\":{},\"cost_model\":{},\"cost\":{},\"annualization\":{},\"threshold\":{},\"policy\":{},\"book\":{{\"missing_score\":{}}},\
@@ -1113,7 +1255,7 @@ pub fn assemble_cli(args: &[String]) -> Result<(), Fail> {
 \"cpcv\":{{\"scheme_sha256\":{},\"splits_sha256\":{},\"groups\":{},\"test_groups\":{},\"splits\":{},\"paths\":{},\"path\":{},\
 \"seam_rule\":{},\"segments\":[{}]}},\
 \"pooled\":{{\"sharpe\":{},\"max_drawdown\":{},\"net\":{},\"mean_return\":{},\"periods\":{},\"periods_per_year\":{},\
-\"entries\":{},\"active_rows\":{},\"period_net\":[{}],\"period_time\":[{}]{}}}}}\n",
+\"entries\":{},\"active_rows\":{},\"period_net\":[{}],\"period_time\":[{}]{}{}}}}}\n",
             jstr(env!("CARGO_PKG_VERSION")),
             jstr(PATH_SCHEMA),
             jstr(&scheme_sha),
@@ -1143,16 +1285,8 @@ pub fn assemble_cli(args: &[String]) -> Result<(), Fail> {
             opt(p.active_rows),
             nums(&p.net),
             nums(&p.time),
-            if target {
-                format!(
-                    ",\"grid\":{{\"rule\":\"target\",\"periods\":{},\"empty_periods\":{}}},\"period_rows\":[{}]",
-                    p.net.len(),
-                    p.group_empty.iter().sum::<usize>(),
-                    nums(&p.rows)
-                )
-            } else {
-                String::new()
-            }
+            grid,
+            path_series_json(p)
         );
         crate::atomic::write_text_atomic(dir.join(&files[j]), &text).map_err(|e| (3, e))?;
     }
@@ -1244,5 +1378,68 @@ pub fn assemble_cli(args: &[String]) -> Result<(), Fail> {
             print!("{}", summary);
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn window(entry_times: Option<f64>) -> Window {
+        Window { test: (0, 1), entries: None, active_rows: None, expression: None, entry_times }
+    }
+
+    #[test]
+    fn mixed_names_the_first_holder_and_the_first_gap() {
+        assert_eq!(mixed(&[]), None);
+        assert_eq!(mixed(&[true, true, true]), None);
+        assert_eq!(mixed(&[false, false]), None);
+        assert_eq!(mixed(&[true, true, false, false]), Some((0, 2)));
+        assert_eq!(mixed(&[false, true, false]), Some((1, 0)));
+    }
+
+    #[test]
+    fn take_concatenates_in_index_order() {
+        let a = [0.5, -1.0, 2.25, 4.0];
+        let b = [9.0, 8.0];
+        assert_eq!(take(&a, &[2, 3]), vec![2.25, 4.0]);
+        assert!(take(&a, &[]).is_empty());
+        assert_eq!([take(&a, &[0, 1]), take(&b, &[1])].concat(), vec![0.5, -1.0, 8.0]);
+    }
+
+    #[test]
+    fn entry_count_needs_every_window_and_their_sum() {
+        let with = |n: &str| Json::parse(&format!("{{\"pooled\":{{\"entry_times\":{n}}}}}")).unwrap();
+        let without = Json::parse("{\"pooled\":{}}").unwrap();
+        assert_eq!(entry_count(&with("5"), &[window(Some(2.0)), window(Some(3.0))], "r").unwrap(), Some(5.0));
+        assert_eq!(entry_count(&without, &[window(None)], "r").unwrap(), None);
+        let e = entry_count(&with("5"), &[window(Some(2.0)), window(None)], "r").unwrap_err();
+        assert!(e.0 == 2 && e.1.contains("'windows[].entry_times' is missing on window 1 in r"), "{}", e.1);
+        let e = entry_count(&with("6"), &[window(Some(2.0)), window(Some(3.0))], "r").unwrap_err();
+        assert!(e.0 == 2 && e.1.contains("sums to 5 but 'pooled.entry_times' is 6"), "{}", e.1);
+        let e = entry_count(&without, &[window(Some(2.0))], "r").unwrap_err();
+        assert!(e.0 == 2 && e.1.contains("'pooled.entry_times' is missing in r"), "{}", e.1);
+    }
+
+    #[test]
+    fn path_series_json_is_empty_without_series() {
+        let mut p = BuiltPath {
+            splits: Vec::new(),
+            time: Vec::new(),
+            net: Vec::new(),
+            group_net: Vec::new(),
+            group_periods: Vec::new(),
+            entries: None,
+            active_rows: None,
+            rows: Vec::new(),
+            group_empty: Vec::new(),
+            extra: vec![None; PATH_SERIES.len()],
+            entry_times: None,
+            group_entry_times: Vec::new(),
+        };
+        assert_eq!(path_series_json(&p), "");
+        p.extra[4] = Some(vec![0.25, 0.0]);
+        p.entry_times = Some(3.0);
+        assert_eq!(path_series_json(&p), ",\"period_cost\":[0.25,0],\"entry_times\":3");
     }
 }

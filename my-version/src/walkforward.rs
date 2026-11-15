@@ -623,6 +623,9 @@ pub struct WindowResult {
     pub train_last_time: Option<f64>,
     /// #1094: the fitted cut under `--threshold-fit fitness`.
     pub cut: Option<CutReport>,
+    /// #1236: under `--emit-series`, the distinct entry stamps of the window's pooled
+    /// book; the windows of a report sum to `pooled.entry_times`.
+    pub entry_times: Option<usize>,
 }
 
 /// #306: the band/cooldown book and its associative carry.
@@ -2398,6 +2401,7 @@ impl Accum {
                 hindsight_bound: ev.hindsight_bound,
                 band_selection,
                 cut,
+                entry_times: emit_series.then_some(pev.entry_times),
             });
         }
 
@@ -4566,6 +4570,10 @@ impl WindowResult {
         if self.in_sample {
             s.pop();
             s.push_str(",\"in_sample\":true}");
+        }
+        if let Some(n) = self.entry_times {
+            s.pop();
+            s.push_str(&format!(",\"entry_times\":{}}}", n));
         }
         s
     }

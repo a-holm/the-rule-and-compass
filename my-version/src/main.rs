@@ -11867,7 +11867,9 @@ OPTIONS:
                              so gross - m x cost is the net at m times the cost),
                              period_entry_stamp (1 when a row enters a long run),
                              period_bh_net (the buy-and-hold control of the same rows
-                             at the report cost) and entry_times (distinct entry stamps)
+                             at the report cost) and entry_times (distinct entry stamps),
+                             and windows[].entry_times (#1236: the window's share of
+                             entry_times; the windows sum to it)
   --all-members              #1176, with --front: also price every front member alone
                              with its own carried threshold and band, as --expr <member>
                              would, into members[] (archive_rank, complexity, expression,
