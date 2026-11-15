@@ -53,14 +53,16 @@ schema (pooled.period_time, pooled.period_net, window_definition = the CPCV sche
 --wf reads them) and the summary (rcsr-cpcv-summary/1: per-path net, Sharpe and max drawdown,\n\
 the path Sharpe distribution, the share of positive paths, per-group net) to --summary or stdout.\n\
 A missing or extra split report, a report of no split, reset_flat not true, or reports that differ\n\
-in cost, purge, annualization, threshold rule, policy, period grid rule (pooled.grid.rule) or a group's\n\
+in cost, purge, annualization, threshold rule, policy, period grid rule (pooled.grid.rule), missing-score rule\n\
+(book.missing_score) or a group's\n\
 period grid exit 2 naming the split or field. Target-grid reports add pooled.grid and pooled.period_rows\n\
 to every path and the empty periods per path and per group to the summary.\n\
 \n\
 Campaign (--wf):\n\
   --wf <files...>        walk-forward --json reports with identical windows, cost, threshold rule (threshold.quantile, threshold.fixed,\n\
                          threshold.fit, threshold.cut_min_entries, threshold.cut_blocks, threshold.cut_lambda), policy\n\
-                         and period grid (pooled.grid.rule, absent for the score grid, and pooled.period_time)\n\
+                         and period grid (pooled.grid.rule, absent for the score grid, and pooled.period_time) and missing-score\n\
+                         rule (book.missing_score, absent in a report of a build that carried the position)\n\
   --baseline <file>      rcsr ladder --emit-series report; the best of cash, buy_and_hold, constant_long_flat,\n\
                          best_single_feature and any trend rung by mean is the SPA benchmark\n\
   --baseline-rung <name> use this rung as the SPA benchmark instead\n\
@@ -109,10 +111,15 @@ pub(crate) const GUARDS: &[&[&str]] = &[
     &["policy", "band_width"],
     &["policy", "min_hold"],
     GRID_RULE,
+    MISSING_SCORE,
 ];
 
 /// #1199: the period grid rule of `walkforward --period-grid`; a report without it is the score grid.
 pub(crate) const GRID_RULE: &[&str] = &["pooled", "grid", "rule"];
+
+/// #1203: the missing-score rule of the book. A report without it was priced by a build that carried the position
+/// across a row with no finite score (`carry`), so it never mixes with a `flat` or `hold` report.
+pub(crate) const MISSING_SCORE: &[&str] = &["book", "missing_score"];
 
 /// The fitted-cut rule of `walkforward --threshold-fit` (#1094). Reports written without the flag, and before it
 /// existed, read all four as `null` and match each other. `--threshold-arms` skips these paths only.
@@ -252,6 +259,8 @@ fn require_same(a: &Wf, b: &Wf, arms: bool) -> Res<()> {
         if x != y {
             let hint = if FIT_GUARDS.contains(g) {
                 "; pass --threshold-arms to compare a fitted cut with a fixed cut"
+            } else if g == &MISSING_SCORE {
+                "; price every report with the same walkforward --missing-score (null is a report of a build that carried the position)"
             } else if g == &GRID_RULE {
                 "; price every report with the same walkforward --period-grid (null is the score grid)"
             } else {

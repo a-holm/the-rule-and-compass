@@ -1151,6 +1151,7 @@ pub fn procedure_spec(spec: &crate::walkforward::EvalSpec, o: &crate::walkforwar
         spec.periods_per_year,
         spec.band_select
     ));
+    s.push_str(&format!("missing_score={}\n", o.missing_score.name()));
     if spec.policy == crate::walkforward::Policy::Vote {
         s.push_str(&format!("quorum={:?}\n", o.quorum));
     }
