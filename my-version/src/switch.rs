@@ -21,7 +21,7 @@
 use crate::data::TradingSlice;
 use crate::devlog::{num, text};
 use crate::regime_gate::GateSpec;
-use crate::trading::{FitnessBook, FitnessTotals, TradingRows, FITNESS_BLOCK_SHIFT, FITNESS_MAX_BLOCKS};
+use crate::trading::{FitnessBook, FitnessTotals, TradingRows};
 use crate::trading_gpu::order_key_f64;
 
 /// Order key of a gate value: `None` for NaN; `-0.0` equals `+0.0`; `-inf` and
@@ -59,10 +59,6 @@ fn entry(out: &mut Vec<(u32, u32, u32)>, stamp: u32, lo: i64, hi: i64, on: bool)
     if on && lo <= hi {
         out.push((stamp, lo as u32, hi as u32));
     }
-}
-
-fn block_of(flag: u8) -> usize {
-    (flag >> FITNESS_BLOCK_SHIFT) as usize & (FITNESS_MAX_BLOCKS - 1)
 }
 
 fn check_rows(book: &FitnessBook, what: &str, lens: &[(&str, usize)]) -> Result<(), String> {
@@ -345,7 +341,7 @@ pub fn gate_sweep(book: &FitnessBook, a: &[bool], b: &[bool], gate: &[f64], time
     let mut seam_d = vec![0i32; w];
     let mut entries: Vec<(u32, u32, u32)> = Vec::new();
     for i in 0..n {
-        let blk = block_of(flags[i]);
+        let blk = book.block_of(i);
         let ri = rank[i];
         let (ai, bi) = (a[i], b[i]);
         let d = &mut flip_d[blk * w..(blk + 1) * w];
@@ -428,7 +424,7 @@ pub fn gate_sweep(book: &FitnessBook, a: &[bool], b: &[bool], gate: &[f64], time
     // Cut 0: every row with a non-NaN gate value holds `A`.
     for i in 0..n {
         if if rank[i] >= 0 { a[i] } else { b[i] } {
-            let t = &mut totals[block_of(flags[i])];
+            let t = &mut totals[book.block_of(i)];
             t.gross += excess[i];
             t.long_rows += 1;
         }
@@ -452,7 +448,7 @@ pub fn gate_sweep(book: &FitnessBook, a: &[bool], b: &[bool], gate: &[f64], time
             // The row of rank `t - 1` leaves `A` for `B`.
             let i = order[t - 1] as usize;
             if a[i] != b[i] {
-                let tb = &mut totals[block_of(flags[i])];
+                let tb = &mut totals[book.block_of(i)];
                 if a[i] {
                     tb.gross -= excess[i];
                     tb.long_rows -= 1;
@@ -759,7 +755,8 @@ USAGE:
   The k-switch bound V_k is the best net of any time-level switch between A
   and B with at most k switches; it bounds every time-level gate with at most
   k flips. It is a pruning bound, not evidence of an edge. A band, a minimum
-  hold, --pnl-mask, --pnl-excess and --gpu exit 2. See docs/walkforward.md.
+  hold, --pnl-mask, --pnl-excess, --pnl-stat, --pnl-cvar-q and --gpu exit 2.
+  See docs/walkforward.md.
 "
 }
 
@@ -806,6 +803,7 @@ pub fn claim(args: &[String]) -> Vec<String> {
                 fail(&format!("{}: the sweep prices the unmasked book; the gate is the mask", flag))
             }
             "--pnl-excess" => fail("--pnl-excess: the sweep prices the absolute book that walkforward --expr reproduces"),
+            "--pnl-stat" | "--pnl-cvar-q" => fail(&format!("{}: the sweep reports the mean-sd block fitness", flag)),
             _ => {
                 rest.push(args[i].clone());
                 i += 1;
@@ -1368,10 +1366,11 @@ mod tests {
     fn gate_sweep_equals_the_composite_book() {
         let mut rng = Mix(1185);
         let mut cuts = 0;
-        for trial in 0..6 {
+        // #1178: trial 6 has 12 blocks, more than the flags byte holds.
+        for trial in 0..7 {
             let p = panel(&mut rng, 7, 300, if trial % 2 == 0 { 0.03 } else { 0.0 });
             let segments: Vec<f64> = if trial % 3 == 2 { vec![0.0, 140.0 * 3600.0] } else { Vec::new() };
-            let blocks = [1usize, 2, 4][trial % 3];
+            let blocks = if trial == 6 { 12 } else { [1usize, 2, 4][trial % 3] };
             let bk = book(&p, blocks, &segments, 5.0 + 5.0 * (trial % 2) as f64);
             let n = bk.len();
             let a = persistent(&mut rng, n, 0.9);

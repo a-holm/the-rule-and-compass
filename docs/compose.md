@@ -97,7 +97,7 @@ A gate with a band or a dwell has state, so its composite is not a row expressio
 |---|---|
 | no `--gates`, no `--bull` and no `--bear`, `--top 0`, a bad menu | 2 |
 | input runs that differ in target, target spec, cost or split, from each other or from this invocation | 2 |
-| `--threshold`, `--position`, `--book-target`, `--band`, `--band-units`, `--min-holding`, `--max-position`, `--cash-return`, `--funding`, `--pnl-mask`, `--pnl-excess`, `--gpu`, a `--select-rule` other than robust, a `--fitness` other than pnl | 2 |
+| `--threshold`, `--position`, `--book-target`, `--band`, `--band-units`, `--min-holding`, `--max-position`, `--cash-return`, `--funding`, `--pnl-mask`, `--pnl-excess`, `--pnl-stat`, `--pnl-cvar-q`, `--gpu`, a `--select-rule` other than robust, a `--fitness` other than pnl | 2 |
 | `--lags`, `--lag-set`, `--fill`, `--outlier-iqr`, `--smooth` | 2 |
 | no validation rows, or no composite with a usable validation book | 2 |
 | a gate or branch column of the label family, the target, its return column or a construction column | 5 |

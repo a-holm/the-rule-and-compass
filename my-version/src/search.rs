@@ -4285,6 +4285,7 @@ pub fn device_plan_for(cfg: &Config, train: &Sample) -> Option<crate::memory::De
         weights: !train.w.is_empty(),
         label_sign,
         pnl_book: long_pnl,
+        pnl_block_ids: cfg.fitness.book().is_some_and(|b| b.blocks() > crate::trading::FITNESS_MAX_BLOCKS),
     };
     let caps = crate::memory::DeviceCaps::from_env(cfg.gpu_memory);
     Some(crate::memory::device_plan(&workload, &info, &caps))
