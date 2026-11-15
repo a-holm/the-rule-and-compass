@@ -38,9 +38,22 @@ fn input_err<T>(m: impl Into<String>) -> Res<T> {
 pub fn usage() -> &'static str {
     "usage: rcsr trials --wf <report.json>... [--baseline <ladder.json>] [options]\n\
 \x20      rcsr trials --compare <A> <B> [options]\n\
+\x20      rcsr trials --cpcv-assemble <report.json>... --splits <csv> --out-dir <dir> [--summary <file>]\n\
 \n\
 Campaign trial accounting from walk-forward reports (pooled.period_net), or a paired\n\
 comparison of two runs. A and B are each one report or a comma-separated list (one per seed).\n\
+\n\
+CPCV paths (--cpcv-assemble, #1174): the walk-forward reports of one configuration, one per split\n\
+of a `rcsr protocol cpcv` table (--splits), each priced with --pool-reset-flat. A report belongs to\n\
+the split with its test intervals. Path j of group g takes the j-th split, in lexicographic order of\n\
+the test groups, that tests g (López de Prado 2018, ch. 12); every group of a path is one book\n\
+segment that starts flat and pays its final exit. Writes <dir>/path_<j>.json in the walk-forward\n\
+schema (pooled.period_time, pooled.period_net, window_definition = the CPCV scheme hash, so\n\
+--wf reads them) and the summary (rcsr-cpcv-summary/1: per-path net, Sharpe and max drawdown,\n\
+the path Sharpe distribution, the share of positive paths, per-group net) to --summary or stdout.\n\
+A missing or extra split report, a report of no split, reset_flat not true, or reports that differ\n\
+in cost, purge, annualization, threshold rule, policy or a group's period grid exit 2 naming the\n\
+split or field.\n\
 \n\
 Campaign (--wf):\n\
   --wf <files...>        walk-forward --json reports with identical windows, cost, threshold rule (threshold.quantile, threshold.fixed,\n\
@@ -82,7 +95,7 @@ Exit 0 ok, 2 usage error or reports that do not match (the message names the fie
 // ---------------------------------------------------------------------------
 
 /// Fields that must be equal across the reports of one comparison, as paths.
-const GUARDS: &[&[&str]] = &[
+pub(crate) const GUARDS: &[&[&str]] = &[
     &["window_definition"],
     &["purge"],
     &["cost_model", "per_side_bps"],
@@ -97,7 +110,7 @@ const GUARDS: &[&[&str]] = &[
 
 /// The fitted-cut rule of `walkforward --threshold-fit` (#1094). Reports written without the flag, and before it
 /// existed, read all four as `null` and match each other. `--threshold-arms` skips these paths only.
-const FIT_GUARDS: &[&[&str]] = &[
+pub(crate) const FIT_GUARDS: &[&[&str]] = &[
     &["threshold", "fit"],
     &["threshold", "cut_min_entries"],
     &["threshold", "cut_blocks"],
@@ -841,6 +854,9 @@ fn run_inner(args: &[String]) -> Res<()> {
     if args.iter().any(|a| a == "-h" || a == "--help") {
         print!("{}", usage());
         return Ok(());
+    }
+    if args.iter().any(|a| a == "--cpcv-assemble") {
+        return crate::cpcv::assemble_cli(args);
     }
     let o = parse_args(args)?;
     let text = if o.compare.is_some() { compare(&o)? } else { campaign(&o)? };

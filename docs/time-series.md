@@ -168,6 +168,14 @@ split.
 
 **Verify.** `tests/interval_split.rs::planted_leaks_are_excluded_from_training` (a feature that reads 500 hours back and a label that crosses the test interval are both left out), `src/intervals.rs::tests::interval_split_purges_and_embargoes_every_edge` (200 random tables at each label horizon 1, 24, 72 and 168 h), `tests/interval_split.rs::embargo_auto_follows_the_lookback`, and `tests/interval_split.rs::interval_guard_allows_cpcv_test_groups` with `interval_guard_refuses_overlap` for the walk-forward guard: a window is in sample when a kept training or validation row of the run reaches it, not when it is earlier than the last training row.
 
+### Combinatorial purged cross-validation: many test periods
+
+**Check.** One walk-forward path tests only the years after its first training window, so a bear market in the first year is never out of sample. `rcsr protocol cpcv --groups N --test-groups k` (#1174) cuts the span into N equal calendar groups at UTC midnights (locked ranges become holes) and writes the C(N, k) splits as a `--split-table`; every group is tested C(N-1, k-1) times and `rcsr trials --cpcv-assemble` joins the test series into C(N-1, k-1) complete paths (López de Prado 2018, ch. 12). The training and validation intervals of the table are already trimmed by the purge before and the lookback embargo after every test group, with the same predicate as `--split-table`. Each group of a path starts flat and pays its final exit, so no position carries from one split's model into another's.
+
+**What fails.** A long lookback costs training rows after every test group: under CPCV(6, 2) the 56-day embargo of `ma_slope672` drops up to 112 days of training rows per split, 56 after each test group. A view whose embargo empties a training group is refused (exit 2) instead of training on a sliver. Paths of configurations with different embargoes still compare: the path's `window_definition` hashes the groups, not the embargo.
+
+**Verify.** `tests/cpcv.rs::cpcv_splits_respect_purge_and_embargo` (random spans, hole layouts and horizons 1, 24, 72 and 168 h: no training or validation interval meets a test group widened by the purge before and the embargo after, and the search's own trim keeps every table row), `cpcv_skips_locked_holes`, `cpcv_6_2_counts`, `cpcv_6_1_counts` and `cpcv_paths_cover_each_group_once`.
+
 ---
 
 ## 2b. Target structure: the label must not encode a column

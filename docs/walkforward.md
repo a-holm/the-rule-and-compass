@@ -721,6 +721,47 @@ After a recorded read whose report is lost, run the same command again with `--v
 
 Every locked read stores `binding_sha256` in its ledger line: the SHA-256 of the resolved window set and of every other setting that binds the report beyond the sealed entry (the whole walkforward spec and protocol options, `--gpu` included because it changes the report, with the `--front` path left out because the run file's SHA-256 binds its content and another spelling of the same file verifies; the whole ladder option set, columns, window rows, scheme, embargo, the resolved lock (`--lockbox`, `--retired`) and `--allow-in-sample`, with the `--sr-run` path left out for the same reason). `--verify-read` compares it with the recorded read before the panel is loaded and scores nothing when it differs: exit 3, `the window set or another setting that binds the report differs from the recorded read`, no report hash printed, ledger and marker unchanged. A read recorded without the field (written by an older build) cannot be compared: `--verify-read` refuses it (exit 3, `the recorded read stores no binding digest`) and the report hash stays unrecomputable. The digest is built from derived `Debug` text of the resolved structs, so a verify needs the same build line that recorded the read: another Rust version or a renamed field changes every digest and the verify is refused with the same message.
 
+## CPCV
+
+Combinatorial purged cross-validation (López de Prado 2018, *Advances in Financial Machine Learning*, ch. 12) cuts the development span into N calendar groups and tests every choice of k of them. There are C(N, k) splits, every group is tested in C(N-1, k-1) of them, and the test results join into phi = k C(N, k) / N = C(N-1, k-1) complete backtest paths, each an out-of-sample book over the whole span. Walk-forward never tests the first groups; CPCV tests every group, and the path distribution replaces one lucky or unlucky path.
+
+| scheme | splits | tests per group | paths |
+|---|---:|---:|---:|
+| CPCV(6, 1) | 6 | 1 | 1 |
+| CPCV(6, 2) | 15 | 5 | 5 |
+| CPCV(4, 2) | 6 | 3 | 3 |
+
+```sh
+rcsr protocol cpcv --start 2017-12-15 --end 2023-11-01 --groups 6 --test-groups 2 \
+  --purge-seconds 7200 --embargo-seconds auto --vars "$VIEW" --bar-seconds 3600 \
+  --validation-share 0.2 --data panel.rcsb --out cpcv62
+# one search per split
+rcsr --data panel.rcsb ... --split-table cpcv62/splits.csv --split-id s07 --json > s07.run.json
+# one walk-forward per split, every test group its own book
+rcsr walkforward --data panel.rcsb --time ts --group-by symbol --from-run s07.run.json \
+  --windows cpcv62/windows_s07.csv --pool-reset-flat --json --out wf_s07.json
+rcsr trials --cpcv-assemble wf_s*.json --splits cpcv62/splits.csv --out-dir paths --summary paths/summary.json
+rcsr trials --wf paths/path_*.json other-config/paths/path_*.json --baseline ladder.json
+```
+
+### Splits (`rcsr protocol cpcv`)
+
+* Groups: `--start` and `--end` are UTC midnights. The locked ranges of `--data` (or `--lockbox`, `--lockbox-embargo`, resolved as for a search) are holes `[start - purge, end + max(embargo, purge))` widened to midnights. Of the D usable days, group g ends at usable day `floor(g D / N)`, so group lengths differ by at most one day and a group may hold a hole. The pilot span 2017-12-15..2023-11-01 gives the boundaries 2018-12-07, 2019-11-30, 2020-11-22, 2021-11-15 and 2022-11-08.
+* Splits are numbered `s01`, `s02`, ... in lexicographic order of their test-group tuples: CPCV(4, 2) has s01 = (G1, G2), s02 = (G1, G3), s03 = (G1, G4), s04 = (G2, G3), s05 = (G2, G4), s06 = (G3, G4).
+* Validation: the last `--validation-share` of every training group (whole days, floored) is a validation interval; `--select-blocks intervals` gives the robust rule one block per validation interval.
+* Purge and embargo: the table holds whole test groups and training and validation intervals already trimmed by the predicate of `--split-table` (`IntervalSplit::effective`, #1173): a row is left out when its label window `[t, t + purge)` reaches a test group or when it lies in `[end, end + embargo)` after one, and training rows are purged on both sides of every validation interval. The search applies the same trim again and keeps every row (the table is a fixed point). `--embargo-seconds auto` (the default) is the larger of the purge and the longest lookback of the `--vars` columns at a bar of `--bar-seconds` (rule `rcsr-lookback/1`); an explicit value below it exits 2. A search that resolves a larger embargo for its own `--vars` trims more; a smaller one trims nothing more.
+* Refusals: k >= N, more than 10000 splits, a non-midnight `--start` or `--end`, a training group or validation interval with no time left after the holes, purge and embargo, and a group with no usable day exit 2 and name the split and group. An interval that still reaches a locked range exits 3, as `--split-table` does.
+* Files: `splits.csv` (the `--split-table`), `groups.csv` (`group,start,end,days`, one row per piece), `windows_<id>.csv` (one walk-forward window per test group, labelled `G1`..`GN`, with a one-second training range that ends `--purge-seconds` before the test start) and `cpcv.json` (`rcsr-cpcv/1`: counts, purge, embargo and its source, holes, `scheme_sha256`, `splits_sha256`, the test groups of every split and the path assignment). The output depends only on the arguments and the lock: two runs write identical bytes.
+
+### Paths (`rcsr trials --cpcv-assemble`)
+
+* Input: the walk-forward reports of one configuration, one per split. A report belongs to the split whose test intervals equal its windows' test intervals; a report of no split, two reports of one split and a split without a report exit 2.
+* Assignment: path j of group g takes the test series of the j-th split, in lexicographic order, that tests g. Every path covers every group once and every (split, test group) result is on exactly one path.
+* Seam rule: every group of a path is one book segment that starts flat and pays its final exit, whichever split it comes from. Two groups of one path usually come from two models, and a position that one model holds was never decided by the next, so no position carries across a group boundary. This is the flat reset of #1189 (`--pool-reset-flat`) at every group seam; two touching groups of one split follow the same rule, so there is one rule and no definition of touching. The assembler refuses a report whose `pooled_seam.reset_flat` is not `true` (exit 2); with it, the pooled series of a report is the concatenation of its per-window books, and a group series is cut from it by period time.
+* Guards: the split reports must agree on `purge`, `cost_model.per_side_bps`, `cost`, `annualization.periods_per_year`, the threshold rule (`threshold.quantile`, `threshold.fixed` and the fit fields) and the policy (`policy.name`, `policy.band_width`, `policy.min_hold`), the fields `rcsr trials --wf` guards, and every split that tests a group must give it the same period grid. A mismatch exits 2 and names the field. `window_definition` differs per split and is not compared.
+* Path files: `path_<j>.json` in the walk-forward schema: `window_definition` is `scheme_sha256` (the hash of N, k and the group pieces, not of purge or embargo, so configurations with other lookback embargoes on the same groups compare), the guarded objects of the first report, `pooled.period_time` and `pooled.period_net` (the chosen group series in group order, bit for bit), `pooled.sharpe`, `pooled.max_drawdown`, `pooled.net`, `pooled.entries`, `pooled.active_rows`, and `cpcv.segments` (group, split, report path and SHA-256, expression, periods, net). `rcsr trials --wf` reads the paths of all configurations like any reports: `N_eff`, DSR, SPA and PBO across them.
+* Summary (`rcsr-cpcv-summary/1`, `--summary` or stdout): per path the net at the report cost (sum of `period_net`), annualised mean net, Sharpe and max drawdown; the path Sharpe distribution (values, mean, sd, min, median, max); path net mean, median, minimum and the share of positive paths; per group the net on each path. PBO needs several configurations, so the summary of one configuration names `rcsr trials --wf` for it.
+
 ## Fold sign test
 
 The report also carries a one-sided binomial sign test over the per-window mean
