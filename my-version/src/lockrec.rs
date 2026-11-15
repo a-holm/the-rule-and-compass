@@ -492,5 +492,7 @@ mod tests {
         assert_eq!(with_record(Some(p), Some(r), &r).unwrap(), (Some(p), Some(r)));
         assert_eq!(with_record(Some(r), None, &r).unwrap(), (Some(r), None));
         assert!(with_record(Some(p), Some(Lockbox { start: 20, end: 30 }), &r).is_err());
+        let other = Lockbox { start: 20, end: 30 };
+        assert_eq!(with_record(Some(r), Some(other), &r).unwrap(), (Some(r), Some(other)));
     }
 }
