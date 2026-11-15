@@ -1,12 +1,6 @@
 //! #1177: `rcsr trials --table`, the multi-metric candidate table.
 
-#[\"annualization\":{{\"periods_per_year\":{},\"method\":\"explicit\"}},{}{}\
-\"pooled\":{{{}}}}}",
-        windows.join(","),
-        fx.ppy,
-        fx.protocol.as_ref().map_or(String::new(), |p| format!("\"protocol\":{p},")),
-        fx.selection.as_ref().map_or(String::new(), |s| format!("\"selection\":{s},")),
-ath = "common/cpcv_series.rs"]
+#[path = "common/cpcv_series.rs"]
 mod cpcv_series;
 #[path = "common/rcsr.rs"]
 mod rcsr_cmd;
