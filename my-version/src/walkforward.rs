@@ -136,6 +136,47 @@ pub struct ProtocolOptions {
     /// carried like the band. Rows with the gate off drop out of the test book
     /// and every on-run is its own book: it starts flat and pays its exit.
     pub mask: Option<crate::regime_gate::GateSpec>,
+    /// #1199: the periods of the pooled series (`--period-grid`).
+    pub period_grid: PeriodGrid,
+}
+
+/// #1199: which periods the pooled series of a report has. The grid never
+/// changes the book: positions, costs and exits are the same under both rules.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PeriodGrid {
+    /// A period where some row has a finite score and a finite target.
+    #[default]
+    Score,
+    /// A period where some test row of the window has a finite target before
+    /// the gate; a period where the book prices no row books net 0.
+    Target,
+}
+
+impl PeriodGrid {
+    pub fn parse(s: &str) -> Result<PeriodGrid, String> {
+        match s {
+            "score" => Ok(PeriodGrid::Score),
+            "target" => Ok(PeriodGrid::Target),
+            other => Err(format!("--period-grid needs score or target, got '{}'", other)),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PeriodGrid::Score => "score",
+            PeriodGrid::Target => "target",
+        }
+    }
+}
+
+/// #1199: the grid of the pooled series under `--period-grid target`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GridSummary {
+    pub rule: PeriodGrid,
+    /// Periods with no priced row (no finite score, or the gate off): net 0.
+    pub empty_periods: usize,
+    /// Priced rows of every period of the pooled series; 0 marks an empty period.
+    pub period_rows: Vec<usize>,
 }
 
 /// #1094: the rule of `--threshold-fit fitness`: the cut with the lowest block
@@ -245,6 +286,7 @@ impl Default for ProtocolOptions {
             stride_seconds: None,
             threshold_fit: None,
             mask: None,
+            period_grid: PeriodGrid::Score,
         }
     }
 }
@@ -673,6 +715,8 @@ pub struct Report {
     /// stamps, in the order of the pooled series.
     pub period_net: Vec<f64>,
     pub period_time: Vec<f64>,
+    /// #1199: `Some` under `--period-grid target`; `None` is the score grid.
+    pub period_grid: Option<GridSummary>,
     /// #487: cost source and return units of the book.
     pub cost: crate::target::CostDecl,
     pub cost_bps: f64,
@@ -2205,6 +2249,7 @@ impl Accum {
             pooled,
             period_net: pooled_returns,
             period_time: pooled_times,
+            period_grid: None,
             cost: opts.cost_decl(spec.cost_bps),
             cost_bps: spec.cost_bps,
             threshold_quantile: spec.threshold_quantile,

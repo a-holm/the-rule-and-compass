@@ -12054,6 +12054,13 @@ fn run_walkforward(args: &[String]) -> ! {
                 i += 1;
             }
             "--pool-reset-flat" => pool_reset_flat = true,
+            "--period-grid" => {
+                popts.period_grid = walkforward::PeriodGrid::parse(&need(args, i + 1, "--period-grid")).unwrap_or_else(|e| {
+                    eprintln!("error: {}\n\n{}", e, walkforward_usage());
+                    std::process::exit(EXIT_USAGE);
+                });
+                i += 1;
+            }
             "--device-pnl" => device_pnl = true,
             "--batch-pnl" => popts.batch_pnl = true,
             "--gpu" => gpu = true,
