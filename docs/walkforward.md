@@ -198,6 +198,34 @@ Interval-list runs (`--split-table`, #1173) compare intervals instead of the las
 
 The report's `selection` block gains `source: "front"`, `run`, `run_sha256` (SHA-256 of the file) and `candidate_labels`. `--select-band` and `--batch-pnl` work unchanged on the front's candidates.
 
+### Every member out of sample (`--all-members`, #1176)
+
+`--front run.json` selects one member per window by validation error, so its report holds the test book of the selected member only, and `--batch-pnl` gives net per window and member, not per period. A selection rule over several out-of-sample metrics (#1177) needs the test book of every member. `--all-members` adds it without changing the selection:
+
+```sh
+rcsr walkforward --data panel.rcsb --front s07.run.json --windows cpcv62/windows_s07.csv \
+  --all-members --period-grid target --json --out wf_s07_members.json
+rcsr trials --wf wf_s07_members.json --members all --out members_s07.json
+```
+
+* Every member is priced alone on every window with its own carried threshold and band (`validation_book.band_resolved` under sd units), exactly as `--expr <member>` with the run's threshold, cost and band would price it: the same rows, the same missing-score rule (`--missing-score`), the same seams (`--pool-reset-flat`, the flat start after a gap between the test intervals of a splits table), the same regime gate (`--pnl-mask` of the run) and the same period grid. The scan reads the data once for all members.
+* `members[]`, in front order: `archive_rank`, `label` (`front_rank_<k>`), `complexity`, `expression` (the string priced; `selection.expression_source` says whether it is the exact or the rounded form), `constant` (the expression reads no input, so the book takes one position on every row), `dropped_rows` (the member's own count under the row-drop rule of the scalar evaluator), `windows` (label, threshold, threshold source, row counts and metrics per window), `pooled` (the pooled metrics, `net_mean`, `entry_times`, `seam_cost`, `missing_score_exits`, `unpriced_target_rows`, `break_even_bps_per_side`, `break_even_status`, `cost_ladder`) and `series` (the `--emit-series` series below, and `period_rows` under `--period-grid target`).
+* `selection.source` is `front_all_members` and the report has `diagnostic: true`. The top-level windows, pooled block, economics and inference are those of `--front` without the flag: no member enters the selection, `selection.test_used_for_selection` stays false and the deflated Sharpe keeps the front size as its trials (#1027). A member carries no bootstrap, null or batch section.
+* Windows without a validation slice (a splits table with `--split-id`): plain `--front` refuses to select among several members (exit 3). With `--all-members` nothing is selected: the report book of every window is the first front member, `selection.selected_on` says so, and every member is priced as above.
+* `--period-grid target` puts every member on one period grid, so `rcsr trials --members all` and the candidate table of #1177 join the members period by period. Under the score grid a member with no score on a stretch has no period there.
+* `--select-band`, `--threshold-fit`, `--policy vote` and `--locked-test` exit 2: the flag is a development diagnostic that selects nothing, and a locked read reports the sealed candidate only. `--all-members` without `--front` exits 2. A front of one member gives one member equal to the top-level book, and to `--from-run` when the run's finalist is that member.
+
+### Per-period series (`--emit-series`, #1176)
+
+`--emit-series` (implied by `--all-members`) writes, beside `pooled.period_time` and `pooled.period_net`, the `--period-series` series `period_gross`, `period_exposure` (mean position of the period's priced rows), `period_entries` (rows entering a long run) and `period_bh` (the cost-free equal-weight mean of the same rows), and adds:
+
+* `period_cost`: `period_gross - period_net` in f64, the per-period cost the cost ladder and the break-even use. The net at `m` times the cost is `period_gross - m * period_cost`; with the same f64 operations it reproduces every `cost_ladder` row bit for bit, and at `m = 1` it returns `period_net` up to one rounding (exactly when the difference is exact). Weighted by the priced rows of each period it sums to `pooled.total_cost` up to rounding.
+* `period_entry_stamp`: 1 for a period where at least one row enters a long run, else 0.
+* `period_bh_net`: the net of the buy-and-hold control on the same rows at the report cost (long on every priced row, the entry paid on the first row of a book and the exit on its last, every window started flat): the series behind `economics.benchmarks` `buy_and_hold`. Excess returns are measured against it or against the equal-weight universe, never against an interest rate.
+* `pooled.entry_times`: distinct timestamps at which at least one row enters a long run; one market-wide entry on many symbols counts once, as the fitted-cut sweep of #1094 counts them.
+
+Every series has the length of `period_time` and, under `--period-grid target`, 0 on an empty period. Without `--emit-series` and `--all-members` the report is byte-identical to the report of an earlier build.
+
 ## Position rule, costs and aggregation
 
 * `position = 1` if `score > threshold`, the score is finite and the shared
