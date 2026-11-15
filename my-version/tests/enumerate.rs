@@ -203,9 +203,14 @@ fn the_family_null_certifies_the_planted_rule() {
     assert!(arr(null, &["best"]).iter().all(|f| f.as_f64().is_some_and(|f| f > observed)));
     assert!(num(null, &["p_family"]) <= 0.05, "p_family {}", num(null, &["p_family"]));
     assert_eq!(num(&arr(&j, &["top"])[0], &["p_family"]), num(null, &["p_family"]));
-    // The shifts come from the walk-forward range of the 300 training periods.
-    assert_eq!(num(null, &["periods"]), 300.0);
-    assert_eq!((num(null, &["shift_lo"]), num(null, &["shift_count"])), (7.0, 287.0));
+    // The shifts come from the walk-forward range of the training periods.
+    let periods = num(null, &["periods"]);
+    assert_eq!(periods * 4.0, num(&j, &["split", "train_rows"]), "four symbols at every training timestamp");
+    let lo = num(null, &["shift_lo"]);
+    assert_eq!(lo, num(null, &["block_len"]).min((periods / 4.0).floor()).max(1.0));
+    let count = num(null, &["shift_count"]);
+    assert_eq!(count, periods + 1.0 - 2.0 * lo);
+    assert!(arr(null, &["nums"]).iter().all(|k| k.as_f64().is_some_and(|k| k >= lo && k < lo + count)));
 }
 
 #[test]
@@ -233,10 +238,13 @@ fn gap_against_a_run() {
         stdout(&enumerate(&data, &spec, &["--ops", OPS10, "--max-size", "3", "--compare-run", &early]))
     );
     for r in rows {
-        if let Some(size) = r.get("class_size").and_then(Json::as_f64) {
-            let best = num(&arr(&j, &["best"])[size as usize - 1], &["fitness"]);
-            assert_eq!(num(r, &["class_best"]).to_bits(), best.to_bits());
-            assert_eq!(num(r, &["gap"]), num(r, &["search_fitness"]) - best);
+        let field = |k: &str| r.get(k).and_then(Json::as_f64);
+        if let (Some(size), Some(search)) = (field("class_size"), field("search_fitness")) {
+            let best = arr(&j, &["best"])[..size as usize].iter().filter_map(|b| b.get("fitness").and_then(Json::as_f64)).fold(f64::INFINITY, f64::min);
+            assert_eq!(num(r, &["class_best"]).to_bits(), best.to_bits(), "the best member with at most {size} nodes");
+            let nodes = num(r, &["complexity"]) - if num(r, &["constants"]) == 0.0 { 0.0 } else { 2.0 };
+            assert_eq!(size, nodes);
+            assert_eq!(num(r, &["gap"]), search - best);
         }
     }
     // --emit-seeds: the top members, best first, read by --seed-file.
@@ -245,10 +253,12 @@ fn gap_against_a_run() {
     assert_eq!(lines[0], str_at(&planted, &["expression"]));
     let seeded = search(&dir.join("seeded.json"), &["--seed-file", &seeds, "--no-fit"]);
     let j = json(&enumerate(&data, &spec, &["--ops", OPS10, "--max-size", "3", "--compare-run", &seeded, "--json"]));
-    let at5: Vec<&Json> = arr(&j, &["compare", "rows"]).iter().filter(|r| num(r, &["complexity"]) == 5.0).collect();
-    assert!(!at5.is_empty(), "the seeded front holds a member of complexity 5");
-    assert_eq!(num(at5[0], &["gap"]), 0.0, "the front holds the planted rule: {}", str_at(at5[0], &["expression"]));
-    assert_eq!(num(at5[0], &["search_fitness"]).to_bits(), num(&planted, &["fitness"]).to_bits());
+    // The planted book is the optimum of the class; the front holds it at tree size 3, as
+    // the seed (c - (x1 - x2)) at complexity 5 or as a constant-free (x2 - x1) at complexity 3.
+    let at3: Vec<&Json> = arr(&j, &["compare", "rows"]).iter().filter(|r| r.get("class_size").and_then(Json::as_f64) == Some(3.0)).collect();
+    assert!(!at3.is_empty(), "the seeded front holds a member of tree size 3");
+    assert_eq!(num(at3[0], &["gap"]), 0.0, "the front holds the planted rule: {}", str_at(at3[0], &["expression"]));
+    assert_eq!(num(at3[0], &["search_fitness"]).to_bits(), num(&planted, &["fitness"]).to_bits());
     // walkforward --expr accepts the first member.
     let wf_out = dir.join("wf.json").to_string_lossy().into_owned();
     let w = format!("w,{},{},{},{}", T0, T0 + 99 * STEP, T0 + 101 * STEP, T0 + 300 * STEP);
@@ -283,7 +293,7 @@ fn enumerate_refuses_what_it_cannot_price() {
         (vec!["--ops", OPS10, "--fitness", "metric"], "--fitness"),
         (vec!["--ops", OPS10, "--cuts", "15"], "--cuts"),
         (vec!["--ops", OPS10, "--null-shifts", "5"], "--null-shifts 5"),
-        (vec!["--ops", OPS10, "--null-shifts", "400"], "287 distinct shifts"),
+        (vec!["--ops", OPS10, "--null-shifts", "400"], "distinct shifts"),
         (vec!["--ops", OPS10, "--max-size", "5"], "canonical trees"),
     ] {
         let o = enumerate(&data, &spec, &extra);

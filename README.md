@@ -300,6 +300,19 @@ rcsr compose --data dev.rcsb --target lbl_h24a_y --target-spec dev.targets.json 
 
 See [`docs/compose.md`](docs/compose.md).
 
+### Every small formula, scored exactly (`rcsr enumerate`)
+
+`rcsr enumerate` takes the flags of a `--fitness pnl` run, builds that run's training book and stops before any search. It scores every tree of at most `--max-size` nodes over the normalised `--vars` and the unary and binary `--ops` (no constant leaf, canonical forms only) at `--cuts Q` quantiles of each tree's own training predictions, with the same book code the search ranks by. The report gives the class counts, the best member of every size (the certified class optimum), the `--top` members with their validation book, and the expression of each member in original units. `--compare-run run.json` gives the gap of a finished search to the class optimum at each complexity, `--null-shifts R` the family-wise p-value of the class under R shared circular shifts of the returns (White 2000; Romano and Wolf 2005), and `--emit-seeds` writes the top members for `--seed-file` and `walkforward --expr`. Above 4 nodes the command needs `--allow-large`.
+
+```sh
+rcsr enumerate --data dev.rcsb --target lbl_h1_y --target-spec dev.targets.json --vars "$VIEW" \
+  --ops add,sub,mul,div,abs,exp,square,tanh,logistic,gauss --time ts --group-by symbol \
+  --split temporal --validation-frac 0.3 --objective sharpe --cost-bps 10 --pnl-blocks 4 \
+  --max-size 4 --null-shifts 19 --compare-run run.json --emit-seeds seeds.txt --json --out enumerate.json
+```
+
+See [`docs/optimisation.md`](docs/optimisation.md) section 3.6 and [`docs/overfitting.md`](docs/overfitting.md) section 3.12.
+
 ### Combinatorial purged cross-validation (CPCV)
 
 `rcsr protocol cpcv --start 2017-12-15 --end 2023-11-01 --groups 6 --test-groups 2 --purge-seconds 7200 --embargo-seconds auto --vars "$VIEW" --bar-seconds 3600 --validation-share 0.2 --out cpcv62` writes the C(N, k) splits of N equal calendar groups as a `--split-table` (training and validation intervals already purged before and embargoed after every test group, locked ranges as holes), one walk-forward windows file per split and `cpcv.json`. After one search and one `walkforward --pool-reset-flat --period-grid target` per split (the target grid gives every split the same periods on a group, whatever NaN coverage or gate its formula has; a period where the book prices no row books net 0), `rcsr trials --cpcv-assemble wf_s*.json --splits cpcv62/splits.csv --out-dir paths` joins the test series into C(N-1, k-1) complete backtest paths (López de Prado 2018, ch. 12): path j of group g takes the j-th split that tests g, and every group starts flat and pays its final exit. The paths are walk-forward-schema reports, so `rcsr trials --wf` gives `N_eff`, DSR, SPA and PBO across configurations; the summary gives the path Sharpe distribution. Split reports written with `--emit-series` give every path their per-period series and `entry_times` (#1236), so `rcsr trials --table` gates path rows on net at twice the cost, exposure, entry times and the alpha over buy-and-hold. See [`docs/walkforward.md`](docs/walkforward.md#cpcv).

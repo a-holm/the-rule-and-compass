@@ -555,6 +555,17 @@ A fitted cut (`--threshold-fit fitness`, #1094) is one more parameter per window
 
 Verify: `tests/inference.rs` (hand-computed CVaR, break-even, BH, PSR and PBO fixtures, the AR(1) and overlapping-label design effects, SPA on signal and noise) and `tests/eval_protocol.rs`.
 
+#### The family null of an enumerated class (`rcsr enumerate --null-shifts R`, #1183)
+
+`rcsr enumerate` scores every tree of a fixed class at every cut of its grid (docs/optimisation.md 3.6). Its best member is the maximum over the whole class, so its training fitness is optimistic in the way a search finalist is. Because the class is fixed and scored completely, the null of that maximum is exact: rotate the excess returns of every group by one shared fraction of its length, rebuild the book, score the class again and keep its best fitness `f_r`. With `R` shifts, `p_family = (1 + #{f_r <= f_obs}) / (R + 1)` for the observed class best `f_obs` (lower fitness is better). This is the maximum-statistic null of the reality check (White 2000) and the single-step adjusted p-value of stepwise multiple testing (Romano and Wolf 2005); `top[].p_family` applies the same count to each member's own fitness. No trial count, cluster threshold or effective-N estimate enters.
+
+- The shift of shift `k` moves group `g` by `floor(k n_g / P)` rows, `P` the distinct training timestamps: the rule of `baselines::shifted_positions`, applied once to the returns (and the funding) instead of to every candidate's positions. With every group present at every timestamp it is one joint time shift, so the cross-section, the serial dependence of returns and of features, and the market drift stay; only the alignment of features and returns breaks.
+- `k` is drawn without replacement, from `--seed`, from the walk-forward shift range: the smallest shift is `min(block, P / 4)` with `block = max(label horizon in periods, ceil(P^(1/3)))`, and `P + 1 - 2 x smallest` shifts are available. Fewer available shifts than `R` exits 2 and names the count; `R` from 1 to 18 exits 2 because no p-value at or below 0.05 is reachable.
+- The null says that the class holds signal, not which member is the simplest sufficient one: in the synthetic study quoted in #1183, a world with one rule and no regime was certified in every trial while the class best was a gated pair. The report therefore lists the best member of every size.
+- Trials: the class is one family. A member taken from `top[]` to an out-of-sample test carries `p_family` and `class.bits = log2(canonical x Q)`. Picking a member from an enumerated class without the family null is `canonical x Q` trials, not one.
+
+Verify: `null_plan_draws_distinct_shifts_from_the_walk_forward_range`, `shifted_returns_follow_the_shifted_positions_rule` and `shifted_returns_equal_inversely_shifted_positions` (lib), `the_family_null_certifies_the_planted_rule` (`tests/enumerate.rs`), and the ignored `family_null_level_on_signal_free_panels` (200 signal-free panels at 19 shifts; the count is recorded in #1183).
+
 ### 3.13 Baseline ladder and add-one-family ablation (implemented)
 
 A formula is only as good as the best opponent it beat. `rcsr ladder` runs every opponent on the same rows, folds, preprocessing, projection and cost model. Every rung is a `{0, 1}` long/flat book or cash.
