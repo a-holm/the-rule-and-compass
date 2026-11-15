@@ -2596,3 +2596,42 @@ fn unpriced_target_rows_count_the_uncovered_rows_inside_a_run() {
     let r = run(&table(&|i| i % 4 == 0), 4.0 * H, 8.0 * H, 12.0 * H);
     assert_eq!(r.unpriced_target_rows, 0);
 }
+
+/// #1203: one symbol at t = 0..20. `z` has no value on `gap`; after t = 12 `late` scores
+/// and returns replace the base ones. The target at t = 9, the last priced row before
+/// the gap, is a loss of 5 %.
+fn causal_table(gap: std::ops::Range<usize>, late: bool) -> data::Table {
+    let mut s = String::from("ts,sym,z,target\n");
+    for i in 0..20usize {
+        let z = if gap.contains(&i) { String::new() } else if late && i > 12 { "-1".to_string() } else { "1".to_string() };
+        let y = if i == 9 { -0.05 } else if late && i > 12 { -0.02 } else { 0.001 };
+        s.push_str(&format!("{i},A,{z},{y}\n"));
+    }
+    data::parse_table(&s).unwrap()
+}
+
+#[test]
+fn missing_score_flat_exit_is_causal() {
+    let run = |t: &data::Table| {
+        let mut s = spec("z", vec![window("w", 0.0, 4.0, 4.0, 20.0)]);
+        s.vars = vec!["z".to_string()];
+        s.threshold_fixed = Some(0.0);
+        walkforward::run_table(t, &s, "test").unwrap()
+    };
+    let at = |r: &walkforward::Report, t: f64| r.period_net[r.period_time.iter().position(|&x| x == t).unwrap()];
+    let gapped = run(&causal_table(10..13, false));
+    let scored = run(&causal_table(0..0, false));
+    // The missing score of t = 10 is known at t = 10, so the long of t = 9 earns the loss of
+    // t = 9 and pays its exit there; every earlier period is the book with no gap.
+    for t in 4..9 {
+        assert_eq!(at(&gapped, t as f64).to_bits(), at(&scored, t as f64).to_bits(), "t = {t}");
+    }
+    assert_eq!(at(&gapped, 9.0).to_bits(), (-0.05f64 - 0.001).to_bits(), "the loss and the exit at t = 9");
+    assert_eq!(at(&scored, 9.0).to_bits(), (-0.05f64).to_bits());
+    // Scores and returns after the gap do not reach any period up to it.
+    let late = run(&causal_table(10..13, true));
+    for t in 4..10 {
+        assert_eq!(at(&gapped, t as f64).to_bits(), at(&late, t as f64).to_bits(), "t = {t}");
+    }
+    assert_ne!(bits(&gapped.period_net), bits(&late.period_net), "the late rows do change the later periods");
+}
