@@ -1367,10 +1367,11 @@ mod tests {
     fn gate_sweep_equals_the_composite_book() {
         let mut rng = Mix(1185);
         let mut cuts = 0;
-        for trial in 0..6 {
+        // #1178: trial 6 has 12 blocks, more than the flags byte holds.
+        for trial in 0..7 {
             let p = panel(&mut rng, 7, 300, if trial % 2 == 0 { 0.03 } else { 0.0 });
             let segments: Vec<f64> = if trial % 3 == 2 { vec![0.0, 140.0 * 3600.0] } else { Vec::new() };
-            let blocks = [1usize, 2, 4][trial % 3];
+            let blocks = if trial == 6 { 12 } else { [1usize, 2, 4][trial % 3] };
             let bk = book(&p, blocks, &segments, 5.0 + 5.0 * (trial % 2) as f64);
             let n = bk.len();
             let a = persistent(&mut rng, n, 0.9);

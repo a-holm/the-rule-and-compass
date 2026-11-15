@@ -1527,8 +1527,14 @@ pub const FITNESS_WARPS: usize = 8;
 /// training-score sd of [`score_sd`]. The two-pass sd of #925 added no word,
 /// so its checkpoints refuse to resume.
 pub const SCORE_SD_ALGORITHM: u64 = 2;
-/// Most time blocks of the consistency term (`--pnl-blocks`).
+/// Most time blocks whose id fits the flags byte ([`FITNESS_BLOCK_SHIFT`]), and
+/// the limit of `--select-blocks` and `--cut-blocks`. A fitness book with more
+/// blocks keeps its ids in [`FitnessBook::block_ids`] only.
 pub const FITNESS_MAX_BLOCKS: usize = 8;
+/// #1178: most time blocks of the consistency term (`--pnl-blocks`).
+pub const FITNESS_BOOK_MAX_BLOCKS: usize = 64;
+/// #1178: the default share of worst blocks under `--pnl-stat cvar`.
+pub const DEFAULT_CVAR_Q: f64 = 0.25;
 /// #925: most minimum-hold rows the device band scorer carries (`K + 1`
 /// automaton states); a longer hold scores on the CPU.
 pub const FITNESS_DEVICE_MAX_HOLD: usize = 32;
@@ -1536,6 +1542,83 @@ pub const FITNESS_DEVICE_MAX_HOLD: usize = 32;
 pub const FITNESS_BLOCK_SHIFT: u8 = 2;
 /// #1180: bit 5 of a [`FitnessBook::flags`] byte marks a row outside the regime mask.
 pub const FITNESS_MASK_OFF: u8 = 0x20;
+
+/// #1178: the statistic of the block regrets `r_k = 1 - c_k` that a fitness
+/// book ranks by (`--pnl-stat`); `c_k = net_k / B_k` is the capture of block `k`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum BlockStat {
+    /// `mean(r) + lambda * sd(r)`, sample sd (ddof 1); one block is the plain regret.
+    #[default]
+    MeanSd,
+    /// `mean(r) + lambda * sqrt(mean_k(max(r_k - 1, 0)^2))`: only blocks that
+    /// lose against cash (`c_k < 0`) cost.
+    MeanSemi,
+    /// The mean of the [`BlockStat::cvar_count`] largest `r_k` (the smallest
+    /// captures), ties to the lower block index; `q` in (0, 1].
+    Cvar(f64),
+}
+
+impl BlockStat {
+    /// `--pnl-stat` with `q` from `--pnl-cvar-q` (read under `cvar` only).
+    pub fn parse(name: &str, q: f64) -> Result<BlockStat, String> {
+        match name.trim() {
+            "mean-sd" => Ok(BlockStat::MeanSd),
+            "mean-semi" => Ok(BlockStat::MeanSemi),
+            "cvar" if q > 0.0 && q <= 1.0 => Ok(BlockStat::Cvar(q)),
+            "cvar" => Err(format!("--pnl-cvar-q must be in (0, 1], got {}", q)),
+            other => Err(format!("--pnl-stat must be mean-sd, mean-semi or cvar, got '{}'", other)),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            BlockStat::MeanSd => "mean-sd",
+            BlockStat::MeanSemi => "mean-semi",
+            BlockStat::Cvar(_) => "cvar",
+        }
+    }
+
+    /// The statistic code of the device book (`RC_PNL_STAT_*`, `src/cuda/eval.cu`).
+    pub fn code(self) -> i32 {
+        match self {
+            BlockStat::MeanSd => 0,
+            BlockStat::MeanSemi => 1,
+            BlockStat::Cvar(_) => 2,
+        }
+    }
+
+    /// `ceil(q * blocks)`, at least 1 and at most `blocks`; a product within
+    /// `1e-9` of an integer is that integer, so `q = 0.3` of 10 blocks is 3.
+    pub fn cvar_count(q: f64, blocks: usize) -> usize {
+        let x = q * blocks as f64;
+        let near = x.round();
+        let m = if (x - near).abs() <= 1e-9 { near } else { x.ceil() };
+        (m.max(1.0) as usize).min(blocks.max(1))
+    }
+}
+
+/// #1178: `stat` of the finite block regrets `r` with spread weight `lambda`.
+/// The device finish (`rc_pnl_stat`, `src/cuda/eval.cu`) does the same `f64`
+/// operations in the same order.
+pub fn block_stat(stat: BlockStat, r: &[f64], lambda: f64) -> f64 {
+    let nb = r.len();
+    let _ = stat;
+    let mut sum = 0.0f64;
+    for v in r {
+        sum += *v;
+    }
+    let mean = sum / nb as f64;
+    if nb == 1 {
+        return r[0];
+    }
+    let mut ss = 0.0f64;
+    for v in r {
+        let d = *v - mean;
+        ss += d * d;
+    }
+    let sd = (ss / (nb - 1) as f64).sqrt();
+    mean + lambda * sd
+}
 
 /// Time block of every row: the sorted distinct timestamps are cut into
 /// `blocks` runs of equal count, the last run takes the remainder. Rows with
@@ -1645,6 +1728,10 @@ pub struct FitnessBook {
     cases: std::sync::OnceLock<BookCases>,
     /// #1180: rows with the regime mask off; 0 for an unmasked book.
     off_rows: usize,
+    /// #1178: the statistic of the block regrets.
+    stat: BlockStat,
+    /// #1178: the time block of every row; empty for a single block.
+    block_id: Vec<u8>,
 }
 
 /// #1023: the `(group, time block)` sub-books of a [`FitnessBook`]: one per run
@@ -1807,6 +1894,7 @@ impl FitnessBook {
             ));
         }
         let mut block_bounds = vec![bound];
+        let mut block_id = Vec::new();
         if blocks > 1 {
             let ids = block_ids(&rows.time, blocks)?;
             block_bounds.clear();
@@ -1832,14 +1920,17 @@ impl FitnessBook {
                 }
                 block_bounds.push(bb);
             }
+            // #1178: more blocks than the flags byte holds keep their ids in `block_id` only.
+            let in_flags = blocks <= FITNESS_MAX_BLOCKS;
             for i in 0..n {
                 let first = flags[i] & TradingRows::FIRST != 0 || (i > 0 && ids[i] != ids[i - 1]);
                 let last = flags[i] & TradingRows::LAST != 0 || (i + 1 < n && ids[i] != ids[i + 1]);
                 flags[i] = (if first { TradingRows::FIRST } else { 0 })
                     | (if last { TradingRows::LAST } else { 0 })
                     | (flags[i] & FITNESS_MASK_OFF)
-                    | (ids[i] << FITNESS_BLOCK_SHIFT);
+                    | (if in_flags { ids[i] << FITNESS_BLOCK_SHIFT } else { 0 });
             }
+            block_id = ids;
         }
         let mut hash = 0xcbf2_9ce4_8422_2325u64;
         for e in &excess {
@@ -1856,6 +1947,11 @@ impl FitnessBook {
             fnv_u64(&mut hash, lambda.to_bits());
             for b in &block_bounds {
                 fnv_u64(&mut hash, b.to_bits());
+            }
+            if blocks > FITNESS_MAX_BLOCKS {
+                for id in &block_id {
+                    fnv_u64(&mut hash, *id as u64);
+                }
             }
         }
         let band = spec.band.multiple;
@@ -1890,7 +1986,43 @@ impl FitnessBook {
             min_hold: spec.min_holding,
             cases: std::sync::OnceLock::new(),
             off_rows,
+            stat: BlockStat::MeanSd,
+            block_id,
         })
+    }
+
+    /// #1178: the book ranked by `stat` over its block regrets. `MeanSd` keeps
+    /// the book and its hash; another statistic folds its code and parameter
+    /// (the lambda under `MeanSemi`, `q` under `Cvar`) into the hash. Refused
+    /// for `q` outside (0, 1] and on a book whose statistic is already set.
+    pub fn with_stat(mut self, stat: BlockStat) -> Result<Self, String> {
+        if let BlockStat::Cvar(q) = stat {
+            if !(q > 0.0 && q <= 1.0) {
+                return Err(format!("the cvar share must be in (0, 1], got {}", q));
+            }
+        }
+        if self.stat != BlockStat::MeanSd {
+            return Err("the block statistic of the book is already set".to_string());
+        }
+        self.stat = stat;
+        Ok(self)
+    }
+
+    /// #1178: the statistic of the block regrets.
+    pub fn stat(&self) -> BlockStat {
+        self.stat
+    }
+
+    /// #1178: the time block of every row; empty for a single block. With at
+    /// most [`FITNESS_MAX_BLOCKS`] blocks the flags carry the same ids.
+    pub fn block_ids(&self) -> &[u8] {
+        &self.block_id
+    }
+
+    /// #1178: the time block of row `i`.
+    #[inline]
+    pub fn block_of(&self, i: usize) -> usize {
+        self.block_id.get(i).map_or(0, |&b| b as usize)
     }
 
     pub fn len(&self) -> usize {
@@ -1932,7 +2064,8 @@ impl FitnessBook {
 
     /// Seam flags per row: [`TradingRows::FIRST`] and [`TradingRows::LAST`]. With
     /// several blocks they mark the seams of every `(group, block)` run, and
-    /// bits 2 to 4 carry the block id ([`FITNESS_BLOCK_SHIFT`]).
+    /// with at most [`FITNESS_MAX_BLOCKS`] blocks bits 2 to 4 carry the block
+    /// id ([`FITNESS_BLOCK_SHIFT`]); more blocks leave those bits 0.
     pub fn flags(&self) -> &[u8] {
         &self.flags
     }
@@ -2041,7 +2174,7 @@ impl FitnessBook {
     /// #1084: [`FitnessBook::regret`] and the [`BookShape`] of the same
     /// reduction, so the shape follows the position rule the regret prices.
     pub fn regret_and_shape(&self, pred: &[f64]) -> (f64, BookShape) {
-        if self.blocks() == 1 {
+        if self.blocks() == 1 && self.stat == BlockStat::MeanSd {
             let t = self.totals(pred);
             (self.regret_of(&t), BookShape::of(self.len() - self.off_rows, std::slice::from_ref(&t)))
         } else {
@@ -2093,7 +2226,7 @@ impl FitnessBook {
             for k in seg_start..seg_end {
                 let p = pred[k];
                 let flag = self.flags[k];
-                let b = (flag >> FITNESS_BLOCK_SHIFT) as usize & (FITNESS_MAX_BLOCKS - 1);
+                let b = self.block_of(k);
                 let long = if p.is_finite() {
                     p > self.threshold
                 } else {
@@ -2159,14 +2292,15 @@ impl FitnessBook {
         totals.iter().enumerate().map(|(b, t)| self.block_regret_of(b, t)).collect()
     }
 
-    /// The search fitness from per-block totals: `mean + lambda * sd` of the
-    /// block regrets (sample standard deviation, ddof 1); with one block the
+    /// The search fitness from per-block totals: [`block_stat`] of the block
+    /// regrets under the book's [`BlockStat`] (default `mean + lambda * sd`,
+    /// sample standard deviation, ddof 1); with one block and `MeanSd` the
     /// plain regret. `+inf` for a non-finite prediction, fewer than
     /// `min_trades` flips over all blocks, or a non-finite block regret.
     pub fn fitness_of(&self, totals: &[FitnessTotals]) -> f64 {
         let nb = self.blocks();
         debug_assert_eq!(totals.len(), nb);
-        if nb == 1 {
+        if nb == 1 && self.stat == BlockStat::MeanSd {
             return self.regret_of(&totals[0]);
         }
         let flips: u64 = totals.iter().map(|t| t.flips).sum();
@@ -2177,18 +2311,7 @@ impl FitnessBook {
         if r.iter().any(|v| !v.is_finite()) {
             return f64::INFINITY;
         }
-        let mut sum = 0.0f64;
-        for v in &r {
-            sum += *v;
-        }
-        let mean = sum / nb as f64;
-        let mut ss = 0.0f64;
-        for v in &r {
-            let d = *v - mean;
-            ss += d * d;
-        }
-        let sd = (ss / (nb - 1) as f64).sqrt();
-        let f = mean + self.lambda * sd;
+        let f = block_stat(self.stat, &r, self.lambda);
         if f.is_finite() {
             f
         } else {
@@ -2277,7 +2400,7 @@ impl FitnessBook {
             for k in seg_start..seg_end {
                 let p = pred[k];
                 let flag = self.flags[k];
-                let b = if per_block { (flag >> FITNESS_BLOCK_SHIFT) as usize & (FITNESS_MAX_BLOCKS - 1) } else { 0 };
+                let b = if per_block { self.block_of(k) } else { 0 };
                 if !p.is_finite() {
                     out[b].nonfinite = true;
                 }
@@ -2491,7 +2614,7 @@ impl FitnessBook {
             rank[i as usize] = r as u32;
         }
         let nb = self.blocks();
-        let block = |i: usize| (self.flags[i] >> FITNESS_BLOCK_SHIFT) as usize & (FITNESS_MAX_BLOCKS - 1);
+        let block = |i: usize| self.block_of(i);
         // `diff[b * w + t]`: change of a count of block `b` where the cut reaches `t`.
         let w = n + 2;
         let mut flip_diff = vec![0i32; nb * w];
@@ -3006,7 +3129,7 @@ mod block_tests {
         assert_eq!(block_ids(&t, 4).unwrap(), vec![0, 0, 0, 1, 1, 1, 2, 2, 3, 3, 3]);
         assert_eq!(block_ids(&t, 1).unwrap(), vec![0; 11]);
         assert!(block_ids(&t[..3], 4).unwrap_err().contains("distinct training timestamps"));
-        assert!(block_ids(&t, 9).is_err());
+        assert!(block_ids(&t, 65).is_err());
     }
 
     fn panel(sizes: &[usize]) -> crate::data::TradingSlice {
@@ -3134,6 +3257,206 @@ mod block_tests {
         assert!((fit - (mean + lambda * sd)).abs() <= 1e-12, "{fit} vs {}", mean + lambda * sd);
         let flat = FitnessBook::with_blocks(&s, &spec(), 900.0, k, 0.0).unwrap();
         assert!((flat.regret(&p) - mean).abs() <= 1e-12);
+    }
+
+    /// #1178: the hash and fitness bits of mean-sd books with 1 to 8 blocks,
+    /// pinned on the base before the block statistics: that path is unchanged
+    /// bit for bit.
+    #[test]
+    fn mean_sd_books_up_to_8_blocks_are_pinned() {
+        const PINNED: [(usize, u64, u64); 4] = [(1, 0, 0), (2, 0, 0), (4, 0, 0), (8, 0, 0)];
+        let s = panel(&[9000, 4000, 1, 7000, 300]);
+        let p = pred(s.ret.len());
+        let got: Vec<(usize, u64, u64)> = PINNED
+            .iter()
+            .map(|&(k, _, _)| {
+                let book = FitnessBook::with_blocks(&s, &spec(), 900.0, k, 1.5).unwrap();
+                (k, book.hash(), book.regret(&p).to_bits())
+            })
+            .collect();
+        let text: Vec<String> = got.iter().map(|(k, h, f)| format!("({}, 0x{:016x}, 0x{:016x})", k, h, f)).collect();
+        assert_eq!(got, PINNED.to_vec(), "got [{}]", text.join(", "));
+    }
+
+    /// #1178: 48 blocks keep their ids out of the flags; every block regret
+    /// equals its rows priced as a separate book.
+    #[test]
+    fn block_regret_k48_equals_separate_books() {
+        let s = panel(&[9000, 4000, 1, 7000, 300]);
+        let k = 48usize;
+        let book = FitnessBook::with_blocks(&s, &spec(), 900.0, k, 1.0).unwrap();
+        let ids = block_ids(&s.rows.time, k).unwrap();
+        assert_eq!(book.blocks(), k);
+        assert_eq!(book.block_ids(), &ids[..]);
+        assert!(book.flags().iter().all(|f| *f & (7u8 << FITNESS_BLOCK_SHIFT) == 0), "no block id in the flags");
+        let p = pred(s.ret.len());
+        let totals = book.block_totals(&p);
+        let regrets = book.block_regrets(&totals);
+        for b in 0..k {
+            let sl = block_slice(&s, &ids, b as u8);
+            let bp: Vec<f64> = (0..ids.len()).filter(|&i| ids[i] as usize == b).map(|i| p[i]).collect();
+            let plain = FitnessBook::new(&sl, &spec(), 900.0).unwrap();
+            assert_eq!(plain.bound().to_bits(), book.block_bounds()[b].to_bits(), "block {b} bound");
+            let r = plain.regret(&bp);
+            assert!((r - regrets[b]).abs() <= 1e-12, "block {b}: {r} vs {}", regrets[b]);
+        }
+        assert_eq!(book.regret(&p).to_bits(), block_stat(BlockStat::MeanSd, &regrets, 1.0).to_bits());
+        assert!(FitnessBook::with_blocks(&s, &spec(), 900.0, 65, 1.0).unwrap_err().contains("1 to 64"));
+    }
+
+    /// Block regrets of the hand fixtures: the captures 0.5, -0.2, 0.1, -0.5,
+    /// 0.3, 0.0, 0.2, -0.1, 0.4 and 0.6 of 10 blocks.
+    const HAND: [f64; 10] = [0.5, 1.2, 0.9, 1.5, 0.7, 1.0, 0.8, 1.1, 0.6, 0.4];
+
+    /// #1178: the mean regret is 0.87; the losing captures -0.2, -0.5 and -0.1
+    /// give the semi-deviation sqrt((0.04 + 0.25 + 0.01) / 10) = sqrt(0.03).
+    #[test]
+    fn mean_semi_matches_hand_value() {
+        let want = 0.87 + 2.0 * 0.03f64.sqrt();
+        let got = block_stat(BlockStat::MeanSemi, &HAND, 2.0);
+        assert!((got - want).abs() <= 1e-12, "{got} vs {want}");
+        // No losing block: the mean exactly, which is mean-sd with lambda 0.
+        let winning = [0.5, 0.9, 1.0, 0.7, 0.2];
+        assert_eq!(
+            block_stat(BlockStat::MeanSemi, &winning, 3.0).to_bits(),
+            block_stat(BlockStat::MeanSd, &winning, 0.0).to_bits()
+        );
+        // A 10-block book ranks by the same statistic of its block regrets.
+        let s = panel(&[3000, 2500, 1]);
+        let p = pred(s.ret.len());
+        let book = FitnessBook::with_blocks(&s, &spec(), 900.0, 10, 2.0).unwrap().with_stat(BlockStat::MeanSemi).unwrap();
+        let r = book.block_regrets(&book.block_totals(&p));
+        assert!(r.iter().any(|&v| v > 1.0), "a block loses: {r:?}");
+        assert_eq!(book.regret(&p).to_bits(), block_stat(BlockStat::MeanSemi, &r, 2.0).to_bits());
+    }
+
+    /// #1178: q = 0.25 of 10 blocks takes ceil(2.5) = 3 worst captures, -0.5,
+    /// -0.2 and -0.1, so the fitness is 1 + 0.8 / 3; q = 0.31 adds the capture
+    /// 0.0 as the fourth.
+    #[test]
+    fn cvar_matches_hand_value() {
+        let got = block_stat(BlockStat::Cvar(0.25), &HAND, 7.0);
+        assert!((got - (1.0 + 0.8 / 3.0)).abs() <= 1e-12, "{got}");
+        assert_eq!(block_stat(BlockStat::Cvar(0.3), &HAND, 0.0).to_bits(), got.to_bits(), "0.3 of 10 is 3 blocks");
+        let four = block_stat(BlockStat::Cvar(0.31), &HAND, 0.0);
+        assert!((four - 1.2).abs() <= 1e-12, "{four}");
+        assert_eq!(BlockStat::cvar_count(0.25, 10), 3);
+        assert_eq!(BlockStat::cvar_count(0.3, 10), 3);
+        assert_eq!(BlockStat::cvar_count(0.31, 10), 4);
+        assert_eq!(BlockStat::cvar_count(1e-6, 10), 1);
+        assert_eq!(BlockStat::cvar_count(1.0, 64), 64);
+        assert_eq!(BlockStat::cvar_count(0.25, 1), 1);
+        let s = panel(&[3000, 2500, 1]);
+        let p = pred(s.ret.len());
+        let book = FitnessBook::with_blocks(&s, &spec(), 900.0, 10, 1.0).unwrap().with_stat(BlockStat::Cvar(0.25)).unwrap();
+        let r = book.block_regrets(&book.block_totals(&p));
+        let mut sorted = r.clone();
+        sorted.sort_by(|a, b| b.total_cmp(a));
+        let fit = book.regret(&p);
+        assert!((fit - (sorted[0] + sorted[1] + sorted[2]) / 3.0).abs() <= 1e-12, "{fit} vs {sorted:?}");
+        assert_eq!(fit.to_bits(), block_stat(BlockStat::Cvar(0.25), &r, 1.0).to_bits());
+    }
+
+    /// #1178: q = 1 takes every block: the mean, bit for bit the mean-sd
+    /// fitness with lambda 0.
+    #[test]
+    fn cvar_q1_is_the_mean() {
+        assert_eq!(block_stat(BlockStat::Cvar(1.0), &HAND, 5.0).to_bits(), block_stat(BlockStat::MeanSd, &HAND, 0.0).to_bits());
+        let s = panel(&[3000, 2500, 1]);
+        let n = s.ret.len();
+        for k in [2usize, 10, 64] {
+            let mean = FitnessBook::with_blocks(&s, &spec(), 900.0, k, 0.0).unwrap();
+            let cvar = FitnessBook::with_blocks(&s, &spec(), 900.0, k, 0.0).unwrap().with_stat(BlockStat::Cvar(1.0)).unwrap();
+            let ramp: Vec<f64> = (0..n).map(|i| (i % 17) as f64 - 8.0).collect();
+            for p in [pred(n), vec![-1.0; n], ramp] {
+                assert_eq!(cvar.regret(&p).to_bits(), mean.regret(&p).to_bits(), "{k} blocks");
+            }
+        }
+    }
+
+    /// #1178: the statistic and its parameter enter the hash; mean-sd keeps it.
+    #[test]
+    fn block_stat_enters_the_hash() {
+        let s = panel(&[3000, 2500, 1]);
+        let base = |k: usize, l: f64| FitnessBook::with_blocks(&s, &spec(), 900.0, k, l).unwrap();
+        let h = |k: usize, l: f64, st: BlockStat| base(k, l).with_stat(st).unwrap().hash();
+        assert_eq!(h(10, 1.0, BlockStat::MeanSd), base(10, 1.0).hash());
+        assert_eq!(h(1, 1.0, BlockStat::MeanSd), FitnessBook::new(&s, &spec(), 900.0).unwrap().hash());
+        let all = [
+            h(10, 1.0, BlockStat::MeanSd),
+            h(10, 1.0, BlockStat::MeanSemi),
+            h(10, 2.0, BlockStat::MeanSemi),
+            h(10, 1.0, BlockStat::Cvar(0.25)),
+            h(10, 1.0, BlockStat::Cvar(0.5)),
+            h(12, 1.0, BlockStat::Cvar(0.25)),
+            h(1, 1.0, BlockStat::MeanSemi),
+            h(1, 2.0, BlockStat::MeanSemi),
+            h(1, 1.0, BlockStat::MeanSd),
+            h(9, 1.0, BlockStat::MeanSd),
+        ];
+        for i in 0..all.len() {
+            for j in 0..i {
+                assert_ne!(all[i], all[j], "{i} vs {j}");
+            }
+        }
+        assert!(base(10, 1.0).with_stat(BlockStat::Cvar(0.0)).is_err());
+        assert!(base(10, 1.0).with_stat(BlockStat::Cvar(1.5)).is_err());
+        assert!(base(10, 1.0).with_stat(BlockStat::MeanSemi).unwrap().with_stat(BlockStat::Cvar(0.5)).is_err());
+    }
+
+    /// #1178: the `+inf` rules hold under every statistic, for 12 blocks and one.
+    #[test]
+    fn inf_rules_hold_under_every_statistic() {
+        let s = panel(&[3000, 2500, 1]);
+        let n = s.ret.len();
+        for k in [1usize, 12] {
+            for st in [BlockStat::MeanSd, BlockStat::MeanSemi, BlockStat::Cvar(0.25)] {
+                let book = FitnessBook::with_blocks(&s, &spec(), 900.0, k, 1.0).unwrap().with_stat(st).unwrap();
+                let mut p = pred(n);
+                assert!(book.regret(&p).is_finite(), "{k} {st:?}");
+                p[n / 2] = f64::NAN;
+                assert_eq!(book.regret(&p), f64::INFINITY, "{k} {st:?}: a non-finite prediction");
+                let floor = FitnessBook::with_blocks(&s, &TradingSpec { min_trades: 1_000_000, ..spec() }, 900.0, k, 1.0)
+                    .unwrap()
+                    .with_stat(st)
+                    .unwrap();
+                assert_eq!(floor.regret(&pred(n)), f64::INFINITY, "{k} {st:?}: the trade floor");
+            }
+        }
+    }
+
+    /// #1178: 12 blocks over interval segments and under a regime mask: block
+    /// `b` equals its rows priced as a separate book with the same segments and
+    /// the mask on those rows, and the mask bit stays in the flags.
+    #[test]
+    fn wide_blocks_compose_with_segments_and_a_mask() {
+        let s = panel(&[3000, 2500, 1]);
+        let n = s.ret.len();
+        let k = 12usize;
+        let segments = [0.0, 900.0 * 1000.0, 900.0 * 2200.0];
+        let on: Vec<bool> = (0..n).map(|i| (i / 37) % 3 != 2).collect();
+        let ids = block_ids(&s.rows.time, k).unwrap();
+        let p = pred(n);
+        for (segs, mask) in [(&segments[..], None), (&[][..], Some(&on)), (&segments[..], Some(&on))] {
+            let m = mask.map(|on| BookMask { on, identity: "m" });
+            let book = FitnessBook::with_segments(&s, &spec(), 900.0, k, 1.0, segs, m).unwrap().with_stat(BlockStat::MeanSemi).unwrap();
+            if let Some(on) = mask {
+                assert!(book.flags().iter().zip(on).all(|(f, o)| (*f & FITNESS_MASK_OFF != 0) == !o));
+            }
+            let r = book.block_regrets(&book.block_totals(&p));
+            for b in 0..k {
+                let rows: Vec<usize> = (0..n).filter(|&i| ids[i] as usize == b).collect();
+                let sl = block_slice(&s, &ids, b as u8);
+                let on_b: Vec<bool> = mask.map_or_else(Vec::new, |on| rows.iter().map(|&i| on[i]).collect());
+                let mb = mask.map(|_| BookMask { on: &on_b, identity: "m" });
+                let alone = FitnessBook::with_segments(&sl, &spec(), 900.0, 1, 1.0, segs, mb).unwrap();
+                let bp: Vec<f64> = rows.iter().map(|&i| p[i]).collect();
+                assert_eq!(alone.bound().to_bits(), book.block_bounds()[b].to_bits(), "block {b} bound");
+                let want = alone.regret(&bp);
+                assert!((want - r[b]).abs() <= 1e-12, "block {b}: {want} vs {}", r[b]);
+            }
+            assert_eq!(book.regret(&p).to_bits(), block_stat(BlockStat::MeanSemi, &r, 1.0).to_bits());
+        }
     }
 
     /// #1023: every `(group, block)` run totals as a separate book of its own

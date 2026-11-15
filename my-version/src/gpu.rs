@@ -1987,6 +1987,25 @@ impl GpuEvaluator {
         (rc == 0).then_some((sd as f64, score as f64))
     }
 
+    /// #1178 skeleton: the block ids and the statistic are not uploaded yet.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn upload_pnl_book_with(
+        &mut self,
+        excess: &[f64],
+        flags: &[u8],
+        block_ids: &[u8],
+        side: f64,
+        threshold: f64,
+        bounds: &[f64],
+        lambda: f64,
+        stat: (i32, i32),
+        min_trades: u64,
+    ) -> Result<(), String> {
+        let _ = (block_ids, stat);
+        self.upload_pnl_book(excess, flags, side, threshold, bounds, lambda, min_trades)
+    }
+
     /// #604: [`GpuEvaluator::set_pnl_book`] on raw book parts. The row count is
     /// `excess.len()`; every refusal names its cause. Public so a test can
     /// reach the device-side checks that a built `FitnessBook` never trips.

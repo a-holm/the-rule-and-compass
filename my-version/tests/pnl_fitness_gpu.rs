@@ -452,6 +452,95 @@ fn block_trade_floor_and_flat_programs_have_exact_values() {
     }
 }
 
+// ---- #1178: up to 64 blocks and the block statistics ----
+
+use rcsr::trading::BlockStat;
+
+const STATS: [BlockStat; 4] = [BlockStat::MeanSd, BlockStat::MeanSemi, BlockStat::Cvar(0.25), BlockStat::Cvar(1.0)];
+
+fn stat_book(f: &Fixture, blocks: usize, lambda: f64, stat: BlockStat) -> FitnessBook {
+    book_blocks(f, 1, blocks, lambda).with_stat(stat).expect("a valid block statistic")
+}
+
+/// The memcheck book: 9, 32 and 64 blocks (ids beside the flags, the wide
+/// kernel) under every statistic, and the new statistics on the flag-byte
+/// kernels (1, 4 and 8 blocks): device per-block totals and fitness against
+/// the CPU on the device predictions, bit for bit.
+#[test]
+fn device_block_stat_parity() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    let f = fixture(&STARTS_SMALL, 16_401, 11);
+    let trees = programs(24, 5);
+    for blocks in [9usize, 32, 64] {
+        for stat in STATS {
+            let b = stat_book(&f, blocks, 1.5, stat);
+            assert_eq!(b.block_ids().len(), f.n);
+            let finite = assert_exact_blocks(&f, &b, &trees);
+            assert!(finite == 0 || finite >= 8, "{finite} finite programs at {blocks} blocks, {stat:?}");
+        }
+    }
+    for blocks in [1usize, 4, 8] {
+        for stat in [BlockStat::MeanSemi, BlockStat::Cvar(0.25)] {
+            let b = stat_book(&f, blocks, 2.0, stat);
+            let finite = assert_exact_blocks(&f, &b, &trees);
+            assert!(finite == 0 || finite >= 8, "{finite} finite programs at {blocks} blocks, {stat:?}");
+        }
+    }
+}
+
+/// Two 16384-row groups: 64 blocks cut both groups every 256 rows (on warp
+/// steps and on the 8192-row segment seam), 33 blocks cut inside warp steps,
+/// and a one-row group follows.
+#[test]
+fn device_block_stat_parity_when_cuts_meet_steps_and_segments() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    let f = fixture(&[0, 16_384, 32_768], 32_769, 19);
+    let trees = programs(24, 7);
+    for blocks in [64usize, 33] {
+        for stat in [BlockStat::MeanSemi, BlockStat::Cvar(0.25)] {
+            let b = stat_book(&f, blocks, 1.0, stat);
+            let finite = assert_exact_blocks(&f, &b, &trees);
+            assert!(finite == 0 || finite >= 8, "{finite} finite programs at {blocks} blocks, {stat:?}");
+        }
+    }
+}
+
+/// The band kernels with ids beside the flags: a 1-row and a 24-row hold in
+/// score units and a 12-row hold in sd units, 9 and 64 blocks.
+#[test]
+fn device_block_stat_parity_with_a_band() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    if GpuEvaluator::new(&[0.0], 1, 1, &[0.0]).is_none() {
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    let f = fixture(&STARTS_SMALL, 16_401, 11);
+    let trees = band_programs(16, 5);
+    for (band, hold, units) in [(0.3, 1, BandUnits::Score), (0.5, 24, BandUnits::Score), (1.0, 12, BandUnits::Sd)] {
+        for blocks in [9usize, 64] {
+            for stat in [BlockStat::MeanSd, BlockStat::Cvar(0.25)] {
+                let b = band_book(&f, band, units, hold, blocks).with_stat(stat).expect("a valid block statistic");
+                assert!(!b.is_plain());
+                let n = assert_exact_blocks(&f, &b, &trees);
+                assert!(n > 0, "band {band} hold {hold} {units:?} blocks {blocks} {stat:?}: no finite program");
+            }
+        }
+    }
+}
+
+/// Thirteen segments and 37 groups: 64 and 9 blocks on device predictions.
+#[test]
+fn device_block_stat_parity_on_device_predictions() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    let f = fixture(&STARTS_100K, 100_003, 7);
+    let trees = programs(64, 9);
+    for (blocks, stat) in [(64usize, BlockStat::MeanSd), (64, BlockStat::Cvar(0.25)), (9, BlockStat::MeanSemi)] {
+        let b = stat_book(&f, blocks, 1.0, stat);
+        let finite = assert_exact_blocks(&f, &b, &trees);
+        assert!(finite == 0 || finite >= 32, "{finite} finite programs at {blocks} blocks, {stat:?}");
+    }
+}
+
 // ---- search level ----
 
 /// Four groups of 600 rows. `x0` carries the return, `x1` is noise.
@@ -731,6 +820,31 @@ fn blocked_synchronous_device_fit_archives_device_scores() {
     assert_device_scored(&out);
     assert!(out.gpu.as_ref().unwrap().fit_gpu > 0, "the device fitted constants");
     assert_archived_values_are_device_scores(&sample, &b, &seen);
+}
+
+/// #1178: a 12-block cvar book and a 9-block mean-semi book in a device-
+/// dispatched search: every archived value is the device score of its tree
+/// and the reported front is the exact CPU fitness.
+#[test]
+fn wide_block_stat_search_archives_device_scores() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    if GpuEvaluator::new(&[0.0], 1, 1, &[0.0]).is_none() {
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    for (blocks, stat) in [(12usize, BlockStat::Cvar(0.25)), (9, BlockStat::MeanSemi)] {
+        let (sample, plain) = search_fixture_blocks(blocks);
+        let b = Arc::new((*plain).clone().with_stat(stat).expect("a valid block statistic"));
+        let seen: Archived = Arc::default();
+        let cfg = config(&b, &seen);
+        let out = search::run(&cfg, &sample, &sample);
+        assert_device_scored(&out);
+        assert_archived_values_are_device_scores(&sample, &b, &seen);
+        for s in &out.archive.items {
+            let pred: Vec<f64> = sample.x.iter().map(|r| rcsr::expr::eval(&s.tree, r)).collect();
+            assert_eq!(s.error.to_bits(), b.regret(&pred).to_bits(), "{}", show(&s.tree));
+        }
+    }
 }
 
 /// Throughput of the blocked kernel against the unblocked one on the same
@@ -1063,8 +1177,13 @@ fn every_device_side_book_refusal_names_its_cause() {
     let _faults = Faults::arm("");
     let bound = b.block_bounds()[0];
     let nine = [bound; 9];
+    let many = [bound; 65];
     let zero = [0.0];
-    let cases: [(&str, Result<(), String>); 6] = [
+    // #1178: ids beside the flags for more than 8 blocks, and the statistic.
+    let ids = vec![0u8; f.n];
+    let mut bad_ids = ids.clone();
+    bad_ids[f.n / 2] = 9;
+    let cases: [(&str, Result<(), String>); 11] = [
         (
             "the row count differs",
             ev.upload_pnl_book(&b.excess()[..100], &b.flags()[..100], b.side(), b.threshold(), &[bound], 1.0, 1),
@@ -1074,8 +1193,28 @@ fn every_device_side_book_refusal_names_its_cause() {
             ev.upload_pnl_book(b.excess(), b.flags(), b.side(), b.threshold(), &[], 1.0, 1),
         ),
         (
-            "the block count is outside 1 to 8",
+            "the block count is outside 1 to 64",
+            ev.upload_pnl_book(b.excess(), b.flags(), b.side(), b.threshold(), &many, 1.0, 1),
+        ),
+        (
+            "more than 8 blocks need a block id per row",
             ev.upload_pnl_book(b.excess(), b.flags(), b.side(), b.threshold(), &nine, 1.0, 1),
+        ),
+        (
+            "a block id is not below the block count",
+            ev.upload_pnl_book_with(b.excess(), b.flags(), &bad_ids, b.side(), b.threshold(), &nine, 1.0, (0, 0), 1),
+        ),
+        (
+            "block ids are read with more than 8 blocks only",
+            ev.upload_pnl_book_with(b.excess(), b.flags(), &ids, b.side(), b.threshold(), &[bound], 1.0, (0, 0), 1),
+        ),
+        (
+            "the block statistic is unknown",
+            ev.upload_pnl_book_with(b.excess(), b.flags(), &[], b.side(), b.threshold(), &[bound], 1.0, (3, 0), 1),
+        ),
+        (
+            "the cvar block count is outside 1 to the block count",
+            ev.upload_pnl_book_with(b.excess(), b.flags(), &ids, b.side(), b.threshold(), &nine, 1.0, (2, 10), 1),
         ),
         (
             "the block spread weight",
