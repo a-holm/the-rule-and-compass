@@ -361,7 +361,7 @@ USAGE:
   A finalist whose gate has a band or a dwell above 1 is carried in compose.gate;
   walkforward --from-run, ladder --sr-run and the seal refuse such a run. A band,
   a minimum hold, --threshold, --position, --book-target, --pnl-mask, --pnl-excess,
-  --pnl-stat, --pnl-cvar-q and --gpu exit 2. See docs/compose.md.
+  --pnl-stat, --pnl-cvar-q, --sample-rows and --gpu exit 2. See docs/compose.md.
 "
 }
 
