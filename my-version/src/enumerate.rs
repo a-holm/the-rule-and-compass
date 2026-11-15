@@ -1744,7 +1744,7 @@ mod tests {
 
     /// CPU seconds at the campaign training shape (306 groups x 7,403 hours, 32
     /// variables, 4 blocks, the ten campaign operators) on 4 threads. Run by hand:
-    /// it prints the seconds and asserts no time.
+    /// it prints wall and process CPU seconds and asserts no time.
     #[test]
     #[ignore]
     fn enumerate_cost_at_the_campaign_shape() {
@@ -1764,26 +1764,40 @@ mod tests {
         let params = BookParams { spec: &spec(), horizon_seconds: 3600.0, blocks: 4, lambda: 1.0, stat: BlockStat::MeanSd, segments: &[] };
         let b = book_of(&slice, &params).unwrap();
         let o = ops(OPS10);
-        for max in [3usize, 4] {
-            let class = Class::build(nvars, &o, max, true).unwrap();
-            let start = std::time::Instant::now();
-            let p = pass(&Scan { class: &class, cols: &cols, rows: n, cuts: 16, threads: 4 }, &[&b], true);
-            let secs = start.elapsed().as_secs_f64();
-            println!(
-                "enumerate cost: max size {max}: {} trees, {} distinct books, {n} rows, 4 blocks, 16 cuts, 1 book, 4 threads: {secs:.1} s wall",
-                class.scored().len(),
-                p.books.len()
-            );
-        }
         let plan = null_plan(&slice.rows, 3600.0, 19, 1).unwrap();
         let shifted: Vec<FitnessBook> = plan.nums.iter().map(|&s| book_of(&shifted_slice(&slice, s, plan.periods as u64).unwrap(), &params).unwrap()).collect();
         let mut books: Vec<&FitnessBook> = vec![&b];
         books.extend(shifted.iter());
         let class = Class::build(nvars, &o, 2, true).unwrap();
         for k in [1usize, 20] {
-            let start = std::time::Instant::now();
+            let (start, cpu) = (std::time::Instant::now(), cpu_seconds());
             pass(&Scan { class: &class, cols: &cols, rows: n, cuts: 16, threads: 4 }, &books[..k], false);
-            println!("enumerate cost: max size 2: {} trees, {k} book(s), 4 threads: {:.1} s wall", class.scored().len(), start.elapsed().as_secs_f64());
+            println!(
+                "enumerate cost: max size 2: {} trees, {n} rows, 4 blocks, 16 cuts, {k} book(s), 4 threads: {:.1} s wall, {:.1} s cpu",
+                class.scored().len(),
+                start.elapsed().as_secs_f64(),
+                cpu_seconds() - cpu
+            );
         }
+        for max in [3usize, 4] {
+            let class = Class::build(nvars, &o, max, true).unwrap();
+            let (start, cpu) = (std::time::Instant::now(), cpu_seconds());
+            let p = pass(&Scan { class: &class, cols: &cols, rows: n, cuts: 16, threads: 4 }, &[&b], true);
+            println!(
+                "enumerate cost: max size {max}: {} trees, {} distinct books, {n} rows, 4 blocks, 16 cuts, 1 book, 4 threads: {:.1} s wall, {:.1} s cpu",
+                class.scored().len(),
+                p.books.len(),
+                start.elapsed().as_secs_f64(),
+                cpu_seconds() - cpu
+            );
+        }
+    }
+
+    /// User plus system CPU seconds of this process, all threads, from `/proc/self/stat`
+    /// (fields 14 and 15, in clock ticks of 1/100 s, the Linux USER_HZ).
+    fn cpu_seconds() -> f64 {
+        let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+        let rest: Vec<&str> = stat[stat.rfind(')').unwrap() + 2..].split_whitespace().collect();
+        (rest[11].parse::<f64>().unwrap() + rest[12].parse::<f64>().unwrap()) / 100.0
     }
 }
