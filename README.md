@@ -268,6 +268,19 @@ The verdict (`ablation/verdict.json`, `ablation/verdict.md`) says ship or drop p
 
 Regime strata (#1175): `rcsr protocol regimes` writes a bull, bear and sideways calendar from daily closes (ex-post by default, `--mode causal` for a causal label; locked ranges are written `not_dated`). `rcsr walkforward --regimes calendar.csv --regime-expr <expr>` and `rcsr trials --regimes calendar.csv` report the pooled periods per stratum with switch counts, exposure and alpha against the equal-weight series. Without the flags the output is byte-identical. See [`docs/walkforward.md`](docs/walkforward.md) and [`docs/time-series.md`](docs/time-series.md).
 
+### Two books and a gate (`rcsr switch`)
+
+`rcsr switch` takes the flags of a `--fitness pnl` run, builds that run's training book and stops before any search. For two fixed books `--a` and `--b` (an expression or `flat`) and each `--gate`, it gives the net, cost counts and block fitness of `if(greater(g, c), A, B)` at every cut `c` from one sort and one sweep, the best cut over all cuts and over a grid of `--cuts Q` quantiles with its plateau, the seam identity at that cut and the composite as one exact expression that `walkforward --expr` accepts. It also gives the k-switch bound: the best net of any time-level switch between A and B with at most k switches (`--switches 2,8,32`), which no time-level gate with at most k flips can beat. The bound is a pruning bound, not evidence of an edge, and every number is a training-row value. Gate columns pass the `--pnl-mask` column checks.
+
+```sh
+rcsr switch --data dev.rcsb --target lbl_h1_y --target-spec dev.targets.json --vars "$VIEW" \
+  --time ts --group-by symbol --split temporal --validation-frac 0.3 \
+  --objective sharpe --threshold 1e-30 --cost-bps 10 --pnl-blocks 4 \
+  --a "<expression>" --b flat --gate btc_r672 --gate mtf_1d_ma_ratio --cuts 16 --switches 2,8,32 --json --out switch.json
+```
+
+See [`docs/walkforward.md`](docs/walkforward.md#two-books-and-a-gate-rcsr-switch-1185).
+
 ### Combinatorial purged cross-validation (CPCV)
 
 `rcsr protocol cpcv --start 2017-12-15 --end 2023-11-01 --groups 6 --test-groups 2 --purge-seconds 7200 --embargo-seconds auto --vars "$VIEW" --bar-seconds 3600 --validation-share 0.2 --out cpcv62` writes the C(N, k) splits of N equal calendar groups as a `--split-table` (training and validation intervals already purged before and embargoed after every test group, locked ranges as holes), one walk-forward windows file per split and `cpcv.json`. After one search and one `walkforward --pool-reset-flat --period-grid target` per split (the target grid gives every split the same periods on a group, whatever NaN coverage or gate its formula has; a period where the book prices no row books net 0), `rcsr trials --cpcv-assemble wf_s*.json --splits cpcv62/splits.csv --out-dir paths` joins the test series into C(N-1, k-1) complete backtest paths (López de Prado 2018, ch. 12): path j of group g takes the j-th split that tests g, and every group starts flat and pays its final exit. The paths are walk-forward-schema reports, so `rcsr trials --wf` gives `N_eff`, DSR, SPA and PBO across configurations; the summary gives the path Sharpe distribution. See [`docs/walkforward.md`](docs/walkforward.md#cpcv).

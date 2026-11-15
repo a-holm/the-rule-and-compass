@@ -1762,6 +1762,9 @@ pub struct TradingColumns {
     /// #1180: the regime gate of `--pnl-mask`: the gate state of every slice row
     /// is built into [`TradingSplit::masks`].
     pub mask: Option<crate::regime_gate::GateSpec>,
+    /// #1185: numeric columns whose raw values travel with the training rows
+    /// into [`TradingSplit::train_values`] (`rcsr switch`).
+    pub train_values: Vec<String>,
 }
 
 /// #1180: the regime mask of each slice, aligned with its trading rows.
@@ -1823,6 +1826,9 @@ pub struct TradingSplit {
     pub test_context: Option<TradingContext>,
     /// #1180: the regime mask of each slice under `--pnl-mask`.
     pub masks: Option<TradingMasks>,
+    /// #1185: raw values of [`TradingColumns::train_values`] on the training
+    /// rows, one vector per name; empty without names.
+    pub train_values: Vec<Vec<f64>>,
 }
 
 /// Feature rows (as in [`Sample::x`]) and trading rows of a cross-section context.
@@ -4987,8 +4993,16 @@ fn build_trading(
             })
         }
     };
+    let mut train_values = Vec::with_capacity(cols.train_values.len());
+    if cols.train {
+        for name in &cols.train_values {
+            let c = numeric(name, "switch")?;
+            train_values.push(train_idx.iter().map(|&i| c[i]).collect());
+        }
+    }
     Ok(TradingSplit {
         masks,
+        train_values,
         train: cols.train.then(|| slice(train_idx, train)),
         validation: validation.map(|v| slice(validation_idx, v)),
         test: slice(test_idx, test),
@@ -6237,6 +6251,7 @@ mod tests {
                 cross_section: false,
                 book_rows: false,
                 mask: None,
+                train_values: Vec::new(),
             }),
             canonical_train_order: canonical,
             ..Default::default()

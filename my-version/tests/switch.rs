@@ -1,0 +1,290 @@
+//! #1185: `rcsr switch`, the gate-cut profile of `if(greater(g, c), A, B)` and
+//! the k-switch bound on the training rows of a `--fitness pnl` run.
+
+#[path = "common/rcsr.rs"]
+mod rcsr_cmd;
+#[path = "common/scratch.rs"]
+mod scratch;
+
+use rcsr::devlog::Json;
+use scratch::Scratch;
+use std::path::{Path, PathBuf};
+use std::process::Output;
+
+const T0: i64 = 1_600_000_000;
+const STEP: i64 = 900;
+const STAMPS: usize = 480;
+const SYMBOLS: [&str; 3] = ["a", "b", "c"];
+
+fn scratch() -> (Scratch, PathBuf) {
+    let scratch = Scratch::new("switch");
+    let path = scratch.path().to_path_buf();
+    (scratch, path)
+}
+
+fn frac(v: f64) -> f64 {
+    v - v.floor()
+}
+
+/// The regime gate of stamp `k`: positive in alternate 48-stamp blocks, the
+/// same for every symbol.
+fn regime(k: usize) -> f64 {
+    let m = 0.5 + 0.4 * frac(k as f64 * 0.324_717_957_244_746);
+    if (k / 48) % 2 == 0 {
+        m
+    } else {
+        -m
+    }
+}
+
+/// Three symbols on a 900 s grid from `T0 + first * STEP`. `x1` pays while the
+/// gate `g` is positive and `0 - x1` while it is negative; `h` varies inside a
+/// timestamp; `lbl_h24a_y` is a label-family column no gate may read. `alter`
+/// rewrites the gate and the return of a row from its stamp.
+fn write_csv(dir: &Path, name: &str, first: i64, alter: impl Fn(i64) -> Option<(f64, f64)>) -> String {
+    let mut text = String::from("t,s,x1,x2,g,h,r,y,lbl_h24a_y\n");
+    for k in first..STAMPS as i64 {
+        for (j, sym) in SYMBOLS.iter().enumerate() {
+            let i = (k + 40) as f64 * 3.0 + j as f64;
+            let x1 = frac(i * 0.618_033_988_749_894_9) - 0.5;
+            let x2 = frac(i * 0.754_877_666_246_692_7) - 0.5;
+            let h = frac(i * 0.414_213_562_373_095) - 0.5;
+            let noise = frac(i * 0.324_717_957_244_746) - 0.5;
+            let g = if k >= 0 { regime(k as usize) } else { 0.3 };
+            let r = if g > 0.0 { 0.01 } else { -0.01 } * x1 + 0.0005 * noise;
+            let (g, r) = alter(k).unwrap_or((g, r));
+            text.push_str(&format!("{},{},{},{},{},{},{},{},{}\n", T0 + STEP * k, sym, x1, x2, g, h, r, r, r));
+        }
+    }
+    let path = dir.join(name);
+    std::fs::write(&path, text).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+fn write_spec(dir: &Path) -> String {
+    let text = "{\"schema\":\"rcsr-target-spec/1\",\"targets\":[{\"column\":\"y\",\"name\":\"raw_target\",\
+         \"kind\":\"forward_return\",\"deprecated\":false,\"return_column\":\"r\",\"return_units\":\"log\",\
+         \"horizon_seconds\":900,\"entry_offset_seconds\":0,\"delay_seconds\":0,\
+         \"entry_price\":\"open\",\"exit_price\":\"close\",\"offset\":0.0,\
+         \"scale\":{\"kind\":\"constant\",\"value\":1.0},\"clip\":null,\"units\":\"log_return\",\
+         \"cost_bps\":null,\"cost_in_label\":false,\"construction_columns\":[],\"note\":null}]}";
+    let path = dir.join("s.json");
+    std::fs::write(&path, text).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+fn rcsr(args: &[&str]) -> Output {
+    rcsr_cmd::rcsr().args(args).output().expect("run rcsr")
+}
+
+/// `rcsr switch` with the flags of a `--fitness pnl` run plus `extra`.
+fn switch(data: &str, spec: &str, extra: &[&str]) -> Output {
+    let mut args = vec![
+        "switch", "--data", data, "--target", "y", "--vars", "x1,x2", "--time", "t", "--group-by", "s", "--split", "temporal",
+        "--target-spec", spec, "--objective", "pnl", "--cost-bps", "5", "--validation-frac", "0.3", "--test-frac", "0.2",
+        "--no-dev-log", "--quiet",
+    ];
+    args.extend_from_slice(extra);
+    rcsr(&args)
+}
+
+fn code(o: &Output) -> i32 {
+    o.status.code().unwrap_or(-1)
+}
+
+fn stderr(o: &Output) -> String {
+    String::from_utf8_lossy(&o.stderr).into_owned()
+}
+
+fn json(o: &Output) -> Json {
+    assert_eq!(code(o), 0, "{}", stderr(o));
+    let text = String::from_utf8_lossy(&o.stdout);
+    Json::parse(text.trim()).unwrap_or_else(|| panic!("stdout is not json: {text}"))
+}
+
+fn at<'a>(j: &'a Json, path: &[&str]) -> &'a Json {
+    let mut cur = j;
+    for k in path {
+        cur = cur.get(k).unwrap_or_else(|| panic!("missing '{k}' in {path:?}"));
+    }
+    cur
+}
+
+fn num(j: &Json, path: &[&str]) -> f64 {
+    at(j, path).as_f64().unwrap_or_else(|| panic!("{path:?} is not a number"))
+}
+
+fn arr<'a>(j: &'a Json, path: &[&str]) -> &'a Vec<Json> {
+    match at(j, path) {
+        Json::Arr(a) => a,
+        _ => panic!("{path:?} is not an array"),
+    }
+}
+
+const GATES: [&str; 6] = ["--a", "x1", "--b", "0 - x1", "--gate", "g"];
+
+#[test]
+fn switch_reports_the_profile_and_the_bound() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, "d.csv", 0, |_| None);
+    let spec = write_spec(&dir);
+    let out_path = dir.join("switch.json").to_string_lossy().into_owned();
+    let mut args: Vec<&str> = GATES.to_vec();
+    args.extend(["--gate", "h", "--cuts", "8", "--switches", "0,2,8,100000", "--json", "--out", &out_path]);
+    let first = switch(&data, &spec, &args);
+    let j = json(&first);
+    assert_eq!(at(&j, &["schema"]).as_str(), Some("rcsr-switch/1"));
+    assert_eq!(at(&j, &["rows"]).as_str(), Some("train"));
+    assert_eq!(num(&j, &["groups"]), 3.0);
+    assert_eq!(num(&j, &["train_rows"]), 3.0 * num(&j, &["timestamps"]));
+    let reference = num(&j, &["a", "net"]).max(num(&j, &["b", "net"]));
+    assert_eq!(num(&j, &["bound", "reference"]), reference);
+    assert_eq!(at(&j, &["bound", "is_evidence"]), &Json::Bool(false));
+    assert_eq!(at(&j, &["bound", "exact"]), &Json::Bool(true));
+    let ks = arr(&j, &["bound", "k"]);
+    assert_eq!(ks.len(), 4);
+    assert!((num(&ks[0], &["value"]) - reference).abs() <= 1e-12, "V_0 is the better branch");
+    for w in ks.windows(2) {
+        assert!(num(&w[1], &["value"]) >= num(&w[0], &["value"]));
+    }
+    let last = &ks[3];
+    assert_eq!(num(last, &["requested"]), 100000.0);
+    assert_eq!(num(last, &["k"]), num(&j, &["timestamps"]) - 1.0);
+    assert_eq!(at(last, &["clamped"]), &Json::Bool(true));
+    assert_eq!(num(last, &["value"]), num(&j, &["bound", "free"]));
+
+    let gates = arr(&j, &["gates"]);
+    assert_eq!(gates.len(), 2);
+    let g = &gates[0];
+    assert_eq!(at(g, &["time_level"]), &Json::Bool(true));
+    let best = at(g, &["best"]);
+    let net = num(best, &["net"]);
+    assert!(net > reference, "the regime gate beats both branches: {net} vs {reference}");
+    let k = num(best, &["switches"]);
+    let bound_k = ks.iter().find(|b| num(b, &["k"]) >= k).expect("a budget at or above K");
+    assert!(net <= num(bound_k, &["value"]) + 1e-12);
+    let seam = at(best, &["seam"]);
+    assert!((num(seam, &["sum"]) - net).abs() <= 1e-9, "seam identity at the best cut");
+    assert!((num(seam, &["composite"]) - net).abs() <= 1e-12);
+    let grid_best = num(g, &["grid", "best", "net"]);
+    assert!(grid_best <= net);
+    assert_eq!(arr(g, &["grid", "profile"]).len(), 7);
+    let plateau = at(best, &["plateau"]);
+    assert!(num(plateau, &["lo"]) <= num(best, &["index"]) && num(best, &["index"]) <= num(plateau, &["hi"]));
+    assert!(at(best, &["expression"]).as_str().unwrap().starts_with("if(greater(g, "));
+    let h = &gates[1];
+    assert_eq!(at(h, &["time_level"]), &Json::Bool(false));
+    assert_eq!(at(h, &["best", "switches"]), &Json::Null);
+
+    let written = std::fs::read_to_string(&out_path).unwrap();
+    assert_eq!(written.trim(), String::from_utf8_lossy(&first.stdout).trim(), "--out holds the printed report");
+    let second = switch(&data, &spec, &args);
+    assert_eq!(first.stdout, second.stdout, "the report is deterministic");
+    let plain = switch(&data, &spec, &GATES);
+    assert_eq!(code(&plain), 0, "{}", stderr(&plain));
+    let text = String::from_utf8_lossy(&plain.stdout);
+    assert!(text.contains("pruning bound, not evidence") && text.contains("expression: if(greater(g, "), "{text}");
+}
+
+#[test]
+fn the_printed_expression_reproduces_the_book() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, "d.csv", 0, |_| None);
+    let spec = write_spec(&dir);
+    for b in ["0 - x1", "flat"] {
+        let j = json(&switch(&data, &spec, &["--a", "x1", "--b", b, "--gate", "g", "--json"]));
+        let best = at(&j, &["gates"]);
+        let best = match best {
+            Json::Arr(a) => at(&a[0], &["best"]),
+            _ => panic!(),
+        };
+        let expr = at(best, &["expression"]).as_str().unwrap().to_string();
+        let first = num(&j, &["time_first"]) as i64;
+        let last = num(&j, &["time_last"]) as i64;
+        assert_eq!(first, T0);
+        // The walk-forward data has 30 earlier stamps for its training window;
+        // its test window is exactly the training rows of the switch.
+        let wf_data = write_csv(&dir, "wf.csv", -30, |_| None);
+        let w = format!("w,{},{},{},{}", T0 - 30 * STEP, T0 - STEP, T0, last + 1);
+        let wf_out = dir.join("wf.json").to_string_lossy().into_owned();
+        let wf = rcsr(&[
+            "walkforward", "--data", &wf_data, "--target", "y", "--target-spec", &spec, "--expr", &expr, "--vars", "g,x1,x2",
+            "--time", "t", "--group-by", "s", "--window", &w, "--threshold-fixed", "0", "--cost-bps", "5", "--out", &wf_out,
+        ]);
+        assert_eq!(code(&wf), 0, "{expr}: {}", stderr(&wf));
+        let report = Json::parse(std::fs::read_to_string(&wf_out).unwrap().trim()).unwrap();
+        let m = at(&arr(&report, &["windows"])[0], &["metrics"]);
+        let turns = num(best, &["flips"]) + num(best, &["exits"]);
+        assert_eq!(num(m, &["rows"]), num(&j, &["train_rows"]), "{b}: the window holds the training rows");
+        assert_eq!(num(m, &["entries"]) * 2.0, turns, "{b}: entries");
+        assert!((num(m, &["total_cost"]) - 0.0005 * turns).abs() <= 1e-12, "{b}: cost {} for {turns} turns", num(m, &["total_cost"]));
+        // Three symbols at every stamp: the period mean is a third of the row sum.
+        let wf_net = num(m, &["mean_return"]) * num(m, &["periods"]) * 3.0;
+        assert!((wf_net - num(best, &["net"])).abs() <= 1e-10, "{b}: walkforward net {wf_net}, switch net {}", num(best, &["net"]));
+    }
+}
+
+#[test]
+fn cuts_read_only_the_training_rows() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, "d.csv", 0, |_| None);
+    let spec = write_spec(&dir);
+    let args = ["--a", "x1", "--b", "0 - x1", "--gate", "g", "--gate", "h", "--json"];
+    let base = switch(&data, &spec, &args);
+    let last = num(&json(&base), &["time_last"]) as i64;
+    let k_last = (last - T0) / STEP;
+    let scrambled = write_csv(&dir, "scrambled.csv", 0, |k| (k > k_last).then(|| (frac(k as f64 * 0.77) - 0.5, 0.02 * (frac(k as f64 * 0.41) - 0.5))));
+    let other = switch(&scrambled, &spec, &args);
+    assert_eq!(code(&other), 0, "{}", stderr(&other));
+    assert_eq!(base.stdout, other.stdout, "gate values and returns after the training rows change nothing");
+}
+
+#[test]
+fn switch_refusals_name_their_reason() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, "d.csv", 0, |_| None);
+    let spec = write_spec(&dir);
+    let refused = |extra: &[&str], want: i32, needle: &str| {
+        let o = switch(&data, &spec, extra);
+        assert_eq!(code(&o), want, "{extra:?}: {}", stderr(&o));
+        assert!(stderr(&o).contains(needle), "{extra:?}: want '{needle}' in {}", stderr(&o));
+    };
+    for col in ["y", "r", "lbl_h24a_y", "g + lbl_h24a_y"] {
+        refused(&["--a", "x1", "--b", "flat", "--gate", col], 5, "--gate");
+        refused(&["--a", "x1", "--b", "flat", "--gate", col], 5, "D13");
+    }
+    refused(&["--a", "x1 + y", "--b", "flat", "--gate", "g"], 5, "--a");
+    refused(&["--a", "x1", "--b", "flat", "--gate", "nope"], 3, "nope");
+    refused(&["--a", "x1", "--b", "flat", "--gate", "mean(g)"], 2, "aggregate");
+    refused(&["--a", "x1", "--b", "flat", "--gate", "g +"], 2, "--gate");
+    refused(&["--a", "x1", "--b", "flat", "--gate", "1"], 2, "distinct");
+    refused(&["--a", "x1", "--b", "x1", "--gate", "g"], 2, "same book");
+    refused(&["--a", "x1", "--b", "flat", "--gate", "g", "--band", "0.1"], 2, "not plain");
+    refused(&["--a", "x1", "--b", "flat", "--gate", "g", "--pnl-mask", "g"], 2, "--pnl-mask");
+    refused(&["--a", "x1", "--b", "flat", "--gate", "g", "--gpu"], 2, "--gpu");
+    refused(&["--a", "x1", "--b", "flat", "--gate", "g", "--fitness", "metric"], 2, "--fitness must be pnl");
+    refused(&["--a", "x1", "--b", "flat"], 2, "--gate <expr> is required");
+    refused(&["--b", "flat", "--gate", "g"], 2, "--a <expr|flat> is required");
+    refused(&["--a", "x1", "--b", "flat", "--gate", "g", "--cuts", "1"], 2, "--cuts");
+    refused(&["--a", "x1", "--b", "flat", "--gate", "g", "--switches", "2,x"], 2, "--switches");
+}
+
+#[test]
+fn switch_help_lists_its_options() {
+    let o = rcsr(&["switch", "--help"]);
+    assert_eq!(code(&o), 0);
+    let help = String::from_utf8_lossy(&o.stdout);
+    let doc = rcsr::schema::json();
+    let start = doc.find("\"switch\":{").expect("schema documents rcsr switch");
+    let section = &doc[start..];
+    let section = &section[..section.find("]}").unwrap()];
+    let mut names = 0;
+    for part in section.split("\"name\":\"--").skip(1) {
+        let name = format!("--{}", part.split('"').next().unwrap());
+        assert!(help.contains(&name), "rcsr switch --help is missing {name}");
+        names += 1;
+    }
+    assert_eq!(names, 7);
+    let top = rcsr(&["--help"]);
+    assert!(String::from_utf8_lossy(&top.stdout).contains("rcsr switch"));
+}
