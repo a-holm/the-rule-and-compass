@@ -312,8 +312,186 @@ impl GateSweep {
 /// or non-plain book, a non-finite time, fewer than 2 distinct non-NaN gate
 /// values.
 pub fn gate_sweep(book: &FitnessBook, a: &[bool], b: &[bool], gate: &[f64], time: &[f64]) -> Result<GateSweep, String> {
-    let _ = (book, a, b, gate, time);
-    Err("gate sweep: not implemented".to_string())
+    check_rows(book, "gate sweep", &[("A positions", a.len()), ("B positions", b.len()), ("gate values", gate.len()), ("times", time.len())])?;
+    let n = book.len();
+    let (stamps, tix) = stamp_index(time).map_err(|e| format!("gate sweep: {}", e))?;
+    let mut keyed: Vec<(u64, u32)> = (0..n).filter_map(|i| gate_key(gate[i]).map(|k| (k, i as u32))).collect();
+    keyed.sort_unstable();
+    let m = keyed.len();
+    let distinct = if m == 0 { 0 } else { 1 + keyed.windows(2).filter(|w| w[0].0 != w[1].0).count() };
+    if distinct < 2 {
+        return Err(format!(
+            "gate sweep: the gate has {} distinct non-NaN value(s) on the {} rows; a cut needs at least 2",
+            distinct, n
+        ));
+    }
+    let mut rank = vec![-1i64; n];
+    for (r, &(_, i)) in keyed.iter().enumerate() {
+        rank[i as usize] = r as i64;
+    }
+    let valid: Vec<bool> = (0..=m).map(|t| t == 0 || t == m || keyed[t - 1].0 != keyed[t].0).collect();
+    let order: Vec<u32> = keyed.iter().map(|&(_, i)| i).collect();
+    drop(keyed);
+
+    let flags = book.flags();
+    let excess = book.excess();
+    let nb = book.blocks();
+    let top = m as i64;
+    let w = m + 2;
+    // `*_d[t]`: change of a count where the cut reaches `t` (ascending).
+    let mut flip_d = vec![0i32; nb * w];
+    let mut exit_d = vec![0i32; nb * w];
+    let mut gate_d = vec![0i32; w];
+    let mut seam_d = vec![0i32; w];
+    let mut entries: Vec<(u32, u32, u32)> = Vec::new();
+    for i in 0..n {
+        let blk = block_of(flags[i]);
+        let ri = rank[i];
+        let (ai, bi) = (a[i], b[i]);
+        let d = &mut flip_d[blk * w..(blk + 1) * w];
+        if flags[i] & TradingRows::FIRST != 0 {
+            // A run starts flat: the row enters whenever it is long.
+            add(d, 0, ri, ai);
+            add(d, ri + 1, top, bi);
+            entry(&mut entries, tix[i], 0, ri, ai);
+            entry(&mut entries, tix[i], ri + 1, top, bi);
+        } else {
+            let rj = rank[i - 1];
+            let (aj, bj) = (a[i - 1], b[i - 1]);
+            let (lo, hi) = (ri.min(rj), ri.max(rj));
+            // Inside `lo < t <= hi` the row of higher rank holds `A`, the other `B`.
+            let (xi, xj) = if ri > rj { (ai, bj) } else { (bi, aj) };
+            add(d, 0, lo, ai != aj);
+            add(d, lo + 1, hi, xi != xj);
+            add(d, hi + 1, top, bi != bj);
+            add(&mut gate_d, lo + 1, hi, true);
+            add(&mut seam_d, lo + 1, hi, xi && xj);
+            entry(&mut entries, tix[i], 0, lo, ai && !aj);
+            entry(&mut entries, tix[i], lo + 1, hi, xi && !xj);
+            entry(&mut entries, tix[i], hi + 1, top, bi && !bj);
+        }
+        if flags[i] & TradingRows::LAST != 0 {
+            let e = &mut exit_d[blk * w..(blk + 1) * w];
+            add(e, 0, ri, ai);
+            add(e, ri + 1, top, bi);
+        }
+    }
+    // A timestamp counts once on the union of its rows' entry intervals.
+    entries.sort_unstable();
+    let mut entry_d = vec![0i32; w];
+    let mut k = 0;
+    while k < entries.len() {
+        let (stamp, mut lo, mut hi) = entries[k];
+        k += 1;
+        while k < entries.len() && entries[k].0 == stamp {
+            let (_, s, e) = entries[k];
+            if s <= hi + 1 {
+                hi = hi.max(e);
+            } else {
+                entry_d[lo as usize] += 1;
+                entry_d[hi as usize + 1] -= 1;
+                lo = s;
+                hi = e;
+            }
+            k += 1;
+        }
+        entry_d[lo as usize] += 1;
+        entry_d[hi as usize + 1] -= 1;
+    }
+    drop(entries);
+    // Time-level: one gate key per timestamp. Any row of a timestamp stands for
+    // it, since a valid cut never splits equal keys.
+    let mut rep: Vec<Option<(Option<u64>, i64)>> = vec![None; stamps];
+    let mut time_level = true;
+    for i in 0..n {
+        let u = tix[i] as usize;
+        let key = gate_key(gate[i]);
+        let current = rep[u];
+        match current {
+            None => rep[u] = Some((key, rank[i])),
+            Some((k0, _)) if k0 != key => time_level = false,
+            Some(_) => {}
+        }
+    }
+    let switch_d: Option<Vec<i32>> = time_level.then(|| {
+        let mut d = vec![0i32; w];
+        for u in 1..stamps {
+            let (r0, r1) = (rep[u - 1].map_or(-1, |r| r.1), rep[u].map_or(-1, |r| r.1));
+            add(&mut d, r0.min(r1) + 1, r0.max(r1), true);
+        }
+        d
+    });
+    drop(rep);
+
+    let empty = FitnessTotals { gross: 0.0, flips: 0, exits: 0, long_rows: 0, nonfinite: false };
+    let mut totals = vec![empty; nb];
+    // Cut 0: every row with a non-NaN gate value holds `A`.
+    for i in 0..n {
+        if if rank[i] >= 0 { a[i] } else { b[i] } {
+            let t = &mut totals[block_of(flags[i])];
+            t.gross += excess[i];
+            t.long_rows += 1;
+        }
+    }
+    drop(rank);
+    let mut net = vec![f64::NAN; m + 1];
+    let mut gross = vec![f64::NAN; m + 1];
+    let mut fitness = vec![f64::INFINITY; m + 1];
+    let mut flips = vec![0u32; m + 1];
+    let mut exits = vec![0u32; m + 1];
+    let mut long_rows = vec![0u32; m + 1];
+    let mut entry_times = vec![0u32; m + 1];
+    let mut gate_flips = vec![0u32; m + 1];
+    let mut seam_pairs = vec![0u32; m + 1];
+    let mut switches = switch_d.as_ref().map(|_| vec![0u32; m + 1]);
+    let mut run_f = vec![0i64; nb];
+    let mut run_e = vec![0i64; nb];
+    let (mut run_entry, mut run_gate, mut run_seam, mut run_switch) = (0i64, 0i64, 0i64, 0i64);
+    for t in 0..=m {
+        if t > 0 {
+            // The row of rank `t - 1` leaves `A` for `B`.
+            let i = order[t - 1] as usize;
+            if a[i] != b[i] {
+                let tb = &mut totals[block_of(flags[i])];
+                if a[i] {
+                    tb.gross -= excess[i];
+                    tb.long_rows -= 1;
+                } else {
+                    tb.gross += excess[i];
+                    tb.long_rows += 1;
+                }
+            }
+        }
+        let (mut f, mut e, mut l) = (0u64, 0u64, 0u64);
+        for blk in 0..nb {
+            run_f[blk] += flip_d[blk * w + t] as i64;
+            run_e[blk] += exit_d[blk * w + t] as i64;
+            totals[blk].flips = run_f[blk] as u64;
+            totals[blk].exits = run_e[blk] as u64;
+            f += totals[blk].flips;
+            e += totals[blk].exits;
+            l += totals[blk].long_rows;
+        }
+        run_entry += entry_d[t] as i64;
+        run_gate += gate_d[t] as i64;
+        run_seam += seam_d[t] as i64;
+        flips[t] = f as u32;
+        exits[t] = e as u32;
+        long_rows[t] = l as u32;
+        entry_times[t] = run_entry as u32;
+        gate_flips[t] = run_gate as u32;
+        seam_pairs[t] = run_seam as u32;
+        if let (Some(d), Some(s)) = (&switch_d, switches.as_mut()) {
+            run_switch += d[t] as i64;
+            s[t] = run_switch as u32;
+        }
+        if valid[t] {
+            fitness[t] = book.fitness_of(&totals);
+            net[t] = totals.iter().map(|x| book.net_of(x)).sum();
+            gross[t] = totals.iter().map(|x| x.gross).sum();
+        }
+    }
+    Ok(GateSweep { order, rows: n, net, gross, fitness, flips, exits, long_rows, entry_times, gate_flips, seam_pairs, switches })
 }
 
 /// #1185: the k-switch hindsight bound of two books: `V_k`, the best net of
@@ -352,8 +530,82 @@ impl SwitchBound {
 /// dynamic program `V_k(u, s) = W_u(s) + max(V_k(u-1, s) - side F_u(s, s),
 /// V_(k-1)(u-1, s') - side F_u(s', s))` in `O(T k)`.
 pub fn switch_bound(book: &FitnessBook, a: &[bool], b: &[bool], time: &[f64], max_k: usize) -> Result<SwitchBound, String> {
-    let _ = (book, a, b, time, max_k);
-    Err("switch bound: not implemented".to_string())
+    check_rows(book, "switch bound", &[("A positions", a.len()), ("B positions", b.len()), ("times", time.len())])?;
+    let n = book.len();
+    let (stamps, tix) = stamp_index(time).map_err(|e| format!("switch bound: {}", e))?;
+    let flags = book.flags();
+    let excess = book.excess();
+    let side = book.side();
+    let x = |i: usize, s: usize| if s == 0 { a[i] } else { b[i] };
+    // `wgt[u][s]`: what the rows of timestamp `u` earn in state `s`; `cross[u][p][s]`:
+    // flips between a row at `u - 1` in state `p` and its successor at `u` in `s`.
+    let mut wgt = vec![[0.0f64; 2]; stamps];
+    let mut cross = vec![[[0u32; 2]; 2]; stamps];
+    let mut gap_pairs = 0u64;
+    for i in 0..n {
+        let u = tix[i] as usize;
+        let first = flags[i] & TradingRows::FIRST != 0;
+        let last = flags[i] & TradingRows::LAST != 0;
+        for s in 0..2 {
+            if x(i, s) {
+                wgt[u][s] += excess[i];
+                if first {
+                    wgt[u][s] -= side;
+                }
+                if last {
+                    wgt[u][s] -= side;
+                }
+            }
+        }
+        if first {
+            continue;
+        }
+        let j = i - 1;
+        match u - tix[j] as usize {
+            0 => {
+                for s in 0..2 {
+                    if x(i, s) != x(j, s) {
+                        wgt[u][s] -= side;
+                    }
+                }
+            }
+            1 => {
+                for p in 0..2 {
+                    for s in 0..2 {
+                        if x(i, s) != x(j, p) {
+                            cross[u][p][s] += 1;
+                        }
+                    }
+                }
+            }
+            _ => {
+                gap_pairs += 1;
+                for s in 0..2 {
+                    if x(i, s) != x(j, 0) && x(i, s) != x(j, 1) {
+                        wgt[u][s] -= side;
+                    }
+                }
+            }
+        }
+    }
+    let layers = max_k.min(stamps - 1);
+    let mut v = vec![wgt[0]; layers + 1];
+    let mut next = v.clone();
+    let mut free = wgt[0];
+    for u in 1..stamps {
+        let c = |p: usize, s: usize| side * cross[u][p][s] as f64;
+        for k in 0..=layers {
+            for s in 0..2 {
+                let o = 1 - s;
+                let stay = v[k][s] - c(s, s);
+                let switch = if k > 0 { v[k - 1][o] - c(o, s) } else { f64::NEG_INFINITY };
+                next[k][s] = wgt[u][s] + stay.max(switch);
+            }
+        }
+        std::mem::swap(&mut v, &mut next);
+        free = [0, 1].map(|s| wgt[u][s] + (free[s] - c(s, s)).max(free[1 - s] - c(1 - s, s)));
+    }
+    Ok(SwitchBound { timestamps: stamps, gap_pairs, values: v.iter().map(|s| s[0].max(s[1])).collect(), free: free[0].max(free[1]) })
 }
 
 /// The per-block totals of the book that holds `a` on the rows with `on` and
@@ -387,8 +639,22 @@ pub struct Seam {
 }
 
 pub fn seam(book: &FitnessBook, a: &[bool], b: &[bool], on: &[bool]) -> Seam {
-    let _ = (book, a, b, on);
-    Seam { net_a: 0.0, net_b: 0.0, masked_a: 0.0, masked_b: 0.0, pairs: 0, seam: 0.0, composite: 0.0 }
+    let n = book.len();
+    let none = vec![false; n];
+    let all = vec![true; n];
+    let net = |a: &[bool], b: &[bool], on: &[bool]| net_of(book, &composite_totals(book, a, b, on));
+    let flags = book.flags();
+    let pos = |i: usize| if on[i] { a[i] } else { b[i] };
+    let pairs = (1..n).filter(|&i| flags[i] & TradingRows::FIRST == 0 && on[i] != on[i - 1] && pos(i) && pos(i - 1)).count() as u64;
+    Seam {
+        net_a: net(a, a, &all),
+        net_b: net(b, b, &all),
+        masked_a: net(a, &none, on),
+        masked_b: net(&none, b, on),
+        pairs,
+        seam: 2.0 * book.side() * pairs as f64,
+        composite: net(a, b, on),
+    }
 }
 
 // ---------------------------------------------------------------- the command

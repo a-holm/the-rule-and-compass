@@ -1518,6 +1518,17 @@ Why the constants keep the metric fit. A fixed linear structure (`[1, tanh z24, 
 
 The P&L-aligned fits raise train net but not validation net. Turnover is set by the structure, not by the constants, so the leverage is in ranking structures by exact P&L.
 
+#### The seam identity of a two-branch gate (`rcsr switch`, #1185)
+
+A composite `if(greater(g, c), A, B)` of two fixed books holds `A` on the rows whose gate value is above `c` and `B` on the others. Let `masked_a` be the book that holds `A` on the rows in state `A` and is flat elsewhere, every run of those rows starting flat and paying its exit (the `--pnl-mask` book of `A` under that state), and `masked_b` likewise for `B`. The gross terms add up. At a row pair of one book run whose state changes, with `a` the position of the row in state `A` and `b` that of the row in state `B`, the masked books pay `side (a + b)` and the composite pays `side [a != b] = side (a + b - 2 a b)`. Every other pair costs the same in both. Hence
+
+```text
+net(composite) = masked_a + masked_b + 2 side J,   J = state changes of one run with a long row on both sides
+0 <= net(composite) - masked_a - masked_b <= 2 side N K   for N groups and K gate flips per group
+```
+
+The identity holds for any row state; for a slow gate the best composite is, up to the seam term, the pair of masked optima, so the branches can be searched separately and the gate couples them only through `J`. `rcsr switch` reports the identity at the best cut (`gates[].best.seam`), and `the_seam_identity_holds` (`src/switch.rs`) checks it on 200 random panels against the masked `FitnessBook` to `1e-9`. The same command gives the exact net of the composite at every cut in one sort and one sweep, and the k-switch hindsight bound of the pair; see [`walkforward.md`](walkforward.md#two-books-and-a-gate-rcsr-switch-1185).
+
 #### `--fit-accept fitness`: keep a fit only when the fitness is not worse (#1078)
 
 Under `--fitness pnl` a candidate is changed by two objectives in a row: the fit minimises `--metric` (squared error on the label), then the long/flat regret scores the tree. The position is `1[pred > threshold]`, so only the sign boundary of the prediction matters to the score, and the squared-error fit puts it where the regression wants it. `--fit-accept fitness` scores the candidate with its pre-fit constants too and keeps the fitted tree unless the unfitted one has a strictly lower error (or a finite error against a non-finite one). A tie keeps the fitted tree, so under the metric fitness on the scoring rows, where the fit does not raise the error, the rule changes nothing except the extra score. The comparison is exact (`<` on the stored errors) and a pure function of the two scores, so it draws no random number and does not depend on `--threads`.
