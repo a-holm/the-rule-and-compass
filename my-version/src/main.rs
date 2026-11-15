@@ -230,6 +230,9 @@ USAGE:
   rcsr trials --cpcv-assemble <report.json>... --splits <csv> --out-dir <dir>
   rcsr protocol cpcv --start <date> --end <date> --groups N --test-groups K ...
   rcsr lock check --record <record.json> <path>...
+  rcsr switch <--fitness pnl run flags> --a <expr|flat> --b <expr|flat> --gate <expr>...
+                              the exact gate-cut profile of if(greater(g, c), A, B)
+                              and the k-switch bound on the training rows
   rcsr audit --data <file> --target <col> [--time <col>] [--horizon N] [--json]
              [--lockbox <START,END|none>]
              [--target-spec <file>]
@@ -2777,6 +2780,8 @@ fn main() {
     if args.first().map(|s| s.as_str()) == Some("trials") {
         rcsr::trials::run(&args[1..]);
     }
+    // #1185: `rcsr switch` builds the training book of a --fitness pnl run and stops before the search.
+    let args: Vec<String> = if args.first().map(|s| s.as_str()) == Some("switch") { rcsr::switch::claim(&args[1..]) } else { args };
     // #124: a reusable Rust walk-forward evaluator over the column store.
     if matches!(
         args.first().map(|s| s.as_str()),
@@ -4630,6 +4635,16 @@ fn main() {
             Some(spec)
         }
     };
+    // #1185: every column `rcsr switch` reads passes the --pnl-mask checks before any row is read.
+    if let Some(sw) = rcsr::switch::request() {
+        if lags > 0 || lag_set_src.is_some() || fill != data::FillMethod::None || outlier_iqr.is_some() || smooth > 0 {
+            trading_usage("rcsr switch reads the raw columns of the training rows: --lags, --lag-set, --fill, --outlier-iqr and --smooth would change them");
+        }
+        let specs: Vec<&target::TargetSpec> = target_resolved.iter().chain(book_resolved.iter()).map(|r| &r.spec).collect();
+        for (flag, columns) in sw.column_sets() {
+            enforce_gate_columns(flag, columns, &specs, &target_names, allow_target_structure);
+        }
+    }
 
     // #71/#112: the guard and the backing choice happen before any resident
     // Table or search sample is built. A CSV estimate uses the table's shape
@@ -4895,6 +4910,9 @@ fn main() {
                         }
                         if let Some(g) = &gate_spec {
                             pnames.extend(g.columns.iter().cloned());
+                        }
+                        if let Some(sw) = rcsr::switch::request() {
+                            pnames.extend(sw.columns());
                         }
                     }
                     pnames.sort();
@@ -5611,6 +5629,7 @@ fn main() {
             cross_section: top_tercile,
             book_rows: book_resolved.is_some(),
             mask: gate_spec.clone(),
+            train_values: rcsr::switch::request().map_or_else(Vec::new, |sw| sw.columns()),
         });
         if gate_spec.is_some() && top_tercile {
             trading_usage("--pnl-mask prices the long/flat threshold book: it cannot combine with --position top_tercile");
@@ -5792,6 +5811,9 @@ fn main() {
             let mut embargo_columns: Vec<String> = vars.clone();
             if let Some(g) = &gate_spec {
                 embargo_columns.extend(g.columns.iter().cloned());
+            }
+            if let Some(sw) = rcsr::switch::request() {
+                embargo_columns.extend(sw.columns());
             }
             let (embargo, source, column) = rcsr::intervals::resolve_embargo(flag, purge, &embargo_columns, bar).unwrap_or_else(|e| trading_usage(&e));
             Some(rcsr::intervals::IntervalSplit::new(declared, purge, embargo, source, column))
@@ -5979,6 +6001,18 @@ fn main() {
     } else {
         None
     };
+    // #1185: `rcsr switch` reports on the training book and exits before the search.
+    if let Some(sw) = rcsr::switch::request() {
+        let (Some(book), Some(slice), Some(split)) = (&fitness_book, prepared.trading.as_ref().and_then(|t| t.train.as_ref()), prepared.trading.as_ref()) else {
+            trading_usage("rcsr switch found no training book");
+        };
+        let ctx = rcsr::switch::Context {
+            target: &target_names[0],
+            per_side_bps: trading_spec.as_ref().map_or(0.0, |s| s.per_side_bps()),
+            segments: interval_split.as_ref().map_or(1, |s| s.segment_starts().len().max(1)),
+        };
+        rcsr::switch::run(sw, book, slice, &split.train_values, &ctx);
+    }
     // #1180: the validation and test books price the same regime mask: every
     // on-run is its own book and the rows outside the mask are dropped. The raw
     // slices stay for the unmasked reference nets.
