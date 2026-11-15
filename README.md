@@ -286,6 +286,19 @@ rcsr switch --data dev.rcsb --target lbl_h1_y --target-spec dev.targets.json --v
 
 See [`docs/walkforward.md`](docs/walkforward.md#two-books-and-a-gate-rcsr-switch-1185).
 
+### Regime-switching composition (`rcsr compose`)
+
+`rcsr compose` takes the flags of the pool searches, a pre-registered gate menu (`--gates`, at most 8 gates with fixed 3-bit codewords, bands and dwells) and the run.json files of a bull pool, a bear pool and an all-weather pool. From the top `--top K` members of each run it builds every composite of the menu: an all-weather member alone (C0), a bull member with cash in the gate-off state and a bear member with cash in the gate-on state (C1), and every bull and bear pair `if(greater(gate, 0), f_bull, f_bear)` (C2). Every composite is one exact expression priced by the long/flat book code, counted in `search.candidates_evaluated` and listed with its description length under the composite code. The choice reads the training and validation rows only (the robust rule plus a non-negative alpha in each gate state); the test rows are priced once the finalist is fixed. The output is a run.json that `walkforward --from-run` and `ladder --sr-run` price unchanged, with the per-state net, exposure and alpha, the gate switches per year and the cost paid in switch periods. A finalist whose gate has a band or a dwell is carried in `compose.gate`, and the evaluators refuse it.
+
+```sh
+rcsr compose --data dev.rcsb --target lbl_h24a_y --target-spec dev.targets.json --vars "$VIEW" \
+  --time ts --group-by symbol --split-table cpcv61/splits.csv --split-id s07 \
+  --objective sharpe --cost-bps 10 --gates menu.json --bull bull_s07.run.json --bear bear_s07.run.json \
+  --all-weather f1_s07.run.json --top 5 --json --out compose_s07.run.json
+```
+
+See [`docs/compose.md`](docs/compose.md).
+
 ### Combinatorial purged cross-validation (CPCV)
 
 `rcsr protocol cpcv --start 2017-12-15 --end 2023-11-01 --groups 6 --test-groups 2 --purge-seconds 7200 --embargo-seconds auto --vars "$VIEW" --bar-seconds 3600 --validation-share 0.2 --out cpcv62` writes the C(N, k) splits of N equal calendar groups as a `--split-table` (training and validation intervals already purged before and embargoed after every test group, locked ranges as holes), one walk-forward windows file per split and `cpcv.json`. After one search and one `walkforward --pool-reset-flat --period-grid target` per split (the target grid gives every split the same periods on a group, whatever NaN coverage or gate its formula has; a period where the book prices no row books net 0), `rcsr trials --cpcv-assemble wf_s*.json --splits cpcv62/splits.csv --out-dir paths` joins the test series into C(N-1, k-1) complete backtest paths (López de Prado 2018, ch. 12): path j of group g takes the j-th split that tests g, and every group starts flat and pays its final exit. The paths are walk-forward-schema reports, so `rcsr trials --wf` gives `N_eff`, DSR, SPA and PBO across configurations; the summary gives the path Sharpe distribution. See [`docs/walkforward.md`](docs/walkforward.md#cpcv).
@@ -1534,6 +1547,7 @@ docs/data-preparation.md      missing values, outliers, smoothing, scaling and f
 docs/memory-model.md          bytes per cell, dictionary encoding and row selectors
 docs/data-format.md           versioned .rcsb column store, import and the memory guard
 docs/walkforward.md           walk-forward evaluation, costs, metrics and the long/flat rule
+docs/compose.md               regime-switching composition of specialist pools (rcsr compose)
 docs/variable-types.md        boolean and categorical inputs, one-hot encoding
 docs/weights.md               per-row weights, weighted metrics and weighted least squares
 docs/implicit.md              implicit relations f(x, y) = 0 and the level-set metric
