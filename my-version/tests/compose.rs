@@ -504,8 +504,24 @@ fn compose_help_lists_its_options() {
     assert!(String::from_utf8_lossy(&top.stdout).contains("rcsr compose"));
 }
 
-/// #1237: a walk-forward of a composed run states the composite (D19); the same run.json
-/// without its compose block gives the report of the build before the marker.
+/// `j` without the fields `drop` (top-level keys, or `parent.key`).
+fn without(j: &Json, drop: &[&str]) -> Json {
+    let Json::Obj(fields) = j else { panic!("an object") };
+    let kept = fields
+        .iter()
+        .filter(|(k, _)| !drop.contains(&k.as_str()))
+        .map(|(k, v)| {
+            let inner: Vec<&str> = drop.iter().filter_map(|d| d.strip_prefix(&format!("{k}."))).collect();
+            (k.clone(), if inner.is_empty() { v.clone() } else { without(v, &inner) })
+        })
+        .collect();
+    Json::Obj(kept)
+}
+
+/// #1237: a walk-forward of a composed run states the composite (D19) and nothing else
+/// changes: the same run.json without its compose block gives the same report without the
+/// marker, and a plain run (no compose block, no switch) gives the report of the build
+/// before the marker.
 #[test]
 fn from_run_of_compose_marks_composite() {
     let p = planted(&BULL, &BEAR);
@@ -513,10 +529,13 @@ fn from_run_of_compose_marks_composite() {
     let out = p.dir.join("composed.json").to_string_lossy().into_owned();
     let j = json(&compose(&p.data, &p.spec, &["--gates", &menu, "--bull", &p.bull, "--top", "3", "--json", "--out", &out]));
     assert_eq!(s(&j, &["compose", "chosen", "type"]), "C1");
-    let Json::Obj(fields) = &j else { panic!("run.json is an object") };
-    let plain: Vec<(String, Json)> = fields.iter().filter(|(k, _)| k != "compose").cloned().collect();
-    let plain_path = p.dir.join("plain.json").to_string_lossy().into_owned();
-    std::fs::write(&plain_path, format!("{}\n", rcsr::cpcv::to_json(&Json::Obj(plain)))).unwrap();
+    let write = |name: &str, doc: &Json| -> String {
+        let path = p.dir.join(name).to_string_lossy().into_owned();
+        std::fs::write(&path, format!("{}\n", rcsr::cpcv::to_json(doc))).unwrap();
+        path
+    };
+    let unmarked = write("unmarked.json", &without(&j, &["compose"]));
+    let plain = write("plain.json", &without(&j, &["compose", "objective.finalist.switch"]));
     let test_rows = num(&j, &["test_rows"]) as i64;
     let k_test = STAMPS as i64 - test_rows / SYMBOLS.len() as i64;
     let first_val = num(&arr(&j, &["split", "validation_time"])[0], &[]) as i64;
@@ -527,17 +546,21 @@ fn from_run_of_compose_marks_composite() {
         assert_eq!(code(&o), 0, "{}", stderr(&o));
         Json::parse(std::fs::read_to_string(&path).unwrap().trim()).unwrap()
     };
-    let plain = report(&plain_path, "wf_plain.json");
-    let plain_sha = s(&plain, &["protocol", "report_sha256"]).to_string();
     let composed = report(&out, "wf_composed.json");
     let m = at(&composed, &["selection", "composite"]);
     assert_eq!(s(m, &["source"]), "rcsr compose");
     assert_eq!(s(m, &["type"]), "C1");
     assert_eq!(s(m, &["form"]), s(&j, &["compose", "chosen", "form"]));
     assert_eq!(s(m, &["gate"]), "g");
-    assert!(at(&plain, &["selection"]).get("composite").is_none());
-    assert_eq!(at(&composed, &["pooled"]), at(&plain, &["pooled"]), "the marker changes no number");
-    assert_eq!(plain_sha, PINNED_PLAIN_FROM_RUN);
+    // The switch prices both runs; the marker is the only difference.
+    let switch = report(&unmarked, "wf_unmarked.json");
+    assert_eq!(s(&switch, &["gate", "source"]), "objective.finalist.switch");
+    assert!(at(&switch, &["selection"]).get("composite").is_none());
+    assert_eq!(without(&composed, &["selection.composite", "protocol"]), without(&switch, &["protocol"]), "the marker changes nothing else");
+    // A plain run: no marker, no gate, the bytes of the base build.
+    let plain = report(&plain, "wf_plain.json");
+    assert!(plain.get("gate").is_none() && at(&plain, &["selection"]).get("composite").is_none());
+    assert_eq!(s(&plain, &["protocol", "report_sha256"]), PINNED_PLAIN_FROM_RUN);
 }
 
 const PINNED_PLAIN_FROM_RUN: &str = "22e9d27e4d0f59c0e35b4597d6265b71bf343a8cb8a1b0f01309b9437079ebe2";

@@ -1144,6 +1144,7 @@ fn freeze_output_carries_rule_and_map_sha() {
     assert_eq!(at(top, &["map"]).as_str(), Some(map.as_str()));
     assert_eq!(at(top, &["map_sha256"]).as_str(), Some(sha(&map).as_str()));
     let f = at(&items(at(&j, &["picks"]))[0], &["freeze"]);
+    assert_eq!(at(f, &["schema"]).as_str(), Some("rcsr-trials-freeze/1"));
     assert_eq!(at(f, &["configuration"]).as_str(), Some("F"));
     assert_eq!((num(f, &["cost_bps"]), num(f, &["periods_per_year"]), num(f, &["period_seconds"])), (10.0, 365.0, 86400.0));
     let pop = at(f, &["population"]);

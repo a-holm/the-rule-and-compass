@@ -567,10 +567,11 @@ pub fn freeze_pick(row: &MapRow, rule: &FreezeRule, map: &FreezeMap, locked: &[(
         .map(|p| format!("{{\"file\":{},\"sha256\":{},\"path\":{},\"periods\":{}}}", jstr(&p.file), jstr(&p.sha256), p.index, p.time.len()))
         .collect();
     let json = format!(
-        "{{\"configuration\":{},\"cost_bps\":{},\"periods_per_year\":{},\"period_seconds\":{},\
+        "{{\"schema\":{},\"configuration\":{},\"cost_bps\":{},\"periods_per_year\":{},\"period_seconds\":{},\
 \"population\":{{\"groups\":{},\"test_groups\":{},\"paths\":{},\"splits_sha256\":{},\"scheme_sha256\":{},\"files\":[{}]}},\
 \"s4_floor\":{{{},\"value\":{}}},\"p1_floor\":{{{},\"value\":{}}},\
 \"drawdown_cap\":{{{},\"percentile_value\":{},\"floor\":{},\"value\":{}}},\"run\":{},\"run_sha256\":{}}}",
+        jstr(SCHEMA),
         jstr(conf),
         jnum(rule.cost_bps),
         jnum(pop.ppy),
