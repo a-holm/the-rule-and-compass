@@ -3578,9 +3578,9 @@ fn evaluate_window(
                 "cooldown scan",
                 || {
                     crate::trading_gpu::cooldown_scan_device(
-                        &ord_scores,
-                        &ord_returns,
-                        &ord_groups,
+                        scan_scores,
+                        scan_returns,
+                        scan_keys,
                         &params,
                         cost_side,
                         crate::trading_gpu::SCAN_THREADS,
@@ -3613,9 +3613,9 @@ fn evaluate_window(
                 "band scan",
                 || {
                     crate::trading_gpu::band_scan_device(
-                        &ord_scores,
-                        &ord_returns,
-                        &ord_groups,
+                        scan_scores,
+                        scan_returns,
+                        scan_keys,
                         &params,
                         cost_side,
                         crate::trading_gpu::SCAN_THREADS,
@@ -3795,9 +3795,9 @@ fn evaluate_window(
         };
         #[cfg(feature = "cuda")]
         let report = crate::trading_gpu::reduce_device(
-            &ord_scores,
+            &dev_scores,
             &ord_returns,
-            &ord_groups,
+            &ord_keys,
             &params,
             256,
             65_536,
@@ -3873,7 +3873,7 @@ fn evaluate_window(
             || {
                 crate::trading_gpu::dp_scan_device(
                     &ord_returns,
-                    &ord_groups,
+                    &ord_keys,
                     cost_side,
                     crate::trading_gpu::SCAN_THREADS,
                     device_chunk,
