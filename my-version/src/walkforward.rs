@@ -4434,7 +4434,7 @@ impl PeriodSource {
 /// The period width declared by the run: the target spec's horizon or, when
 /// wider, its label stride (#1053), else `--horizon`. One independent return
 /// per group spans exactly this width.
-fn declared_period(spec: &EvalSpec, opts: &ProtocolOptions) -> Option<(f64, PeriodSource)> {
+pub(crate) fn declared_period(spec: &EvalSpec, opts: &ProtocolOptions) -> Option<(f64, PeriodSource)> {
     if spec.horizon.is_finite() && spec.horizon >= 1.0 && spec.horizon <= SECONDS_PER_YEAR {
         let source = if opts.horizon_from_spec { PeriodSource::TargetSpec } else { PeriodSource::HorizonFlag };
         let width = match (source, opts.stride_seconds) {

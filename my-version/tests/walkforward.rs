@@ -2092,6 +2092,39 @@ mod fitted_cut {
         }
     }
 
+    #[test]
+    fn return_units_and_period_width_enter_the_candidate_id() {
+        let mut s = fit_spec(0.0);
+        s.horizon = 3600.0;
+        let from_spec = |units: &str, stride: Option<f64>| ProtocolOptions {
+            horizon_from_spec: true,
+            stride_seconds: stride,
+            cost: Some(rcsr::target::CostDecl {
+                per_side_bps: 5.0,
+                source: rcsr::target::CostSource::TargetSpec,
+                return_units: units.to_string(),
+                spec_per_side_bps: None,
+            }),
+            ..ProtocolOptions::default()
+        };
+        let text = |o: &ProtocolOptions| rcsr::protocol::procedure_spec(&s, o);
+        let simple = text(&from_spec("simple", None));
+        assert!(!simple.contains("return_units") && !simple.contains("period_width"), "{simple}");
+        let log = text(&from_spec("log", None));
+        assert_eq!(log, format!("{simple}return_units=log\n"));
+        assert_eq!(text(&from_spec("simple", Some(1800.0))), simple, "a stride below the horizon keeps the text");
+        assert_eq!(text(&from_spec("simple", Some(3600.0))), simple, "a stride equal to the horizon keeps the text");
+        let wide = text(&from_spec("simple", Some(7200.0)));
+        assert_eq!(wide, format!("{simple}period_width=7200.0\n"));
+        let wider = text(&from_spec("simple", Some(14400.0)));
+        assert!(wider.contains("period_width=14400.0\n"), "{wider}");
+        assert_ne!(wide, wider);
+        let both = text(&from_spec("log", Some(7200.0)));
+        assert!(both.contains("return_units=log\n") && both.contains("period_width=7200.0\n"), "{both}");
+        let flag_run = ProtocolOptions { stride_seconds: Some(7200.0), ..ProtocolOptions::default() };
+        assert_eq!(text(&flag_run), text(&ProtocolOptions::default()), "a stride without a target spec is ignored");
+    }
+
     /// Reports without the flag, pinned to the bytes of the base build.
     #[test]
     fn default_reports_are_pinned() {
