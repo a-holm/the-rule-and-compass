@@ -11680,7 +11680,7 @@ OPTIONS:
                              threshold as the reference cut
                              The expression is objective.finalist.expression_exact,
                              else the 4-decimal expression (expression_source
-                             rounded); --locked-test refuses a rounded source (exit 3)
+                             rounded); --locked-test refuses a rounded source (exit 3).
                              A composed run (rcsr compose) is priced as its switch
                              (objective.finalist.switch; --front: pareto[].switch):
                              the held branch's score under the gate state of
@@ -11689,7 +11689,9 @@ OPTIONS:
                              .regime). --device-pnl, --batch-pnl, --threshold-fit,
                              --select-band, a --policy other than threshold and a
                              band exit 2; a label, target, return or construction
-                             gate column exits 5
+                             gate column exits 5. Such a run writes
+                             selection.composite: source, type, form and gate of its
+                             compose.chosen (#1237); other reports carry no marker
   --threshold-quantile <q>   exact type-7 training/validation score quantile
                              (default {DEFAULT_QUANTILE}); selected by order-preserving
                              radix count, so theta is bit-identical to numpy
@@ -12600,6 +12602,7 @@ fn run_walkforward(args: &[String]) -> ! {
         }
         run_cost = Some((book.per_side_bps, book.source));
         cost_spec = Some(book.spec);
+        popts.composite = run.composite.clone();
         front_run = Some(run);
     } else if let Some(path) = &front_path {
         if !expressions.is_empty() {
@@ -12692,6 +12695,7 @@ fn run_walkforward(args: &[String]) -> ! {
             run_cost = Some((bps, run.cost_source()));
             cost_spec = run.target_spec();
         }
+        popts.composite = run.composite.clone();
         front_run = Some(run);
     } else if let Some(path) = &target_spec_path {
         let text = std::fs::read_to_string(path).unwrap_or_else(|e| input_fail(&format!("{}: {}", path, e)));
