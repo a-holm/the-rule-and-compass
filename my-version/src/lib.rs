@@ -95,6 +95,7 @@ pub mod schema;
 pub mod search;
 pub mod settings; // #1083: one table row per search setting
 pub mod selection; // #111: select on train/validation, never the test lockbox
+pub mod occam; // #1184: description length and the Occam-adjusted p-value
 pub mod stability;
 pub mod store;
 pub mod baselines; // #310: long-only baseline ladder (cash, buy-and-hold, constant, matched-exposure random long)

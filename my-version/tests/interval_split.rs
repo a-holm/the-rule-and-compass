@@ -748,6 +748,40 @@ fn split_windows_start_flat() {
     assert_eq!(at(&ab, &["pooled_seam", "reset_flat"]), &Json::Bool(true));
 }
 
+#[test]
+fn occam_books_start_flat_at_each_interval_segment() {
+    let first: Vec<i64> = (300..360).collect();
+    let second: Vec<i64> = (900..960).collect();
+    let all: Vec<i64> = first.iter().chain(&second).copied().collect();
+    let slice = two_group_slice(&all);
+    let alone = |hours: &[i64], pred: &[f64]| {
+        let s = two_group_slice(hours);
+        rcsr::trading::evaluate(pred, &s.ret, &s.rows, &book_spec()).unwrap().entries
+    };
+    let starts = vec![hour(300) as f64, hour(900) as f64];
+    for seed in 0..4u64 {
+        let (last, next) = (*first.last().unwrap(), second[0]);
+        let pred = straddling_pred(&all, last, next, seed);
+        fn books<'a>(slice: &'a TradingSlice, segments: &'a [f64]) -> rcsr::occam::DevBooks<'a> {
+            rcsr::occam::DevBooks {
+                train_ret: &slice.ret,
+                train_rows: &slice.rows,
+                train_segments: segments,
+                val_ret: &slice.ret,
+                val_rows: &slice.rows,
+                val_segments: segments,
+            }
+        }
+        let spec = book_spec();
+        let (_, split_entries, _) = books(&slice, &starts).alpha(&pred, &pred, &spec).unwrap();
+        let (_, carried_entries, _) = books(&slice, &[]).alpha(&pred, &pred, &spec).unwrap();
+        let (pa, pb) = (straddling_pred(&first, last, next, seed), straddling_pred(&second, last, next, seed));
+        // Training and validation each hold the two intervals as separate books.
+        assert_eq!(split_entries, 2 * (alone(&first, &pa) + alone(&second, &pb)), "seed {seed}");
+        assert_ne!(split_entries, carried_entries, "seed {seed}: a carried book skips the entry at the second interval");
+    }
+}
+
 struct BatchFixture {
     data: String,
     run: String,

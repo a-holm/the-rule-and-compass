@@ -16,6 +16,8 @@ pub struct RunMember {
     pub train_error: f64,
     /// The reported complexity (the configured model's value).
     pub complexity: f64,
+    /// #1184: the normalised search tree of a run written under `--select-rule occam`, in the checkpoint tree encoding.
+    pub occam_tree: Option<String>,
 }
 
 /// The parts of a run.json that re-selection reads.
@@ -63,7 +65,8 @@ impl RunFront {
                 .get("complexity")
                 .and_then(Json::as_f64)
                 .ok_or_else(|| format!("'{}' pareto[{}] has no complexity", path, k))?;
-            members.push(RunMember { archive_rank, expression_exact, train_error, complexity });
+            let occam_tree = m.get("occam_tree").and_then(Json::as_str).map(str::to_string);
+            members.push(RunMember { archive_rank, expression_exact, train_error, complexity, occam_tree });
         }
         members.sort_by_key(|m| m.archive_rank);
         let split = j.get("split");

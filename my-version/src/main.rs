@@ -1201,7 +1201,7 @@ CHECKPOINTS:
                              refused: stderr names it (#860). A time-budget stop is not
                              terminal: --resume continues it and
                              --time-budget may be set again
-  --select-rule validation_objective|robust
+  --select-rule validation_objective|robust|occam
                              post-loop finalist rule (#928, like --prune: not
                              saved search state, outside the config hash).
                              robust needs --objective pnl|sharpe|log_growth:
@@ -1213,11 +1213,25 @@ CHECKPOINTS:
                              pooled alpha wins. No eligible member: verdict
                              no_signal, validation_objective finalist. Reads
                              training and validation rows only
+                             occam (#1184, report-only for the broad pilot):
+                             every member is priced in bits under the
+                             prefix code of docs/occam-code-v1.json and
+                             scored p_occam = min(1, p x 2^bits), with p the
+                             one-sided Student-t tail of the block-mean alpha
+                             t statistic on training and validation rows
+                             (at least 20 blocks, else exit 2); the lowest
+                             p_occam wins and verdict certified needs
+                             p_occam <= --select-delta, else no_signal.
+                             Needs --objective pnl|sharpe|log_growth
   --select-blocks <K|intervals>
                              validation blocks of robust, 1 to 8 (default 4);
                              intervals takes one block per validation interval of
                              --split-table (2 to 8 intervals, exit 2 otherwise)
   --select-se <Z>            one-standard-error multiple (default 1.0)
+  --select-delta <D>         occam: certification level, inside (0, 1) (default
+                             0.05; exit 2 otherwise or without occam)
+  --select-min-entries <E>   occam: fewest entries of an eligible member
+                             (default 30; exit 2 without occam)
   --select-block-len <L>     bootstrap block length in periods, at most half the
                              validation periods (exit 2 above). Default per
                              member: max(ceil(cbrt(T)), mean long hold) for T
@@ -1241,6 +1255,8 @@ CHECKPOINTS:
                              other data, target spec or backend. Another
                              build is accepted and recorded
   --reselect-run <run.json>  the same from a run.json front (expression_exact);
+                             with --select-rule occam it reads pareto[].occam_tree
+                             (exit 2 if absent);
                              split and train rows must match the data
 
 RUN INTEGRITY (#140):
@@ -2671,6 +2687,9 @@ struct Row {
     /// #645: the `"validation_book"` member of the pareto JSON (leading comma);
     /// empty without a trading objective.
     validation_book_json: String,
+    /// #1184: the `"occam"` member of the pareto JSON (leading comma); empty
+    /// without `--select-rule occam`.
+    occam_json: String,
 }
 
 /// Cross-validation summary (issue #19).
@@ -2936,6 +2955,8 @@ fn main() {
     let mut test_frac_given = false;
     let mut select_se_arg: Option<f64> = None;
     let mut select_block_len_arg: Option<usize> = None;
+    let mut select_delta_arg: Option<f64> = None;
+    let mut select_min_entries_arg: Option<usize> = None;
     let mut reselect_path: Option<String> = None;
     let mut reselect_run_path: Option<String> = None;
     // #140: run integrity flags.
@@ -3674,6 +3695,8 @@ fn main() {
             }
             "--select-se" => select_se_arg = Some(parse_nonneg("--select-se", &val!())),
             "--select-block-len" => select_block_len_arg = Some(parse_uint("--select-block-len", &val!())),
+            "--select-delta" => select_delta_arg = Some(parse_nonneg("--select-delta", &val!())),
+            "--select-min-entries" => select_min_entries_arg = Some(parse_uint("--select-min-entries", &val!())),
             "--reselect" => reselect_path = Some(val!()),
             "--reselect-run" => reselect_run_path = Some(val!()),
             "--allow-backend-change" => allow_backend_change = true,
@@ -5582,7 +5605,7 @@ fn main() {
             return_column: ts.return_column.clone(),
             log_returns: ts.return_units == "log",
             funding_column: trade_funding.clone(),
-            train: fitness_pnl || trade_band_units.as_deref() == Some("sd"), // #480, #925
+            train: fitness_pnl || trade_band_units.as_deref() == Some("sd") || select_rule_arg.as_deref().is_some_and(|s| rcsr::selection::SelectRule::parse(s) == Ok(rcsr::selection::SelectRule::Occam)), // #480, #925, #1184
             cross_section: top_tercile,
             book_rows: book_resolved.is_some(),
             mask: gate_spec.clone(),
@@ -6227,6 +6250,20 @@ fn main() {
             trading_usage("--select-rule robust ranks the validation P&L book: add --objective pnl|sharpe|log_growth");
         }
         if let Err(e) = robust_params.validate() {
+            trading_usage(&e);
+        }
+    }
+    let occam_params = rcsr::occam::OccamParams {
+        delta: select_delta_arg.unwrap_or(rcsr::occam::OccamParams::default().delta),
+        min_entries: select_min_entries_arg.unwrap_or(rcsr::occam::OccamParams::default().min_entries),
+    };
+    if select_delta_arg.is_some() || select_min_entries_arg.is_some() {
+        if select_rule != rcsr::selection::SelectRule::Occam {
+            trading_usage("--select-delta and --select-min-entries need --select-rule occam");
+        }
+    }
+    if select_rule == rcsr::selection::SelectRule::Occam {
+        if let Err(e) = occam_params.validate() {
             trading_usage(&e);
         }
     }
@@ -6998,9 +7035,20 @@ fn main() {
         }
         let mut front = rcsr::pareto::Archive::new(run.members.len());
         for m in &run.members {
-            let tree = expr::parse(&m.expression_exact, &vars)
-                .unwrap_or_else(|e| usage(format!("--reselect-run '{}': archive_rank {}: {}", path, m.archive_rank, e)));
-            let tree = normalise_inputs(&tree, &prepared.means, &prepared.stds);
+            // #1184: the Occam rule prices the stored normalised search tree, never the printed expression.
+            let tree = if select_rule_arg.as_deref().is_some_and(|s| rcsr::selection::SelectRule::parse(s) == Ok(rcsr::selection::SelectRule::Occam)) {
+                let text = m.occam_tree.as_deref().unwrap_or_else(|| {
+                    usage(format!(
+                        "--reselect-run '{}': archive_rank {} has no occam_tree: --select-rule occam needs a run.json written by a run with --select-rule occam",
+                        path, m.archive_rank
+                    ))
+                });
+                rcsr::checkpoint::decode_tree(text).unwrap_or_else(|e| usage(format!("--reselect-run '{}': archive_rank {}: occam_tree: {}", path, m.archive_rank, e)))
+            } else {
+                let tree = expr::parse(&m.expression_exact, &vars)
+                    .unwrap_or_else(|e| usage(format!("--reselect-run '{}': archive_rank {}: {}", path, m.archive_rank, e)));
+                normalise_inputs(&tree, &prepared.means, &prepared.stds)
+            };
             front.items.push(rcsr::pareto::Sol {
                 complexity: m.complexity as usize,
                 cost: m.complexity,
@@ -7414,6 +7462,7 @@ fn main() {
     };
     let train_slice = prepared.trading.as_ref().and_then(|t| t.train.as_ref());
     let validation_segments = interval_split.as_ref().map_or_else(Vec::new, |s| s.validation_segment_starts());
+    let occam_train_segments = interval_split.as_ref().map_or_else(Vec::new, |s| s.segment_starts());
     let test_segments = interval_split.as_ref().map_or_else(Vec::new, |s| s.test_segment_starts());
     let mut rows: Vec<Row> = sorted
         .iter()
@@ -7579,6 +7628,7 @@ fn main() {
                     .map(|b| fitness_member_json(b, &book_pred, train_fitness))
                     .unwrap_or_default(),
                 validation_book_json,
+                occam_json: String::new(),
             }
         })
         .collect();
@@ -7671,6 +7721,62 @@ fn main() {
             if interval_cuts.is_some() {
                 selection_rule_fields.push_str(",\"blocks_source\":\"intervals\"");
             }
+        } else if select_rule == rcsr::selection::SelectRule::Occam {
+            let (Some(tspec), Some(v), Some(vslice), Some(tslice)) = (
+                &trading_spec,
+                book_validation,
+                prepared.trading.as_ref().and_then(|t| t.validation.as_ref()),
+                train_slice,
+            ) else {
+                trading_usage("--select-rule occam needs training and validation rows: add --validation-frac <f>");
+            };
+            let vctx = prepared.trading.as_ref().and_then(|t| t.validation_context.as_ref());
+            let (vret, vrows) = trading_inputs(vslice, vctx);
+            let (tret, trows) = trading_inputs(tslice, None);
+            let metas: Vec<rcsr::selection::RobustMeta> = rows
+                .iter()
+                .map(|r| rcsr::selection::RobustMeta {
+                    archive_rank: r.archive_rank,
+                    complexity: r.complexity,
+                    usable: r.objective_value.is_finite(),
+                    objective: r.objective_value,
+                })
+                .collect();
+            let code = rcsr::occam::CodeSpec::v1(&cfg.ops, vars.len());
+            let dev_books = rcsr::occam::DevBooks { train_ret: &tret, train_rows: &trows, train_segments: &occam_train_segments, val_ret: &vret, val_rows: &vrows, val_segments: &validation_segments };
+            let picked = rcsr::occam::select_occam(&metas, occam_params, &code, &mut |i| {
+                let tree = &sorted[rows[i].archive_rank - 1].tree;
+                let mut words = Vec::new();
+                for c in code.candidates(tree) {
+                    let train_pred: Vec<f64> = book_train.x.iter().map(|row| expr::eval(&c.tree, row)).collect();
+                    let base = member_spec(tspec, &train_pred, train_slice);
+                    let val_pred = trading_pred(&c.tree, &v.x, vctx);
+                    let Some((series, entries, hold)) = dev_books.alpha(&train_pred, &val_pred, &base) else {
+                        continue;
+                    };
+                    let den = expr::simplify_display(&expr::denormalize(&expr::simplify_display(&c.tree), &prepared.means, &prepared.stds));
+                    words.push(rcsr::occam::Scored {
+                        tier: c.tier,
+                        expression_exact: expr::to_string_exact(&den, &vars),
+                        bits: c.bits,
+                        series,
+                        entries,
+                        hold,
+                    });
+                }
+                Ok(words)
+            })
+            .unwrap_or_else(|e| trading_usage(&e));
+            for (k, r) in rows.iter_mut().enumerate() {
+                let tree = &sorted[r.archive_rank - 1].tree;
+                let stored = if tree_has_custom(tree) { "null".to_string() } else { jstr(&rcsr::checkpoint::encode_tree(tree)) };
+                r.occam_json = format!("{},\"occam_tree\":{}", picked.member_json(k), stored);
+            }
+            if let Some(c) = picked.chosen {
+                order.retain(|&i| i != c);
+                order.insert(0, c);
+            }
+            selection_rule_fields = picked.fields_json(select_require_edge.then_some(no_edge));
         } else if select_require_edge {
             selection_rule_fields.push_str(",\"require_edge\":true");
             if no_edge {
@@ -8507,7 +8613,7 @@ fn main() {
                     } else {
                         String::new()
                     };
-                    let dimensions = format!("{}{}{}{}", dimensions, r.gate_json, r.fitness_json, r.validation_book_json);
+                    let dimensions = format!("{}{}{}{}{}", dimensions, r.gate_json, r.fitness_json, r.validation_book_json, r.occam_json);
                     // Only a run that actually has a selection criterion gains
                     // the new fields; an ordinary run stays byte-identical.
                     let selection_json = if select_by.is_some() {
@@ -8980,7 +9086,7 @@ fn main() {
                 } else {
                     String::new()
                 };
-                let dimensions = format!("{}{}{}{}", dimensions, r.gate_json, r.fitness_json, r.validation_book_json);
+                let dimensions = format!("{}{}{}{}{}", dimensions, r.gate_json, r.fitness_json, r.validation_book_json, r.occam_json);
                 let selection_json = if select_by.is_some() {
                     format!(
                         "\"archive_rank\":{},\"validation_error\":{},",
@@ -9618,6 +9724,7 @@ fn normalise_inputs(n: &expr::Node, means: &[f64], stds: &[f64]) -> expr::Node {
         },
     }
 }
+
 
 /// #1180: the columns of a regime gate are inputs of the decision: a label,
 /// the target, its return column or a construction column would leak the future
@@ -14273,4 +14380,10 @@ mod tests {
         assert!(t.text().contains("total=0.67s"));
         assert!(t.text().contains("gpu=0.12s"), "GPU wall is a subset, not a phase");
     }
+}
+
+/// #1184: a custom block carries fitted constants in its own copy, which the
+/// checkpoint tree encoding does not hold; such a tree stores no `occam_tree`.
+fn tree_has_custom(n: &expr::Node) -> bool {
+    n.op.is_custom() || n.kids.iter().any(tree_has_custom)
 }

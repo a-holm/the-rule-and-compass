@@ -1,0 +1,5 @@
+{"schema":"rcsr-occam-code/1","version":1,
+"structure":{"order":"pre-order","node":"log2(A) bits per node, A = distinct operators + 2","variable":"log2(V) bits per variable leaf","block_body":"structure free, constants priced once per slot"},
+"constants":{"tier_count":5,"grid_tiers":4,"grid_limit":2,"mantissa_digits":6,"exponent_min":-9,"exponent_max":9,"grid_tolerance":1e-9},
+"candidates":"tiers 0 to 3 by rounding, plus exact (smallest tier that holds each constant, else tier 4 with 6 significant digits)",
+"composite":{"type_codewords":{"C0":"0","C1":"10","C2":"110","C3":"111"},"c3_form_bits":1,"menu_size":8,"cash_side_bits":1,"branch_flag_bits":1,"grid_direction_bits":1,"grid_cut_levels":16}}

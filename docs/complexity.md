@@ -53,6 +53,10 @@ The configured value is what the search prunes on, what the Pareto front is
 sorted and dominated on, and what every solution reports as `complexity=`
 (text) or `"complexity"` (JSON/NDJSON). `--eval-expr` uses the same model.
 
+## Description length is a different price
+
+The complexity axis ranks the front and prunes the search. Description bits (`--select-rule occam`, `docs/overfitting.md`) price a formula under a prefix code fixed before the data: `log2(A)` bits per node, `log2(V)` per variable and a tier code per constant, with `A` the operators plus 2. A node costs the same for every operator, the weights above play no part, and a constant on a coarse grid costs fewer bits than a fine one. Bits feed only the Occam-adjusted p-value of the finalist rule; they are not a Pareto axis or a fitness term.
+
 ## Worked examples
 
 Default, node count:
