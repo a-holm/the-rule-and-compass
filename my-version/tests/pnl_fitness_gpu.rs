@@ -16,7 +16,7 @@ use rcsr::expr::{constant, input, node, Node, Op};
 use rcsr::gpu::{GpuEvaluator, Population};
 use rcsr::metrics::{Metric, ScoreObjective, ScoreStatus};
 use rcsr::search::{self, Config, Fitness};
-use rcsr::trading::{FitnessBook, FitnessTotals, TradingRows, TradingSpec};
+use rcsr::trading::{FitnessBook, FitnessTotals, PnlExcess, TradingRows, TradingSpec};
 use std::sync::{Arc, Mutex};
 
 #[path = "common/scratch.rs"]
@@ -206,6 +206,24 @@ fn device_totals_equal_the_cpu_tree_on_a_small_book() {
         return;
     }
     assert!(cpu.iter().any(|t| t.nonfinite), "a program is non-finite somewhere");
+    assert!(cpu.iter().any(|t| !t.nonfinite && t.flips > 2 && t.exits > 0), "a program trades");
+}
+
+/// #1179: the device scores the CPU-built `--pnl-excess xs-mean` excess. The
+/// groups share timestamps, so the cross-sections hold one to twelve rows.
+#[test]
+fn device_xs_mean_parity() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    let f = fixture(&STARTS_SMALL, 16_401, 13);
+    let xs = FitnessBook::new(&f.slice, &TradingSpec { pnl_excess: PnlExcess::XsMean, ..spec(1) }, 900.0).expect("a profitable xs-mean book");
+    let plain = book(&f, 1);
+    assert_ne!(xs.hash(), plain.hash());
+    let moved = xs.excess().iter().zip(plain.excess()).filter(|(a, b)| a != b).count();
+    assert!(moved > f.n / 2, "{moved} of {} rows have another excess", f.n);
+    let cpu = assert_exact(&f, &xs, &programs(24, 17));
+    if cpu.is_empty() {
+        return;
+    }
     assert!(cpu.iter().any(|t| !t.nonfinite && t.flips > 2 && t.exits > 0), "a program trades");
 }
 
