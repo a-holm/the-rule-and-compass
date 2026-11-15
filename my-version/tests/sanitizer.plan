@@ -191,6 +191,7 @@ regimes                *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=
 switch                 *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs), so no CUDA call in the test process or its children; memcheck with --target-processes application-only does not trace the children; ok-token: "--gpu" (a refusal test)
 compose                *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs), so no CUDA call in the test process or its children; memcheck with --target-processes application-only does not trace the children; ok-token: "--gpu" (a refusal test)
 enumerate              *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs), so no CUDA call in the test process or its children; memcheck with --target-processes application-only does not trace the children; ok-token: "--gpu" (a refusal test)
+stateful_gate          *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs), so no CUDA call in the test process or its children; memcheck with --target-processes application-only does not trace the children; ok-token: "--device-pnl" (a refusal test)
 baselines                  *  device  tests run on the device
 bench                      *  device  tests run on the device
 bench_gpu                  *  device  tests run on the device
