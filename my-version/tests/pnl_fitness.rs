@@ -2054,3 +2054,31 @@ fn resume_needs_the_same_mask() {
     usage_error(&resume(&["--pnl-mask", "g", "--pnl-mask-band", "0.5", "--pnl-mask-dwell", "6"]), "fitness");
     usage_error(&resume(&[]), "fitness");
 }
+
+/// #1203: the validation and test books (`trading::evaluate`) and the walk-forward test book
+/// apply one missing-score rule; the search fitness book prices no missing score.
+#[test]
+fn missing_score_rule_is_shared_by_search_and_walkforward() {
+    use rcsr::trading::MissingScore;
+    // Two groups; each has a leading, two inner and a trailing stretch with no finite prediction.
+    let s = slice(&[120, 120]);
+    let mut pred = prediction(&s);
+    for (i, p) in pred.iter_mut().enumerate() {
+        let k = i % 120;
+        if k < 3 || (40..47).contains(&k) || k == 60 || k >= 117 {
+            *p = f64::NAN;
+        }
+    }
+    let ppy = rcsr::walkforward::SECONDS_PER_YEAR / 900.0;
+    let mut nets = Vec::new();
+    for rule in [MissingScore::Flat, MissingScore::Hold] {
+        let sp = TradingSpec { cost_bps: 7.5, min_trades: 0, missing_score: rule, ..TradingSpec::default() };
+        let got = trading::evaluate(&pred, &s.ret, &s.rows, &sp).unwrap();
+        let want = rcsr::walkforward::reference_metrics(&s.rows.time, &s.rows.group, &s.ret, &pred, 0.0, 7.5e-4, ppy, rule);
+        assert_eq!(format!("{:?}", got.period), format!("{:?}", want), "{rule:?}");
+        nets.push(got.net_pnl);
+    }
+    assert_ne!(nets[0], nets[1], "the two rules price different books");
+    let book = FitnessBook::new(&s, &spec(), 900.0).unwrap();
+    assert_eq!(book.regret(&pred), f64::INFINITY, "a non-finite prediction is refused by the fitness");
+}

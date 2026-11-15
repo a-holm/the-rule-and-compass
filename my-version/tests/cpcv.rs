@@ -548,9 +548,11 @@ struct Fields {
     cost: f64,
     quantile: &'static str,
     reset_flat: bool,
+    /// #1203: `book.missing_score`; `None` writes no `book` object.
+    book: Option<&'static str>,
 }
 
-const FIELDS: Fields = Fields { cost: 10.0, quantile: "0.5", reset_flat: true };
+const FIELDS: Fields = Fields { cost: 10.0, quantile: "0.5", reset_flat: true, book: None };
 
 fn write_report(f: &Synthetic, s: usize, test: &[(i64, i64)], fields: &Fields) -> String {
     let defs: Vec<String> = test.iter().map(|(a, b)| format!("{{\"label\":\"w\",\"train_start\":0,\"train_end\":1,\"test_start\":{a},\"test_end\":{b}}}")).collect();
@@ -568,13 +570,14 @@ fn write_report(f: &Synthetic, s: usize, test: &[(i64, i64)], fields: &Fields) -
         "{{\"mode\":\"walkforward\",\"window_definition\":[{}],\"purge\":{{\"horizon_seconds\":3600,\"embargo_seconds\":3600}},\
 \"cost_model\":{{\"per_side_bps\":{c},\"round_trip_bps\":{rt}}},\"cost\":{{\"per_side_bps\":{c},\"source\":\"flag\"}},\
 \"policy\":{{\"name\":\"threshold\",\"band_width\":0,\"min_hold\":1}},\"threshold\":{{\"quantile\":{q},\"fixed\":null}},\
-\"annualization\":{{\"periods_per_year\":8760,\"method\":\"explicit\"}},\"pooled_seam\":{{\"reset_flat\":{rf},\"seam_cost\":0,\"seam_trades\":0}},\
+\"annualization\":{{\"periods_per_year\":8760,\"method\":\"explicit\"}},{book}\"pooled_seam\":{{\"reset_flat\":{rf},\"seam_cost\":0,\"seam_trades\":0}},\
 \"pooled\":{{\"periods\":{n},\"entries\":10,\"active_rows\":100,\"period_net\":[{net}],\"period_time\":[{time}]}}}}",
         defs.join(","),
         c = fields.cost,
         rt = 2.0 * fields.cost,
         q = fields.quantile,
         rf = fields.reset_flat,
+        book = fields.book.map_or(String::new(), |r| format!("\"book\":{{\"missing_score\":\"{r}\"}},")),
         n = net.len(),
         net = net.join(","),
         time = time.join(","),
@@ -701,4 +704,23 @@ fn cpcv_assemble_common_grid() {
 
 fn bits(v: &[f64]) -> Vec<u64> {
     v.iter().map(|x| x.to_bits()).collect()
+}
+
+#[test]
+fn cpcv_assemble_refuses_mixed_missing_score_rules() {
+    let f = synthetic();
+    let out = f.dir.join("paths");
+    let summary = f.dir.join("summary.json");
+    let flat = Fields { book: Some("flat"), ..FIELDS };
+    let all_flat: Vec<String> = (0..f.scheme.ids.len()).map(|s| write_report(&f, s, &f.scheme.tests[s], &flat)).collect();
+    ok(&assemble(&f.table, &all_flat, &out, &summary));
+    let path = read_json(&out.join("path_1.json"));
+    assert_eq!(at(&path, &["book", "missing_score"]).as_str(), Some("flat"), "a path keeps the rule of its reports");
+    for odd in [Fields { book: Some("hold"), ..FIELDS }, FIELDS] {
+        let mut r = all_flat.clone();
+        r[3] = write_report(&f, 3, &f.scheme.tests[3], &odd);
+        let o = assemble(&f.table, &r, &out, &summary);
+        assert_eq!(code(&o), 2, "{}", stderr(&o));
+        assert!(stderr(&o).contains("book.missing_score"), "{}", stderr(&o));
+    }
 }

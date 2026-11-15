@@ -10,6 +10,7 @@ mod rcsr_cmd;
 
 use rcsr::data;
 use rcsr::store;
+use rcsr::trading::MissingScore;
 use rcsr::walkforward::{self, EvalSpec, Window};
 
 #[path = "common/scratch.rs"]
@@ -587,7 +588,7 @@ fn final_exit_is_charged_per_group_when_rows_are_dropped() {
     let target = [f64::NAN, 0.01, 0.02, 0.03, 0.04];
     let scores = [1.0; 5];
     let mut previous = std::collections::HashMap::new();
-    let t = walkforward::reference_cell(&time, &group, &target, &scores, 0.0, 0.001, &mut previous);
+    let t = walkforward::reference_cell(&time, &group, &target, &scores, 0.0, 0.001, &mut previous, rcsr::trading::MissingScore::Flat);
     assert_eq!(t.rows, 4);
     assert_eq!(t.final_exits, 2);
     assert_eq!(t.entries, 2);
@@ -2100,7 +2101,7 @@ mod fitted_cut {
         assert_eq!(all, PINNED_DEFAULT_REPORTS, "{}", got.join("\n"));
     }
 
-    const PINNED_DEFAULT_REPORTS: &str = "3a81f04a52205a0997503d097eebeba7f0bb7b84977931e29656c206f8256589";
+    const PINNED_DEFAULT_REPORTS: &str = "b613101aacb8980c0938816d6c8b12f69fdb034752a926307f758ba1e9bbfd9f";
 }
 
 #[test]
@@ -2153,6 +2154,10 @@ fn grid_table() -> data::Table {
 const GRID_GAP: std::ops::Range<f64> = 120.0..220.0;
 
 fn grid_run(t: &data::Table, expr: &str, grid: walkforward::PeriodGrid, reset: bool, gate: bool) -> walkforward::Report {
+    grid_run_rule(t, expr, grid, reset, gate, MissingScore::Flat)
+}
+
+fn grid_run_rule(t: &data::Table, expr: &str, grid: walkforward::PeriodGrid, reset: bool, gate: bool, missing: MissingScore) -> walkforward::Report {
     let mut s = spec(expr, vec![window("w1", 0.0, 100.0, 100.0, 250.0), window("w2", 0.0, 250.0, 250.0, 400.0)]);
     s.vars = ["x", "z", "o", "zo"].map(String::from).to_vec();
     s.group = Some("sym".to_string());
@@ -2162,6 +2167,7 @@ fn grid_run(t: &data::Table, expr: &str, grid: walkforward::PeriodGrid, reset: b
     let opts = walkforward::ProtocolOptions {
         period_grid: grid,
         mask: gate.then(|| rcsr::regime_gate::GateSpec::parse("g", 0.0, 1).unwrap()),
+        missing_score: missing,
         ..walkforward::ProtocolOptions::default()
     };
     walkforward::run_table_with(t, &s, "test", &opts).unwrap()
@@ -2255,31 +2261,397 @@ fn period_grid_target_inference_runs_on_the_grid() {
 }
 
 #[test]
-fn period_grid_gap_rule_carries_a_missing_score_and_closes_at_a_gate() {
+fn period_grid_gap_rule_follows_the_missing_score_rule_and_closes_at_a_gate() {
     use walkforward::PeriodGrid::{Score, Target};
     let t = grid_table();
-    // No score on the stretch: the position open before it carries, earns nothing and
-    // trades nothing there; window w1 has one entry and one final exit per symbol.
-    let carry = grid_run(&t, "zo", Target, true, false);
-    let w1 = &carry.windows[0].metrics;
-    assert_eq!((w1.entries, w1.trades), (3, 3), "no exit or re-entry at the stretch");
-    assert!((w1.total_cost - 0.006).abs() < 1e-15, "3 entries and 3 final exits at 10 bp: {}", w1.total_cost);
-    // The gate off on the stretch: every on-run is its own book (#1180), so w1 has two
-    // entries and two paid exits per symbol.
+    // #1203 flat: no score on the stretch ends the run, so window w1 has two entries and two
+    // paid exits per symbol and the stretch books net 0 with no priced row.
+    let flat = grid_run(&t, "zo", Target, true, false);
+    let f1 = &flat.windows[0].metrics;
+    assert_eq!((f1.entries, f1.trades), (6, 6));
+    assert_eq!(flat.missing_score_exits, 3, "one exit per symbol before the stretch");
+    // hold: the position stays on through the stretch and the stretch rows are priced.
+    let held = grid_run_rule(&t, "zo", Target, true, false, MissingScore::Hold);
+    let h1 = &held.windows[0].metrics;
+    assert_eq!((h1.entries, h1.trades), (3, 3), "no exit or re-entry at the stretch");
+    assert!((h1.total_cost - 0.006).abs() < 1e-15, "3 entries and 3 final exits at 10 bp: {}", h1.total_cost);
+    assert_eq!((held.missing_score_exits, held.period_grid.as_ref().unwrap().empty_periods), (0, 0));
+    // The gate off on the stretch: every on-run is its own book (#1180).
     let gated = grid_run(&t, "o", Target, true, true);
     let g1 = &gated.windows[0].metrics;
     assert_eq!((g1.entries, g1.trades), (6, 6), "flat after the gate turns off");
     let ungated = grid_run(&t, "o", Target, true, false);
     assert_eq!(bits(&gated.period_time), bits(&ungated.period_time), "a gated and an ungated book share the grid");
-    assert_eq!(bits(&gated.period_time), bits(&carry.period_time));
-    for r in [&carry, &gated] {
+    assert_eq!(bits(&gated.period_time), bits(&flat.period_time));
+    assert_eq!(bits(&held.period_time), bits(&flat.period_time));
+    for r in [&flat, &gated, &held] {
         let rows = &r.period_grid.as_ref().unwrap().period_rows;
         for (k, &tm) in r.period_time.iter().enumerate() {
             if GRID_GAP.contains(&tm) {
-                assert_eq!((rows[k], r.period_net[k].to_bits()), (0, 0f64.to_bits()), "net 0 and no cost at {tm}");
+                if std::ptr::eq(r, &held) {
+                    assert_eq!(rows[k], 3, "a held row is priced at {tm}");
+                } else {
+                    assert_eq!((rows[k], r.period_net[k].to_bits()), (0, 0f64.to_bits()), "net 0 and no cost at {tm}");
+                }
             }
         }
     }
     assert_eq!(gated.period_grid.as_ref().unwrap().empty_periods, 100);
     assert_eq!(grid_run(&t, "o", Score, true, true).period_time.len(), 200, "the score grid drops the gate-off stretch");
+}
+
+/// #1203: the synthetic fixture of the issue. Two symbols, hourly rows 0..299,
+/// target +0.001 per row and -0.005 on rows 120..159; `z` is 1 with no value on
+/// rows 120..159 and `o` is 1 everywhere.
+fn carry_table() -> data::Table {
+    let mut s = String::from("ts,sym,z,o,target\n");
+    for i in 0..300usize {
+        for sym in ["A", "B"] {
+            let gap = (120..160).contains(&i);
+            let z = if gap { "" } else { "1" };
+            let y = if gap { -0.005 } else { 0.001 };
+            s.push_str(&format!("{},{sym},{z},1,{y}\n", 3600 * i));
+        }
+    }
+    data::parse_table(&s).unwrap()
+}
+
+fn carry_run(t: &data::Table, expr: &str, windows: Vec<Window>, opts: &walkforward::ProtocolOptions) -> walkforward::Report {
+    let mut s = spec(expr, windows);
+    s.vars = vec!["z".to_string(), "o".to_string()];
+    s.group = Some("sym".to_string());
+    s.threshold_fixed = Some(0.0);
+    s.periods_per_year = Some(8760.0);
+    s.pool_reset_flat = true;
+    walkforward::run_table_with(t, &s, "test", opts).unwrap()
+}
+
+const H: f64 = 3600.0;
+
+#[test]
+fn missing_score_flat_equals_the_book_split_at_the_stretch() {
+    let t = carry_table();
+    let o = walkforward::ProtocolOptions::default();
+    let flat = carry_run(&t, "z", vec![window("w", 0.0, 100.0 * H, 100.0 * H, 250.0 * H)], &o);
+    let split = carry_run(
+        &t,
+        "o",
+        vec![window("a", 0.0, 100.0 * H, 100.0 * H, 120.0 * H), window("b", 0.0, 100.0 * H, 160.0 * H, 250.0 * H)],
+        &o,
+    );
+    let sum = |r: &walkforward::Report| r.period_net.iter().sum::<f64>();
+    let (f, s) = (&flat.pooled, &split.pooled);
+    assert_eq!(f.total_cost.to_bits(), s.total_cost.to_bits(), "exit at row 119 and re-entry at row 160: {} vs {}", f.total_cost, s.total_cost);
+    assert_eq!(sum(&flat).to_bits(), sum(&split).to_bits());
+    assert_eq!(f.total_return.to_bits(), s.total_return.to_bits());
+    assert_eq!(f.max_drawdown.to_bits(), s.max_drawdown.to_bits());
+    assert_eq!(bits(&flat.period_net), bits(&split.period_net));
+    assert_eq!((f.trades, f.entries), (4, 4));
+    assert!((f.total_cost - 0.008).abs() < 1e-15, "{}", f.total_cost);
+}
+
+#[test]
+fn missing_score_flat_pays_exit_and_reentry() {
+    use walkforward::PeriodGrid::Target;
+    let t = grid_table();
+    let flat = grid_run(&t, "zo", Target, true, false);
+    let gated = grid_run(&t, "o", Target, true, true);
+    let (w, g) = (&flat.windows[0].metrics, &gated.windows[0].metrics);
+    assert_eq!((w.entries, w.trades), (6, 6), "an exit before the stretch and a re-entry after it per symbol");
+    assert_eq!(w.total_cost.to_bits(), g.total_cost.to_bits(), "the gated o book: {} vs {}", w.total_cost, g.total_cost);
+    assert!((w.total_cost - 0.012).abs() < 1e-15, "6 entries and 6 exits at 10 bp: {}", w.total_cost);
+    // The gate relabels the groups, so a period sums its symbols in another order.
+    assert_eq!(flat.period_net.len(), gated.period_net.len());
+    for (a, b) in flat.period_net.iter().zip(&gated.period_net) {
+        assert!((a - b).abs() <= 1e-15, "the series of the gated book: {a} vs {b}");
+    }
+}
+
+/// #1203: two symbols at t = 0..300; `z` is `x` with no value on `[150, 200)`.
+fn pbo_table() -> data::Table {
+    let frac = |v: f64| v - v.floor();
+    let mut s = String::from("ts,sym,x,z,target\n");
+    for i in 0..300usize {
+        for (k, sym) in ["A", "B"].iter().enumerate() {
+            let f = i as f64 + 0.37 * k as f64;
+            let x = frac(f * 0.618_033_988_749_894_9) - 0.5;
+            let y = 0.01 * (frac(f * 0.754_877_666_246_692_7) - 0.5) + 0.002 * x;
+            let z = if (150..200).contains(&i) { String::new() } else { x.to_string() };
+            s.push_str(&format!("{i},{sym},{x},{z},{y}\n"));
+        }
+    }
+    data::parse_table(&s).unwrap()
+}
+
+fn pbo_run(t: &data::Table, exprs: &[&str], grid: walkforward::PeriodGrid, inference: bool) -> walkforward::Report {
+    let mut s = spec(exprs[0], vec![window("w", 0.0, 100.0, 100.0, 300.0)]);
+    if exprs.len() > 1 {
+        s.candidates = exprs.iter().map(|e| e.to_string()).collect();
+    }
+    s.vars = vec!["x".to_string(), "z".to_string()];
+    s.group = Some("sym".to_string());
+    s.threshold_fixed = Some(0.0);
+    s.validation_frac = 0.2;
+    s.periods_per_year = Some(8760.0);
+    s.pool_reset_flat = true;
+    let opts = walkforward::ProtocolOptions {
+        period_grid: grid,
+        bootstrap_draws: if inference { 200 } else { 0 },
+        block_len: inference.then_some(5),
+        pbo_blocks: 4,
+        ..walkforward::ProtocolOptions::default()
+    };
+    walkforward::run_table_with(t, &s, "test", &opts).unwrap()
+}
+
+#[test]
+fn in_report_pbo_columns_share_the_target_grid() {
+    use walkforward::PeriodGrid::{Score, Target};
+    let t = pbo_table();
+    let pair = pbo_run(&t, &["z", "x + 1"], Score, true);
+    assert_eq!(pair.windows[0].candidate, 0, "z has the lower validation error");
+    assert_eq!(pair.pooled.periods, 150, "the pooled series stays on the score grid");
+    // The column of each candidate is its own book on the window's target grid.
+    let cols: Vec<Vec<f64>> = ["z", "x + 1"].iter().map(|e| pbo_run(&t, &[e], Target, false).period_net).collect();
+    assert!(cols.iter().all(|c| c.len() == 200), "the target grid has 200 periods");
+    let stretch: Vec<usize> = (50..100).collect();
+    assert!(stretch.iter().all(|&k| cols[0][k] == 0.0), "z prices no row on the stretch");
+    assert!(stretch.iter().filter(|&&k| cols[1][k] != 0.0).count() > 40, "x + 1 is long on the stretch");
+    let m = pair.inference.as_ref().unwrap().multiple.as_ref().unwrap();
+    let pbo = m.pbo.as_ref().expect("two candidates give a PBO");
+    let want = rcsr::inference::pbo_cscv(&cols, 4).unwrap();
+    assert_eq!(pbo.rows_per_block, 50, "every column has the length of the target grid");
+    assert_eq!(pbo.pbo.to_bits(), want.pbo.to_bits());
+    assert_eq!(bits(&pbo.logits), bits(&want.logits));
+    for (c, col) in cols.iter().enumerate() {
+        let d = rcsr::inference::bootstrap_draws(col, 5, 200, walkforward::ProtocolOptions::default().seed.wrapping_add(c as u32 + 1));
+        assert_eq!(m.p_values[c].to_bits(), rcsr::inference::bootstrap_p_mean_positive(col, &d).to_bits(), "candidate {c}");
+    }
+    // With full coverage the score and the target grid are one grid and the block is unchanged.
+    let multiple = |r: &walkforward::Report| -> String {
+        let j = rcsr::devlog::Json::parse(&r.json()).unwrap();
+        j.get("inference").and_then(|i| i.get("multiple_testing")).map(|m| format!("{m:?}")).expect("the multiple_testing block")
+    };
+    assert_eq!(multiple(&pbo_run(&t, &["x", "x + 1"], Score, true)), multiple(&pbo_run(&t, &["x", "x + 1"], Target, true)));
+}
+
+#[test]
+fn missing_score_hold_prices_the_held_position() {
+    use walkforward::PeriodGrid::{Score, Target};
+    let t = grid_table();
+    for grid in [Score, Target] {
+        for reset in [false, true] {
+            let held = grid_run_rule(&t, "zo", grid, reset, false, MissingScore::Hold);
+            let o = grid_run(&t, "o", grid, reset, false);
+            let (h, b) = (&held.pooled, &o.pooled);
+            assert_eq!(bits(&held.period_net), bits(&o.period_net), "{grid:?} reset {reset}");
+            assert_eq!(h.total_cost.to_bits(), b.total_cost.to_bits(), "{grid:?} reset {reset}");
+            assert_eq!((h.trades, h.entries, h.rows, h.active_rows), (b.trades, b.entries, b.rows, b.active_rows), "{grid:?} reset {reset}");
+        }
+    }
+    let j = grid_run_rule(&t, "zo", Target, true, false, MissingScore::Hold).json();
+    assert!(j.contains("\"book\":{\"missing_score\":\"hold\",\"missing_score_exits\":0,"), "{j}");
+}
+
+/// #1203: one symbol at t = 0..12; `z` is 1 with no value at t = 7, the last row of
+/// window `a`, and at t = 8, the first row of window `b`.
+fn seam_table() -> data::Table {
+    let mut s = String::from("ts,sym,z,target\n");
+    for i in 0..12 {
+        let z = if i == 7 || i == 8 { "" } else { "1" };
+        s.push_str(&format!("{i},A,{z},{}\n", 0.001 * (i as f64 + 1.0)));
+    }
+    data::parse_table(&s).unwrap()
+}
+
+#[test]
+fn missing_score_at_a_carried_seam() {
+    let t = seam_table();
+    let run = |missing: MissingScore| {
+        let mut s = spec("z", vec![window("a", 0.0, 4.0, 4.0, 8.0), window("b", 0.0, 4.0, 8.0, 12.0)]);
+        s.vars = vec!["z".to_string()];
+        s.threshold_fixed = Some(0.0);
+        let opts = walkforward::ProtocolOptions { missing_score: missing, ..walkforward::ProtocolOptions::default() };
+        walkforward::run_table_with(&t, &s, "test", &opts).unwrap()
+    };
+    // flat: window a pays its exit at t = 6, its last priced row, and leaves flat; window b
+    // starts flat and pays the entry at t = 9. No position crosses the seam.
+    let flat = run(MissingScore::Flat);
+    assert!(!flat.pool_reset_flat);
+    assert_eq!((flat.pooled.rows, flat.pooled.entries, flat.pooled.trades), (6, 2, 2));
+    assert!((flat.pooled.total_cost - 0.004).abs() < 1e-15, "{}", flat.pooled.total_cost);
+    assert_eq!((flat.missing_score_exits, flat.seam_trades), (1, 0));
+    // hold: t = 7 and t = 8 hold the long and earn their returns; window b's first row holds the
+    // carried position, so the seam trades nothing.
+    let held = run(MissingScore::Hold);
+    assert_eq!((held.pooled.rows, held.pooled.entries, held.pooled.trades), (8, 1, 1));
+    assert!((held.pooled.total_cost - 0.003).abs() < 1e-15, "entry, the window-end exit of a, the final exit: {}", held.pooled.total_cost);
+    assert_eq!((held.missing_score_exits, held.seam_trades), (0, 0));
+}
+
+/// #1203: one symbol at t = 0..20 under `--policy band --min-hold 3`, with no score at t = 6.
+fn cooldown_table(drop_gap: bool) -> data::Table {
+    let mut s = String::from("ts,sym,z,target\n");
+    for i in 0..20usize {
+        let z = match i {
+            6 if drop_gap => continue,
+            6 => String::new(),
+            4 | 8 | 9 | 13 => "1".to_string(),
+            _ => "-1".to_string(),
+        };
+        s.push_str(&format!("{i},A,{z},{}\n", 0.001 * ((i * 7 % 5) as f64 - 1.5)));
+    }
+    data::parse_table(&s).unwrap()
+}
+
+fn cooldown_run(t: &data::Table, windows: Vec<Window>, missing: MissingScore) -> walkforward::Report {
+    let mut s = spec("z", windows);
+    s.vars = vec!["z".to_string()];
+    s.threshold_fixed = Some(0.0);
+    s.policy = walkforward::Policy::Band;
+    s.min_hold = 3;
+    s.pool_reset_flat = true;
+    let opts = walkforward::ProtocolOptions { missing_score: missing, ..walkforward::ProtocolOptions::default() };
+    walkforward::run_table_with(t, &s, "test", &opts).unwrap()
+}
+
+#[test]
+fn missing_score_inside_a_cooldown_hold() {
+    let t = cooldown_table(false);
+    let one = || vec![window("w", 0.0, 4.0, 4.0, 20.0)];
+    // flat: the cooldown automaton restarts at t = 7, as in a window that starts there.
+    let flat = cooldown_run(&t, one(), MissingScore::Flat);
+    let split = cooldown_run(&t, vec![window("a", 0.0, 4.0, 4.0, 6.0), window("b", 0.0, 4.0, 7.0, 20.0)], MissingScore::Flat);
+    assert_eq!(bits(&flat.period_net), bits(&split.period_net));
+    assert_eq!(flat.pooled.total_cost.to_bits(), split.pooled.total_cost.to_bits());
+    assert_eq!((flat.pooled.trades, flat.pooled.entries), (split.pooled.trades, split.pooled.entries));
+    assert_eq!(flat.missing_score_exits, 1, "the long of t = 4 and 5 exits at t = 5");
+    // hold: the automaton carries its state across t = 6, so the scored rows hold the positions of the
+    // book without that row, and t = 6 holds the long of t = 5.
+    let held = cooldown_run(&t, one(), MissingScore::Hold);
+    let dropped = cooldown_run(&cooldown_table(true), one(), MissingScore::Hold);
+    assert_eq!((held.pooled.trades, held.pooled.entries), (dropped.pooled.trades, dropped.pooled.entries));
+    assert_eq!(held.pooled.total_cost.to_bits(), dropped.pooled.total_cost.to_bits());
+    assert_eq!((held.pooled.rows, held.pooled.active_rows), (dropped.pooled.rows + 1, dropped.pooled.active_rows + 1));
+    assert!(flat.pooled.entries > held.pooled.entries, "flat re-enters at t = 8; hold is still long there");
+    let band = held.windows[0].band.as_ref().expect("the cooldown scan check");
+    assert!((band.net - band.scalar_net).abs() < 1e-15, "the scan net plus the held row equals the book: {} vs {}", band.net, band.scalar_net);
+}
+
+#[test]
+fn missing_score_under_top_tercile() {
+    // Three symbols at t = 0..10. A has the top score at every timestamp and no score at t = 6,
+    // which leaves two finite scores there, so the tercile holds nothing on B and C at t = 6.
+    let mut s = String::from("ts,sym,z,target\n");
+    for i in 0..10 {
+        for (sym, z) in [("A", "3"), ("B", "2"), ("C", "1")] {
+            let z = if sym == "A" && i == 6 { "" } else { z };
+            s.push_str(&format!("{i},{sym},{z},0.001\n"));
+        }
+    }
+    let t = data::parse_table(&s).unwrap();
+    let run = |missing: MissingScore| {
+        let mut s = spec("z", vec![window("w", 0.0, 4.0, 4.0, 10.0)]);
+        s.vars = vec!["z".to_string()];
+        s.group = Some("sym".to_string());
+        s.policy = walkforward::Policy::TopTercile;
+        let opts = walkforward::ProtocolOptions { missing_score: missing, ..walkforward::ProtocolOptions::default() };
+        walkforward::run_table_with(&t, &s, "test", &opts).unwrap()
+    };
+    let flat = run(MissingScore::Flat);
+    let f = &flat.pooled;
+    assert_eq!((f.rows, f.active_rows, f.entries, f.trades), (17, 5, 2, 2), "A exits at t = 5 and re-enters at t = 7");
+    assert!((f.total_cost - 0.004).abs() < 1e-15, "{}", f.total_cost);
+    assert_eq!(flat.missing_score_exits, 1);
+    let held = run(MissingScore::Hold);
+    let h = &held.pooled;
+    assert_eq!((h.rows, h.active_rows, h.entries, h.trades), (18, 6, 1, 1), "A holds its long at t = 6");
+    assert!((h.total_cost - 0.002).abs() < 1e-15, "{}", h.total_cost);
+}
+
+#[test]
+fn unpriced_target_rows_count_the_uncovered_rows_inside_a_run() {
+    let table = |target: &dyn Fn(usize) -> bool| {
+        let mut s = String::from("ts,sym,z,target\n");
+        for i in 0..60usize {
+            let y = if target(i) { "0.001" } else { "" };
+            s.push_str(&format!("{},A,1,{y}\n", 3600 * i));
+        }
+        data::parse_table(&s).unwrap()
+    };
+    let run = |t: &data::Table, horizon: f64, train_end: f64, test_start: f64| {
+        let mut s = spec("z", vec![window("w", 0.0, train_end, test_start, 60.0 * H)]);
+        s.vars = vec!["z".to_string()];
+        s.threshold_fixed = Some(0.0);
+        s.horizon = horizon;
+        s.periods_per_year = Some(8760.0);
+        walkforward::run_table(t, &s, "test").unwrap()
+    };
+    // A missing next bar on rows 20..29: a score and no target, inside the long run.
+    let r = run(&table(&|i| !(20..30).contains(&i)), H, 9.0 * H, 10.0 * H);
+    assert_eq!(r.unpriced_target_rows, 10);
+    assert!(r.json().contains("\"unpriced_target_rows\":10}"), "{}", r.json());
+    // A strided label: a target every fourth hour and a four-hour horizon. The return of a target row
+    // covers the next three rows, so none of them counts.
+    let r = run(&table(&|i| i % 4 == 0), 4.0 * H, 8.0 * H, 12.0 * H);
+    assert_eq!(r.unpriced_target_rows, 0);
+}
+
+/// #1203: one symbol at t = 0..20. `z` has no value on `gap`; after t = 12 `late` scores
+/// and returns replace the base ones. The target at t = 9, the last priced row before
+/// the gap, is a loss of 5 %.
+fn causal_table(gap: std::ops::Range<usize>, late: bool) -> data::Table {
+    let mut s = String::from("ts,sym,z,target\n");
+    for i in 0..20usize {
+        let z = if gap.contains(&i) { String::new() } else if late && i > 12 { "-1".to_string() } else { "1".to_string() };
+        let y = if i == 9 { -0.05 } else if late && i > 12 { -0.02 } else { 0.001 };
+        s.push_str(&format!("{i},A,{z},{y}\n"));
+    }
+    data::parse_table(&s).unwrap()
+}
+
+#[test]
+fn missing_score_flat_exit_is_causal() {
+    let run = |t: &data::Table| {
+        let mut s = spec("z", vec![window("w", 0.0, 4.0, 4.0, 20.0)]);
+        s.vars = vec!["z".to_string()];
+        s.threshold_fixed = Some(0.0);
+        walkforward::run_table(t, &s, "test").unwrap()
+    };
+    let at = |r: &walkforward::Report, t: f64| r.period_net[r.period_time.iter().position(|&x| x == t).unwrap()];
+    let gapped = run(&causal_table(10..13, false));
+    let scored = run(&causal_table(0..0, false));
+    // The missing score of t = 10 is known at t = 10, so the long of t = 9 earns the loss of
+    // t = 9 and pays its exit there; every earlier period is the book with no gap.
+    for t in 4..9 {
+        assert_eq!(at(&gapped, t as f64).to_bits(), at(&scored, t as f64).to_bits(), "t = {t}");
+    }
+    assert_eq!(at(&gapped, 9.0).to_bits(), (-0.05f64 - 0.001).to_bits(), "the loss and the exit at t = 9");
+    assert_eq!(at(&scored, 9.0).to_bits(), (-0.05f64).to_bits());
+    // Scores and returns after the gap do not reach any period up to it.
+    let late = run(&causal_table(10..13, true));
+    for t in 4..10 {
+        assert_eq!(at(&gapped, t as f64).to_bits(), at(&late, t as f64).to_bits(), "t = {t}");
+    }
+    assert_ne!(bits(&gapped.period_net), bits(&late.period_net), "the late rows do change the later periods");
+}
+
+#[test]
+fn missing_score_device_pnl_reduction_reads_the_same_book() {
+    let t = grid_table();
+    for missing in [MissingScore::Flat, MissingScore::Hold] {
+        let mut s = spec("z", vec![window("w1", 0.0, 100.0, 100.0, 250.0), window("w2", 0.0, 250.0, 250.0, 400.0)]);
+        s.vars = ["x", "z", "o", "zo"].map(String::from).to_vec();
+        s.group = Some("sym".to_string());
+        s.threshold_fixed = Some(0.0);
+        s.periods_per_year = Some(8760.0);
+        s.pool_reset_flat = true;
+        s.device_pnl = true;
+        let opts = walkforward::ProtocolOptions { missing_score: missing, ..walkforward::ProtocolOptions::default() };
+        let r = walkforward::run_table_with(&t, &s, "test", &opts).unwrap();
+        let d = r.device_pnl.as_ref().expect("the --device-pnl summary");
+        assert_eq!((d.windows, d.bit_mismatch_windows, d.count_mismatch_windows), (2, 0, 0), "{missing:?}");
+        assert!(d.max_abs_net_delta < 1e-12, "{missing:?}: {}", d.max_abs_net_delta);
+        assert_eq!(d.rows, r.pooled.rows as u64, "{missing:?}: the reduction prices the rows of the book");
+    }
 }
