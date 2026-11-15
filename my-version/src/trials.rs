@@ -63,6 +63,9 @@ Campaign (--wf):\n\
                          threshold.fit, threshold.cut_min_entries, threshold.cut_blocks, threshold.cut_lambda), policy\n\
                          and period grid (pooled.grid.rule, absent for the score grid, and pooled.period_time) and missing-score\n\
                          rule (book.missing_score, absent in a report of a build that carried the position)\n\
+  --members <mode>       selected (default): one series per report, pooled.period_net; all: one series per\n\
+                         members[] row of a walkforward --front --all-members report (members[].series), named\n\
+                         <report>#<archive_rank>; a report without members exits 2\n\
   --baseline <file>      rcsr ladder --emit-series report; the best of cash, buy_and_hold, constant_long_flat,\n\
                          best_single_feature and any trend rung by mean is the SPA benchmark\n\
   --baseline-rung <name> use this rung as the SPA benchmark instead\n\
@@ -133,6 +136,8 @@ pub(crate) const FIT_GUARDS: &[&[&str]] = &[
 struct Wf {
     label: String,
     path: String,
+    /// `pooled`, or `series` for a `members[]` entry (#1176).
+    prefix: &'static str,
     net: Vec<f64>,
     /// #1175: the per-period series a walkforward report carries with `--period-series`.
     gross: Option<Vec<f64>>,
@@ -185,42 +190,75 @@ fn median_step(time: &[f64]) -> f64 {
     d[d.len() / 2]
 }
 
-fn load_wf(path: &str) -> Res<Wf> {
+fn read_report(path: &str) -> Res<Json> {
     let text = std::fs::read_to_string(path).or_else(|e| input_err(format!("{}: {}", path, e)))?;
-    let j = Json::parse(text.trim()).map_or_else(|| input_err(format!("{}: not a JSON report", path)), Ok)?;
-    let net = series(&j, &["pooled", "period_net"], path)?;
-    let time = series(&j, &["pooled", "period_time"], path)?;
+    Json::parse(text.trim()).map_or_else(|| input_err(format!("{}: not a JSON report", path)), Ok)
+}
+
+fn load_wf(path: &str) -> Res<Wf> {
+    let j = read_report(path)?;
+    wf_entry(&j, &j, "pooled", path, label_of(path))
+}
+
+/// #1176: one entry per `members[]` row of a `walkforward --all-members` report,
+/// labelled `<report>#<archive_rank>`, with the series of `members[].series`.
+fn load_members(path: &str) -> Res<Vec<Wf>> {
+    let j = read_report(path)?;
+    let Some(Json::Arr(members)) = j.get("members") else {
+        return usage_err(format!(
+            "field 'members' is missing in {} (write the report with walkforward --front --all-members, or read it with --members selected)",
+            path
+        ));
+    };
+    members
+        .iter()
+        .enumerate()
+        .map(|(k, m)| {
+            let rank = m.get("archive_rank").and_then(Json::as_f64).map_or_else(|| (k + 1).to_string(), jnum);
+            wf_entry(&j, m, "series", &format!("{}#{}", path, rank), format!("{}#{}", label_of(path), rank))
+        })
+        .collect()
+}
+
+/// `root.<prefix>` holds the series; the guards, the annualisation and the rule come
+/// from the report `j`, the hold length from `root.pooled`.
+fn wf_entry(j: &Json, root: &Json, prefix: &'static str, path: &str, label: String) -> Res<Wf> {
+    let net = series(root, &[prefix, "period_net"], path)?;
+    let time = series(root, &[prefix, "period_time"], path)?;
     if net.len() != time.len() {
         return usage_err(format!(
-            "field 'pooled.period_time' has {} values but 'pooled.period_net' has {} in {}",
+            "field '{}.period_time' has {} values but '{}.period_net' has {} in {}",
+            prefix,
             time.len(),
+            prefix,
             net.len(),
             path
         ));
     }
     let optional = |key: &str| -> Res<Option<Vec<f64>>> {
-        let v = at(&j, &["pooled", key]).is_some().then(|| series(&j, &["pooled", key], path)).transpose()?;
+        let v = at(root, &[prefix, key]).is_some().then(|| series(root, &[prefix, key], path)).transpose()?;
         match v {
-            Some(x) if x.len() != net.len() => usage_err(format!("field 'pooled.{}' has {} values but 'pooled.period_net' has {} in {}", key, x.len(), net.len(), path)),
+            Some(x) if x.len() != net.len() => usage_err(format!("field '{}.{}' has {} values but '{}.period_net' has {} in {}", prefix, key, x.len(), prefix, net.len(), path)),
             v => Ok(v),
         }
     };
     let (gross, exposure, entry_series, bh) = (optional("period_gross")?, optional("period_exposure")?, optional("period_entries")?, optional("period_bh")?);
-    let Some(ppy) = at(&j, &["annualization", "periods_per_year"]).and_then(Json::as_f64) else {
+    let Some(ppy) = at(j, &["annualization", "periods_per_year"]).and_then(Json::as_f64) else {
         return usage_err(format!("field 'annualization.periods_per_year' is missing in {}", path));
     };
-    let guards = GUARDS.iter().map(|g| at(&j, g).cloned().unwrap_or(Json::Null)).collect();
-    let fit_guards: Vec<Json> = FIT_GUARDS.iter().map(|g| at(&j, g).cloned().unwrap_or(Json::Null)).collect();
-    let rule = threshold_rule(&j);
-    let horizon = at(&j, &["purge", "horizon_seconds"]).and_then(Json::as_f64).unwrap_or(0.0);
+    let guards = GUARDS.iter().map(|g| at(j, g).cloned().unwrap_or(Json::Null)).collect();
+    let fit_guards: Vec<Json> = FIT_GUARDS.iter().map(|g| at(j, g).cloned().unwrap_or(Json::Null)).collect();
+    let rule = threshold_rule(j);
+    let horizon = at(j, &["purge", "horizon_seconds"]).and_then(Json::as_f64).unwrap_or(0.0);
     let dt = median_step(&time);
     let horizon_periods = if horizon > 0.0 && dt > 0.0 { (horizon / dt).ceil() as usize } else { 0 };
-    let entries = at(&j, &["pooled", "entries"]).and_then(Json::as_f64).unwrap_or(0.0);
-    let active = at(&j, &["pooled", "active_rows"]).and_then(Json::as_f64).unwrap_or(0.0);
+    let entries = at(root, &["pooled", "entries"]).and_then(Json::as_f64).unwrap_or(0.0);
+    let active = at(root, &["pooled", "active_rows"]).and_then(Json::as_f64).unwrap_or(0.0);
     let hold = if entries > 0.0 { (active / entries).ceil() as usize } else { 1 };
     Ok(Wf {
-        label: label_of(path),
+        label,
         path: path.to_string(),
+        prefix,
         default_block: inference::auto_block_len(net.len(), horizon_periods, hold),
         net,
         gross,
@@ -276,29 +314,39 @@ fn require_same(a: &Wf, b: &Wf, arms: bool) -> Res<()> {
         }
     }
     if a.time != b.time {
+        let (field, hint) = if a.prefix == "pooled" && b.prefix == "pooled" {
+            ("pooled.period_time".to_string(), "")
+        } else {
+            (format!("{}.period_time", if a.prefix == b.prefix { a.prefix } else { "series" }), "; price the members with walkforward --period-grid target")
+        };
         return usage_err(format!(
-            "reports differ in field 'pooled.period_time': {} ({} periods) vs {} ({} periods)",
+            "reports differ in field '{}': {} ({} periods) vs {} ({} periods){}",
+            field,
             a.path,
             a.time.len(),
             b.path,
-            b.time.len()
+            b.time.len(),
+            hint
         ));
     }
     Ok(())
 }
 
 fn load_all(paths: &[String]) -> Res<Vec<Wf>> {
-    load_set(paths, false)
+    load_set(paths, false, false)
 }
 
-fn load_set(paths: &[String], arms: bool) -> Res<Vec<Wf>> {
+/// `members`: one entry per `members[]` row of every report (`--members all`, #1176).
+fn load_set(paths: &[String], arms: bool, members: bool) -> Res<Vec<Wf>> {
     let mut out: Vec<Wf> = Vec::with_capacity(paths.len());
     for p in paths {
-        let w = load_wf(p)?;
-        if let Some(first) = out.first() {
-            require_same(first, &w, arms)?;
+        let entries = if members { load_members(p)? } else { vec![load_wf(p)?] };
+        for w in entries {
+            if let Some(first) = out.first() {
+                require_same(first, &w, arms)?;
+            }
+            out.push(w);
         }
-        out.push(w);
     }
     Ok(out)
 }
@@ -326,6 +374,8 @@ struct Options {
     seed: u32,
     out: Option<String>,
     threshold_arms: bool,
+    /// #1176: `--members all`: one series per `members[]` row.
+    all_members: bool,
     regimes: Option<String>,
 }
 
@@ -345,6 +395,7 @@ fn parse_args(args: &[String]) -> Res<Options> {
         seed: DEFAULT_SEED,
         out: None,
         threshold_arms: false,
+        all_members: false,
         regimes: None,
     };
     let mut given: Vec<&str> = Vec::new();
@@ -390,6 +441,14 @@ fn parse_args(args: &[String]) -> Res<Options> {
             "--seed" => o.seed = num(a, &val(&mut i)?)?,
             "--out" => o.out = Some(val(&mut i)?),
             "--threshold-arms" => o.threshold_arms = true,
+            "--members" => {
+                let v = val(&mut i)?;
+                o.all_members = match v.as_str() {
+                    "all" => true,
+                    "selected" => false,
+                    _ => return usage_err(format!("--members must be all or selected, got '{}'", v)),
+                };
+            }
             "--regimes" => o.regimes = Some(val(&mut i)?),
             other => return usage_err(format!("unknown argument '{}'", other)),
         }
@@ -403,7 +462,7 @@ fn parse_args(args: &[String]) -> Res<Options> {
         return usage_err("give --wf <reports...> or --compare <A> <B>");
     }
     let (campaign_only, compare_only): (&[&str], &[&str]) = (
-        &["--baseline", "--baseline-rung", "--cluster-rho", "--pbo-blocks", "--regimes"],
+        &["--baseline", "--baseline-rung", "--cluster-rho", "--pbo-blocks", "--regimes", "--members"],
         &["--bootstrap", "--level", "--s-seed"],
     );
     let wrong = if o.compare.is_some() { campaign_only } else { compare_only };
@@ -526,7 +585,7 @@ fn skipped(reason: &str) -> String {
 }
 
 fn campaign(o: &Options) -> Res<String> {
-    let wfs = load_set(&o.wf, o.threshold_arms)?;
+    let wfs = load_set(&o.wf, o.threshold_arms, o.all_members)?;
     let n = wfs[0].net.len();
     let ppy = wfs[0].ppy;
     let block = o.block_len.unwrap_or_else(|| default_block(&wfs)).clamp(1, n.max(1));

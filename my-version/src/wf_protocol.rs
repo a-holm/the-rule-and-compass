@@ -611,7 +611,8 @@ fn null_row_json(r: &NullRow) -> String {
 }
 
 impl Economics {
-    pub fn json(&self) -> String {
+    /// The `cost_ladder` array.
+    pub fn ladder_json(&self) -> String {
         let ladder: Vec<String> = self
             .ladder
             .iter()
@@ -628,6 +629,10 @@ impl Economics {
                 )
             })
             .collect();
+        format!("[{}]", ladder.join(","))
+    }
+
+    pub fn json(&self) -> String {
         let bench: Vec<String> = self
             .benchmarks
             .iter()
@@ -662,7 +667,7 @@ impl Economics {
         format!(
             "{{\"book\":\"long_flat_vs_cash\",\"cost_bps_per_side\":{},\"periods_per_year\":{},\
              \"sortino\":{},\"calmar\":{},\"cvar_95\":{},\"cvar_99\":{},\
-             \"break_even_bps_per_side\":{},\"break_even_status\":{},\"cost_ladder\":[{}],\"daily\":{}{},\
+             \"break_even_bps_per_side\":{},\"break_even_status\":{},\"cost_ladder\":{},\"daily\":{}{},\
              \"benchmark_series\":\"every window started flat\",\"best_baseline\":{},\"benchmarks\":[{}]}}",
             jnum(self.cost_bps),
             jnum(self.periods_per_year),
@@ -672,7 +677,7 @@ impl Economics {
             jnum(self.cvar99),
             jnum(self.break_even_bps_per_side),
             jstr(self.break_even_status),
-            ladder.join(","),
+            self.ladder_json(),
             daily,
             unavailable,
             jstr(&self.best_baseline),

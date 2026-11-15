@@ -371,6 +371,18 @@ INPUT:
                              state. Needs --pnl-mask
   --pnl-mask-dwell D        minimum rows per gate state, per group (default 1,
                              integer >= 1). Needs --pnl-mask
+  --pnl-excess none|xs-mean the benchmark of the --fitness pnl excess (default
+                             none: return - funding - cash return). xs-mean
+                             subtracts the equal-weight mean return of the
+                             training rows at each timestamp (the rows the
+                             book can trade), so the fitness pays for timing
+                             and selection, not for market beta. Validation,
+                             test, robust selection and walk-forward stay
+                             absolute; objective.validation and
+                             objective.test gain xs_excess_net. Needs
+                             --fitness pnl and --cash-return 0 (exit 2); the
+                             book hash covers it, so a resume needs the same
+                             value
   --book-target COL         price the long/flat book on another label of the
                              same --target-spec file: its return_column,
                              horizon, entry offset and cost give the fitness,
@@ -2861,6 +2873,7 @@ fn main() {
     let mut pnl_mask_arg: Option<String> = None;
     let mut pnl_mask_band_arg: Option<String> = None;
     let mut pnl_mask_dwell_arg: Option<String> = None;
+    let mut pnl_excess_arg: Option<String> = None;
     let mut trading_flags: Vec<&'static str> = Vec::new();
     let mut position_arg: Option<String> = None;
     let mut allow_short = false;
@@ -3177,6 +3190,7 @@ fn main() {
             "--pnl-mask" => pnl_mask_arg = Some(val!()),
             "--pnl-mask-band" => pnl_mask_band_arg = Some(val!()),
             "--pnl-mask-dwell" => pnl_mask_dwell_arg = Some(val!()),
+            "--pnl-excess" => pnl_excess_arg = Some(val!()),
             "--book-target" => {
                 trading_flags.push("--book-target");
                 book_target_arg = Some(val!());
@@ -5521,12 +5535,14 @@ fn main() {
         },
     };
     if !fitness_pnl {
-        for (flag, given) in [("--pnl-blocks", pnl_blocks_arg.is_some()), ("--pnl-block-lambda", pnl_lambda_arg.is_some())] {
+        for (flag, given) in [("--pnl-blocks", pnl_blocks_arg.is_some()), ("--pnl-block-lambda", pnl_lambda_arg.is_some()), ("--pnl-excess", pnl_excess_arg.is_some())] {
             if given {
                 trading_usage(&format!("{} needs --fitness pnl", flag));
             }
         }
     }
+    // #1179: the fitness benchmark; every reported net stays absolute.
+    let pnl_excess = pnl_excess_arg.as_deref().map_or(Ok(rcsr::trading::PnlExcess::None), rcsr::trading::PnlExcess::parse).unwrap_or_else(|e| trading_usage(&e));
     let mut trading_spec: Option<rcsr::trading::TradingSpec> = None;
     let mut trading_cols: Option<data::TradingColumns> = None;
     let mut trading_cost: Option<target::CostDecl> = None;
@@ -5678,6 +5694,7 @@ fn main() {
             threshold: trade_threshold,
             max_position: trade_max_position,
             position: position_map,
+            pnl_excess,
             ..Default::default()
         };
         if let Err(e) = tspec.validate() {
@@ -6068,7 +6085,7 @@ fn main() {
     if let Some(cp) = &resume_checkpoint {
         if cp.config.fitness.key() != cfg.fitness.key() {
             trading_usage(&format!(
-                "--resume conflicts with the saved search settings: fitness {} (saved {}); the book depends on the cost, threshold, band, band units, minimum hold, min-trades and training rows",
+                "--resume conflicts with the saved search settings: fitness {} (saved {}); the book depends on the cost, threshold, band, band units, minimum hold, min-trades, pnl excess and training rows",
                 cfg.fitness.key(),
                 cp.config.fitness.key()
             ));
@@ -8991,7 +9008,7 @@ fn main() {
                 backend_json,
                 match &fitness_book {
                     Some(b) => format!(
-                        "\"search_fitness\":{{\"kind\":\"long_pnl_regret\",\"rows\":{},\"groups\":{},\"cost_per_side\":{},\"threshold\":{},\"bound\":{},\"min_trades\":{},\"band\":{},\"band_units\":\"{}\",\"min_holding\":{},\"backend\":\"cpu_f64\",\"book_hash\":\"{:016x}\",{}{}{}{}}},",
+                        "\"search_fitness\":{{\"kind\":\"long_pnl_regret\",\"rows\":{},\"groups\":{},\"cost_per_side\":{},\"threshold\":{},\"bound\":{},\"min_trades\":{},\"band\":{},\"band_units\":\"{}\",\"min_holding\":{},\"backend\":\"cpu_f64\",\"book_hash\":\"{:016x}\",{}{}{}{}{}}},",
                         b.len(),
                         b.groups(),
                         jnum(b.side()),
@@ -9024,6 +9041,11 @@ fn main() {
                                 b.masked_rows()
                             ),
                             _ => String::new(),
+                        },
+                        // #1179: omitted under `none`, so the default report is unchanged.
+                        match b.excess_mode() {
+                            rcsr::trading::PnlExcess::None => String::new(),
+                            m => format!("\"excess\":\"{}\",", m.name()),
                         },
                         // #481: what ranked the generations; `backend` above is
                         // the reported values, always exact CPU f64.
@@ -11782,6 +11804,20 @@ OPTIONS:
                              period_entries and period_bh, so `rcsr trials --regimes`
                              reports exposure and alpha per stratum (implied by the
                              regime flags above)
+  --emit-series              #1176: --period-series plus pooled.period_cost (gross - net,
+                             so gross - m x cost is the net at m times the cost),
+                             period_entry_stamp (1 when a row enters a long run),
+                             period_bh_net (the buy-and-hold control of the same rows
+                             at the report cost) and entry_times (distinct entry stamps)
+  --all-members              #1176, with --front: also price every front member alone
+                             with its own carried threshold and band, as --expr <member>
+                             would, into members[] (archive_rank, complexity, expression,
+                             constant, dropped_rows, per-window metrics, pooled metrics
+                             with entry_times and cost_ladder, and the --emit-series
+                             series); selection.source front_all_members, diagnostic true.
+                             The selection of the report is unchanged and no member feeds
+                             it; implies --emit-series. --select-band, --threshold-fit,
+                             --policy vote and --locked-test exit 2
   --block-len <L>            block length in periods (default
                              max(h, hold, n^(1/3))); must be >= max(h, hold)
   --null-draws <B>           draws of the hour-block permutation null and the
@@ -12008,6 +12044,8 @@ fn run_walkforward(args: &[String]) -> ! {
     let mut regime_band_arg: Option<String> = None;
     let mut regime_dwell_arg: Option<String> = None;
     let mut period_series = false;
+    let mut emit_series = false;
+    let mut all_members = false;
 
     let need = |args: &[String], i: usize, flag: &str| -> String {
         match args.get(i) {
@@ -12130,6 +12168,8 @@ fn run_walkforward(args: &[String]) -> ! {
                 i += 1;
             }
             "--period-series" => period_series = true,
+            "--emit-series" => emit_series = true,
+            "--all-members" => all_members = true,
             "--threshold-quantile" => {
                 quantile = number(
                     need(args, i + 1, "--threshold-quantile"),
@@ -12388,6 +12428,12 @@ fn run_walkforward(args: &[String]) -> ! {
         eprintln!("error: {}", msg);
         std::process::exit(EXIT_INPUT);
     };
+    if all_members {
+        let vote = policy == walkforward::Policy::Vote;
+        if let Some(msg) = walkforward::all_members_conflict(front_path.is_some(), band_select, threshold_fit, vote, locked_test) {
+            usage_fail(&msg);
+        }
+    }
     // #487: one declaration of the label window, the return units and the
     // cost, read from a target spec or from the run that selected the book.
     let given = |names: &[&str]| args.iter().any(|a| names.iter().any(|n| a == n || a.starts_with(&format!("{}=", n))));
@@ -12526,6 +12572,7 @@ fn run_walkforward(args: &[String]) -> ! {
             run: path.clone(),
             run_sha256: run.sha256.clone(),
             labels: run.front.iter().map(|m| format!("front_rank_{}", m.rank)).collect(),
+            ranks: run.front.iter().map(|m| m.rank).collect(),
         });
         if vars_src.is_none() && !run.variables.is_empty() {
             vars_src = Some(run.variables.join(","));
@@ -12696,7 +12743,9 @@ fn run_walkforward(args: &[String]) -> ! {
         enforce_gate_columns("--regime-expr", &gate.columns, &specs, &names, false);
         popts.regime_exprs.push(rcsr::regimes::ExprSpec { name, gate });
     }
-    popts.period_series = period_series;
+    popts.emit_series = emit_series || all_members;
+    popts.all_members = all_members;
+    popts.period_series = period_series || popts.emit_series;
     let horizon = horizon.unwrap_or(0.0);
     let target = target.unwrap_or_else(|| {
         eprintln!("error: walkforward needs --target\n\n{}", walkforward_usage());

@@ -203,6 +203,7 @@ long/flat from the training mean, matched-exposure random long seeded by
 `--control-seed`) with exposure, turnover, beta and excess over cash; see
 `src/baselines.rs`.
 `--front run.json` takes the candidates from the Pareto front of a run, carries the run's threshold and per-side cost, defaults `--trials` to the front size (the search trials only when a window is in sample; `--from-run` uses one trial for an out-of-sample book) and refuses a window that tests rows the run trained or selected on (`docs/walkforward.md`).
+`--front run.json --all-members` (#1176) also prices every front member alone, with its own carried threshold and band, into `members[]` (per-window and pooled metrics, cost ladder, entry timestamps and per-period series) without changing the selection; `--emit-series` writes the per-period gross, cost, exposure, entries, entry stamps and buy-and-hold net beside `pooled.period_net`, and `rcsr trials --members all` reads one series per member (`docs/walkforward.md`).
 Pass `--batch-pnl` to score every candidate on every window in one batch (`src/wf_batch.rs`, kernel `src/cuda/wf_batch.cu`), per window and pooled, with the baseline ladder; finalist values stay exact CPU f64 and batch values are labelled `gpu_proxy`. Its timings are printed in a separate `batch_timings` object, outside `report_sha256`.
 `--policy top-tercile` holds the top `floor(n/3)` finite scores of each timestamp long and the rest flat (no threshold); it prices the book of a search run with `--position top_tercile` on an `xs_rank` target made by `rcsr panel rank` (`docs/time-series.md`).
 
@@ -690,7 +691,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--objective mse|pnl|sharpe|log_growth] [--position long_only|top_tercile] [--threshold f]
      [--cost-bps f | --cost-override f] [--slippage-bps f] [--cash-return f] [--funding col]
      [--max-position f] [--min-trades n] [--min-holding n] [--band B] [--band-units score|sd] [--allow-short]
-     [--fitness metric|pnl] [--pnl-blocks K] [--pnl-block-lambda L] [--pnl-mask expr] [--pnl-mask-band h] [--pnl-mask-dwell D] [--book-target col]
+     [--fitness metric|pnl] [--pnl-blocks K] [--pnl-block-lambda L] [--pnl-mask expr] [--pnl-mask-band h] [--pnl-mask-dwell D] [--pnl-excess none|xs-mean] [--book-target col]
 |pnl]
      [--equivalence-z z] [--noise-lag n|auto]
      [--allow-lockbox] [--lockbox START,END|none] [--lockbox-embargo SECONDS] [--retired retired.json] [--ledger file] [--arm name] [--target-spec file] [--allow-target-structure] [--require-clean-inputs]
@@ -846,6 +847,7 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
   regret plus `--pnl-block-lambda` (default 1.0) times their standard deviation, so a formula
   that earns in one regime only scores worse; the device computes it bit for bit like the CPU.
   `--pnl-mask <expr>` (with `--pnl-mask-band h` and `--pnl-mask-dwell D`) scores only the rows inside a causal regime gate, so bull and bear specialists can be searched: rows outside are flat, every run of on rows starts flat and pays its exit, and the validation and test books apply the same mask (CPU only; `docs/optimisation.md`).
+  `--pnl-excess xs-mean` (default `none`) scores the excess over the equal-weight mean return of the training rows at each timestamp instead of over cash, so the fitness pays for timing and selection relative to the cross-section, not for market beta; the validation and test books, robust selection and walk-forward stay absolute and `objective.validation` and `objective.test` gain `xs_excess_net` (needs `--fitness pnl` and `--cash-return 0`; `docs/optimisation.md`).
   `--book-target COL` prices the book on another label of the same target spec (fit on `--target`); a row with a NaN fit label and a finite book return stays in the book and leaves the constant fit.
   `--reject-fixed-position` (off by default) rejects trees whose position cannot depend on the
   inputs, such as `gauss(c * x)` or `exp(c * x)` at threshold 0, before the constant fit and keeps them
