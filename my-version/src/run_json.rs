@@ -59,6 +59,36 @@ pub const INTERIM_REFUSAL: &str = "run.json comes from an --interim-chunk run: i
 pub const CARRIED_GATE_REFUSAL: &str = "run.json comes from rcsr compose with a finalist gate that has a band or a dwell (compose.gate.carried): \
      its gate state is not a row expression, so the finalist expression would price another book; objective.test holds the composite's own test book";
 
+/// #1237 (D19): the compose provenance of a run's finalist, `compose.chosen` of an `rcsr compose` run.json.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CompositeMarker {
+    /// `compose.chosen.type`: C0 to C3.
+    pub kind: String,
+    /// `compose.chosen.form`, e.g. `if(gate, f, cash)`.
+    pub form: Option<String>,
+    /// `compose.chosen.gate`: the menu gate name, `None` for C0.
+    pub gate: Option<String>,
+}
+
+impl CompositeMarker {
+    /// The marker a walk-forward report writes as `selection.composite`.
+    pub fn json(&self) -> String {
+        let text = |v: &Option<String>| v.as_deref().map_or("null".to_string(), crate::walkforward::jstr);
+        format!(
+            "{{\"source\":\"rcsr compose\",\"type\":{},\"form\":{},\"gate\":{}}}",
+            crate::walkforward::jstr(&self.kind),
+            text(&self.form),
+            text(&self.gate)
+        )
+    }
+
+    fn of(j: &Json) -> Option<CompositeMarker> {
+        let chosen = j.get("compose")?.get("chosen")?;
+        let text = |k: &str| chosen.get(k).and_then(Json::as_str).map(str::to_string);
+        Some(CompositeMarker { kind: text("type")?, form: text("form"), gate: text("gate") })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RunFile {
     pub path: String,
@@ -96,6 +126,8 @@ pub struct RunFile {
     pub elapsed_seconds: Option<f64>,
     /// `search.cumulative.elapsed_seconds` when the block is complete (#923).
     pub cumulative_elapsed_seconds: Option<f64>,
+    /// #1237: `compose.chosen` of a composed run; `None` for every other run.
+    pub composite: Option<CompositeMarker>,
     /// The parsed document, for views such as `RunFile::book`.
     doc: Json,
 }
@@ -192,6 +224,7 @@ impl RunFile {
                 .filter(|c| c.get("complete").map_or(false, |v| matches!(v, Json::Bool(true))))
                 .and_then(|c| c.get("elapsed_seconds"))
                 .and_then(Json::as_f64),
+            composite: CompositeMarker::of(&j),
             doc: j.clone(),
         })
     }

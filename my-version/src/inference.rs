@@ -172,9 +172,11 @@ pub fn sharpe_per_period(x: &[f64]) -> f64 {
     }
 }
 
+/// #1237: the 1-based nearest-rank position `ceil(P n / 100)` of an integer percentile `P`
+/// in 1..=99 among `n` ascending values, as `(P n + 99) / 100` in integer arithmetic; 0 for
+/// `n = 0`. No interpolation: the percentile is the value at that position.
 pub fn nearest_rank(n: usize, percentile: u32) -> usize {
-    let _ = (n, percentile);
-    0
+    (percentile as usize * n + 99) / 100
 }
 
 /// Type-7 quantile of an ascending slice.

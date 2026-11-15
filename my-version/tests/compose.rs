@@ -508,7 +508,6 @@ fn from_run_of_compose_marks_composite() {
     };
     let plain = report(&plain_path, "wf_plain.json");
     let plain_sha = s(&plain, &["protocol", "report_sha256"]).to_string();
-    eprintln!("plain report sha256 {plain_sha}");
     let composed = report(&out, "wf_composed.json");
     let m = at(&composed, &["selection", "composite"]);
     assert_eq!(s(m, &["source"]), "rcsr compose");
@@ -520,4 +519,4 @@ fn from_run_of_compose_marks_composite() {
     assert_eq!(plain_sha, PINNED_PLAIN_FROM_RUN);
 }
 
-const PINNED_PLAIN_FROM_RUN: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+const PINNED_PLAIN_FROM_RUN: &str = "22e9d27e4d0f59c0e35b4597d6265b71bf343a8cb8a1b0f01309b9437079ebe2";

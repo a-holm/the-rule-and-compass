@@ -1219,4 +1219,31 @@ fn rule_sha_unchanged_without_new_keys() {
     assert_eq!(at(rule, &["sha256"]).as_str(), Some(PINNED_FLAG_RULE_SHA), "{rule:?}");
 }
 
-const PINNED_FLAG_RULE_SHA: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+const PINNED_FLAG_RULE_SHA: &str = "db5dabcc350c18d4c719a404617b67a92a75f53431c5e0123bd013e6d51b4b90";
+
+#[test]
+fn freeze_rule_refuses_bad_keys() {
+    let (_s, dir) = scratch("freeze-rule-keys");
+    let rows = freeze_rows(&dir);
+    let paths = f_paths(&dir, "f", &|_| {});
+    let map = write_map(&dir, "map.json", &[(rows[0].as_str(), &paths[..], None)]);
+    let good = f_rule((3, 2), 30, 0.025);
+    for (k, (from, to, key)) in [
+        ("\"percentile\":30", "\"percentile\":0", "freeze.s4.percentile"),
+        ("\"percentile\":30", "\"percentile\":100", "freeze.s4.percentile"),
+        ("\"p1\":{\"window_days\":2", "\"p1\":{\"window_days\":0", "freeze.p1.window_days"),
+        ("\"floor\":0.025", "\"floor\":1", "freeze.drawdown_cap.floor"),
+        ("\"floor\":0.025", "\"floor\":-0.1", "freeze.drawdown_cap.floor"),
+        ("\"cpcv\":[3,2]", "\"cpcv\":[3,3]", "freeze.cpcv"),
+        ("\"cost_bps\":10", "\"cost_bps\":10,\"extra\":1", "freeze.extra"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        assert!(good.contains(from), "{from}");
+        let rule = write_text(&dir, &format!("bad{k}.json"), &good.replacen(from, to, 1));
+        let o = freeze_run(&rows, &rule, &map, &[]);
+        assert_eq!(code(&o), 2, "{key}: {}", stderr(&o));
+        assert!(stderr(&o).contains(key), "{key}: {}", stderr(&o));
+    }
+}

@@ -95,6 +95,8 @@ pub struct ProtocolOptions {
     pub front: Option<FrontSource>,
     /// #807: which string of the run the candidates are; `None` for `--expr`.
     pub expression_source: Option<crate::run_json::ExpressionSource>,
+    /// #1237: the compose provenance of the run (`--from-run`, `--front`); `None` for any other source.
+    pub composite: Option<crate::run_json::CompositeMarker>,
     /// #482: labels of windows that overlap the run's training or validation
     /// rows and were allowed anyway.
     pub in_sample_windows: Vec<String>,
@@ -295,6 +297,7 @@ impl Default for ProtocolOptions {
             cost: None,
             front: None,
             expression_source: None,
+            composite: None,
             in_sample_windows: Vec::new(),
             final_read: false,
             locked_ranges: Vec::new(),
@@ -797,6 +800,8 @@ pub struct Report {
     pub front: Option<FrontSource>,
     /// #807: `exact` or `rounded` for candidates read from a run.json.
     pub expression_source: Option<crate::run_json::ExpressionSource>,
+    /// #1237: the compose provenance of the run, written as `selection.composite`.
+    pub composite: Option<crate::run_json::CompositeMarker>,
     /// #308: whether the band protocol selected the candidate.
     pub band_select: bool,
     /// True when no test row influenced candidate or threshold selection.
@@ -2643,6 +2648,7 @@ impl Accum {
             selected_on,
             front: opts.front.clone(),
             expression_source: opts.expression_source,
+            composite: opts.composite.clone(),
             band_select: spec.band_select,
             test_used_for_selection: false,
             pool_reset_flat: spec.pool_reset_flat,
@@ -4652,10 +4658,11 @@ impl Member {
 }
 
 impl Report {
-    /// #482: `source`, `run`, `run_sha256` and the candidate labels, with a
-    /// leading comma. Empty when the candidates came from `--expr`.
+    /// #482: `source`, `run`, `run_sha256` and the candidate labels, then the #1237
+    /// `composite` marker of a composed run, with a leading comma. Empty when the
+    /// candidates came from `--expr`.
     fn front_json(&self, paths: bool) -> String {
-        match &self.front {
+        let mut s = match &self.front {
             Some(f) => format!(
                 ",\"source\":\"{}\"{},\"run_sha256\":{},\"candidate_labels\":[{}]",
                 if self.members.is_some() { "front_all_members" } else { "front" },
@@ -4664,7 +4671,11 @@ impl Report {
                 f.labels.iter().map(|l| jstr(l)).collect::<Vec<_>>().join(",")
             ),
             None => String::new(),
+        };
+        if let Some(c) = &self.composite {
+            s.push_str(&format!(",\"composite\":{}", c.json()));
         }
+        s
     }
 
     /// Machine-readable JSON. The deterministic report, with the `--front` path.
