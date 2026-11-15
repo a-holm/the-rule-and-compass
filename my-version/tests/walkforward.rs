@@ -2819,7 +2819,7 @@ mod members {
                 }
                 assert_eq!(get(&all, &["pooled", "period_net"]), get(&members[0], &["series", "period_net"]));
             } else {
-                let plain = wf(&f.data, &[vec!["--front", &run], variant.clone()].concat());
+                let plain = wf(&f.data, &[vec!["--front", &run, "--emit-series"], variant.clone()].concat());
                 for k in ["candidates", "windows", "economics"] {
                     assert_eq!(get(&all, &[k]), get(&plain, &[k]), "{variant:?}: {k}");
                 }
@@ -2962,7 +2962,7 @@ mod members {
         assert_eq!(per.iter().sum::<f64>(), get(&j, &["pooled", "entry_times"]).as_f64().unwrap());
     }
 
-    const PINNED_PLAIN_REPORT: &str = "pinned from the red run";
+    const PINNED_PLAIN_REPORT: &str = "ab322d39470888d46f39b5f4a56372cb29fae75c22473b411fa589a26eeca269";
 
     /// Buy and hold of the rows the book prices: long on every row of a symbol in a
     /// window, the entry paid on its first row and the exit on its last.
