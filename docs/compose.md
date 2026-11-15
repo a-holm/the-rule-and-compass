@@ -128,3 +128,60 @@ A run written before the switch block (`compose.gate.carried: true` and no `obje
 | an unreadable menu or run, a missing column | 3 |
 | a pool run whose member carries a `switch` (nested switch) | 2 |
 | a composed run with `compose.gate.carried` and no `objective.finalist.switch` | 3 |
+
+## Gate search (`--gate-search`, #1182)
+
+The menu fixes the gates in advance. `--gate-search` finds the gate itself: the genome is one formula `g` over `--vars`, and the two branches are frozen.
+
+```sh
+rcsr --data dev.rcsb --target lbl_h24a_y --target-spec dev.targets.json --vars btc_r96,btc_r672,btc_vol96,mkt_r96,mkt_breadth \
+  --time ts --group-by symbol --split-table cpcv61/splits.csv --split-id s07 --objective sharpe --cost-bps 10 --pnl-blocks 8 \
+  --gate-search --branch-on bull_s07.run.json --branch-off bear_s07.run.json --gate-band 0.0 --gate-dwell 24 \
+  --pop 64 --islands 4 --generations 300 --max-complexity 7 --ops add,sub,mul,greater,min,max,tanh --json --out gate_s07.run.json
+```
+
+`--fitness pnl`, `--select-rule robust` and `--cpu` are implied. `--vars` is required and lists the gate's variables only; the branches may read other columns.
+
+### Branches
+
+`--branch-on` is held where the gate state is on, `--branch-off` elsewhere. Each is one of:
+
+* `cash`: flat on every row (a C1 composite);
+* a run.json file: its `objective.finalist.expression_exact` with the run's threshold subtracted, `(f) - (t)`, as a compose member. The run must share the target, the target spec, the cost and the split fields of the table above with this invocation and with the other branch run (exit 2). A composed run (a switch), a band, a minimum hold or the top-tercile book exits 2;
+* an expression, long where it is above 0.
+
+The branch positions on the training rows are computed once, before the search, and never change. Identical branches, or branches with the same position on every training row, exit 2: there is nothing to switch.
+
+### The fitness of a gate
+
+For gate values `g` on the training rows, the cuts are the inner cuts of the 16-quantile grid of those values: rank `floor(j m / 16)` for `j = 1..15`, moved up to the next rank that does not split equal values, at the midpoint of the two neighbouring values (the grid of the exact sweep of `rcsr switch`, #1185). At each cut `c` the state of a row is the `--pnl-mask` kernel over `g - c` with `--gate-band` and `--gate-dwell`, per group and training segment (the training-row rule of compose); the composite holds the on branch in state on and the off branch elsewhere, and is priced as one book by the `--fitness pnl` statistic (`--pnl-blocks`, `--pnl-block-lambda`, `--pnl-stat`). The gate's fitness is the lowest over the cuts, ties to the lower cut. A gate with fewer than two distinct training values is constant: it holds the better branch alone. A gate with a non-finite value on a training row scores `+inf`, like any candidate with a non-finite prediction.
+
+For band 0 and dwell 1 the state at cut `c` is the state of the exact sweep at the same rank, so every grid cut prices what `gate_sweep` prices there.
+
+### The front, the choice and the run.json
+
+Every front member becomes a searched gate. Its expression is the member as the search prints it (in raw column units); the cut is chosen again on the raw values, and the gate written to the run.json is `(g) - (c)` with `--gate-band` and `--gate-dwell` (a constant gate is `1.0` or `-1.0`, band 0, dwell 1). Each searched gate has one composite, C2 for two branches or C1 with a cash branch. The choice and the pricing are those of compose: every composite on the validation rows with the gate states of `rcsr-gate-state/1`, the robust rule with alpha at least 0 in each gate state, the test rows priced once the finalist is fixed. The run.json is a composed run (`compose` block, `objective.finalist.switch`, `pareto[].switch`), so `walkforward --from-run`, `--front`, `ladder --sr-run`, `--reselect-run`, the seal and the sealed read price it with no other code. It adds:
+
+* `gate_search` (`rcsr-gate-search/1`): `branch_on`, `branch_off` (kind, path and sha256 of a run, expression, branch), `band`, `dwell`, `form`, `variables`, `cut`, `generations`, `candidates_evaluated`, `front`, the training hindsight `bound`, `branches_train` (fitness and net of each branch alone) and `gates[]`: per composite id the printed `expression`, the `search_tree` (the tree as searched, over the normalised variables), complexity, `search_fitness` (the archive's), `fitness` and `train_net` (on the raw values), `cut`, `cut_rank`, `constant`, `on_share`, `gate_bits` and `bits`;
+* `pareto[].gate_search`: expression, cut, constant, fitness and training net of the member's gate.
+
+`search.candidates_evaluated`, `compose.candidates_evaluated` and `objective.candidates` count every candidate the search scored, not only the front: out of sample the run is one trial whose in-sample count is the whole search. `generations_run` is the search's.
+
+### Description length
+
+Every composite pays its full length under the composite code (report-only): the C3 type selector (3 bits) and its form bit, the searched gate (the flag bit, the #1184 tree code of the searched tree, 4 bits for the cut on the 16-quantile grid), the cash side of a C1, and the branch codes. The code's alphabet is `--ops` plus every operator the branches use; its variables are `--vars` plus every column the branches read.
+
+### Refusals
+
+| case | exit |
+|---|---|
+| `--branch-on`, `--branch-off`, `--gate-band` or `--gate-dwell` without `--gate-search`; a missing branch; a band below 0 or a dwell below 1 | 2 |
+| no `--vars`; an aggregate, meta or building-block operator in `--ops` | 2 |
+| branch runs that differ in target, target spec, cost or split, from each other or from this invocation; a composed, banded, minimum-hold or top-tercile run | 2 |
+| identical branches or the same training positions | 2 |
+| `--gpu`, the pricing flags compose refuses, `--allow-short`, `--pnl-excess`, `--save`, `--save-every`, `--resume`, `--interim-chunk`, `--reselect`, `--reselect-run`, `--eval-expr`, `--function`, `--implicit`, `--format`, `--ndjson`, `--json-out`, `--report` | 2 |
+| `--lags`, `--lag-set`, `--fill` other than `drop`, `--outlier-iqr`, `--smooth` | 2 |
+| a label-family column, the target, its return column or a construction column in `--vars` or a branch | 5 |
+| an unreadable branch run | 3 |
+
+The device arm is refused: the device book carries no gate layer.

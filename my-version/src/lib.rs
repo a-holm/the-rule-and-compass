@@ -108,6 +108,7 @@ pub mod target; // #254: declared target spec
 pub mod run_book; // #487: the book a search run selected, read back by the evaluators
 pub mod switch; // #1185: gate-cut profile of if(greater(g, c), A, B) and the k-switch bound
 pub mod compose; // #1181: regime-switching composition of specialist pools into one exact formula
+pub mod gate_search; // #1182: gate search between two frozen branches (--gate-search)
 pub mod trading; // #263: exact long/flat P&L, Sharpe and log-growth objective
 pub mod trading_gpu; // #304/#305: fused long-only P&L, exact threshold and shared mask
 pub mod units;

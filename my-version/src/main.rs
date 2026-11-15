@@ -237,6 +237,9 @@ USAGE:
                --bear <run.json>... [--all-weather <run.json>...] [--out <run.json>]
                               regime-switching composites of the pools from a
                               pre-registered gate menu, chosen on validation rows
+  rcsr <--fitness pnl run flags> --gate-search --branch-on <run.json|expr|cash>
+       --branch-off <run.json|expr|cash> [--gate-band h] [--gate-dwell D]
+                              search the gate of a switch between frozen branches
   rcsr audit --data <file> --target <col> [--time <col>] [--horizon N] [--json]
              [--lockbox <START,END|none>]
              [--target-spec <file>]
@@ -392,6 +395,37 @@ INPUT:
                              state. Needs --pnl-mask
   --pnl-mask-dwell D        minimum rows per gate state, per group (default 1,
                              integer >= 1). Needs --pnl-mask
+  --gate-search             search a regime gate g over --vars (required)
+                             between two frozen branches (#1182). A candidate
+                             is scored at its best cut c of the 16-quantile
+                             grid of its training values by the --fitness pnl
+                             book of the composite that holds --branch-on where
+                             the gate state (the --pnl-mask kernel over g - c)
+                             is on and --branch-off elsewhere; a constant gate
+                             holds the better branch. The front goes to the
+                             choice and pricing of rcsr compose (robust rule,
+                             alpha >= 0 in each gate state on the validation
+                             rows, rcsr-gate-state/1 on the validation and test
+                             rows); --json prints the composed run.json with
+                             the switch of every searched gate, gate_search and
+                             pareto[].gate_search; every candidate counts in
+                             search.candidates_evaluated and every composite
+                             pays its full bits. Implies --fitness pnl,
+                             --select-rule robust and --cpu; --gpu, the pricing
+                             flags compose refuses, --save, --resume and
+                             --reselect exit 2; a label, target, return or
+                             construction column exits 5. See docs/compose.md
+  --branch-on <run.json|expr|cash>
+                             the branch held where the gate is on: a run's
+                             finalist with its threshold subtracted (the run
+                             shares target, target spec, cost and split, else
+                             exit 2), an expression long above 0, or cash
+  --branch-off <run.json|expr|cash>
+                             the branch held where the gate is off
+  --gate-band h             hysteresis of the searched gate (default 0): on
+                             above c + h, off below c - h. Needs --gate-search
+  --gate-dwell D            minimum rows per searched gate state, per group
+                             (default 1). Needs --gate-search
   --pnl-excess none|xs-mean the benchmark of the --fitness pnl excess (default
                              none: return - funding - cash return). xs-mean
                              subtracts the equal-weight mean return of the
@@ -2830,6 +2864,8 @@ fn main() {
         Some(path) => rcsr::compose::claim_reselect(&args, &path),
         None => args,
     };
+    // #1182: `--gate-search` scores gate trees by the composite of two frozen branches.
+    let args: Vec<String> = if args.first().is_some_and(|a| a.starts_with("--")) { rcsr::gate_search::claim(args) } else { args };
     // #124: a reusable Rust walk-forward evaluator over the column store.
     if matches!(
         args.first().map(|s| s.as_str()),
@@ -4710,6 +4746,19 @@ fn main() {
             enforce_gate_columns(flag, &columns, &specs, &target_names, allow_target_structure);
         }
     }
+    // #1182: the gate variables and the branch columns of `--gate-search` pass the same checks.
+    if let Some(gs) = rcsr::gate_search::request() {
+        if vars.is_empty() {
+            trading_usage("--gate-search needs --vars: it lists the gate's variables");
+        }
+        if lags > 0 || lag_set_src.is_some() || !matches!(fill, data::FillMethod::None | data::FillMethod::Drop) || outlier_iqr.is_some() || smooth > 0 {
+            trading_usage("--gate-search reads the raw columns of the rows: --lags, --lag-set, --fill other than drop, --outlier-iqr and --smooth would change them");
+        }
+        let specs: Vec<&target::TargetSpec> = target_resolved.iter().chain(book_resolved.iter()).map(|r| &r.spec).collect();
+        for (flag, columns) in gs.column_sets(&vars) {
+            enforce_gate_columns(flag, columns, &specs, &target_names, allow_target_structure);
+        }
+    }
 
     // #71/#112: the guard and the backing choice happen before any resident
     // Table or search sample is built. A CSV estimate uses the table's shape
@@ -4981,6 +5030,9 @@ fn main() {
                         }
                         if let Some(cp) = rcsr::compose::request() {
                             pnames.extend(cp.columns());
+                        }
+                        if let Some(gs) = rcsr::gate_search::request() {
+                            pnames.extend(gs.columns(&vars));
                         }
                     }
                     pnames.sort();
@@ -5723,9 +5775,14 @@ fn main() {
             cross_section: top_tercile,
             book_rows: book_resolved.is_some(),
             mask: gate_spec.clone(),
-            train_values: rcsr::switch::request().map(|sw| sw.columns()).or_else(|| rcsr::compose::request().map(|cp| cp.columns())).unwrap_or_default(),
-            slice_values: rcsr::compose::request().is_some(), // #1181
+            train_values: rcsr::switch::request()
+                .map(|sw| sw.columns())
+                .or_else(|| rcsr::compose::request().map(|cp| cp.columns()))
+                .or_else(|| rcsr::gate_search::request().map(|gs| gs.columns(&vars)))
+                .unwrap_or_default(),
+            slice_values: rcsr::compose::request().is_some() || rcsr::gate_search::request().is_some(), // #1181, #1182
             state_gates: rcsr::compose::request().map_or_else(Vec::new, |cp| cp.state_gates()), // #1214
+            gate_rows: if rcsr::gate_search::request().is_some() { vars.clone() } else { Vec::new() }, // #1182
         });
         if gate_spec.is_some() && top_tercile {
             trading_usage("--pnl-mask prices the long/flat threshold book: it cannot combine with --position top_tercile");
@@ -5914,6 +5971,9 @@ fn main() {
             }
             if let Some(cp) = rcsr::compose::request() {
                 embargo_columns.extend(cp.columns());
+            }
+            if let Some(gs) = rcsr::gate_search::request() {
+                embargo_columns.extend(gs.columns(&vars));
             }
             let (embargo, source, column) = rcsr::intervals::resolve_embargo(flag, purge, &embargo_columns, bar).unwrap_or_else(|e| trading_usage(&e));
             Some(rcsr::intervals::IntervalSplit::new(declared, purge, embargo, source, column))
@@ -6422,22 +6482,28 @@ fn main() {
         );
         std::process::exit(EXIT_USAGE);
     }
+    // #1181, #1182: the `split` object of a composed run.
+    let composed_split_json = if rcsr::compose::request().is_some() || rcsr::gate_search::request().is_some() {
+        format!(
+            "{{\"mode\":{},\"train_rows\":{}{},\"test_rows\":{}{}{}{}}}",
+            jstr(prepared.report.mode),
+            prepared.train.len(),
+            if prepared.report.validation_rows > 0 { format!(",\"validation_rows\":{}", prepared.report.validation_rows) } else { String::new() },
+            prepared.test.len(),
+            target::split_purge_json(&prepared.report),
+            split_time_json(prepared.keys.as_ref()),
+            interval_split.as_ref().map_or_else(String::new, |s| s.json_fields(&split_table_sha))
+        )
+    } else {
+        String::new()
+    };
     // #1181: `rcsr compose` composes the pools on these rows and exits before the search.
     if let Some(cp) = rcsr::compose::request() {
         rcsr::compose::start(cp, &command, &prepared, fitness_book.as_deref(), trading_spec.as_ref(), &rcsr::compose::Inputs {
             target: &target_names[0],
             target_sha: target_sha.as_deref(),
             target_spec_json: &target_spec_json,
-            split_json: &format!(
-                "{{\"mode\":{},\"train_rows\":{}{},\"test_rows\":{}{}{}{}}}",
-                jstr(prepared.report.mode),
-                prepared.train.len(),
-                if prepared.report.validation_rows > 0 { format!(",\"validation_rows\":{}", prepared.report.validation_rows) } else { String::new() },
-                prepared.test.len(),
-                target::split_purge_json(&prepared.report),
-                split_time_json(prepared.keys.as_ref()),
-                interval_split.as_ref().map_or_else(String::new, |s| s.json_fields(&split_table_sha))
-            ),
+            split_json: &composed_split_json,
             objective,
             cost: trading_cost.clone(),
             min_group_step,
@@ -6449,6 +6515,31 @@ fn main() {
             vars: &vars,
             book_target: book_resolved.is_some(),
         });
+    }
+    // #1182: the gate search scores a gate by the composite book of the frozen branches.
+    if let Some(gs) = rcsr::gate_search::request() {
+        let (Some(book), Some(split)) = (&fitness_book, prepared.trading.as_ref()) else {
+            trading_usage("--gate-search found no training book");
+        };
+        let Some(train) = split.train.as_ref() else {
+            trading_usage("--gate-search found no training trading rows");
+        };
+        let segments = interval_split.as_ref().map_or_else(Vec::new, |s| s.segment_starts());
+        let layered = rcsr::gate_search::setup(gs, book, &rcsr::gate_search::Setup {
+            train,
+            train_values: &split.train_values,
+            train_segments: &segments,
+            vars: &vars,
+            ops: &cfg.ops,
+            target: &target_names[0],
+            target_sha: target_sha.as_deref(),
+            per_side_bps: trading_spec.as_ref().map_or(0.0, |s| s.per_side_bps()),
+            split_json: &composed_split_json,
+            trading_objective: objective.is_trading(),
+            validation: split.validation.is_some(),
+        });
+        cfg.fitness = search::Fitness::LongPnl(layered);
+        cfg.reject_fixed_position = false;
     }
 
     // #14: implicit relations. The target becomes one more input (normalised
@@ -7308,6 +7399,35 @@ fn main() {
             std::process::exit(gpu_required_exit(&e).unwrap_or(EXIT_INPUT));
         }
     };
+    // #1182: the front of a gate search goes to compose's choice and pricing; the process exits there.
+    if let (Some(gs), Some(tspec)) = (rcsr::gate_search::request(), trading_spec.as_ref()) {
+        let finish = rcsr::gate_search::Finish {
+            front: &outcome.archive.items,
+            candidates_evaluated: outcome.candidates_evaluated,
+            generations: outcome.generations,
+            vars: &vars,
+            ops: &cfg.ops,
+            means: &prepared.means,
+            stds: &prepared.stds,
+        };
+        let inputs = rcsr::compose::Inputs {
+            target: &target_names[0],
+            target_sha: target_sha.as_deref(),
+            target_spec_json: &target_spec_json,
+            split_json: &composed_split_json,
+            objective,
+            cost: trading_cost.clone(),
+            min_group_step,
+            horizon_seconds: target_horizon,
+            robust: robust_params,
+            cuts: interval_cuts.as_deref(),
+            interval_split: interval_split.as_ref(),
+            ops: &cfg.ops,
+            vars: &vars,
+            book_target: book_resolved.is_some(),
+        };
+        rcsr::gate_search::finish(gs, &finish, prepared.trading.as_ref(), tspec, &command, &inputs);
+    }
     if let Some(g) = outcome.gpu.as_mut() {
         g.ledger.record_outside(rcsr::gpu_stats::Stage::Io, table_loaded_s);
         g.ledger
