@@ -1382,6 +1382,29 @@ pub fn threshold_fit_refusal(spec: &EvalSpec, opts: &ProtocolOptions) -> Option<
     None
 }
 
+/// #1176: the refusal of `--all-members` for these inputs, or `None`. The CLI
+/// reports it as a usage error before any data work.
+pub fn all_members_conflict(front: bool, band_select: bool, threshold_fit: bool, vote: bool, locked_read: bool) -> Option<String> {
+    if !front {
+        return Some("--all-members needs --front: it prices every member of a run's Pareto front".to_string());
+    }
+    if locked_read {
+        return Some("--all-members refuses --locked-test: a locked read reports the sealed candidate only".to_string());
+    }
+    let refused = [(band_select, "--select-band"), (threshold_fit, "--threshold-fit"), (vote, "--policy vote")];
+    refused.iter().find(|(set, _)| *set).map(|(_, flag)| {
+        format!("--all-members refuses {}: it prices every front member with its carried threshold and band and selects none", flag)
+    })
+}
+
+/// #1176: why `--all-members` cannot run with this spec, or `None`.
+pub fn all_members_refusal(spec: &EvalSpec, opts: &ProtocolOptions) -> Option<String> {
+    if !opts.all_members {
+        return None;
+    }
+    all_members_conflict(opts.front.is_some(), spec.band_select, opts.threshold_fit.is_some(), spec.policy == Policy::Vote, opts.final_read)
+}
+
 /// Votes needed for a long row: `ceil(quorum x K)`, at least 1.
 pub fn votes_required(quorum: f64, members: usize) -> usize {
     ((quorum * members as f64 - 1e-9).ceil().max(1.0) as usize).min(members.max(1))
@@ -1465,6 +1488,9 @@ fn validate_windows(spec: &EvalSpec, opts: &ProtocolOptions) -> Result<(), Strin
             return Err(format!("the run carries {} bands for {} candidates", bands.len(), n));
         }
     }
+    if let Some(msg) = all_members_refusal(spec, opts) {
+        return Err(msg);
+    }
     if spec.policy == Policy::TopTercile {
         if let Some(msg) = top_tercile_refusal(spec, opts) {
             return Err(msg);
@@ -1483,7 +1509,7 @@ fn validate_windows(spec: &EvalSpec, opts: &ProtocolOptions) -> Result<(), Strin
     }
     let table_validation = !opts.validation_starts.is_empty()
         && spec.windows.iter().all(|w| opts.validation_starts.iter().any(|(l, _)| *l == w.label));
-    if spec.candidates.len() > 1 && spec.policy != Policy::Vote && spec.validation_frac <= 0.0 && !table_validation {
+    if spec.candidates.len() > 1 && spec.policy != Policy::Vote && spec.validation_frac <= 0.0 && !table_validation && !opts.all_members {
         return Err(
             "multiple --expr candidates need a validation slice (--validation-frac > 0 or a windows \
              table with validation_start): select on a validation slice, never on the test block"
@@ -2051,6 +2077,7 @@ impl Accum {
         let want_strata = opts.regimes.is_some() || !opts.regime_exprs.is_empty() || opts.period_series || emit_series;
         let mut strata_in = StrataIn::new(opts.regime_exprs.len());
         let mut entry_times = 0usize;
+        let validated = self.windows.iter().all(|d| d.validation_start.is_some());
         for (window_index, mut d) in self.windows.into_iter().enumerate() {
             // #1199: the target grid, its period width and the rows that define it come from the rows before the gate.
             let grid_source = target_grid.then(|| {
@@ -2545,6 +2572,8 @@ impl Accum {
         };
         let selected_on = if vote {
             "none (all members vote; thresholds from validation or train rows)".to_string()
+        } else if expressions.len() > 1 && !validated {
+            "none (--all-members without a validation slice: the report book of every window is the first front member)".to_string()
         } else if expressions.len() > 1 {
             "validation".to_string()
         } else if spec.validation_frac > 0.0 {

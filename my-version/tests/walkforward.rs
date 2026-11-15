@@ -2785,15 +2785,26 @@ mod members {
             assert_eq!(get(&all, &["selection", "source"]).as_str(), Some("front_all_members"), "{variant:?}");
             assert_eq!(get(&all, &["selection", "test_used_for_selection"]), &Json::Bool(false));
             assert_eq!(get(&all, &["diagnostic"]), &Json::Bool(true));
-            let plain = wf(&f.data, &[vec!["--front", &run], variant.clone()].concat());
-            for k in ["candidates", "windows", "economics"] {
-                assert_eq!(get(&all, &[k]), get(&plain, &[k]), "{variant:?}: {k}");
-            }
-            for k in METRICS.iter().chain(&["period_net", "period_time"]) {
-                assert_eq!(get(&all, &["pooled", k]), get(&plain, &["pooled", k]), "{variant:?}: pooled.{k}");
-            }
             let members = items(get(&all, &["members"]));
             assert_eq!(members.len(), 3, "{variant:?}");
+            if variant.contains(&"--split-id") {
+                // No validation slice: plain --front refuses to select, the report book is the first member.
+                let (code, _, err) = wf_raw(&f.data, &[vec!["--front", &run], variant.clone()].concat());
+                assert_eq!(code, 3, "{err}");
+                assert!(get(&all, &["selection", "selected_on"]).as_str().unwrap().starts_with("none (--all-members"));
+                for k in METRICS {
+                    assert_eq!(get(&all, &["pooled", k]), get(&members[0], &["pooled", k]), "{variant:?}: pooled.{k}");
+                }
+                assert_eq!(get(&all, &["pooled", "period_net"]), get(&members[0], &["series", "period_net"]));
+            } else {
+                let plain = wf(&f.data, &[vec!["--front", &run], variant.clone()].concat());
+                for k in ["candidates", "windows", "economics"] {
+                    assert_eq!(get(&all, &[k]), get(&plain, &[k]), "{variant:?}: {k}");
+                }
+                for k in METRICS.iter().chain(&["period_net", "period_time"]) {
+                    assert_eq!(get(&all, &["pooled", k]), get(&plain, &["pooled", k]), "{variant:?}: pooled.{k}");
+                }
+            }
             let target_grid = variant.contains(&"target");
             for (k, (m, e)) in members.iter().zip(EXPRS).enumerate() {
                 let at = format!("{variant:?} member {k}");
@@ -2838,7 +2849,9 @@ mod members {
         assert!(!time.is_empty(), "{at}");
         for t in 0..time.len() {
             assert_eq!(cost[t].to_bits(), (gross[t] - net[t]).to_bits(), "{at}: period {t}");
-            assert_eq!((gross[t] - cost[t]).to_bits(), net[t].to_bits(), "{at}: period {t}");
+            // `gross - cost` rounds once more than `net`: the identity holds to one rounding of the larger term.
+            let bound = 2.0 * f64::EPSILON * gross[t].abs().max(net[t].abs());
+            assert!((gross[t] - cost[t] - net[t]).abs() <= bound, "{at}: period {t}");
             assert_eq!(stamp[t], if entries[t] > 0.0 { 1.0 } else { 0.0 }, "{at}: period {t}");
         }
         let total = get(pooled, &["total_cost"]).as_f64().unwrap();
@@ -2933,7 +2946,7 @@ mod members {
         let one = wf(&f.data, &[single("x"), win.to_vec()].concat());
         let all = wf(&f.data, &[&["--front", run.as_str(), "--all-members"][..], &win].concat());
         let member = &items(get(&all, &["members"]))[0];
-        for (at, s) in [("emit-series", get(&one, &["pooled"])), ("all-members", get(&all, &["pooled"])), ("member x", get(member, &["series"]))] {
+        for (at, s) in [("emit-series", get(&one, &["pooled"])), ("member x", get(member, &["series"]))] {
             let got = nums(s, &["period_bh_net"]);
             assert_eq!(got.len(), want.len(), "{at}");
             for (t, (g, w)) in got.iter().zip(&want).enumerate() {

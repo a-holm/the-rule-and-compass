@@ -204,9 +204,11 @@ fn load_wf(path: &str) -> Res<Wf> {
 /// labelled `<report>#<archive_rank>`, with the series of `members[].series`.
 fn load_members(path: &str) -> Res<Vec<Wf>> {
     let j = read_report(path)?;
-    let members = match j.get("members") {
-        Some(Json::Arr(m)) => m.clone(),
-        _ => Vec::new(),
+    let Some(Json::Arr(members)) = j.get("members") else {
+        return usage_err(format!(
+            "field 'members' is missing in {} (write the report with walkforward --front --all-members, or read it with --members selected)",
+            path
+        ));
     };
     members
         .iter()
@@ -441,7 +443,11 @@ fn parse_args(args: &[String]) -> Res<Options> {
             "--threshold-arms" => o.threshold_arms = true,
             "--members" => {
                 let v = val(&mut i)?;
-                o.all_members = v == "all";
+                o.all_members = match v.as_str() {
+                    "all" => true,
+                    "selected" => false,
+                    _ => return usage_err(format!("--members must be all or selected, got '{}'", v)),
+                };
             }
             "--regimes" => o.regimes = Some(val(&mut i)?),
             other => return usage_err(format!("unknown argument '{}'", other)),
@@ -456,7 +462,7 @@ fn parse_args(args: &[String]) -> Res<Options> {
         return usage_err("give --wf <reports...> or --compare <A> <B>");
     }
     let (campaign_only, compare_only): (&[&str], &[&str]) = (
-        &["--baseline", "--baseline-rung", "--cluster-rho", "--pbo-blocks", "--regimes"],
+        &["--baseline", "--baseline-rung", "--cluster-rho", "--pbo-blocks", "--regimes", "--members"],
         &["--bootstrap", "--level", "--s-seed"],
     );
     let wrong = if o.compare.is_some() { campaign_only } else { compare_only };

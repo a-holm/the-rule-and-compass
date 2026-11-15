@@ -12355,6 +12355,12 @@ fn run_walkforward(args: &[String]) -> ! {
         eprintln!("error: {}", msg);
         std::process::exit(EXIT_INPUT);
     };
+    if all_members {
+        let vote = policy == walkforward::Policy::Vote;
+        if let Some(msg) = walkforward::all_members_conflict(front_path.is_some(), band_select, threshold_fit, vote, locked_test) {
+            usage_fail(&msg);
+        }
+    }
     // #487: one declaration of the label window, the return units and the
     // cost, read from a target spec or from the run that selected the book.
     let given = |names: &[&str]| args.iter().any(|a| names.iter().any(|n| a == n || a.starts_with(&format!("{}=", n))));
