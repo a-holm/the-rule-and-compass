@@ -118,7 +118,7 @@ fn g(k: i64) -> f64 {
 }
 
 /// The gate `h` (band 0.02, dwell 5). Around each slice start `s` it is off for
-/// 6 stamps, on at `s - 2` and off again from `s - 1`, so the state at `s` has
+/// 12 stamps, on at `s - 2` and off again from `s - 1`, so the state at `s` has
 /// held 2 rows of a 5-row dwell and a restart at `s` would take the raw off
 /// state. Elsewhere it alternates in 17-stamp blocks per symbol, inside the band
 /// on every seventh stamp.
@@ -128,7 +128,7 @@ fn h(k: i64, j: usize, starts: &[i64]) -> f64 {
         if k == s - 2 {
             return 0.3 + 0.01 * j as f64;
         }
-        if (s - 8..s + 12).contains(&k) {
+        if (s - 14..s + 12).contains(&k) {
             return -0.3 - 0.01 * j as f64;
         }
     }
@@ -464,7 +464,7 @@ fn a_switch_pays_only_the_position_change() {
     });
     let sw = "{\"gate\":{\"schema\":\"rcsr-gate/1\",\"expr\":\"g\",\"columns\":[\"g\"],\"band\":0,\"dwell\":2,\"state_rule\":\"rcsr-gate-state/1\"},\"on\":\"a\",\"off\":\"b\"}";
     let run = hand_run(&dir, "switch.json", "if(greater(g, 0), a, b)", None, Some(sw));
-    let w = format!("w,{},{},{},{}", stamp(0), stamp(10), stamp(10), stamp(30));
+    let w = format!("w,{},{},{},{}", stamp(0), stamp(9), stamp(10), stamp(30));
     let r = json(&hand_walk(&data, &run, &w, &[]));
     let m = at(first_window(&r), &["metrics"]);
     // Entry at 10; at the flip to b at 18 both branches are long: no cost; at the flip to a at 24
@@ -483,9 +483,9 @@ fn a_switch_pays_only_the_position_change() {
     assert!((parts - net).abs() <= 1e-12, "state nets plus the seam make the composite net: {parts} vs {net}");
 }
 
-/// Usable rows of a CSV (finite target and `x1`) as `(stamp, symbol, state)`: the kernel over
+/// Every row of a CSV as `(stamp, state, finite target, finite x1)`: the state from the kernel over
 /// every row of the file in file order, per symbol (no barrier: the data has no locked range).
-fn usable_states(path: &str) -> Vec<(i64, usize, bool)> {
+fn row_states(path: &str) -> Vec<(i64, bool, bool, bool)> {
     let text = std::fs::read_to_string(path).unwrap();
     let rows: Vec<Vec<String>> = text.lines().skip(1).map(|l| l.split(',').map(str::to_string).collect()).collect();
     let parse = |v: &str| v.parse::<f64>().unwrap_or(f64::NAN);
@@ -494,9 +494,7 @@ fn usable_states(path: &str) -> Vec<(i64, usize, bool)> {
     let states = regime_gate::hysteresis_states(&gate, &group, BAND, DWELL);
     rows.iter()
         .zip(&states)
-        .zip(&group)
-        .filter(|((r, _), _)| parse(&r[7]).is_finite() && parse(&r[2]).is_finite())
-        .map(|((r, &st), &g)| (((parse(&r[0]) as i64) - T0) / STEP, g as usize, st))
+        .map(|(r, &st)| (((parse(&r[0]) as i64) - T0) / STEP, st, parse(&r[7]).is_finite(), parse(&r[2]).is_finite()))
         .collect()
 }
 
@@ -514,23 +512,31 @@ fn gate_state_ignores_labels_and_row_drops() {
         }
         c
     };
-    for (tag, fixture) in [("sg-labels-a", composed("sg-labels-a")), ("sg-labels-b", composed_with("sg-labels-b", damaged, &["--split", "temporal", "--validation-frac", "0.3", "--test-frac", "0.2", "--fill", "drop"]))] {
+    let fill = ["--split", "temporal", "--validation-frac", "0.3", "--test-frac", "0.2", "--fill", "drop"];
+    for (tag, fixture) in [("sg-labels-a", composed("sg-labels-a")), ("sg-labels-b", composed_with("sg-labels-b", damaged, &fill))] {
         let c = fixture;
-        let usable = usable_states(&c.data);
+        let rows = row_states(&c.data);
+        let sw = at(&c.j, &["objective", "finalist", "switch"]);
+        let (on, off) = (s(sw, &["on"]).to_string(), s(sw, &["off"]).to_string());
+        // A slice row of compose survives the missing-cell drop; a walk-forward row is priced when its
+        // target is finite and the branch its state holds has a score (cash always has one).
+        let slice_row = |r: &(i64, bool, bool, bool)| r.2 && r.3;
+        let priced = |r: &(i64, bool, bool, bool)| r.2 && (r.3 || (if r.1 { &on } else { &off }) == "-1.0");
         let (v0, v1) = ((num(&arr(&c.j, &["split", "validation_time"])[0], &[]) as i64 - T0) / STEP, (c.last_validation() - T0) / STEP);
         let test_rows = num(&c.j, &["test_rows"]) as usize;
-        let count = |rows: &[&(i64, usize, bool)]| (rows.len() as f64, rows.iter().filter(|r| r.2).count() as f64);
-        let validation: Vec<&(i64, usize, bool)> = usable.iter().filter(|r| (v0..=v1).contains(&r.0)).collect();
-        let test: Vec<&(i64, usize, bool)> = usable.iter().rev().take(test_rows).collect();
+        let count = |rows: &[&(i64, bool, bool, bool)]| (rows.len() as f64, rows.iter().filter(|r| r.1).count() as f64);
+        let validation: Vec<&(i64, bool, bool, bool)> = rows.iter().filter(|r| (v0..=v1).contains(&r.0) && slice_row(r)).collect();
+        let test: Vec<&(i64, bool, bool, bool)> = rows.iter().filter(|r| slice_row(r)).rev().take(test_rows).collect();
         for (slot, rows) in [("validation", &validation), ("test", &test)] {
             let regime = at(&c.j, &["compose", "chosen", slot, "regime"]);
             assert_eq!((num(regime, &["rows"]), num(regime, &["states", "on", "rows"])), count(rows), "{tag} compose {slot}");
         }
         let ts = test.iter().map(|r| r.0).min().unwrap();
+        let window: Vec<&(i64, bool, bool, bool)> = rows.iter().filter(|r| r.0 >= ts && priced(r)).collect();
         let w = format!("t,{},{},{},{}", T0, stamp(v0), stamp(ts), stamp(STAMPS as i64));
         let r = json(&c.walk(&c.run, &w, &[]));
         let regime = at(first_window(&r), &["gate", "regime"]);
-        assert_eq!((num(regime, &["rows"]), num(regime, &["states", "on", "rows"])), count(&test), "{tag} walkforward test");
+        assert_eq!((num(regime, &["rows"]), num(regime, &["states", "on", "rows"])), count(&window), "{tag} walkforward test");
     }
 }
 

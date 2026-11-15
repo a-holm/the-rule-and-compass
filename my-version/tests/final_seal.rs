@@ -1246,14 +1246,14 @@ fn switch_store(dir: &Path, name: &str) -> String {
 /// dwell) holding `on` where the state is on and `off` elsewhere.
 fn switch_run(dir: &Path, name: &str, band: f64, dwell: usize, on: &str, off: &str) -> String {
     let spec = "{\"column\":\"y\",\"name\":\"y\",\"kind\":\"forward_return\",\"deprecated\":false,\"return_column\":null,\"return_units\":\"simple\",\
-         \"horizon_seconds\":5,\"entry_offset_seconds\":0,\"delay_seconds\":0,\"entry_price\":\"open\",\"exit_price\":\"close\",\"offset\":0.0,\
+         \"horizon_seconds\":3600,\"entry_offset_seconds\":0,\"delay_seconds\":0,\"entry_price\":\"open\",\"exit_price\":\"close\",\"offset\":0.0,\
          \"scale\":{\"kind\":\"constant\",\"value\":1.0},\"clip\":null,\"units\":\"return\",\"cost_bps\":null,\"cost_in_label\":false,\"construction_columns\":[],\"note\":null}";
     let display = format!("if(greater(h, 0), {on}, {off})");
     let sw = format!(
         "{{\"gate\":{{\"schema\":\"rcsr-gate/1\",\"expr\":\"h\",\"columns\":[\"h\"],\"band\":{band},\"dwell\":{dwell},\"state_rule\":\"rcsr-gate-state/1\"}},\"on\":\"{on}\",\"off\":\"{off}\"}}"
     );
     let body = format!(
-        "{{\"tool\":\"rcsr\",\"target\":\"y\",\"variables\":[\"x\"],\"split\":{{\"mode\":\"temporal\",\"train_time\":[{},{}],\"required_purge_seconds\":5}},\
+        "{{\"tool\":\"rcsr\",\"target\":\"y\",\"variables\":[\"x\"],\"split\":{{\"mode\":\"temporal\",\"train_time\":[{},{}],\"required_purge_seconds\":3600}},\
          \"target_spec\":{spec},\"search\":{{\"candidates_evaluated\":3}},\
          \"objective\":{{\"spec\":{{\"threshold\":0.0,\"per_side_bps\":5.0,\"max_position\":1.0,\"cash_return\":0.0,\"min_holding\":1}},\"cost\":{{\"source\":\"flag\"}},\
          \"finalist\":{{\"expression\":\"{display}\",\"expression_exact\":\"{display}\",\"switch\":{sw}}}}},\
@@ -1268,7 +1268,7 @@ fn switch_run(dir: &Path, name: &str, band: f64, dwell: usize, on: &str, off: &s
 
 fn switch_wf(data: &str, ledger: &str, run: &str, extra: &[&str]) -> (i32, String, String) {
     let mut a = vec![
-        "walkforward", "--data", data, "--target", "y", "--time", "ts", "--horizon", "5", "--cost-bps", "5", "--periods-per-year", "365", "--json", "--ledger", ledger,
+        "walkforward", "--data", data, "--target", "y", "--time", "ts", "--cost-bps", "5", "--json", "--ledger", ledger,
         "--from-run", run,
     ];
     a.extend_from_slice(extra);
