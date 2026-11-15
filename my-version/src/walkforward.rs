@@ -1896,8 +1896,11 @@ impl Accum {
         let want_strata = opts.regimes.is_some() || !opts.regime_exprs.is_empty() || opts.period_series;
         let mut strata_in = StrataIn::new(opts.regime_exprs.len());
         for (window_index, mut d) in self.windows.into_iter().enumerate() {
-            // #1199: the target grid and its period width come from the rows before the gate.
-            let grid_source = target_grid.then(|| (target_times(&d.test_rows), window_period(spec, opts, &d.test_rows)));
+            // #1199: the target grid, its period width and the rows that define it come from the rows before the gate.
+            let grid_source = target_grid.then(|| {
+                let rows: Vec<usize> = (0..d.test_rows.len()).filter(|&i| d.test_rows[i].target.is_finite()).collect();
+                (target_times(&d.test_rows), window_period(spec, opts, &d.test_rows), rows)
+            });
             let regime_states: Vec<Vec<bool>> = opts
                 .regime_exprs
                 .iter()
@@ -1976,7 +1979,7 @@ impl Accum {
                 ThresholdSource::TrainType7
             };
             let (ppy, inferred_dt, bucket, source) = match &grid_source {
-                Some((_, period)) => *period,
+                Some((_, period, _)) => *period,
                 None => window_period(spec, opts, &d.test_rows),
             };
             period_source = Some(source);
@@ -2064,7 +2067,7 @@ impl Accum {
                 + d.validation_scores[candidate].len();
             dropped += d.dropped;
             let grid = match &grid_source {
-                Some((times, _)) => {
+                Some((times, _, _)) => {
                     Some(Grid::new(times, bucket, &pev.times).map_err(|e| format!("window '{}': {}", d.window.label, e))?)
                 }
                 None => None,
@@ -2076,10 +2079,13 @@ impl Accum {
                 }
             };
             if want_strata {
-                let valid: Vec<usize> = (0..d.test_rows.len())
-                    .filter(|&i| d.test_scores[candidate].get(i).is_some_and(|s| s.is_finite()) && d.test_rows[i].target.is_finite())
-                    .collect();
-                strata_in.add_window(&pev, bucket, opts, &d, &valid, &regime_states);
+                let valid: Vec<usize> = match &grid_source {
+                    Some((_, _, rows)) => rows.clone(),
+                    None => (0..d.test_rows.len())
+                        .filter(|&i| d.test_scores[candidate].get(i).is_some_and(|s| s.is_finite()) && d.test_rows[i].target.is_finite())
+                        .collect(),
+                };
+                strata_in.add_window(&pev, bucket, opts, &d, &valid, &regime_states, grid.as_ref());
             }
             pooled_returns.extend(on_grid(&pev.returns));
             pooled_gross.extend(on_grid(&pev.gross_returns));
@@ -2881,14 +2887,25 @@ impl StrataIn {
         StrataIn { extra: PeriodExtra::default(), states: vec![Vec::new(); exprs], counts: vec![Default::default(); exprs] }
     }
 
-    fn add_window(&mut self, pev: &WindowEval, bucket: f64, opts: &ProtocolOptions, d: &WindowData, valid: &[usize], regime_states: &[Vec<bool>]) {
+    /// `valid` are the rows behind the period states: the priced rows, or under the #1199 target grid
+    /// the rows with a finite target before the gate. On the grid every series has the grid's length
+    /// and an empty period has no gross, exposure, entry or buy-and-hold return.
+    #[allow(clippy::too_many_arguments)]
+    fn add_window(&mut self, pev: &WindowEval, bucket: f64, opts: &ProtocolOptions, d: &WindowData, valid: &[usize], regime_states: &[Vec<bool>], grid: Option<&Grid>) {
         let key = |t: f64| if bucket > 0.0 { (t / bucket).floor() } else { t };
-        self.extra.gross.extend_from_slice(&pev.gross_returns);
-        self.extra.exposure.extend_from_slice(&pev.exposure);
-        self.extra.entries.extend_from_slice(&pev.entries);
-        self.extra.bh.extend_from_slice(&pev.market);
-        self.extra.bucket_start.extend(pev.times.iter().map(|&t| if bucket > 0.0 { key(t) * bucket } else { t }));
-        let period_keys: Vec<f64> = pev.times.iter().map(|&t| key(t)).collect();
+        let pad = |v: &[f64]| -> Vec<f64> {
+            match grid {
+                Some(g) => g.pad(v),
+                None => v.to_vec(),
+            }
+        };
+        let times: &[f64] = grid.map_or(&pev.times, |g| &g.times);
+        self.extra.gross.extend(pad(&pev.gross_returns));
+        self.extra.exposure.extend(pad(&pev.exposure));
+        self.extra.entries.extend(pad(&pev.entries));
+        self.extra.bh.extend(pad(&pev.market));
+        self.extra.bucket_start.extend(times.iter().map(|&t| if bucket > 0.0 { key(t) * bucket } else { t }));
+        let period_keys: Vec<f64> = times.iter().map(|&t| key(t)).collect();
         let row_keys: Vec<f64> = valid.iter().map(|&i| key(d.test_rows[i].time)).collect();
         for k in 0..opts.regime_exprs.len() {
             let on: Vec<bool> = valid.iter().map(|&i| regime_states[k][i]).collect();
