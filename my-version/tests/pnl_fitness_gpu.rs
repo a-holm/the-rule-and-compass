@@ -1641,15 +1641,16 @@ fn alternate_mask(n: usize) -> Vec<bool> {
 }
 
 /// `regime_gate::hysteresis_states` with band 0.02 and dwell 7 on a slow gate:
-/// a sine of the row's time step with a period of 400 steps and a phase per
+/// a sine of the row's time step with a period of 160 steps and a phase per
 /// group, plus a small fast term, so the band and the dwell decide near every
-/// crossing.
+/// crossing. An off-run is shorter than a time block of 64 even where one
+/// group alone has rows, so every block keeps on rows.
 fn gate_mask(f: &Fixture) -> Vec<bool> {
     let rows = &f.slice.rows;
     let g: Vec<f64> = (0..f.n)
         .map(|i| {
             let step = (rows.time[i] - 1.6e9) / 900.0;
-            (std::f64::consts::TAU * step / 400.0 + 0.7 * rows.group[i] as f64).sin() + 0.05 * (1.3 * step).sin()
+            (std::f64::consts::TAU * step / 160.0 + 0.7 * rows.group[i] as f64).sin() + 0.05 * (1.3 * step).sin()
         })
         .collect();
     rcsr::regime_gate::hysteresis_states(&g, &rows.group, 0.02, 7)
@@ -1887,11 +1888,13 @@ fn device_mask_sd_band_stays_on_the_cpu() {
     }
 }
 
-/// #1179 under a mask: the CPU-built xs-mean excess over the on rows.
+/// #1179 under a mask: the CPU-built xs-mean excess over the on rows. Four
+/// groups of 4,000 rows share every timestamp, so each time block holds
+/// cross-sections of several rows; the segment seam at row 8192 falls inside a group.
 #[test]
 fn device_mask_xs_mean_parity() {
     let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
-    let f = fixture(&STARTS_SMALL, 16_401, 13);
+    let f = fixture(&[0, 4_000, 8_000, 12_000], 16_000, 13);
     let Some(mut run) = device_run(&f, &programs(32, 17)) else {
         return;
     };
