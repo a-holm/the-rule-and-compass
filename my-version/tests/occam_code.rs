@@ -313,3 +313,26 @@ fn the_rule_picks_the_lowest_adjusted_value_and_certifies_under_delta() {
     assert!(sel.fields_json(None).contains("\"verdict\":\"no_signal\""));
     assert!(sel.member_json(0).contains("\"p_occam\":1"));
 }
+
+#[test]
+fn the_stored_tree_text_round_trips_bit_for_bit() {
+    use rcsr::checkpoint::{decode_tree, encode_tree};
+    let (x1, x2) = (|| input(0), || input(1));
+    let c = constant;
+    let shapes = vec![
+        node(Op::Div, vec![x1(), c(-150.754_123_456_789_1)]),
+        node(Op::Add, vec![node(Op::Mul, vec![c(0.034_583_263_591_152_26), x1()]), c(-0.000_415_212_764_189_539_4)]),
+        node(Op::Neg, vec![x1()]),
+        node(Op::Sub, vec![c(1.5), x2()]),
+        node(Op::Add, vec![x1(), x1()]),
+        node(Op::Div, vec![node(Op::Sub, vec![x2(), x1()]), c(-150.754)]),
+        node(Op::Neg, vec![c(2.0)]),
+        node(Op::Mul, vec![c(-0.5), node(Op::Sub, vec![x2(), x1()])]),
+        c(1e-300),
+    ];
+    for t in shapes {
+        let text = encode_tree(&t);
+        let back = decode_tree(&text).unwrap_or_else(|e| panic!("{text}: {e}"));
+        assert_eq!(back, t, "{text}");
+    }
+}

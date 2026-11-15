@@ -7033,11 +7033,18 @@ fn main() {
         }
         let mut front = rcsr::pareto::Archive::new(run.members.len());
         for m in &run.members {
-            let tree = expr::parse(&m.expression_exact, &vars)
-                .unwrap_or_else(|e| usage(format!("--reselect-run '{}': archive_rank {}: {}", path, m.archive_rank, e)));
+            // #1184: the Occam rule prices the stored normalised search tree, never the printed expression.
             let tree = if select_rule_arg.as_deref().is_some_and(|s| rcsr::selection::SelectRule::parse(s) == Ok(rcsr::selection::SelectRule::Occam)) {
-                normalise_inputs_folded(&tree, &prepared.means, &prepared.stds)
+                let text = m.occam_tree.as_deref().unwrap_or_else(|| {
+                    usage(format!(
+                        "--reselect-run '{}': archive_rank {} has no occam_tree: --select-rule occam needs a run.json written by a run with --select-rule occam",
+                        path, m.archive_rank
+                    ))
+                });
+                rcsr::checkpoint::decode_tree(text).unwrap_or_else(|e| usage(format!("--reselect-run '{}': archive_rank {}: occam_tree: {}", path, m.archive_rank, e)))
             } else {
+                let tree = expr::parse(&m.expression_exact, &vars)
+                    .unwrap_or_else(|e| usage(format!("--reselect-run '{}': archive_rank {}: {}", path, m.archive_rank, e)));
                 normalise_inputs(&tree, &prepared.means, &prepared.stds)
             };
             front.items.push(rcsr::pareto::Sol {
@@ -7759,7 +7766,9 @@ fn main() {
             })
             .unwrap_or_else(|e| trading_usage(&e));
             for (k, r) in rows.iter_mut().enumerate() {
-                r.occam_json = picked.member_json(k);
+                let tree = &sorted[r.archive_rank - 1].tree;
+                let stored = if tree_has_custom(tree) { "null".to_string() } else { jstr(&rcsr::checkpoint::encode_tree(tree)) };
+                r.occam_json = format!("{},\"occam_tree\":{}", picked.member_json(k), stored);
             }
             if let Some(c) = picked.chosen {
                 order.retain(|&i| i != c);
@@ -9715,91 +9724,6 @@ fn normalise_inputs(n: &expr::Node, means: &[f64], stds: &[f64]) -> expr::Node {
 }
 
 
-/// #1184: [`normalise_inputs`] followed by a fold of the affine maps. Every
-/// `x_i` becomes `s x_i + m`; sums, differences, products and quotients of such
-/// a map with constants collapse back into one map `a x_i + b`, so a formula
-/// printed as `(x - m) / s` returns to the bare input (up to float residue
-/// below 1e-9) and a scaled and shifted input becomes `a * (x + b / a)`. The
-/// Occam code words then price the same tree shape the search held.
-fn normalise_inputs_folded(n: &expr::Node, means: &[f64], stds: &[f64]) -> expr::Node {
-    fold_affine(n, means, stds).into_node()
-}
-
-enum Folded {
-    Const(f64),
-    Lin(usize, f64, f64),
-    Tree(expr::Node),
-}
-
-impl Folded {
-    fn into_node(self) -> expr::Node {
-        const EPS: f64 = 1e-9;
-        match self {
-            Folded::Const(c) => expr::constant(c),
-            Folded::Tree(n) => n,
-            Folded::Lin(i, a, b) => {
-                if (a - 1.0).abs() < EPS && b.abs() < EPS {
-                    expr::input(i)
-                } else if b.abs() < EPS {
-                    expr::node(Op::Mul, vec![expr::constant(a), expr::input(i)])
-                } else if (a - 1.0).abs() < EPS {
-                    expr::node(Op::Add, vec![expr::input(i), expr::constant(b)])
-                } else {
-                    expr::node(Op::Mul, vec![expr::constant(a), expr::node(Op::Add, vec![expr::input(i), expr::constant(b / a)])])
-                }
-            }
-        }
-    }
-}
-
-fn fold_affine(n: &expr::Node, means: &[f64], stds: &[f64]) -> Folded {
-    if n.op.is_meta() || n.op.is_agg() {
-        return Folded::Tree(n.clone());
-    }
-    let generic = |n: &expr::Node| {
-        Folded::Tree(expr::Node {
-            op: n.op,
-            val: n.val,
-            kids: n.kids.iter().map(|k| fold_affine(k, means, stds).into_node()).collect(),
-            block: n.block.clone(),
-        })
-    };
-    match (n.op, n.kids.len()) {
-        (Op::Input, _) => {
-            let i = n.val as usize;
-            let (m, s) = (means.get(i).copied().unwrap_or(0.0), stds.get(i).copied().unwrap_or(1.0));
-            if m == 0.0 && s == 1.0 {
-                Folded::Tree(expr::input(i))
-            } else {
-                Folded::Lin(i, s, m)
-            }
-        }
-        (Op::Const, _) => Folded::Const(n.val),
-        (Op::Neg, 1) => match fold_affine(&n.kids[0], means, stds) {
-            Folded::Const(c) => Folded::Const(-c),
-            Folded::Lin(i, a, b) => Folded::Lin(i, -a, -b),
-            Folded::Tree(t) => Folded::Tree(expr::node(Op::Neg, vec![t])),
-        },
-        (op @ (Op::Add | Op::Sub | Op::Mul | Op::Div), 2) if !op.is_custom() => {
-            let (l, r) = (fold_affine(&n.kids[0], means, stds), fold_affine(&n.kids[1], means, stds));
-            match (op, l, r) {
-                (Op::Add, Folded::Const(x), Folded::Const(y)) => Folded::Const(x + y),
-                (Op::Sub, Folded::Const(x), Folded::Const(y)) => Folded::Const(x - y),
-                (Op::Mul, Folded::Const(x), Folded::Const(y)) => Folded::Const(x * y),
-                (Op::Div, Folded::Const(x), Folded::Const(y)) if y != 0.0 => Folded::Const(x / y),
-                (Op::Add, Folded::Lin(i, a, b), Folded::Const(c)) | (Op::Add, Folded::Const(c), Folded::Lin(i, a, b)) => Folded::Lin(i, a, b + c),
-                (Op::Sub, Folded::Lin(i, a, b), Folded::Const(c)) => Folded::Lin(i, a, b - c),
-                (Op::Sub, Folded::Const(c), Folded::Lin(i, a, b)) => Folded::Lin(i, -a, c - b),
-                (Op::Mul, Folded::Lin(i, a, b), Folded::Const(c)) | (Op::Mul, Folded::Const(c), Folded::Lin(i, a, b)) => Folded::Lin(i, a * c, b * c),
-                (Op::Div, Folded::Lin(i, a, b), Folded::Const(c)) if c != 0.0 => Folded::Lin(i, a / c, b / c),
-                (Op::Add, Folded::Lin(i, a, b), Folded::Lin(j, c, d)) if i == j => Folded::Lin(i, a + c, b + d),
-                (Op::Sub, Folded::Lin(i, a, b), Folded::Lin(j, c, d)) if i == j => Folded::Lin(i, a - c, b - d),
-                (op, l, r) => Folded::Tree(expr::node(op, vec![l.into_node(), r.into_node()])),
-            }
-        }
-        _ => generic(n),
-    }
-}
 /// #1180: the columns of a regime gate are inputs of the decision: a label,
 /// the target, its return column or a construction column would leak the future
 /// into the mask (D13, exit 5).
@@ -14454,4 +14378,10 @@ mod tests {
         assert!(t.text().contains("total=0.67s"));
         assert!(t.text().contains("gpu=0.12s"), "GPU wall is a subset, not a phase");
     }
+}
+
+/// #1184: a custom block carries fitted constants in its own copy, which the
+/// checkpoint tree encoding does not hold; such a tree stores no `occam_tree`.
+fn tree_has_custom(n: &expr::Node) -> bool {
+    n.op.is_custom() || n.kids.iter().any(tree_has_custom)
 }

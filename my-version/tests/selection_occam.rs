@@ -278,3 +278,66 @@ fn reselect_run_prices_the_code_words_of_the_in_loop_rule() {
         assert!((qa - qc).abs() <= 1e-9 * qa.abs().max(1e-300), "rank {ra}: p_occam {qa} vs {qc}");
     }
 }
+
+/// 600 rows with offset inputs, so the front holds `c * X + e`, `X / c`, negated and
+/// differenced shapes after the search scales its inputs.
+fn write_offset_csv(dir: &Path) -> String {
+    let mut text = String::from("t,x1,x2,r,y\n");
+    for i in 0..600usize {
+        let f = i as f64;
+        let x1 = 1.0 + 3.0 * frac(f * 0.618_033_988_749_894_9);
+        let x2 = -0.3 + 2.0 * frac(f * 0.754_877_666_246_692_7);
+        let noise = frac(f * 0.324_717_957_244_746) - 0.5;
+        let r = 0.01 * (x1 - 2.5) - 0.008 * (x2 - 0.7) + 0.004 * noise;
+        text.push_str(&format!("{},{},{},{},{}\n", T0 + 900 * i as i64, x1, x2, r, r));
+    }
+    let path = dir.join("offset.csv");
+    std::fs::write(&path, text).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+#[test]
+fn reselect_run_prices_the_stored_search_tree_of_every_shape() {
+    let fx = fixture();
+    let data = write_offset_csv(&fx.dir);
+    let level: &[&str] = &["--ops", "add,sub,mul,div,neg", "--select-rule", "occam", "--select-min-entries", "5", "--select-delta", "0.05", "--seed", "6"];
+    let run = fx.path("e.run.json");
+    let (ck, log) = (fx.path("e.ckpt"), fx.path("e.dev.ndjson"));
+    let mut args = vec!["--generations", "150", "--pop", "128", "--save", ck.as_str(), "--json-out", run.as_str(), "--dev-log", log.as_str()];
+    args.extend_from_slice(level);
+    ok(&fx.rcsr(&data, &args));
+    let a = fx.run_json("e");
+    let out = fx.path("f.run.json");
+    let mut args = vec!["--reselect-run", run.as_str(), "--json-out", out.as_str(), "--no-dev-log"];
+    args.extend_from_slice(level);
+    ok(&fx.rcsr(&data, &args));
+    let c = fx.run_json("f");
+    assert_eq!(without_reselected_from(&a), without_reselected_from(&c));
+    let tiers = |j: &Json| -> Vec<Option<usize>> { pareto(j).iter().map(|m| m.get("occam").and_then(|o| o.get("tier")).and_then(Json::as_usize)).collect() };
+    assert_eq!(tiers(&a), tiers(&c));
+    let (pa, pc) = (priced(&a), priced(&c));
+    assert!(pa.len() >= 3, "{pa:?}");
+    assert_eq!(pa.len(), pc.len());
+    for ((ra, ba, qa), (rc, bc, qc)) in pa.iter().zip(&pc) {
+        assert_eq!(ra, rc);
+        assert_eq!(ba, bc, "rank {ra}: bits");
+        assert_eq!(qa, qc, "rank {ra}: p_occam");
+    }
+}
+
+#[test]
+fn reselect_run_without_the_stored_tree_is_refused_under_occam() {
+    let fx = fixture();
+    ok(&fx.search("a", &[]));
+    let run = fx.path("a.run.json");
+    let out = fx.path("c.run.json");
+    let mut args = vec!["--reselect-run", run.as_str(), "--json-out", out.as_str(), "--no-dev-log"];
+    args.extend_from_slice(OCCAM);
+    let o = fx.rcsr(&fx.data, &args);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).contains("no occam_tree"), "{}", stderr(&o));
+    // Other rules read the printed expression as before.
+    let mut args = vec!["--reselect-run", run.as_str(), "--json-out", out.as_str(), "--no-dev-log"];
+    args.extend_from_slice(&["--select-rule", "robust"]);
+    ok(&fx.rcsr(&fx.data, &args));
+}
