@@ -2072,6 +2072,24 @@ mod fitted_cut {
         assert_ne!(bind(&other), bind(&fit));
     }
 
+    #[test]
+    fn mask_enters_the_candidate_id() {
+        let s = fit_spec(0.0);
+        let gate = |e: &str, band: f64, dwell: usize| rcsr::regime_gate::GateSpec::parse(e, band, dwell).unwrap();
+        let with = |g: rcsr::regime_gate::GateSpec| ProtocolOptions { mask: Some(g), ..ProtocolOptions::default() };
+        let base = rcsr::protocol::procedure_spec(&s, &ProtocolOptions::default());
+        assert!(!base.contains("pnl_mask"), "{base}");
+        let text = rcsr::protocol::procedure_spec(&s, &with(gate("x", 0.0, 1)));
+        assert!(text.starts_with(&base) && text.contains("pnl_mask="), "{text}");
+        assert_ne!(text, base);
+        let mut seen = vec![base, text];
+        for g in [gate("-x", 0.0, 1), gate("x", 0.5, 1), gate("x", 0.0, 3)] {
+            let t = rcsr::protocol::procedure_spec(&s, &with(g));
+            assert!(!seen.contains(&t), "{t}");
+            seen.push(t);
+        }
+    }
+
     /// Reports without the flag, pinned to the bytes of the base build.
     #[test]
     fn default_reports_are_pinned() {

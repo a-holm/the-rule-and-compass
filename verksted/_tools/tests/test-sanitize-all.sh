@@ -255,6 +255,32 @@ PLAN=$T/plan-bad run "$T/wt" 9 > "$T/out" 2>&1; r=$?
 check ao-named-rc "$r" "2"
 has ao-named-msg "$T/out" "app-only needs '\*'"
 
+# device: a CUDA binary by design; the runner treats it exactly like an unlisted binary
+cp "$T/plan" "$T/plan-dev"
+echo 'gpu_fit * device the binary calls CUDA by design' >> "$T/plan-dev"
+PLAN=$T/plan-dev run "$T/wt" 9 > /dev/null 2>&1; r=$?
+check dev-rc "$r" "0"
+has dev-line "$sum" '^gpu_fit rc=0 xid=4->4 secs=[0-9]+ \| test result: ok\. [0-9]+ passed.*ERROR SUMMARY: 0 errors$'
+hasnt dev-not-listed "$sum" 'listed no-cuda but called CUDA$'
+has dev-flag "$T/san-calls" 'memcheck --leak-check no --error-exitcode 99 /fake/deps/gpu_fit-fff$'
+hasnt dev-no-target-processes "$T/san-calls" 'gpu_fit.*target-processes|target-processes.*gpu_fit'
+PLAN=$T/plan-dev FAKE_NC_ON=gpu_fit-fff run "$T/wt" 9 > /dev/null 2>&1; r=$?
+check dev-nocuda-rc "$r" "1"
+has dev-nocuda-line "$sum" '^gpu_fit unexpected no CUDA call'
+PLAN=$T/plan-dev run "$T/wt" 9 --dry-run > "$T/out" 2>&1; r=$?
+check dev-dry-rc "$r" "0"
+has dev-dry-cmd "$T/out" '^run gpu_fit: env RCSR_UNDER_SANITIZER=memcheck RCSR_REQUIRE_DEVICE=1 [^ ]+ --tool memcheck --leak-check no --error-exitcode 99 <gpu_fit test binary>$'
+cp "$T/plan-dev" "$T/plan-devskip"
+echo 'gpu_fit slow_case skip too slow under memcheck' >> "$T/plan-devskip"
+PLAN=$T/plan-devskip run "$T/wt" 9 --dry-run > "$T/out" 2>&1; r=$?
+check dev-named-dry-rc "$r" "0"
+has dev-named-skip "$T/out" '^run gpu_fit: .*<gpu_fit test binary> --skip slow_case --exact$'
+hasnt dev-no-star-skip "$T/out" '--skip \*'
+printf 'gpu_fit some_test device reason\n' > "$T/plan-bad"
+PLAN=$T/plan-bad run "$T/wt" 9 > "$T/out" 2>&1; r=$?
+check dev-named-rc "$r" "2"
+has dev-named-msg "$T/out" "device needs '\*'"
+
 # application-only: a target that never calls CUDA can end with the launch timeout message; that counts only for no-cuda-app-only
 PLAN=$T/plan-app FAKE_NC_MODE=noattach FAKE_NC_ON=gpu_fit-fff run "$T/wt" 9 > /dev/null 2>&1; r=$?
 check noattach-app-rc "$r" "0"
