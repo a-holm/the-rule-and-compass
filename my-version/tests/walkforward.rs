@@ -2971,6 +2971,33 @@ mod members {
     }
 
     #[test]
+    fn all_members_refusal_in_the_library() {
+        use rcsr::walkforward::{self, CutFit, EvalSpec, FrontSource, ProtocolOptions};
+        let rows: Vec<(f64, f64, f64)> = (0..40).map(|i| (i as f64, ((i * 7) % 11) as f64 - 5.0, 0.001)).collect();
+        let t = super::single(&rows);
+        let mut s = super::spec("x", vec![super::window("w", 0.0, 20.0, 20.0, 40.0)]);
+        s.candidates = vec!["x".to_string(), "0.5 - x".to_string()];
+        s.validation_frac = 0.3;
+        s.threshold_fixed = Some(0.0);
+        let front = FrontSource {
+            run: "run.json".to_string(),
+            run_sha256: String::new(),
+            labels: vec!["front_rank_1".to_string(), "front_rank_2".to_string()],
+            ranks: vec![1, 2],
+        };
+        let opts = ProtocolOptions { all_members: true, front: Some(front), ..ProtocolOptions::default() };
+        let ok = walkforward::run_table_with(&t, &s, "t", &opts).unwrap();
+        assert_eq!(ok.members.as_ref().map(Vec::len), Some(2));
+        let refused = |s: &EvalSpec, o: &ProtocolOptions| walkforward::run_table_with(&t, s, "t", o).err().unwrap_or_default();
+        let band = EvalSpec { band_select: true, ..s.clone() };
+        assert!(refused(&band, &opts).contains("--all-members refuses --select-band"), "{}", refused(&band, &opts));
+        let fit = ProtocolOptions { threshold_fit: Some(CutFit::default()), ..opts.clone() };
+        assert!(refused(&s, &fit).contains("--all-members refuses --threshold-fit"), "{}", refused(&s, &fit));
+        let no_front = ProtocolOptions { front: None, ..opts.clone() };
+        assert!(refused(&s, &no_front).contains("--all-members needs --front"), "{}", refused(&s, &no_front));
+    }
+
+    #[test]
     fn all_members_refusals() {
         let f = fixture("members-refuse");
         let run = write(&f.dir, "run.json", &run_text(&EXPRS));
