@@ -101,7 +101,7 @@ fn stderr(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).into_owned()
 }
 
-const RUN_FLAGS: [&str; 22] = [
+const RUN_FLAGS: [&str; 20] = [
     "--target", "y", "--vars", "x1,x2", "--time", "t", "--group-by", "s", "--split", "temporal", "--objective", "pnl", "--cost-bps", "5",
     "--validation-frac", "0.3", "--test-frac", "0.2", "--no-dev-log", "--quiet",
 ];
