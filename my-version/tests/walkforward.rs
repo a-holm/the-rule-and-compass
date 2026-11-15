@@ -2635,3 +2635,23 @@ fn missing_score_flat_exit_is_causal() {
     }
     assert_ne!(bits(&gapped.period_net), bits(&late.period_net), "the late rows do change the later periods");
 }
+
+#[test]
+fn missing_score_device_pnl_reduction_reads_the_same_book() {
+    let t = grid_table();
+    for missing in [MissingScore::Flat, MissingScore::Hold] {
+        let mut s = spec("z", vec![window("w1", 0.0, 100.0, 100.0, 250.0), window("w2", 0.0, 250.0, 250.0, 400.0)]);
+        s.vars = ["x", "z", "o", "zo"].map(String::from).to_vec();
+        s.group = Some("sym".to_string());
+        s.threshold_fixed = Some(0.0);
+        s.periods_per_year = Some(8760.0);
+        s.pool_reset_flat = true;
+        s.device_pnl = true;
+        let opts = walkforward::ProtocolOptions { missing_score: missing, ..walkforward::ProtocolOptions::default() };
+        let r = walkforward::run_table_with(&t, &s, "test", &opts).unwrap();
+        let d = r.device_pnl.as_ref().expect("the --device-pnl summary");
+        assert_eq!((d.windows, d.bit_mismatch_windows, d.count_mismatch_windows), (2, 0, 0), "{missing:?}");
+        assert!(d.max_abs_net_delta < 1e-12, "{missing:?}: {}", d.max_abs_net_delta);
+        assert_eq!(d.rows, r.pooled.rows as u64, "{missing:?}: the reduction prices the rows of the book");
+    }
+}
