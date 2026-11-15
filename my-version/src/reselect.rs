@@ -42,6 +42,9 @@ impl RunFront {
         if matches!(j.get("interim"), Some(Json::Bool(true))) {
             return Err(crate::run_json::INTERIM_REFUSAL.to_string());
         }
+        if matches!(j.get("compose").and_then(|c| c.get("gate")).and_then(|g| g.get("carried")), Some(Json::Bool(true))) {
+            return Err(crate::run_json::CARRIED_GATE_REFUSAL.to_string());
+        }
         let variables = match j.get("variables") {
             Some(Json::Arr(a)) => a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
             _ => return Err(format!("'{}' has no 'variables' array", path)),
