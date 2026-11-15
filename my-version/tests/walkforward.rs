@@ -2367,7 +2367,7 @@ fn pbo_table() -> data::Table {
     data::parse_table(&s).unwrap()
 }
 
-fn pbo_run(t: &data::Table, exprs: &[&str], grid: walkforward::PeriodGrid) -> walkforward::Report {
+fn pbo_run(t: &data::Table, exprs: &[&str], grid: walkforward::PeriodGrid, inference: bool) -> walkforward::Report {
     let mut s = spec(exprs[0], vec![window("w", 0.0, 100.0, 100.0, 300.0)]);
     if exprs.len() > 1 {
         s.candidates = exprs.iter().map(|e| e.to_string()).collect();
@@ -2380,8 +2380,8 @@ fn pbo_run(t: &data::Table, exprs: &[&str], grid: walkforward::PeriodGrid) -> wa
     s.pool_reset_flat = true;
     let opts = walkforward::ProtocolOptions {
         period_grid: grid,
-        bootstrap_draws: 200,
-        block_len: Some(5),
+        bootstrap_draws: if inference { 200 } else { 0 },
+        block_len: inference.then_some(5),
         pbo_blocks: 4,
         ..walkforward::ProtocolOptions::default()
     };
@@ -2392,11 +2392,11 @@ fn pbo_run(t: &data::Table, exprs: &[&str], grid: walkforward::PeriodGrid) -> wa
 fn in_report_pbo_columns_share_the_target_grid() {
     use walkforward::PeriodGrid::{Score, Target};
     let t = pbo_table();
-    let pair = pbo_run(&t, &["z", "x + 1"], Score);
+    let pair = pbo_run(&t, &["z", "x + 1"], Score, true);
     assert_eq!(pair.windows[0].candidate, 0, "z has the lower validation error");
     assert_eq!(pair.pooled.periods, 150, "the pooled series stays on the score grid");
     // The column of each candidate is its own book on the window's target grid.
-    let cols: Vec<Vec<f64>> = ["z", "x + 1"].iter().map(|e| pbo_run(&t, &[e], Target).period_net).collect();
+    let cols: Vec<Vec<f64>> = ["z", "x + 1"].iter().map(|e| pbo_run(&t, &[e], Target, false).period_net).collect();
     assert!(cols.iter().all(|c| c.len() == 200), "the target grid has 200 periods");
     let stretch: Vec<usize> = (50..100).collect();
     assert!(stretch.iter().all(|&k| cols[0][k] == 0.0), "z prices no row on the stretch");
@@ -2416,5 +2416,5 @@ fn in_report_pbo_columns_share_the_target_grid() {
         let j = rcsr::devlog::Json::parse(&r.json()).unwrap();
         j.get("inference").and_then(|i| i.get("multiple_testing")).map(|m| format!("{m:?}")).expect("the multiple_testing block")
     };
-    assert_eq!(multiple(&pbo_run(&t, &["x", "x + 1"], Score)), multiple(&pbo_run(&t, &["x", "x + 1"], Target)));
+    assert_eq!(multiple(&pbo_run(&t, &["x", "x + 1"], Score, true)), multiple(&pbo_run(&t, &["x", "x + 1"], Target, true)));
 }
