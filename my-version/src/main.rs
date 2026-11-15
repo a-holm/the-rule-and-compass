@@ -346,14 +346,31 @@ INPUT:
                              exits 2 and auto falls back to the CPU scorer).
                              Resume needs the same cost, threshold, band,
                              band units, minimum hold and rows
-  --pnl-blocks K          1 to 8 time blocks for --fitness pnl (default 1 =
+  --pnl-blocks K          1 to 64 time blocks for --fitness pnl (default 1 =
                              off, the plain regret). The training timestamps
                              are cut into K equal runs, each block is its own
-                             long/flat book, and the fitness is the mean block
-                             regret plus --pnl-block-lambda times their
-                             standard deviation. Needs --fitness pnl
+                             long/flat book, and the fitness is the --pnl-stat
+                             statistic of the block regrets (default the mean
+                             plus --pnl-block-lambda times their standard
+                             deviation). Needs --fitness pnl
   --pnl-block-lambda L      weight of the block spread (default 1.0, finite,
-                             >= 0; 0 is the plain mean). Needs --fitness pnl
+                             >= 0; 0 is the plain mean). With many blocks use
+                             about t / sqrt(K) for a fixed test level t (for
+                             example 2 / sqrt(K)). Needs --fitness pnl; exit 2
+                             under --pnl-stat cvar
+  --pnl-stat S              statistic of the block regrets r_k = 1 - c_k
+                             (c_k = net_k / B_k, the capture of block k):
+                             mean-sd (default) mean(r) + L sd(r); mean-semi
+                             mean(r) + L sqrt(mean(max(r_k - 1, 0)^2)), only
+                             blocks that lose against cash cost; cvar the mean
+                             of the ceil(q K) largest r_k (the worst captures,
+                             ties to the lower block). Needs --fitness pnl.
+                             --json search_fitness gains stat (and cvar_q)
+                             unless mean-sd with K <= 8; the book hash covers
+                             it, so a resume needs the same statistic
+  --pnl-cvar-q q            share of worst blocks under --pnl-stat cvar
+                             (default 0.25, in (0, 1]; 1 is the mean). Needs
+                             --pnl-stat cvar
   --pnl-mask <expr>         price only the rows inside a causal regime gate
                              (a bull or bear specialist). The expression reads
                              columns of the row; aggregates exit 2 and a
@@ -1504,9 +1521,9 @@ fn member_spec(
 /// #480: the `"fitness"` member of a Pareto entry, in exact CPU `f64` on the
 /// training rows. `train_net` is the excess net over cash.
 fn fitness_member_json(book: &rcsr::trading::FitnessBook, pred: &[f64], regret: f64) -> String {
-    if book.blocks() > 1 {
-        // #484: `train_regret` is the search fitness (mean + lambda * sd of the
-        // block regrets); net, flips and exits sum the blocks.
+    if book.blocks() > 1 || book.stat() != rcsr::trading::BlockStat::MeanSd {
+        // #484: `train_regret` is the search fitness (#1178: the block statistic
+        // of the block regrets); net, flips and exits sum the blocks.
         let blocks = book.block_totals(pred);
         let mut net = 0.0;
         let (mut flips, mut exits, mut longs) = (0u64, 0u64, 0u64);
@@ -2870,6 +2887,9 @@ fn main() {
     let mut pnl_blocks_arg: Option<String> = None;
     let mut book_target_arg: Option<String> = None;
     let mut pnl_lambda_arg: Option<String> = None;
+    // #1178: the statistic of the block regrets.
+    let mut pnl_stat_arg: Option<String> = None;
+    let mut pnl_cvar_q_arg: Option<String> = None;
     let mut pnl_mask_arg: Option<String> = None;
     let mut pnl_mask_band_arg: Option<String> = None;
     let mut pnl_mask_dwell_arg: Option<String> = None;
@@ -3187,6 +3207,8 @@ fn main() {
             "--fitness" => fitness_arg = Some(val!()),
             "--pnl-blocks" => pnl_blocks_arg = Some(val!()),
             "--pnl-block-lambda" => pnl_lambda_arg = Some(val!()),
+            "--pnl-stat" => pnl_stat_arg = Some(val!()),
+            "--pnl-cvar-q" => pnl_cvar_q_arg = Some(val!()),
             "--pnl-mask" => pnl_mask_arg = Some(val!()),
             "--pnl-mask-band" => pnl_mask_band_arg = Some(val!()),
             "--pnl-mask-dwell" => pnl_mask_dwell_arg = Some(val!()),
@@ -5520,10 +5542,10 @@ fn main() {
     let pnl_blocks: usize = match pnl_blocks_arg.as_deref() {
         None => 1,
         Some(t) => match t.trim().parse::<usize>() {
-            Ok(k) if (1..=rcsr::trading::FITNESS_MAX_BLOCKS).contains(&k) => k,
+            Ok(k) if (1..=rcsr::trading::FITNESS_BOOK_MAX_BLOCKS).contains(&k) => k,
             _ => trading_usage(&format!(
                 "--pnl-blocks must be an integer from 1 to {}, got '{}'",
-                rcsr::trading::FITNESS_MAX_BLOCKS, t
+                rcsr::trading::FITNESS_BOOK_MAX_BLOCKS, t
             )),
         },
     };
@@ -5535,7 +5557,13 @@ fn main() {
         },
     };
     if !fitness_pnl {
-        for (flag, given) in [("--pnl-blocks", pnl_blocks_arg.is_some()), ("--pnl-block-lambda", pnl_lambda_arg.is_some()), ("--pnl-excess", pnl_excess_arg.is_some())] {
+        for (flag, given) in [
+            ("--pnl-blocks", pnl_blocks_arg.is_some()),
+            ("--pnl-block-lambda", pnl_lambda_arg.is_some()),
+            ("--pnl-excess", pnl_excess_arg.is_some()),
+            ("--pnl-stat", pnl_stat_arg.is_some()),
+            ("--pnl-cvar-q", pnl_cvar_q_arg.is_some()),
+        ] {
             if given {
                 trading_usage(&format!("{} needs --fitness pnl", flag));
             }
@@ -5543,6 +5571,24 @@ fn main() {
     }
     // #1179: the fitness benchmark; every reported net stays absolute.
     let pnl_excess = pnl_excess_arg.as_deref().map_or(Ok(rcsr::trading::PnlExcess::None), rcsr::trading::PnlExcess::parse).unwrap_or_else(|e| trading_usage(&e));
+    // #1178: the block statistic; `--pnl-cvar-q` is read under cvar only.
+    let pnl_cvar_q: f64 = match pnl_cvar_q_arg.as_deref() {
+        None => rcsr::trading::DEFAULT_CVAR_Q,
+        Some(t) => match t.trim().parse::<f64>() {
+            Ok(q) if q > 0.0 && q <= 1.0 => q,
+            _ => trading_usage(&format!("--pnl-cvar-q must be a number in (0, 1], got '{}'", t)),
+        },
+    };
+    let pnl_stat = match rcsr::trading::BlockStat::parse(pnl_stat_arg.as_deref().unwrap_or("mean-sd"), pnl_cvar_q) {
+        Ok(s) => s,
+        Err(e) => trading_usage(&e),
+    };
+    if pnl_cvar_q_arg.is_some() && !matches!(pnl_stat, rcsr::trading::BlockStat::Cvar(_)) {
+        trading_usage("--pnl-cvar-q needs --pnl-stat cvar");
+    }
+    if pnl_lambda_arg.is_some() && matches!(pnl_stat, rcsr::trading::BlockStat::Cvar(_)) {
+        trading_usage("--pnl-block-lambda has no effect under --pnl-stat cvar");
+    }
     let mut trading_spec: Option<rcsr::trading::TradingSpec> = None;
     let mut trading_cols: Option<data::TradingColumns> = None;
     let mut trading_cost: Option<target::CostDecl> = None;
@@ -6029,7 +6075,9 @@ fn main() {
             _ => None,
         };
         let segments = interval_split.as_ref().map_or_else(Vec::new, |s| s.segment_starts());
-        match rcsr::trading::FitnessBook::with_segments(slice, tspec, target_horizon, pnl_blocks, pnl_lambda, &segments, book_mask) {
+        match rcsr::trading::FitnessBook::with_segments(slice, tspec, target_horizon, pnl_blocks, pnl_lambda, &segments, book_mask)
+            .and_then(|b| b.with_stat(pnl_stat))
+        {
             Ok(book) if book.len() == prepared.book.as_ref().map_or(prepared.train.len(), |b| b.train.len()) => Some(std::sync::Arc::new(book)),
             Ok(book) => trading_usage(&format!(
                 "--fitness pnl: {} training trading rows for {} training rows",
@@ -9021,12 +9069,23 @@ fn main() {
                         b.hash(),
                         book_resolved.as_ref().map(|r| format!("\"book_target\":{},", jstr(&r.spec.column))).unwrap_or_default(),
                         // #484: omitted for one block, so the default report is unchanged.
-                        if b.blocks() > 1 {
+                        // #1178: `stat` and `cvar_q` only for another statistic or more
+                        // than 8 blocks, so a run without the new flags is unchanged.
+                        if b.blocks() > 1 || b.stat() != rcsr::trading::BlockStat::MeanSd {
+                            let stat = b.stat();
                             format!(
-                                "\"blocks\":{},\"lambda\":{},\"block_bounds\":[{}],",
+                                "\"blocks\":{},\"lambda\":{},\"block_bounds\":[{}],{}",
                                 b.blocks(),
                                 jnum(b.lambda()),
-                                b.block_bounds().iter().map(|v| jnum(*v)).collect::<Vec<_>>().join(",")
+                                b.block_bounds().iter().map(|v| jnum(*v)).collect::<Vec<_>>().join(","),
+                                if stat != rcsr::trading::BlockStat::MeanSd || b.blocks() > rcsr::trading::FITNESS_MAX_BLOCKS {
+                                    match stat {
+                                        rcsr::trading::BlockStat::Cvar(q) => format!("\"stat\":\"cvar\",\"cvar_q\":{},", jnum(q)),
+                                        s => format!("\"stat\":{},", jstr(s.name())),
+                                    }
+                                } else {
+                                    String::new()
+                                }
                             )
                         } else {
                             String::new()

@@ -675,6 +675,8 @@ pub struct DeviceWorkload {
     pub label_sign: bool,
     /// #481: the long/flat fitness book (f64 excess and a flag byte per row).
     pub pnl_book: bool,
+    /// #1178: the book has more blocks than its flags hold: a block id byte per row.
+    pub pnl_block_ids: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -798,6 +800,9 @@ fn plan_core(w: &DeviceWorkload, d: &DeviceInfo, caps: &DeviceCaps) -> DevicePla
     }
     if w.pnl_book {
         side += n * 9;
+        if w.pnl_block_ids {
+            side += n;
+        }
     }
     let side_vectors = clamp_u64(side, &mut sat);
     let fit_n = if w.device_fit && w.fit_rows > 0 && w.fit_rows < w.rows {
@@ -1299,6 +1304,7 @@ mod tests {
             weights: false,
             label_sign: false,
             pnl_book: false,
+            pnl_block_ids: false,
         }
     }
 
@@ -1479,6 +1485,9 @@ mod tests {
         let book = device_plan(&DeviceWorkload { pnl_book: true, ..w }, &d, &caps);
         assert_eq!(book.terms.side_vectors - plain.terms.side_vectors, 4_775_757 * 9);
         assert_eq!(book.required - plain.required, 4_775_757 * 9);
+        // #1178: more than 8 blocks add a block id byte per row.
+        let wide = device_plan(&DeviceWorkload { pnl_book: true, pnl_block_ids: true, ..w }, &d, &caps);
+        assert_eq!(wide.terms.side_vectors - plain.terms.side_vectors, 4_775_757 * 10);
     }
 
     #[test]
