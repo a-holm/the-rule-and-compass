@@ -98,7 +98,8 @@ impl LockRecord {
 
 /// The ranges a resolved lock and a record guard together. The record takes
 /// the second-range slot; it never replaces a declared range. A different
-/// second range already in place is refused (exit 2).
+/// second range already in place is refused (exit 2), unless the record
+/// already is the primary range.
 pub fn with_record(
     primary: Option<Lockbox>,
     also: Option<Lockbox>,
@@ -109,6 +110,7 @@ pub fn with_record(
         (Some(p), None) if p == *record => Ok((primary, None)),
         (Some(_), None) => Ok((primary, Some(*record))),
         (Some(_), Some(a)) if a == *record => Ok((primary, also)),
+        (Some(p), Some(_)) if p == *record => Ok((primary, also)),
         (Some(p), Some(a)) => Err(usage(format!(
             "--lock-record range {} needs the second-range slot, but the resolved locked ranges are {} + {} (declared by the data, or the protocol default and --locked-test)",
             crate::lockbox::span(record),
@@ -492,5 +494,7 @@ mod tests {
         assert_eq!(with_record(Some(p), Some(r), &r).unwrap(), (Some(p), Some(r)));
         assert_eq!(with_record(Some(r), None, &r).unwrap(), (Some(r), None));
         assert!(with_record(Some(p), Some(Lockbox { start: 20, end: 30 }), &r).is_err());
+        let other = Lockbox { start: 20, end: 30 };
+        assert_eq!(with_record(Some(r), Some(other), &r).unwrap(), (Some(r), Some(other)));
     }
 }

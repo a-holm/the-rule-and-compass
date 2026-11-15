@@ -1765,6 +1765,9 @@ pub struct TradingColumns {
     /// #1185: numeric columns whose raw values travel with the training rows
     /// into [`TradingSplit::train_values`] (`rcsr switch`).
     pub train_values: Vec<String>,
+    /// #1181: the same columns also travel with the validation and test rows
+    /// (`rcsr compose`).
+    pub slice_values: bool,
 }
 
 /// #1180: the regime mask of each slice, aligned with its trading rows.
@@ -1829,6 +1832,10 @@ pub struct TradingSplit {
     /// #1185: raw values of [`TradingColumns::train_values`] on the training
     /// rows, one vector per name; empty without names.
     pub train_values: Vec<Vec<f64>>,
+    /// #1181: the same values on the validation and test rows under
+    /// [`TradingColumns::slice_values`]; empty otherwise.
+    pub validation_values: Vec<Vec<f64>>,
+    pub test_values: Vec<Vec<f64>>,
 }
 
 /// Feature rows (as in [`Sample::x`]) and trading rows of a cross-section context.
@@ -4996,13 +5003,25 @@ fn build_trading(
     let mut train_values = Vec::with_capacity(cols.train_values.len());
     if cols.train {
         for name in &cols.train_values {
-            let c = numeric(name, "switch")?;
+            let c = numeric(name, if cols.slice_values { "compose" } else { "switch" })?;
             train_values.push(train_idx.iter().map(|&i| c[i]).collect());
+        }
+    }
+    let (mut validation_values, mut test_values) = (Vec::new(), Vec::new());
+    if cols.slice_values {
+        for name in &cols.train_values {
+            let c = numeric(name, "compose")?;
+            if validation.is_some() {
+                validation_values.push(validation_idx.iter().map(|&i| c[i]).collect());
+            }
+            test_values.push(test_idx.iter().map(|&i| c[i]).collect());
         }
     }
     Ok(TradingSplit {
         masks,
         train_values,
+        validation_values,
+        test_values,
         train: cols.train.then(|| slice(train_idx, train)),
         validation: validation.map(|v| slice(validation_idx, v)),
         test: slice(test_idx, test),
@@ -6252,6 +6271,7 @@ mod tests {
                 book_rows: false,
                 mask: None,
                 train_values: Vec::new(),
+                slice_values: false,
             }),
             canonical_train_order: canonical,
             ..Default::default()
