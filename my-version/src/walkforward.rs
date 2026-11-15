@@ -136,6 +136,13 @@ pub struct ProtocolOptions {
     /// carried like the band. Rows with the gate off drop out of the test book
     /// and every on-run is its own book: it starts flat and pays its exit.
     pub mask: Option<crate::regime_gate::GateSpec>,
+    /// #1175: a regime calendar that stratifies the pooled periods. A reporting input,
+    /// never read by a search.
+    pub regimes: Option<crate::regimes::Calendar>,
+    /// #1175: causal regime expressions; each splits the pooled periods into on and off.
+    pub regime_exprs: Vec<crate::regimes::ExprSpec>,
+    /// #1175: emit exposure, entries, gross and buy-and-hold per period with the strata.
+    pub period_series: bool,
 }
 
 /// #1094: the rule of `--threshold-fit fitness`: the cut with the lowest block
@@ -245,6 +252,9 @@ impl Default for ProtocolOptions {
             stride_seconds: None,
             threshold_fit: None,
             mask: None,
+            regimes: None,
+            regime_exprs: Vec::new(),
+            period_series: false,
         }
     }
 }
@@ -673,6 +683,10 @@ pub struct Report {
     /// stamps, in the order of the pooled series.
     pub period_net: Vec<f64>,
     pub period_time: Vec<f64>,
+    /// #1175: the strata of the pooled periods; `None` without `--regimes`, `--regime-expr` or `--period-series`.
+    pub regimes: Option<crate::regimes::RegimeReport>,
+    /// #1175: per-period exposure, entries, gross and buy-and-hold beside `period_net`.
+    pub period_extra: Option<PeriodExtra>,
     /// #487: cost source and return units of the book.
     pub cost: crate::target::CostDecl,
     pub cost_bps: f64,
@@ -845,6 +859,7 @@ fn run_table_clocked(
 ) -> Result<Report, String> {
     let mut layout = resolve_layout(spec, &table.names, &table.numeric)?;
     add_mask_columns(&mut layout, &table.names, &table.numeric, opts)?;
+    add_regime_columns(&mut layout, &table.names, &table.numeric, opts)?;
     let trees = parse_expressions(spec, &layout)?;
     validate_windows(spec, opts)?;
 
@@ -853,6 +868,7 @@ fn run_table_clocked(
     let t_pnl = std::time::Instant::now();
     let mut acc = Accum::new(spec, opts, trees.len())?;
     acc.gate_base = layout.vars.len();
+    acc.set_regimes(&layout);
     if opts.final_read {
         acc.pass = Pass::TrainOnly;
     }
@@ -867,7 +883,7 @@ fn run_table_clocked(
             continue;
         }
         features.clear();
-        for &c in layout.vars.iter().chain(&layout.mask_cols) {
+        for &c in layout.vars.iter().chain(&layout.mask_cols).chain(&layout.regime_cols) {
             features.push(table.value(r, c));
         }
         let g = group_ids.as_ref().map_or(0, |ids| ids[r]);
@@ -942,11 +958,13 @@ fn run_store_clocked(
     let mut layout = resolve_layout(spec, &names, &numeric)?;
     layout.time_i64 = fs.header().dtypes()[layout.time] == store::DType::I64;
     add_mask_columns(&mut layout, &names, &numeric, opts)?;
+    add_regime_columns(&mut layout, &names, &numeric, opts)?;
     let trees = parse_expressions(spec, &layout)?;
     validate_windows(spec, opts)?;
 
     let mut acc = Accum::new(spec, opts, trees.len())?;
     acc.gate_base = layout.vars.len();
+    acc.set_regimes(&layout);
     if opts.final_read {
         acc.pass = Pass::TrainOnly;
     }
@@ -966,6 +984,7 @@ fn run_store_clocked(
     let group_f64 = layout.group.filter(|&g| numeric[g]);
     let mut needed: Vec<usize> = named.iter().map(|&p| layout.vars[p]).collect();
     needed.extend(layout.mask_cols.iter().copied());
+    needed.extend(layout.regime_cols.iter().copied());
     needed.push(layout.target);
     if time_f64 {
         needed.push(layout.time);
@@ -979,6 +998,9 @@ fn run_store_clocked(
     for (k, &c) in layout.mask_cols.iter().enumerate() {
         var_at.push((layout.vars.len() + k, at(c)));
     }
+    for (k, &c) in layout.regime_cols.iter().enumerate() {
+        var_at.push((layout.vars.len() + layout.mask_cols.len() + k, at(c)));
+    }
     let target_at = at(layout.target);
     let time_at = time_f64.then(|| at(layout.time));
     let group_at = group_f64.map(at);
@@ -990,7 +1012,7 @@ fn run_store_clocked(
     };
     let mut pg = store::ProjectedGroup::new();
     // Positions no candidate names stay 0.0: `expr::eval` reads a row only at `Input` nodes.
-    let mut features = vec![0.0f64; layout.vars.len() + layout.mask_cols.len()];
+    let mut features = vec![0.0f64; layout.vars.len() + layout.mask_cols.len() + layout.regime_cols.len()];
     let time_levels = header.levels(layout.time);
     let time_of_code = |code: u32| -> f64 {
         time_levels
@@ -1091,6 +1113,35 @@ struct Layout {
     /// #1180: columns of the regime gate, read after the variables in every
     /// feature vector.
     mask_cols: Vec<usize>,
+    /// #1175: the union of the columns of the regime expressions, read after the mask
+    /// columns, and for every expression the position of each of its columns in it.
+    regime_cols: Vec<usize>,
+    regime_slots: Vec<Vec<usize>>,
+}
+
+/// #1175: the table columns of the regime expressions of `opts.regime_exprs`.
+fn add_regime_columns(layout: &mut Layout, names: &[String], numeric: &[bool], opts: &ProtocolOptions) -> Result<(), String> {
+    for e in &opts.regime_exprs {
+        let mut slots = Vec::new();
+        for name in &e.gate.columns {
+            let j = names
+                .iter()
+                .position(|n| n == name)
+                .ok_or_else(|| format!("the regime expression {} reads column '{}', which is not in the data", e.name, name))?;
+            if !numeric.get(j).copied().unwrap_or(false) {
+                return Err(format!("the regime expression {} column '{}' must be numeric", e.name, name));
+            }
+            slots.push(match layout.regime_cols.iter().position(|&c| c == j) {
+                Some(s) => s,
+                None => {
+                    layout.regime_cols.push(j);
+                    layout.regime_cols.len() - 1
+                }
+            });
+        }
+        layout.regime_slots.push(slots);
+    }
+    Ok(())
 }
 
 /// #1180: the table columns of the gate of `opts.mask`.
@@ -1162,6 +1213,8 @@ fn resolve_layout(spec: &EvalSpec, names: &[String], numeric: &[bool]) -> Result
         var_names,
         time_i64: false,
         mask_cols: Vec::new(),
+        regime_cols: Vec::new(),
+        regime_slots: Vec::new(),
     })
 }
 
@@ -1509,6 +1562,8 @@ struct WindowData {
     test_rows: Vec<RowBase>,
     /// #1180: the gate value of every test row (NaN without a mask).
     test_gate: Vec<f64>,
+    /// #1175: the value of every regime expression on every test row, one vector per expression.
+    test_regime: Vec<Vec<f64>>,
     test_scores: Vec<Vec<f64>>,
     /// Sum and count of the finite training-interval targets (#310 constant
     /// control).
@@ -1555,6 +1610,11 @@ struct Accum {
     /// #1180: the regime gate and the feature index of its first column.
     gate: Option<crate::regime_gate::GateSpec>,
     gate_base: usize,
+    /// #1175: the regime expressions, the position of their columns among the regime
+    /// columns and the feature index of the first one.
+    regime_exprs: Vec<crate::regimes::ExprSpec>,
+    regime_slots: Vec<Vec<usize>>,
+    regime_base: usize,
 }
 
 impl Accum {
@@ -1601,6 +1661,7 @@ impl Accum {
                 validation_scores: vec![Vec::new(); candidates],
                 test_rows: Vec::new(),
                 test_gate: Vec::new(),
+                test_regime: vec![Vec::new(); opts.regime_exprs.len()],
                 test_scores: vec![Vec::new(); candidates],
                 train_target_sum: 0.0,
                 train_target_n: 0,
@@ -1625,7 +1686,15 @@ impl Accum {
             threshold_fit: opts.threshold_fit,
             gate: opts.mask.clone(),
             gate_base: 0,
+            regime_exprs: opts.regime_exprs.clone(),
+            regime_slots: Vec::new(),
+            regime_base: 0,
         })
+    }
+
+    fn set_regimes(&mut self, layout: &Layout) {
+        self.regime_slots = layout.regime_slots.clone();
+        self.regime_base = layout.vars.len() + layout.mask_cols.len();
     }
 
     fn wants(&self, t: f64) -> bool {
@@ -1649,6 +1718,24 @@ impl Accum {
 
     fn add(&mut self, t: f64, group: u64, features: &[f64], target: f64, trees: &[Node]) {
         debug_assert_eq!(trees.len(), self.candidates);
+        if !self.regime_exprs.is_empty() && self.pass != Pass::TrainOnly {
+            let values: Vec<f64> = self
+                .regime_exprs
+                .iter()
+                .zip(&self.regime_slots)
+                .map(|(e, slots)| {
+                    let row: Vec<f64> = slots.iter().map(|&s| features[self.regime_base + s]).collect();
+                    expr::eval(&e.gate.tree, &row)
+                })
+                .collect();
+            for d in &mut self.windows {
+                if t >= d.window.test_start && t < d.window.test_end {
+                    for (dst, &v) in d.test_regime.iter_mut().zip(&values) {
+                        dst.push(v);
+                    }
+                }
+            }
+        }
         let gate = match &self.gate {
             Some(g) => {
                 let row: Vec<f64> = (0..g.columns.len()).map(|k| features[self.gate_base + k]).collect();
@@ -1759,7 +1846,18 @@ impl Accum {
         let mut books: Vec<crate::wf_protocol::NullBook> = Vec::new();
         let mut batch_in: Vec<crate::wf_batch::WindowScores> = Vec::new();
         let forced = self.forced.as_deref();
+        let want_strata = opts.regimes.is_some() || !opts.regime_exprs.is_empty() || opts.period_series;
+        let mut strata_in = StrataIn::new(opts.regime_exprs.len());
         for (window_index, mut d) in self.windows.into_iter().enumerate() {
+            let regime_states: Vec<Vec<bool>> = opts
+                .regime_exprs
+                .iter()
+                .zip(&d.test_regime)
+                .map(|(e, values)| {
+                    let groups: Vec<u64> = d.test_rows.iter().map(|r| r.group).collect();
+                    crate::regime_gate::hysteresis_states(values, &groups, e.gate.band, e.gate.dwell)
+                })
+                .collect();
             if let Some(gate) = &opts.mask {
                 apply_mask(&mut d, gate, window_index);
             }
@@ -1913,6 +2011,12 @@ impl Accum {
             let train_rows = d.train_scores[candidate].len()
                 + d.validation_scores[candidate].len();
             dropped += d.dropped;
+            if want_strata {
+                let valid: Vec<usize> = (0..d.test_rows.len())
+                    .filter(|&i| d.test_scores[candidate].get(i).is_some_and(|s| s.is_finite()) && d.test_rows[i].target.is_finite())
+                    .collect();
+                strata_in.add_window(&pev, bucket, opts, &d, &valid, &regime_states);
+            }
             pooled_returns.extend_from_slice(&pev.returns);
             pooled_gross.extend_from_slice(&pev.gross_returns);
             pooled_stats.add_assign(&pev.stats);
@@ -2192,6 +2296,12 @@ impl Accum {
         } else {
             "train (threshold only)".to_string()
         };
+        let (regimes, period_extra) = if want_strata {
+            let r = (opts.regimes.is_some() || !opts.regime_exprs.is_empty()).then(|| strata_in.report(&pooled_returns, opts, pooled_ppy));
+            (r, Some(strata_in.extra))
+        } else {
+            (None, None)
+        };
         Ok(Report {
             expression: windows
                 .first()
@@ -2205,6 +2315,8 @@ impl Accum {
             pooled,
             period_net: pooled_returns,
             period_time: pooled_times,
+            regimes,
+            period_extra,
             cost: opts.cost_decl(spec.cost_bps),
             cost_bps: spec.cost_bps,
             threshold_quantile: spec.threshold_quantile,
@@ -2573,6 +2685,9 @@ struct WindowEval {
     times: Vec<f64>,
     /// Equal-weight mean target per period: the always-long universe, no cost.
     market: Vec<f64>,
+    /// #1175: mean position and entry count of every period.
+    exposure: Vec<f64>,
+    entries: Vec<f64>,
     book: Option<NullBook>,
     stats: Stats,
     first_positions: HashMap<u64, f64>,
@@ -2581,6 +2696,72 @@ struct WindowEval {
     band: Option<BandCheck>,
     hindsight_bound: Option<HindsightBound>,
     controls: Option<crate::baselines::ControlSet>,
+}
+
+/// #1175: the per-period series of the pooled book beside `period_net`.
+#[derive(Clone, Debug, Default)]
+pub struct PeriodExtra {
+    pub gross: Vec<f64>,
+    pub exposure: Vec<f64>,
+    pub entries: Vec<f64>,
+    /// Equal-weight mean target per period: buy-and-hold of the same rows, no cost.
+    pub bh: Vec<f64>,
+    /// Bucket start of every period: the instant a calendar row is tested against.
+    pub bucket_start: Vec<f64>,
+}
+
+/// #1175: the pooled per-period series and the regime expression states, window by window.
+struct StrataIn {
+    extra: PeriodExtra,
+    states: Vec<Vec<bool>>,
+    counts: Vec<crate::regimes::RowCounts>,
+}
+
+impl StrataIn {
+    fn new(exprs: usize) -> Self {
+        StrataIn { extra: PeriodExtra::default(), states: vec![Vec::new(); exprs], counts: vec![Default::default(); exprs] }
+    }
+
+    fn add_window(&mut self, pev: &WindowEval, bucket: f64, opts: &ProtocolOptions, d: &WindowData, valid: &[usize], regime_states: &[Vec<bool>]) {
+        let key = |t: f64| if bucket > 0.0 { (t / bucket).floor() } else { t };
+        self.extra.gross.extend_from_slice(&pev.gross_returns);
+        self.extra.exposure.extend_from_slice(&pev.exposure);
+        self.extra.entries.extend_from_slice(&pev.entries);
+        self.extra.bh.extend_from_slice(&pev.market);
+        self.extra.bucket_start.extend(pev.times.iter().map(|&t| if bucket > 0.0 { key(t) * bucket } else { t }));
+        let period_keys: Vec<f64> = pev.times.iter().map(|&t| key(t)).collect();
+        let row_keys: Vec<f64> = valid.iter().map(|&i| key(d.test_rows[i].time)).collect();
+        for k in 0..opts.regime_exprs.len() {
+            let on: Vec<bool> = valid.iter().map(|&i| regime_states[k][i]).collect();
+            let finite: Vec<bool> = valid.iter().map(|&i| d.test_regime[k][i].is_finite()).collect();
+            let (st, c) = crate::regimes::period_states(&row_keys, &on, &finite, &period_keys);
+            self.states[k].extend(st);
+            self.counts[k].add(c);
+        }
+    }
+
+    fn report(&self, net: &[f64], opts: &ProtocolOptions, ppy: f64) -> crate::regimes::RegimeReport {
+        use crate::regimes::{expr_block, strata, RegimeReport, Series, StatOpts};
+        let o = StatOpts { periods_per_year: ppy, draws: opts.bootstrap_draws, block_len: opts.block_len, seed: opts.seed };
+        let s = Series {
+            net,
+            gross: Some(&self.extra.gross),
+            exposure: Some(&self.extra.exposure),
+            entries: Some(&self.extra.entries),
+            bh: Some(&self.extra.bh),
+        };
+        let mut r = RegimeReport::default();
+        if let Some(cal) = &opts.regimes {
+            let (names, assign) = cal.assign(&self.extra.bucket_start);
+            r.calendar_sha256 = Some(cal.sha256.clone());
+            r.calendar_rows = cal.rows.len();
+            r.calendar = strata(&names, "calendar", &assign, &s, &o);
+        }
+        for (k, e) in opts.regime_exprs.iter().enumerate() {
+            r.exprs.push(expr_block(e, &self.states[k], self.counts[k], &s, &o));
+        }
+        r
+    }
 }
 
 /// #310: what the control ladder needs beyond the test rows.
@@ -2829,6 +3010,7 @@ fn evaluate_window(
     let mut positions = vec![0.0f64; n];
     let mut costs = vec![0.0f64; n];
     let mut net = vec![0.0f64; n];
+    let mut entered = vec![0.0f64; n];
     let mut stats = Stats {
         rows: n,
         ..Default::default()
@@ -2981,6 +3163,7 @@ fn evaluate_window(
             stats.trades += 1;
         }
         if prev == 0.0 && pos > 0.0 {
+            entered[i] = 1.0;
             stats.entries += 1;
         }
         if pos > 0.0 {
@@ -3154,6 +3337,12 @@ fn evaluate_window(
         cross.add(row.time, net[i], positions[i] * row.target);
     }
     let (returns, gross_returns) = cross.series();
+    let mut book_cross = CrossSection::with_bucket(bucket);
+    for &i in &time_order {
+        book_cross.add(rows[valid[i]].time, positions[i], entered[i]);
+    }
+    let exposure: Vec<f64> = book_cross.periods.iter().map(|p| p.net_sum / p.count as f64).collect();
+    let entries: Vec<f64> = book_cross.periods.iter().map(|p| p.gross_sum).collect();
 
     // #310: the control ladder on the same rows, the same cost and the same
     // equal-weight period aggregation. Every control starts flat, like the
@@ -3226,6 +3415,8 @@ fn evaluate_window(
         gross_returns,
         times,
         market,
+        exposure,
+        entries,
         book,
         stats,
         first_positions,
@@ -3834,6 +4025,10 @@ impl Report {
             self.economics.json(),
             self.inference.as_ref().map_or("null".to_string(), |i| i.json())
         ));
+        if let Some(r) = &self.regimes {
+            s.pop();
+            s.push_str(&format!(",\"regimes\":{}}}", r.json()));
+        }
         s
     }
 
@@ -4087,6 +4282,16 @@ impl Report {
             series(&self.period_net),
             series(&self.period_time)
         ));
+        if let Some(x) = &self.period_extra {
+            s.pop();
+            s.push_str(&format!(
+                ",\"period_gross\":[{}],\"period_exposure\":[{}],\"period_entries\":[{}],\"period_bh\":[{}]}}",
+                series(&x.gross),
+                series(&x.exposure),
+                series(&x.entries),
+                series(&x.bh)
+            ));
+        }
         s
     }
 
@@ -4373,6 +4578,10 @@ impl Report {
         if let Some(i) = &self.inference {
             s.push('\n');
             s.push_str(&i.markdown());
+        }
+        if let Some(r) = &self.regimes {
+            s.push('\n');
+            s.push_str(&r.markdown());
         }
         s
     }

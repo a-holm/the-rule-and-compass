@@ -394,6 +394,8 @@ pub enum Event {
         locked_test: Option<LockedRange>,
         binding_sha256: Option<String>,
     },
+    /// #1175: the regime calendar of the locked range, dated after the reads.
+    RegimeDating { calendar_sha256: String, params_sha256: String, locked_test: Option<LockedRange> },
     BaselineRead {
         data_sha256: String,
         report_sha256: String,
@@ -509,6 +511,11 @@ impl Ledger {
                     locked_test: LockedRange::parse(&line),
                     binding_sha256: field_str(&line, "binding_sha256"),
                 },
+                "regime_dating" => Event::RegimeDating {
+                    calendar_sha256: need("calendar_sha256")?,
+                    params_sha256: get("params_sha256"),
+                    locked_test: LockedRange::parse(&line),
+                },
                 "baseline_read" => Event::BaselineRead {
                     data_sha256: need("data_sha256")?,
                     report_sha256: need("report_sha256")?,
@@ -544,6 +551,16 @@ impl Ledger {
         let line = format!("{{\"prev\":\"{}\",{}}}\n", prev, body);
         f.write_all(line.as_bytes()).map_err(io)?;
         f.sync_all().map_err(io)
+    }
+
+    /// #1175: record the calendar that dated the locked range after the reads.
+    pub fn record_regime_dating(&self, calendar_sha256: &str, params_sha256: &str, range: &LockedRange) -> Result<(), String> {
+        self.append(&format!(
+            "\"event\":\"regime_dating\",\"calendar_sha256\":\"{}\",\"params_sha256\":\"{}\",\"test_read\":false,{}",
+            calendar_sha256,
+            params_sha256,
+            range.json()
+        ))
     }
 
     /// Record a development candidate. Returns its id.
@@ -1160,7 +1177,7 @@ pub fn procedure_spec(spec: &crate::walkforward::EvalSpec, o: &crate::walkforwar
 pub const LEDGER_FAULT_EXIT: i32 = 1;
 
 fn protocol_usage() -> &'static str {
-    "rcsr protocol <windows|seal|verify|candidates|selectors> ...
+    "rcsr protocol <windows|seal|verify|candidates|selectors|regimes> ...
 
   windows [--purge-seconds N] [--out FILE]
       Write the UTC windows table (default purge 219600 s: 1 h entry + 60 h label).
@@ -1202,6 +1219,10 @@ fn protocol_usage() -> &'static str {
       (a mismatch exits 3) and stop guarding the protocol default 2025-07-01,2026-07-01
       next to a --lockbox or --locked-test range; the retired range is development
       data from then on and a new locked range that overlaps it exits 2.
+  regimes --data FILE --time-col C --price-col C --symbol-col C (--symbol S | --index equal-weight) --out FILE [options]
+      Write a regime calendar (bull, bear, sideways, not_dated) from daily closes.
+      Locked ranges are never read; --after-read dates the sealed range after the
+      final read. Run `rcsr protocol regimes --help` for the rule and the flags.
   candidates --ledger FILE
       List the candidates without a locked read.
 "
@@ -1216,6 +1237,9 @@ pub fn run(args: &[String]) -> ! {
     if args.is_empty() || args.iter().any(|a| a == "-h" || a == "--help") {
         print!("{}", protocol_usage());
         std::process::exit(if args.is_empty() { 2 } else { 0 });
+    }
+    if args[0] == "regimes" {
+        crate::regime_dating::run(&args[1..]);
     }
     let mut purge = DEFAULT_PURGE_SECONDS;
     let mut out: Option<String> = None;

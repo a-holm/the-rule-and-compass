@@ -51,6 +51,13 @@ Campaign (--wf):\n\
   --baseline-rung <name> use this rung as the SPA benchmark instead\n\
   --cluster-rho <R>      single-linkage threshold on |correlation| (default 0.9); N_eff = clusters\n\
   --pbo-blocks <even n>  CSCV blocks (default 16)\n\
+  --regimes <calendar>   per-stratum metrics of every series in its member entry. Calendar rows label,start,end\n\
+                         (UTC half-open, no overlap, any label set; `rcsr protocol regimes` writes one) are tested\n\
+                         against the period stamps; periods outside every row are `undated`. Each stratum reports\n\
+                         periods, years, net, Sharpe, Sortino, drawdown and the block-bootstrap interval of the mean\n\
+                         (--draws, --seed, --block-len). With pooled.period_gross, period_exposure, period_entries and\n\
+                         period_bh in the reports (walkforward --period-series) it also reports net at twice the cost,\n\
+                         exposure, entries, buy-and-hold and the alpha over exposure-matched buy-and-hold\n\
 \n\
 Comparison (--compare): d_t = A_t - B_t, with X_t the mean of the side's seeds\n\
   --bootstrap <kind>     stationary (default) | circular\n\
@@ -101,6 +108,11 @@ struct Wf {
     label: String,
     path: String,
     net: Vec<f64>,
+    /// #1175: the per-period series a walkforward report carries with `--period-series`.
+    gross: Option<Vec<f64>>,
+    exposure: Option<Vec<f64>>,
+    entries: Option<Vec<f64>>,
+    bh: Option<Vec<f64>>,
     time: Vec<f64>,
     ppy: f64,
     guards: Vec<Json>,
@@ -160,6 +172,14 @@ fn load_wf(path: &str) -> Res<Wf> {
             path
         ));
     }
+    let optional = |key: &str| -> Res<Option<Vec<f64>>> {
+        let v = at(&j, &["pooled", key]).is_some().then(|| series(&j, &["pooled", key], path)).transpose()?;
+        match v {
+            Some(x) if x.len() != net.len() => usage_err(format!("field 'pooled.{}' has {} values but 'pooled.period_net' has {} in {}", key, x.len(), net.len(), path)),
+            v => Ok(v),
+        }
+    };
+    let (gross, exposure, entry_series, bh) = (optional("period_gross")?, optional("period_exposure")?, optional("period_entries")?, optional("period_bh")?);
     let Some(ppy) = at(&j, &["annualization", "periods_per_year"]).and_then(Json::as_f64) else {
         return usage_err(format!("field 'annualization.periods_per_year' is missing in {}", path));
     };
@@ -177,6 +197,10 @@ fn load_wf(path: &str) -> Res<Wf> {
         path: path.to_string(),
         default_block: inference::auto_block_len(net.len(), horizon_periods, hold),
         net,
+        gross,
+        exposure,
+        entries: entry_series,
+        bh,
         time,
         ppy,
         guards,
@@ -272,6 +296,7 @@ struct Options {
     seed: u32,
     out: Option<String>,
     threshold_arms: bool,
+    regimes: Option<String>,
 }
 
 fn parse_args(args: &[String]) -> Res<Options> {
@@ -290,6 +315,7 @@ fn parse_args(args: &[String]) -> Res<Options> {
         seed: DEFAULT_SEED,
         out: None,
         threshold_arms: false,
+        regimes: None,
     };
     let mut given: Vec<&str> = Vec::new();
     let mut i = 0;
@@ -334,6 +360,7 @@ fn parse_args(args: &[String]) -> Res<Options> {
             "--seed" => o.seed = num(a, &val(&mut i)?)?,
             "--out" => o.out = Some(val(&mut i)?),
             "--threshold-arms" => o.threshold_arms = true,
+            "--regimes" => o.regimes = Some(val(&mut i)?),
             other => return usage_err(format!("unknown argument '{}'", other)),
         }
         given.push(a);
@@ -346,7 +373,7 @@ fn parse_args(args: &[String]) -> Res<Options> {
         return usage_err("give --wf <reports...> or --compare <A> <B>");
     }
     let (campaign_only, compare_only): (&[&str], &[&str]) = (
-        &["--baseline", "--baseline-rung", "--cluster-rho", "--pbo-blocks"],
+        &["--baseline", "--baseline-rung", "--cluster-rho", "--pbo-blocks", "--regimes"],
         &["--bootstrap", "--level", "--s-seed"],
     );
     let wrong = if o.compare.is_some() { campaign_only } else { compare_only };
@@ -609,18 +636,34 @@ fn campaign(o: &Options) -> Res<String> {
             constant_books
         ));
     }
+    let calendar = match o.regimes.as_deref() {
+        None => None,
+        Some(path) => {
+            let text = std::fs::read_to_string(path).or_else(|e| input_err(format!("{}: {}", path, e)))?;
+            Some(crate::regimes::Calendar::parse(&text).or_else(|e| usage_err(format!("--regimes {}: {}", path, e)))?)
+        }
+    };
+    let strata_of = |w: &Wf| -> String {
+        use crate::regimes::{strata, strata_json, Series, StatOpts};
+        let Some(cal) = &calendar else { return String::new() };
+        let (names, assign) = cal.assign(&w.time);
+        let s = Series { net: &w.net, gross: w.gross.as_deref(), exposure: w.exposure.as_deref(), entries: w.entries.as_deref(), bh: w.bh.as_deref() };
+        let so = StatOpts { periods_per_year: w.ppy, draws: o.draws, block_len: Some(block), seed: o.seed };
+        format!(",\"regimes\":{}", strata_json(&strata(&names, "calendar", &assign, &s, &so)))
+    };
     let members: Vec<String> = wfs
         .iter()
         .enumerate()
         .map(|(i, w)| {
             let v = varying.iter().position(|&x| x == distinct[book_of[i]]);
             format!(
-                "{{\"label\":{},\"book\":{},\"cluster\":{},\"sharpe_annual\":{}{}}}",
+                "{{\"label\":{},\"book\":{},\"cluster\":{},\"sharpe_annual\":{}{}{}}}",
                 jstr(&w.label),
                 book_of[i],
                 v.map_or("null".to_string(), |p| cluster_of[p].to_string()),
                 jnum(inference::sharpe_per_period(&w.net) * ann),
-                rule_field(o.threshold_arms, &w.rule)
+                rule_field(o.threshold_arms, &w.rule),
+                strata_of(w)
             )
         })
         .collect();
@@ -647,7 +690,16 @@ fn campaign(o: &Options) -> Res<String> {
         jnum(span_years),
         notes.iter().map(|s| jstr(s)).collect::<Vec<_>>().join(","),
         members.join(","),
-        if o.threshold_arms { ",\"threshold_arms\":true" } else { "" }
+        format!(
+            "{}{}",
+            if o.threshold_arms { ",\"threshold_arms\":true" } else { "" },
+            calendar.as_ref().map_or(String::new(), |c| format!(
+                ",\"regimes_calendar\":{{\"sha256\":{},\"rows\":{},\"labels\":[{}]}}",
+                jstr(&c.sha256),
+                c.rows.len(),
+                c.labels().iter().map(|l| jstr(l)).collect::<Vec<_>>().join(",")
+            ))
+        )
     ))
 }
 
