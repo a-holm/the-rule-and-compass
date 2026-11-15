@@ -653,6 +653,8 @@ A walk-forward report scores one out-of-sample path; a regime that lies in the f
 
 ## 4. What `rcsr` reports today
 
+`rcsr trials --regimes calendar.csv` (#1175) adds a `regimes` array to every member and a top-level `regimes_calendar` (sha256, rows, labels). Each stratum holds periods, net mean and Sharpe at the report cost and at twice it, exposure, entries and alpha against the cost-free equal-weight series (no risk-free rate). Members need `pooled.period_gross`, `period_exposure`, `period_entries` and `period_bh`, written by `rcsr walkforward --period-series`. Strata are descriptive and add no trials. The flag is refused with `--compare`. Without it the output is unchanged.
+
 ### The test lockbox and the validation slice
 
 The holdout is a **lockbox**: a block you may look at to report an honest error,
