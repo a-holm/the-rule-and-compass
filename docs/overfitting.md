@@ -637,6 +637,7 @@ rcsr trials --wf wide/reports/wf-*.json --baseline ladder.json \
 * SPA (Hansen consistent p) of all distinct varying series against the best baseline of cash, buy-and-hold, constant long/flat, best single feature and any `trend*` rung, by mean. The baseline series come from `rcsr ladder --emit-series` (`series.period_time`, `series.period_net` per rung) and must sit on the same period grid. `--baseline-rung` picks one rung.
 * PBO by CSCV over the same series (`--pbo-blocks`, default 16). With fewer than 2 distinct varying series, SPA and PBO are skipped with a reason.
 * MinBTL: `(E[max_N] / SR)^2` years at the clustered `N_eff` for the best finalist's annual Sharpe, against the span of the series (`min_btl_years`, `span_years`).
+* `--members all` (#1176) reads every `members[]` row of a `walkforward --front --all-members` report as one series, named `<report>#<archive_rank>`, from `members[].series` (`period_net`, `period_time` and the optional `--period-series` fields); the guarded fields come from the report. The default `--members selected` reads `pooled.period_net`, one series per report. A front of `k` members is `k` books on the same test rows, so their series count, clusters and DSR deflate the choice among them; price the members with `--period-grid target` so they share one grid (members on different grids exit 2 naming `series.period_time`). A report without `members` exits 2, and `--members` with `--compare` exits 2.
 
 #### One period grid across formulas (`walkforward --period-grid target`, #1199)
 
