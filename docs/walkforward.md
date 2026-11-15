@@ -774,6 +774,8 @@ Report (`rcsr-switch/1`, `--json`, or text without it; `--out` writes the JSON t
 
 Edge cases: a gate with fewer than 2 distinct non-NaN values on the training rows exits 2; a cut value that is not finite (a gate whose lowest value above `-inf` is `-f64::MAX`) prints the expression as null.
 
+`rcsr compose` (#1181) builds such composites from whole pools and a pre-registered gate menu, prunes pairs with the k-switch bound, chooses one on the validation rows and writes a run.json that `--from-run` prices; see [`compose.md`](compose.md).
+
 ## CPCV
 
 Combinatorial purged cross-validation (López de Prado 2018, *Advances in Financial Machine Learning*, ch. 12) cuts the development span into N calendar groups and tests every choice of k of them. There are C(N, k) splits, every group is tested in C(N-1, k-1) of them, and the test results join into phi = k C(N, k) / N = C(N-1, k-1) complete backtest paths, each an out-of-sample book over the whole span. Walk-forward never tests the first groups; CPCV tests every group, and the path distribution replaces one lucky or unlucky path.
