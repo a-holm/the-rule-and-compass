@@ -2209,3 +2209,424 @@ fn missing_score_rule_is_shared_by_search_and_walkforward() {
     let book = FitnessBook::new(&s, &spec(), 900.0).unwrap();
     assert_eq!(book.regret(&pred), f64::INFINITY, "a non-finite prediction is refused by the fitness");
 }
+
+// ---- #1179: the cross-sectional excess (`--pnl-excess xs-mean`) ----
+
+use trading::PnlExcess;
+
+fn xs_spec() -> TradingSpec {
+    TradingSpec { pnl_excess: PnlExcess::XsMean, ..spec() }
+}
+
+/// `groups` symbols on `steps` shared timestamps 900 s apart, in canonical
+/// (group, time) order.
+fn panel(groups: usize, steps: usize, ret: impl Fn(usize, usize) -> f64) -> TradingSlice {
+    let mut rows = TradingRows::default();
+    let mut out = Vec::new();
+    for g in 0..groups {
+        for t in 0..steps {
+            rows.group.push(g as u64);
+            rows.time.push(1.6e9 + 900.0 * t as f64);
+            out.push(ret(g, t));
+        }
+    }
+    TradingSlice { rows, ret: out }
+}
+
+/// The mean of the finite returns of the rows `admit` takes at each row's
+/// timestamp, by a scan over every row.
+fn hand_means(s: &TradingSlice, admit: impl Fn(usize) -> bool) -> Vec<f64> {
+    let n = s.ret.len();
+    (0..n)
+        .map(|i| {
+            let (mut sum, mut count) = (0.0, 0usize);
+            for j in 0..n {
+                if s.rows.time[j] == s.rows.time[i] && s.ret[j].is_finite() && admit(j) {
+                    sum += s.ret[j];
+                    count += 1;
+                }
+            }
+            if count == 0 { f64::NAN } else { sum / count as f64 }
+        })
+        .collect()
+}
+
+const DYADIC: f64 = 1.0 / 1024.0;
+
+/// A rising market path; every value is a multiple of 2^-12, so sums and means
+/// over four symbols are exact.
+fn common(t: usize) -> f64 {
+    ((t * 7) % 11) as f64 * DYADIC / 4.0
+}
+
+/// Four symbols' dispersion around their timestamp mean, multiples of 2^-12.
+fn spread(g: usize, t: usize) -> f64 {
+    let base = |g: usize| ((g * 5 + t * 3 + (g * t) % 4) % 9) as f64;
+    let mean = (0..4).map(base).sum::<f64>() / 4.0;
+    (base(g) - mean) * DYADIC
+}
+
+#[test]
+fn xs_mean_removes_common_drift() {
+    // The same return path for every symbol leaves no relative return: no
+    // profitable path, exit 2 at the CLI.
+    let same = panel(4, 64, |_, t| common(t));
+    assert!(FitnessBook::new(&same, &xs_spec(), 900.0).unwrap_err().contains("no profitable"));
+    // The common path over a dispersion is the book of the dispersion alone, bit for bit.
+    let drift = panel(4, 64, |g, t| common(t) + spread(g, t));
+    let book = FitnessBook::new(&drift, &xs_spec(), 900.0).unwrap();
+    let alone = FitnessBook::new(&panel(4, 64, spread), &xs_spec(), 900.0).unwrap();
+    let bits = |b: &FitnessBook| b.excess().iter().map(|e| e.to_bits()).collect::<Vec<_>>();
+    assert_eq!(bits(&book), bits(&alone));
+    assert_eq!(book.bound().to_bits(), alone.bound().to_bits());
+    assert_eq!(book.hash(), alone.hash());
+    let n = drift.ret.len();
+    assert_eq!(book.regret(&vec![-1.0; n]).to_bits(), 1.0f64.to_bits(), "all-flat is exactly 1");
+    // A market-timing rule holds every symbol or none at a timestamp: its gross
+    // is exactly 0, so no such tree scores below 1.
+    for seed in 0..32usize {
+        let pred: Vec<f64> = (0..n).map(|i| if ((i % 64) * 13 + seed * 7) % 5 < 2 + seed % 3 { 1.0 } else { -1.0 }).collect();
+        assert_eq!(book.totals(&pred).gross, 0.0, "seed {seed}");
+        assert!(book.regret(&pred) >= 1.0, "seed {seed}: {}", book.regret(&pred));
+    }
+    // Without the flag the always-long book earns the drift; with it, it pays its costs.
+    let long = vec![1.0; n];
+    assert!(FitnessBook::new(&drift, &spec(), 900.0).unwrap().regret(&long) < 1.0);
+    assert!(book.regret(&long) > 1.0);
+    assert_ne!(book.hash(), FitnessBook::new(&drift, &spec(), 900.0).unwrap().hash());
+}
+
+#[test]
+fn xs_mean_rewards_relative_edge() {
+    // Symbol 0 beats the cross-section by `a` on every row of a rising market.
+    let a = 2.0 * DYADIC;
+    let s = panel(4, 48, |g, t| common(t) + if g == 0 { a } else { 0.0 });
+    let book = FitnessBook::new(&s, &xs_spec(), 900.0).unwrap();
+    let side = spec().per_side_bps() * 1e-4;
+    for (i, &e) in book.excess().iter().enumerate() {
+        assert_eq!(e, if i < 48 { 0.75 * a } else { -0.25 * a }, "row {i}");
+    }
+    // The bound holds symbol 0 on all 48 rows and every other symbol flat.
+    let bound = 36.0 * a - 2.0 * side;
+    assert!((book.bound() - bound).abs() <= 1e-12, "bound {} vs {bound}", book.bound());
+    let n = s.ret.len();
+    let rule = |steps: usize| -> Vec<f64> { (0..n).map(|i| if i < steps { 1.0 } else { -1.0 }).collect() };
+    let full = book.regret(&rule(48));
+    assert!(full.abs() <= 1e-12, "long symbol 0 throughout reaches the bound: {full}");
+    let half = book.regret(&rule(24));
+    let hand = 18.0 * a / bound;
+    assert!(half < 1.0 && (half - hand).abs() <= 1e-12, "long symbol 0 for 24 rows: {half} vs {hand}");
+    let long = book.regret(&vec![1.0; n]);
+    assert!((long - (1.0 + 8.0 * side / bound)).abs() <= 1e-12, "long every symbol: {long}");
+}
+
+#[test]
+fn xs_mean_bound_matches_brute_force() {
+    // Rows (group, time): (0, t0), (0, t1), (1, t0), (1, t1).
+    let base = TradingSlice {
+        rows: TradingRows { time: vec![1.6e9, 1.6e9 + 900.0, 1.6e9, 1.6e9 + 900.0], group: vec![0, 0, 1, 1], funding: Vec::new() },
+        ret: vec![0.010, -0.004, -0.002, 0.006],
+    };
+    let mut funded = base.clone();
+    funded.rows.funding = vec![0.0001, 0.0002, 0.0003, 0.0004];
+    let side = spec().per_side_bps() * 1e-4;
+    for s in [&base, &funded] {
+        let f = |i: usize| if s.rows.funding.is_empty() { 0.0 } else { s.rows.funding[i] };
+        let m = [(s.ret[0] + s.ret[2]) / 2.0, (s.ret[1] + s.ret[3]) / 2.0];
+        let e: Vec<f64> = (0..4).map(|i| (s.ret[i] - m[i % 2]) - f(i)).collect();
+        // The best net over all 16 paths; each run starts flat and pays its exit.
+        let best = |runs: &[&[usize]]| -> f64 {
+            (0..16u32)
+                .map(|bits| {
+                    let p = |i: usize| ((bits >> i) & 1) as f64;
+                    runs.iter()
+                        .map(|run| {
+                            let (mut prev, mut net) = (0.0, 0.0);
+                            for &i in run.iter() {
+                                net += p(i) * e[i] - side * (p(i) - prev).abs();
+                                prev = p(i);
+                            }
+                            net - side * prev
+                        })
+                        .sum::<f64>()
+                })
+                .fold(f64::NEG_INFINITY, f64::max)
+        };
+        let want = best(&[&[0, 1], &[2, 3]]);
+        assert!(want > 0.0);
+        let book = FitnessBook::new(s, &xs_spec(), 900.0).unwrap();
+        assert!((book.bound() - want).abs() <= 1e-15, "bound {} vs brute force {want}", book.bound());
+        let blocked = FitnessBook::with_blocks(s, &xs_spec(), 900.0, 2, 1.0).unwrap();
+        let want_blocks = [best(&[&[0], &[2]]), best(&[&[1], &[3]])];
+        assert_eq!(blocked.block_bounds().len(), 2);
+        for (b, w) in want_blocks.iter().enumerate() {
+            assert!((blocked.block_bounds()[b] - w).abs() <= 1e-15, "block {b}: {} vs {w}", blocked.block_bounds()[b]);
+        }
+    }
+}
+
+/// The search books keep the absolute net; `xs_excess_net` is the net of the same
+/// book on the returns minus their timestamp mean, under both missing-score rules
+/// and with interval segments, and it equals the fitness net on training rows.
+#[test]
+fn xs_excess_net_is_the_net_over_the_timestamp_mean() {
+    use rcsr::trading::MissingScore;
+    let mut s = slice(&[150, 150, 120, 1]);
+    s.rows.funding = (0..s.ret.len()).map(|i| 0.0001 * frac(i as f64 * 0.31)).collect();
+    for i in [5, 151, 152, 400] {
+        s.ret[i] = f64::NAN;
+    }
+    let mut pred = prediction(&s);
+    for i in [7, 8, 9, 200, 301] {
+        pred[i] = f64::NAN;
+    }
+    let m = hand_means(&s, |_| true);
+    let demeaned: Vec<f64> = s.ret.iter().zip(&m).map(|(r, m)| r - m).collect();
+    let starts = [1.6e9 + 900.0 * 60.0, 1.6e9 + 900.0 * 100.0];
+    for rule in [MissingScore::Flat, MissingScore::Hold] {
+        for segments in [&[][..], &starts[..]] {
+            let sp = TradingSpec { missing_score: rule, segment_starts: segments.to_vec(), ..spec() };
+            let plain = trading::evaluate(&pred, &s.ret, &s.rows, &sp).unwrap();
+            let xs = trading::evaluate(&pred, &s.ret, &s.rows, &TradingSpec { pnl_excess: PnlExcess::XsMean, ..sp.clone() }).unwrap();
+            assert_eq!(plain.xs_excess_net, None);
+            assert_eq!(xs.net_pnl.to_bits(), plain.net_pnl.to_bits(), "{rule:?}: the reported net stays absolute");
+            assert_eq!(xs.json().replace(&format!(",\"xs_excess_net\":{}", rcsr::devlog::num(xs.xs_excess_net.unwrap())), ""), plain.json());
+            let want = trading::evaluate(&pred, &demeaned, &s.rows, &sp).unwrap().net_pnl;
+            let got = xs.xs_excess_net.unwrap();
+            assert!((got - want).abs() <= 1e-12, "{rule:?} {segments:?}: {got} vs {want}");
+            assert!((got - xs.net_pnl).abs() > 1e-6, "{rule:?}: the timestamp mean moves the net");
+        }
+    }
+    let t = slice(&[150, 150, 120, 1]);
+    let pred = prediction(&t);
+    for segments in [&[][..], &starts[..]] {
+        let book = FitnessBook::with_segments(&t, &xs_spec(), 900.0, 1, 1.0, segments, None).unwrap();
+        let stats = trading::evaluate(&pred, &t.ret, &t.rows, &TradingSpec { segment_starts: segments.to_vec(), ..xs_spec() }).unwrap();
+        let net = book.net_of(&book.totals(&pred));
+        assert!((net - stats.xs_excess_net.unwrap()).abs() <= 1e-12, "{segments:?}: fitness net {net} vs {:?}", stats.xs_excess_net);
+    }
+}
+
+#[test]
+fn xs_mean_composes_with_the_mask_and_interval_segments() {
+    let s = slice(&[300, 280, 260]);
+    let pred = prediction(&s);
+    let n = s.ret.len();
+    let plain = FitnessBook::new(&s, &xs_spec(), 900.0).unwrap();
+    let all_on = masked(&s, &xs_spec(), 1, &vec![true; n]).unwrap();
+    assert_eq!(plain.hash(), all_on.hash());
+    assert_eq!(plain.regret(&pred).to_bits(), all_on.regret(&pred).to_bits());
+    // Under a mask the timestamp mean reads the rows with the gate on; rows outside earn nothing.
+    let on: Vec<bool> = (0..n).map(|i| (i / 37 + s.rows.group[i] as usize) % 3 != 0).collect();
+    let book = masked(&s, &xs_spec(), 1, &on).unwrap();
+    let m = hand_means(&s, |j| on[j]);
+    for i in 0..n {
+        let want = if on[i] { s.ret[i] - m[i] } else { 0.0 };
+        assert!((book.excess()[i] - want).abs() <= 1e-15, "row {i}: {} vs {want}", book.excess()[i]);
+    }
+    assert_ne!(book.hash(), masked(&s, &spec(), 1, &on).unwrap().hash());
+    // Interval segments cut by time, so the timestamp means stay and the bound
+    // and the net are the sums over the separately built segments.
+    let cut = 1.6e9 + 900.0 * 140.0;
+    let seg = FitnessBook::with_segments(&s, &xs_spec(), 900.0, 1, 1.0, &[1.6e9, cut], None).unwrap();
+    let (mut bound, mut net) = (0.0, 0.0);
+    for before in [true, false] {
+        let keep: Vec<usize> = (0..n).filter(|&i| (s.rows.time[i] < cut) == before).collect();
+        let part = TradingSlice {
+            rows: TradingRows {
+                time: keep.iter().map(|&i| s.rows.time[i]).collect(),
+                group: keep.iter().map(|&i| s.rows.group[i]).collect(),
+                funding: Vec::new(),
+            },
+            ret: keep.iter().map(|&i| s.ret[i]).collect(),
+        };
+        let b = FitnessBook::new(&part, &xs_spec(), 900.0).unwrap();
+        let p: Vec<f64> = keep.iter().map(|&i| pred[i]).collect();
+        bound += b.bound();
+        net += b.net_of(&b.totals(&p));
+    }
+    assert!((seg.bound() - bound).abs() <= 1e-12, "bound {} vs {bound}", seg.bound());
+    assert!((seg.net_of(&seg.totals(&pred)) - net).abs() <= 1e-12);
+}
+
+// -- CLI --
+
+const PANEL_SYMBOLS: usize = 4;
+const PANEL_STEPS: usize = 400;
+
+/// Four symbols on 400 shared timestamps, rows in time order. `r = c_t + 0.01 x1
+/// + noise`: `c_t` is a market path that rises, then falls; `x2` is a market
+/// feature (`c_t` scaled, the same for every symbol at a timestamp); `x1` is a
+/// symbol feature.
+fn write_panel_csv(dir: &std::path::Path) -> String {
+    let mut text = String::from("t,sym,x1,x2,r,y\n");
+    for t in 0..PANEL_STEPS {
+        let c = if t < PANEL_STEPS / 2 { 0.003 } else { -0.003 } * (0.5 + frac(t as f64 * 0.414_213_562_373_095));
+        for k in 0..PANEL_SYMBOLS {
+            let f = (t * PANEL_SYMBOLS + k) as f64;
+            let x1 = frac(f * 0.618_033_988_749_894_9) - 0.5;
+            let noise = frac(f * 0.324_717_957_244_746) - 0.5;
+            let r = c + 0.01 * x1 + 0.0005 * noise;
+            text.push_str(&format!("{},S{},{},{},{},{}\n", T0 + 900 * t as i64, k, x1, c / 0.003, r, r));
+        }
+    }
+    let path = dir.join("panel.csv");
+    std::fs::write(&path, text).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+/// The spec of `write_spec` with the entry at the label time, so the test block
+/// starts at the split.
+fn write_panel_spec(dir: &std::path::Path) -> String {
+    let text = std::fs::read_to_string(write_spec(dir)).unwrap().replace("\"entry_offset_seconds\":900", "\"entry_offset_seconds\":0");
+    let path = dir.join("panel-spec.json");
+    std::fs::write(&path, text).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+fn run_panel(data: &str, spec: &str, extra: &[&str]) -> Output {
+    run(data, spec, &[&["--group-by", "sym"][..], extra].concat())
+}
+
+#[test]
+fn xs_mean_reports_absolute_net() {
+    let (_scratch, dir) = scratch();
+    let data = write_panel_csv(&dir);
+    let spec = write_panel_spec(&dir);
+    let out = run_panel(&data, &spec, &["--fitness", "pnl", "--pnl-excess", "xs-mean"]);
+    let j = json(&out);
+    assert_eq!(at(&j, &["search_fitness", "excess"]).as_str(), Some("xs_mean"));
+    assert_eq!(at(&j, &["objective", "spec", "pnl_excess"]).as_str(), Some("xs_mean"));
+    for slot in ["validation", "test"] {
+        let b = at(&j, &["objective", slot]);
+        let (net, xs) = (num(b, &["net_pnl"]), num(b, &["xs_excess_net"]));
+        assert!(net.is_finite() && xs.is_finite() && net != xs, "{slot}: net {net} xs {xs}");
+    }
+    let run_path = dir.join("run.json");
+    std::fs::write(&run_path, &out.stdout).unwrap();
+    let run = run_path.to_string_lossy().into_owned();
+    let step = |k: usize| (T0 + 900 * k as i64).to_string();
+    let w = format!("v,{},{},{},{}", step(0), step(299), step(300), step(PANEL_STEPS));
+    let wf_path = dir.join("wf.json").to_string_lossy().into_owned();
+    let wf = rcsr_cmd::rcsr()
+        .args(["walkforward", "--data", &data, "--time", "t", "--group-by", "sym", "--from-run", &run, "--window", &w, "--out", &wf_path])
+        .output()
+        .unwrap();
+    assert_eq!(code(&wf), 0, "{}", stderr(&wf));
+    let wf_json = Json::parse(std::fs::read_to_string(&wf_path).unwrap().trim()).unwrap();
+    let m = match at(&wf_json, &["windows"]) {
+        Json::Arr(a) => at(&a[0], &["metrics"]).clone(),
+        _ => panic!("windows is not an array"),
+    };
+    let test = at(&j, &["objective", "test"]);
+    for key in ["rows", "trades", "entries", "total_cost", "exposure"] {
+        assert!((num(&m, &[key]) - num(test, &[key])).abs() <= 1e-12, "{key}: walkforward {} objective {}", num(&m, &[key]), num(test, &[key]));
+    }
+    let wf_net = num(&m, &["mean_return"]) * num(&m, &["periods"]) * PANEL_SYMBOLS as f64;
+    assert!((wf_net - num(test, &["net_pnl"])).abs() <= 1e-12, "walkforward net {wf_net} objective {}", num(test, &["net_pnl"]));
+}
+
+#[test]
+fn explicit_none_is_the_default_run() {
+    let (_scratch, dir) = scratch();
+    let data = write_panel_csv(&dir);
+    let spec = write_panel_spec(&dir);
+    let plain = run_panel(&data, &spec, &["--fitness", "pnl"]);
+    let none = run_panel(&data, &spec, &["--fitness", "pnl", "--pnl-excess", "none"]);
+    let (a, b) = (json(&plain), json(&none));
+    assert_eq!(members(&a), members(&b));
+    assert_eq!(at(&a, &["search_fitness"]).get("book_hash"), at(&b, &["search_fitness"]).get("book_hash"));
+    assert_eq!(without_digits(&plain), without_digits(&none));
+    assert!(at(&b, &["search_fitness"]).get("excess").is_none());
+    assert!(at(&b, &["objective", "spec"]).get("pnl_excess").is_none());
+    assert!(at(&b, &["objective", "test"]).get("xs_excess_net").is_none());
+    let (la, lb) = (dir.join("plain.jsonl"), dir.join("none.jsonl"));
+    let logged = |log: &std::path::Path, extra: &[&str]| run_logged(&data, &spec, log, &[&["--group-by", "sym"][..], extra].concat());
+    assert_eq!(code(&logged(&la, &["--fitness", "pnl"])), 0);
+    assert_eq!(code(&logged(&lb, &["--fitness", "pnl", "--pnl-excess", "none"])), 0);
+    assert_eq!(archive_hash(&la), archive_hash(&lb));
+    let xs = json(&run_panel(&data, &spec, &["--fitness", "pnl", "--pnl-excess", "xs-mean"]));
+    assert_ne!(at(&a, &["search_fitness"]).get("book_hash"), at(&xs, &["search_fitness"]).get("book_hash"));
+}
+
+#[test]
+fn xs_mean_flags_name_their_reason() {
+    let (_scratch, dir) = scratch();
+    let data = write_panel_csv(&dir);
+    let spec = write_panel_spec(&dir);
+    usage_error(&run_panel(&data, &spec, &["--pnl-excess", "xs-mean"]), "--pnl-excess needs --fitness pnl");
+    usage_error(&run_panel(&data, &spec, &["--fitness", "pnl", "--pnl-excess", "beta"]), "--pnl-excess must be none or xs-mean");
+    usage_error(
+        &run_panel(&data, &spec, &["--fitness", "pnl", "--pnl-excess", "xs-mean", "--cash-return", "0.0001"]),
+        "--pnl-excess xs-mean needs --cash-return 0",
+    );
+    // One symbol: every timestamp has one row, so no row has a relative return.
+    let single = write_csv(&dir, 900);
+    usage_error(&run(&single, &write_spec(&dir), &["--fitness", "pnl", "--pnl-excess", "xs-mean"]), "no profitable long/flat path");
+    for sub in ["switch", "compose"] {
+        let o = rcsr_cmd::rcsr().args([sub, "--pnl-excess", "xs-mean"]).output().unwrap();
+        usage_error(&o, "--pnl-excess");
+    }
+}
+
+#[test]
+fn resume_needs_the_same_excess() {
+    let (_scratch, dir) = scratch();
+    let data = write_panel_csv(&dir);
+    let spec = write_panel_spec(&dir);
+    let cp = dir.join("xs.rcsr").to_string_lossy().into_owned();
+    let saved = ["--fitness", "pnl", "--pnl-excess", "xs-mean"];
+    let first = run_panel(&data, &spec, &[&saved[..], &["--generations", "10", "--save", &cp]].concat());
+    assert_eq!(code(&first), 0, "{}", stderr(&first));
+    let straight = json(&run_panel(&data, &spec, &[&saved[..], &["--generations", "20"]].concat()));
+    let resumed = json(&run_panel(&data, &spec, &[&saved[..], &["--generations", "20", "--resume", &cp]].concat()));
+    assert_eq!(members(&straight), members(&resumed));
+    let resume = |extra: &[&str]| run_panel(&data, &spec, &[&["--fitness", "pnl", "--generations", "20", "--resume", &cp][..], extra].concat());
+    usage_error(&resume(&[]), "fitness");
+    usage_error(&resume(&["--pnl-excess", "none"]), "fitness");
+}
+
+/// An interval split (two training segments, a validation and a test interval)
+/// with a regime mask: the xs-mean fitness, the masked books and `xs_excess_net`.
+#[test]
+fn xs_mean_runs_with_a_split_table_and_a_mask() {
+    let (_scratch, dir) = scratch();
+    let data = write_panel_csv(&dir);
+    let spec = write_panel_spec(&dir);
+    let step = |k: i64| T0 + 900 * k;
+    let table = dir.join("splits.csv");
+    std::fs::write(
+        &table,
+        format!(
+            "split_id,role,start,end\na,train,{},{}\na,validation,{},{}\na,train,{},{}\na,test,{},{}\n",
+            step(0),
+            step(150),
+            step(150),
+            step(200),
+            step(200),
+            step(300),
+            step(300),
+            step(400)
+        ),
+    )
+    .unwrap();
+    let table = table.to_string_lossy().into_owned();
+    let out = rcsr_cmd::rcsr()
+        .args([
+            "--data", &data, "--target", "y", "--vars", "x1,x2", "--time", "t", "--group-by", "sym", "--split-table", &table,
+            "--split-id", "a", "--target-spec", &spec, "--cpu", "--no-dev-log", "--seed", "3", "--generations", "10", "--pop",
+            "32", "--metric", "squared", "--json", "--quiet", "--objective", "pnl", "--cost-bps", "5", "--fitness", "pnl",
+            "--pnl-excess", "xs-mean", "--pnl-mask", "x1 + 0.3",
+        ])
+        .output()
+        .unwrap();
+    let j = json(&out);
+    assert_eq!(at(&j, &["split", "mode"]).as_str(), Some("temporal-intervals"));
+    assert_eq!(at(&j, &["search_fitness", "excess"]).as_str(), Some("xs_mean"));
+    assert!(num(&j, &["search_fitness", "mask", "off_rows"]) > 0.0);
+    for slot in ["validation", "test"] {
+        let b = at(&j, &["objective", slot]);
+        assert!(num(b, &["xs_excess_net"]).is_finite(), "{slot}");
+        assert!(num(b, &["mask", "on_share"]) < 1.0, "{slot}");
+    }
+}

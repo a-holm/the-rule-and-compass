@@ -153,6 +153,57 @@ impl MissingScore {
     }
 }
 
+/// #1179: the benchmark the `--fitness pnl` book subtracts from every return.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PnlExcess {
+    /// `e = r - funding - cash_return`.
+    #[default]
+    None,
+    /// `e = (r - m_t) - funding`, with `m_t` the equal-weight mean return of
+    /// the book's rows at the row's timestamp ([`timestamp_means`]). Needs
+    /// `cash_return` 0.
+    XsMean,
+}
+
+impl PnlExcess {
+    pub fn parse(s: &str) -> Result<PnlExcess, String> {
+        match s.trim() {
+            "none" => Ok(PnlExcess::None),
+            "xs-mean" | "xs_mean" => Ok(PnlExcess::XsMean),
+            other => Err(format!("--pnl-excess must be none or xs-mean, got '{}'", other)),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            PnlExcess::None => "none",
+            PnlExcess::XsMean => "xs_mean",
+        }
+    }
+}
+
+/// #1179: per row, the equal-weight mean of the returns of the rows `admit`
+/// accepts at the same timestamp, summed in row order. A row whose timestamp
+/// has no admitted row, or whose time is not finite, gets `NaN`.
+pub fn timestamp_means(ret: &[f64], time: &[f64], admit: impl Fn(usize) -> bool) -> Vec<f64> {
+    let n = ret.len().min(time.len());
+    let key = |i: usize| (time[i] + 0.0).to_bits();
+    let mut sums: std::collections::HashMap<u64, (f64, u64)> = std::collections::HashMap::new();
+    for i in 0..n {
+        if time[i].is_finite() && ret[i].is_finite() && admit(i) {
+            let s = sums.entry(key(i)).or_insert((0.0, 0));
+            s.0 += ret[i];
+            s.1 += 1;
+        }
+    }
+    (0..n)
+        .map(|i| match sums.get(&key(i)) {
+            Some(&(sum, count)) if time[i].is_finite() => sum / count as f64,
+            _ => f64::NAN,
+        })
+        .collect()
+}
+
 /// #1203: the runs of rows in book order (each book's rows contiguous and in
 /// time order, every row with a finite return) under a [`MissingScore`] rule.
 #[derive(Clone, Debug, PartialEq)]
@@ -485,6 +536,9 @@ pub struct TradingSpec {
     /// #1203: a row with a finite return and no finite score ends its run
     /// (`Flat`) or keeps the position (`Hold`).
     pub missing_score: MissingScore,
+    /// #1179: the fitness excess; the books also report `xs_excess_net` under
+    /// [`PnlExcess::XsMean`]. Every reported net stays absolute.
+    pub pnl_excess: PnlExcess,
 }
 
 impl Default for TradingSpec {
@@ -507,6 +561,7 @@ impl Default for TradingSpec {
             period_seconds: None,
             segment_starts: Vec::new(),
             missing_score: MissingScore::Flat,
+            pnl_excess: PnlExcess::None,
         }
     }
 }
@@ -530,6 +585,12 @@ impl TradingSpec {
         }
         if !self.cash_return.is_finite() {
             return Err("cash_return must be finite".to_string());
+        }
+        if self.pnl_excess == PnlExcess::XsMean && self.cash_return != 0.0 {
+            return Err(format!(
+                "--pnl-excess xs-mean needs --cash-return 0, got {}: the benchmark is the equal-weight cross-section, not a cash return",
+                self.cash_return
+            ));
         }
         if !self.threshold.is_finite() {
             return Err("threshold must be finite".to_string());
@@ -580,7 +641,7 @@ impl TradingSpec {
             "{{\"position\":\"{}\",\"threshold\":{},\"tau\":{},\"max_position\":{},\
              \"cost_bps\":{},\"fee_bps\":{},\"half_spread_bps\":{},\"slippage_bps\":{},\
              \"per_side_bps\":{},\"funding_col\":{},\"cash_return\":{},\"min_trades\":{},\
-             \"min_holding\":{}{}}}",
+             \"min_holding\":{}{}{}}}",
             self.position.name(),
             num(self.threshold),
             self.tau.map(num).unwrap_or_else(|| "null".to_string()),
@@ -597,7 +658,9 @@ impl TradingSpec {
             num(self.cash_return),
             self.min_trades,
             self.min_holding,
-            self.band.json_fields()
+            self.band.json_fields(),
+            // #1179: omitted under `none`, so the default spec is unchanged.
+            if self.pnl_excess == PnlExcess::None { String::new() } else { format!(",\"pnl_excess\":\"{}\"", self.pnl_excess.name()) }
         )
     }
 }
@@ -689,6 +752,10 @@ pub struct PathStats {
     pub gross_pnl: f64,
     /// Sum over rows of `net_t`, including every exit.
     pub net_pnl: f64,
+    /// #1179: under [`PnlExcess::XsMean`], `net_pnl - sum_t p_t * m_t`: the net
+    /// over the equal-weight mean return of the slice's rows at each row's
+    /// timestamp, the excess the fitness scores. `None` otherwise.
+    pub xs_excess_net: Option<f64>,
     /// `net_pnl / rows * periods_per_year`: the mean net return per row, annualised.
     pub net_per_row_annualised: f64,
     pub total_cost: f64,
@@ -734,7 +801,7 @@ impl PathStats {
             .collect();
         format!(
             "{{\"rows\":{},\"groups\":{},\"periods\":{},\"periods_per_year\":{},\"annualisation\":\"{}\",\
-             \"gross_pnl\":{},\"net_pnl\":{},\"net_per_row_annualised\":{},\"total_cost\":{},\"funding_paid\":{},\"total_return\":{},\
+             \"gross_pnl\":{},\"net_pnl\":{}{},\"net_per_row_annualised\":{},\"total_cost\":{},\"funding_paid\":{},\"total_return\":{},\
              \"log_growth\":{},\"sharpe\":{},\"sortino\":{},\"max_drawdown\":{},\"calmar\":{},\
              \"turnover\":{},\"trades\":{},\"entries\":{},\"exits\":{},\"trades_per_year\":{},\
              \"exposure\":{},\"hit_rate\":{},\"break_even_bps_per_side\":{},\
@@ -746,6 +813,7 @@ impl PathStats {
             self.annualisation,
             num(self.gross_pnl),
             num(self.net_pnl),
+            self.xs_excess_net.map_or_else(String::new, |v| format!(",\"xs_excess_net\":{}", num(v))),
             num(self.net_per_row_annualised),
             num(self.total_cost),
             num(self.funding_paid),
@@ -795,6 +863,9 @@ struct Ctx {
     run: Vec<u32>,
     /// #1203: the row has no finite score and holds the position before it.
     held: Vec<bool>,
+    /// #1179: the [`timestamp_means`] of every usable row of the input, at
+    /// each kept row; `None` unless the spec asks for `xs_excess_net`.
+    xs_mean: Option<Vec<f64>>,
 }
 
 impl Ctx {
@@ -886,7 +957,18 @@ impl Ctx {
             segment,
             run: vec![0; n],
             held: vec![false; n],
+            xs_mean: None,
         }
+    }
+
+    /// #1179: under [`PnlExcess::XsMean`], the mean of the returns of every
+    /// usable input row (scored or not) at each kept row's timestamp.
+    fn with_xs_mean(mut self, keep: &[usize], r: &[f64], rows: &TradingRows, spec: &TradingSpec) -> Ctx {
+        if spec.pnl_excess == PnlExcess::XsMean {
+            let m = timestamp_means(r, &rows.time, |i| usable(i, r, rows));
+            self.xs_mean = Some(keep.iter().map(|&i| m[i]).collect());
+        }
+        self
     }
 }
 
@@ -1116,6 +1198,7 @@ fn finish(ctx: &Ctx, positions: &[f64], spec: &TradingSpec) -> Result<PathStats,
         annualisation: series.annualisation,
         gross_pnl,
         net_pnl: main.net_pnl,
+        xs_excess_net: ctx.xs_mean.as_ref().map(|m| (0..n).map(|k| book.net[k] - positions[k] * m[k]).sum::<f64>()),
         net_per_row_annualised: main.net_pnl / n as f64 * series.period_ppy,
         total_cost: book.stats.total_cost,
         funding_paid: book.funding_paid,
@@ -1270,7 +1353,7 @@ pub fn evaluate(
     check_lengths(pred.len(), r, rows)?;
     let (ctx, keep) = Ctx::scored(pred, r, rows, spec);
     let positions = positions_of(pred, rows, &keep, &ctx, spec);
-    finish(&ctx, &positions, spec)
+    finish(&ctx.with_xs_mean(&keep, r, rows, spec), &positions, spec)
 }
 
 /// Position of every usable row, in `ctx` row order. A held row (#1203) takes
@@ -1469,7 +1552,8 @@ pub fn evaluate_positions(
     spec.validate()?;
     check_lengths(positions.len(), r, rows)?;
     let keep: Vec<usize> = (0..positions.len()).filter(|&i| usable(i, r, rows)).collect();
-    let ctx = Ctx::new(&keep, r, rows, spec.cash_return, spec.period_seconds.unwrap_or(0.0), &spec.segment_starts);
+    let ctx = Ctx::new(&keep, r, rows, spec.cash_return, spec.period_seconds.unwrap_or(0.0), &spec.segment_starts)
+        .with_xs_mean(&keep, r, rows, spec);
     let kept: Vec<f64> = keep.iter().map(|&i| positions[i]).collect();
     finish(&ctx, &kept, spec)
 }
@@ -1755,6 +1839,8 @@ pub struct FitnessBook {
     cases: std::sync::OnceLock<BookCases>,
     /// #1180: rows with the regime mask off; 0 for an unmasked book.
     off_rows: usize,
+    /// #1179: what `excess` is measured against.
+    excess_mode: PnlExcess,
     /// #1178: the statistic of the block regrets.
     stat: BlockStat,
     /// #1178: the time block of every row; empty for a single block.
@@ -1899,6 +1985,17 @@ impl FitnessBook {
                 }
             }
         }
+        // #1179: the universe of `m_t` is the rows the book can trade: every
+        // training row, or the rows with the regime mask on.
+        if spec.pnl_excess == PnlExcess::XsMean {
+            let m = timestamp_means(&slice.ret, &rows.time, |i| mask.as_ref().map_or(true, |k| k.on[i]));
+            for i in 0..n {
+                if flags[i] & FITNESS_MASK_OFF == 0 {
+                    let f = if rows.funding.is_empty() { 0.0 } else { rows.funding[i] };
+                    excess[i] = (slice.ret[i] - m[i]) - f;
+                }
+            }
+        }
         let run_key: Option<Vec<u64>> = (segment_starts.len() > 1 || mask.is_some()).then(|| {
             let mut id = 0u64;
             (0..n)
@@ -1997,6 +2094,9 @@ impl FitnessBook {
                 fnv_u64(&mut hash, b as u64);
             }
         }
+        if spec.pnl_excess == PnlExcess::XsMean {
+            fnv_u64(&mut hash, 0x7873_6d65_616e_u64);
+        }
         Ok(FitnessBook {
             excess,
             flags,
@@ -2013,9 +2113,15 @@ impl FitnessBook {
             min_hold: spec.min_holding,
             cases: std::sync::OnceLock::new(),
             off_rows,
+            excess_mode: spec.pnl_excess,
             stat: BlockStat::MeanSd,
             block_id,
         })
+    }
+
+    /// #1179: the benchmark of [`FitnessBook::excess`].
+    pub fn excess_mode(&self) -> PnlExcess {
+        self.excess_mode
     }
 
     /// #1178: the book ranked by `stat` over its block regrets. `MeanSd` keeps
@@ -2092,7 +2198,8 @@ impl FitnessBook {
         self.hash
     }
 
-    /// Excess return per row (return minus funding minus cash), the gross term.
+    /// Excess return per row (return minus funding minus cash, or minus the
+    /// timestamp mean under [`PnlExcess::XsMean`]), the gross term.
     pub fn excess(&self) -> &[f64] {
         &self.excess
     }
