@@ -2283,3 +2283,138 @@ fn period_grid_gap_rule_carries_a_missing_score_and_closes_at_a_gate() {
     assert_eq!(gated.period_grid.as_ref().unwrap().empty_periods, 100);
     assert_eq!(grid_run(&t, "o", Score, true, true).period_time.len(), 200, "the score grid drops the gate-off stretch");
 }
+
+/// #1203: the synthetic fixture of the issue. Two symbols, hourly rows 0..299,
+/// target +0.001 per row and -0.005 on rows 120..159; `z` is 1 with no value on
+/// rows 120..159 and `o` is 1 everywhere.
+fn carry_table() -> data::Table {
+    let mut s = String::from("ts,sym,z,o,target\n");
+    for i in 0..300usize {
+        for sym in ["A", "B"] {
+            let gap = (120..160).contains(&i);
+            let z = if gap { "" } else { "1" };
+            let y = if gap { -0.005 } else { 0.001 };
+            s.push_str(&format!("{},{sym},{z},1,{y}\n", 3600 * i));
+        }
+    }
+    data::parse_table(&s).unwrap()
+}
+
+fn carry_run(t: &data::Table, expr: &str, windows: Vec<Window>, opts: &walkforward::ProtocolOptions) -> walkforward::Report {
+    let mut s = spec(expr, windows);
+    s.vars = vec!["z".to_string(), "o".to_string()];
+    s.group = Some("sym".to_string());
+    s.threshold_fixed = Some(0.0);
+    s.periods_per_year = Some(8760.0);
+    s.pool_reset_flat = true;
+    walkforward::run_table_with(t, &s, "test", opts).unwrap()
+}
+
+const H: f64 = 3600.0;
+
+#[test]
+fn missing_score_flat_equals_the_book_split_at_the_stretch() {
+    let t = carry_table();
+    let o = walkforward::ProtocolOptions::default();
+    let flat = carry_run(&t, "z", vec![window("w", 0.0, 100.0 * H, 100.0 * H, 250.0 * H)], &o);
+    let split = carry_run(
+        &t,
+        "o",
+        vec![window("a", 0.0, 100.0 * H, 100.0 * H, 120.0 * H), window("b", 0.0, 100.0 * H, 160.0 * H, 250.0 * H)],
+        &o,
+    );
+    let sum = |r: &walkforward::Report| r.period_net.iter().sum::<f64>();
+    let (f, s) = (&flat.pooled, &split.pooled);
+    assert_eq!(f.total_cost.to_bits(), s.total_cost.to_bits(), "exit at row 119 and re-entry at row 160: {} vs {}", f.total_cost, s.total_cost);
+    assert_eq!(sum(&flat).to_bits(), sum(&split).to_bits());
+    assert_eq!(f.total_return.to_bits(), s.total_return.to_bits());
+    assert_eq!(f.max_drawdown.to_bits(), s.max_drawdown.to_bits());
+    assert_eq!(bits(&flat.period_net), bits(&split.period_net));
+    assert_eq!((f.trades, f.entries), (4, 4));
+    assert!((f.total_cost - 0.008).abs() < 1e-15, "{}", f.total_cost);
+}
+
+#[test]
+fn missing_score_flat_pays_exit_and_reentry() {
+    use walkforward::PeriodGrid::Target;
+    let t = grid_table();
+    let flat = grid_run(&t, "zo", Target, true, false);
+    let gated = grid_run(&t, "o", Target, true, true);
+    let (w, g) = (&flat.windows[0].metrics, &gated.windows[0].metrics);
+    assert_eq!((w.entries, w.trades), (6, 6), "an exit before the stretch and a re-entry after it per symbol");
+    assert_eq!(w.total_cost.to_bits(), g.total_cost.to_bits(), "the gated o book: {} vs {}", w.total_cost, g.total_cost);
+    assert!((w.total_cost - 0.012).abs() < 1e-15, "6 entries and 6 exits at 10 bp: {}", w.total_cost);
+    // The gate relabels the groups, so a period sums its symbols in another order.
+    assert_eq!(flat.period_net.len(), gated.period_net.len());
+    for (a, b) in flat.period_net.iter().zip(&gated.period_net) {
+        assert!((a - b).abs() <= 1e-15, "the series of the gated book: {a} vs {b}");
+    }
+}
+
+/// #1203: two symbols at t = 0..300; `z` is `x` with no value on `[150, 200)`.
+fn pbo_table() -> data::Table {
+    let frac = |v: f64| v - v.floor();
+    let mut s = String::from("ts,sym,x,z,target\n");
+    for i in 0..300usize {
+        for (k, sym) in ["A", "B"].iter().enumerate() {
+            let f = i as f64 + 0.37 * k as f64;
+            let x = frac(f * 0.618_033_988_749_894_9) - 0.5;
+            let y = 0.01 * (frac(f * 0.754_877_666_246_692_7) - 0.5) + 0.002 * x;
+            let z = if (150..200).contains(&i) { String::new() } else { x.to_string() };
+            s.push_str(&format!("{i},{sym},{x},{z},{y}\n"));
+        }
+    }
+    data::parse_table(&s).unwrap()
+}
+
+fn pbo_run(t: &data::Table, exprs: &[&str], grid: walkforward::PeriodGrid) -> walkforward::Report {
+    let mut s = spec(exprs[0], vec![window("w", 0.0, 100.0, 100.0, 300.0)]);
+    if exprs.len() > 1 {
+        s.candidates = exprs.iter().map(|e| e.to_string()).collect();
+    }
+    s.vars = vec!["x".to_string(), "z".to_string()];
+    s.group = Some("sym".to_string());
+    s.threshold_fixed = Some(0.0);
+    s.validation_frac = 0.2;
+    s.periods_per_year = Some(8760.0);
+    s.pool_reset_flat = true;
+    let opts = walkforward::ProtocolOptions {
+        period_grid: grid,
+        bootstrap_draws: 200,
+        block_len: Some(5),
+        pbo_blocks: 4,
+        ..walkforward::ProtocolOptions::default()
+    };
+    walkforward::run_table_with(t, &s, "test", &opts).unwrap()
+}
+
+#[test]
+fn in_report_pbo_columns_share_the_target_grid() {
+    use walkforward::PeriodGrid::{Score, Target};
+    let t = pbo_table();
+    let pair = pbo_run(&t, &["z", "x + 1"], Score);
+    assert_eq!(pair.windows[0].candidate, 0, "z has the lower validation error");
+    assert_eq!(pair.pooled.periods, 150, "the pooled series stays on the score grid");
+    // The column of each candidate is its own book on the window's target grid.
+    let cols: Vec<Vec<f64>> = ["z", "x + 1"].iter().map(|e| pbo_run(&t, &[e], Target).period_net).collect();
+    assert!(cols.iter().all(|c| c.len() == 200), "the target grid has 200 periods");
+    let stretch: Vec<usize> = (50..100).collect();
+    assert!(stretch.iter().all(|&k| cols[0][k] == 0.0), "z prices no row on the stretch");
+    assert!(stretch.iter().filter(|&&k| cols[1][k] != 0.0).count() > 40, "x + 1 is long on the stretch");
+    let m = pair.inference.as_ref().unwrap().multiple.as_ref().unwrap();
+    let pbo = m.pbo.as_ref().expect("two candidates give a PBO");
+    let want = rcsr::inference::pbo_cscv(&cols, 4).unwrap();
+    assert_eq!(pbo.rows_per_block, 50, "every column has the length of the target grid");
+    assert_eq!(pbo.pbo.to_bits(), want.pbo.to_bits());
+    assert_eq!(bits(&pbo.logits), bits(&want.logits));
+    for (c, col) in cols.iter().enumerate() {
+        let d = rcsr::inference::bootstrap_draws(col, 5, 200, walkforward::ProtocolOptions::default().seed.wrapping_add(c as u32 + 1));
+        assert_eq!(m.p_values[c].to_bits(), rcsr::inference::bootstrap_p_mean_positive(col, &d).to_bits(), "candidate {c}");
+    }
+    // With full coverage the score and the target grid are one grid and the block is unchanged.
+    let multiple = |r: &walkforward::Report| -> String {
+        let j = rcsr::devlog::Json::parse(&r.json()).unwrap();
+        j.get("inference").and_then(|i| i.get("multiple_testing")).map(|m| format!("{m:?}")).expect("the multiple_testing block")
+    };
+    assert_eq!(multiple(&pbo_run(&t, &["x", "x + 1"], Score)), multiple(&pbo_run(&t, &["x", "x + 1"], Target)));
+}
