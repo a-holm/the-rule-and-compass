@@ -3499,6 +3499,28 @@ mod block_tests {
         }
     }
 
+    /// #1178: the CPU cost of one fitness evaluation on 25,000 rows for 8 and
+    /// 48 blocks and each statistic. A measurement, run by hand.
+    #[test]
+    #[ignore = "measurement: run by hand with --ignored --nocapture"]
+    fn block_stat_fitness_cost() {
+        let s = panel(&[25_000]);
+        let p = pred(s.ret.len());
+        for (k, st) in [(8usize, BlockStat::MeanSd), (48, BlockStat::MeanSd), (48, BlockStat::MeanSemi), (48, BlockStat::Cvar(0.25))] {
+            let book = FitnessBook::with_blocks(&s, &spec(), 900.0, k, 1.0).unwrap().with_stat(st).unwrap();
+            let mut best = f64::INFINITY;
+            let mut sum = 0.0;
+            for _ in 0..5 {
+                let t = std::time::Instant::now();
+                for _ in 0..200 {
+                    sum += book.regret(&p);
+                }
+                best = best.min(t.elapsed().as_secs_f64() / 200.0);
+            }
+            println!("blocks {} {}: best of 5 {:.1} us per fitness (sum {})", k, st.name(), best * 1e6, sum);
+        }
+    }
+
     /// #1023: every `(group, block)` run totals as a separate book of its own
     /// rows, bit for bit, for the plain rule and the minimum-hold automaton;
     /// the case regret is that book's regret.
