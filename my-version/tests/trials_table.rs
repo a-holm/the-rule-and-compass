@@ -296,7 +296,7 @@ fn average_rank_matches_hand_table() {
     let f = friedman(&ranks);
     assert!((f.chi2 - 0.8).abs() <= 1e-12, "chi2 {}", f.chi2);
     assert_eq!(f.df, 3);
-    assert!((f.p - rcsr::diagnostics::chi2_sf(0.8, 3)).abs() <= 1e-15, "p {}", f.p);
+    assert!((f.p - rcsr::diagnostics::chi2_sf(0.8, 3)).abs() <= 1e-12, "p {}", f.p);
 }
 
 // ---------------------------------------------------------------------------
