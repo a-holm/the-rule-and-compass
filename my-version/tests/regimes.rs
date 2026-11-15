@@ -262,7 +262,7 @@ fn overlapping_calendar_rows_exit_two() {
     std::fs::write(&cal, "label,start,end\na,2020-09-14,2020-10-01\nb,2020-09-30,2020-10-10\n").unwrap();
     let o = wf(&data, "x", "0", &["--regimes", &s(&cal)]);
     assert_eq!(code(&o), 2, "{}", stderr(&o));
-    assert!(stderr(&o).contains("overlap"), "{}", stderr(&o));
+    assert!(stderr(&o).contains("calendar rows overlap"), "{}", stderr(&o));
 }
 
 #[test]
@@ -481,7 +481,7 @@ fn regime_dating_finds_planted_phases() {
     // the ex-post calendar of the cut series differs: its first labels use later closes
     let post_cut = s(&dir.join("post-cut.csv"));
     assert_eq!(code(&regimes(&cut, &post_cut, &["--locked-test", "none", "--min-days", "5", "--sideways-days", "0"])), 0);
-    assert_eq!(rows(&post_cut).len(), 3, "the cut series ends inside the third phase");
+    assert_eq!(rows(&post_cut).len(), 2, "the cut series ends before the third phase is confirmed");
 }
 
 #[test]
