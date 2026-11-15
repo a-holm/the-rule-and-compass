@@ -556,7 +556,12 @@ fn from_run_of_compose_marks_composite() {
     let switch = report(&unmarked, "wf_unmarked.json");
     assert_eq!(s(&switch, &["gate", "source"]), "objective.finalist.switch");
     assert!(at(&switch, &["selection"]).get("composite").is_none());
-    assert_eq!(without(&composed, &["selection.composite", "protocol"]), without(&switch, &["protocol"]), "the marker changes nothing else");
+    // `ledger` holds wall-clock timings.
+    assert_eq!(
+        without(&composed, &["selection.composite", "protocol", "ledger"]),
+        without(&switch, &["protocol", "ledger"]),
+        "the marker changes nothing else"
+    );
     // A plain run: no marker, no gate, the bytes of the base build.
     let plain = report(&plain, "wf_plain.json");
     assert!(plain.get("gate").is_none() && at(&plain, &["selection"]).get("composite").is_none());
