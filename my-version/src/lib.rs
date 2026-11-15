@@ -106,6 +106,7 @@ pub mod ablation; // #266: add-one-family ablation arms, manifests, null columns
 pub mod ladder; // #266: long-only baseline ladder on one panel and one set of folds
 pub mod target; // #254: declared target spec
 pub mod run_book; // #487: the book a search run selected, read back by the evaluators
+pub mod switch; // #1185: gate-cut profile of if(greater(g, c), A, B) and the k-switch bound
 pub mod trading; // #263: exact long/flat P&L, Sharpe and log-growth objective
 pub mod trading_gpu; // #304/#305: fused long-only P&L, exact threshold and shared mask
 pub mod units;
