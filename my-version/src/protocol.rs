@@ -1172,6 +1172,12 @@ pub fn procedure_spec(spec: &crate::walkforward::EvalSpec, o: &crate::walkforwar
     if o.period_grid != crate::walkforward::PeriodGrid::Score {
         s.push_str(&format!("period_grid={}\n", o.period_grid.as_str()));
     }
+    // #1214: a composed candidate's book is its switch, one line per candidate.
+    if o.switches.iter().any(Option::is_some) {
+        for c in &o.switches {
+            s.push_str(&format!("switch={}\n", c.as_ref().map_or_else(|| "none".to_string(), |c| c.switch.identity())));
+        }
+    }
     s
 }
 

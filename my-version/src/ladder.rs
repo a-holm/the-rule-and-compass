@@ -331,6 +331,8 @@ pub struct SrRun {
     pub band: crate::trading::BandSpec,
     /// #951: the minimum hold the run priced.
     pub min_holding: usize,
+    /// #1214: `objective.finalist.switch` of a composed run: the rung prices the switch.
+    pub switch: Option<crate::regime_gate::Switch>,
     /// `(fold label, out-of-fold)` for every window of the table.
     pub fold_oof: Vec<(String, bool)>,
 }
@@ -349,6 +351,7 @@ impl SrRun {
             threshold: book.threshold,
             band: book.band.clone(),
             min_holding: book.min_holding,
+            switch: book.switch.clone(),
             run,
             fold_oof: Vec::new(),
         })
@@ -371,11 +374,14 @@ impl SrRun {
             .iter()
             .map(|(l, ok)| format!("{{\"fold\":{},\"oof\":{}}}", jstr(l), ok))
             .collect();
-        let book = if self.has_band() {
+        let mut book = if self.has_band() {
             format!(",\"policy\":\"band\"{},\"min_holding\":{},\"band_source\":\"run\"", self.band.json_fields(), self.min_holding)
         } else {
             String::new()
         };
+        if let Some(sw) = &self.switch {
+            book.push_str(&format!(",\"switch\":{}", sw.json()));
+        }
         format!(
             "{{{}\"run_sha256\":{},\"expression\":{},\"expression_source\":{},\"expression_from\":\"objective.finalist\",\
 \"threshold\":{},\"threshold_source\":\"run\"{},\"folds\":[{}]}}",
@@ -419,6 +425,9 @@ pub struct Options {
     pub sr_wall_basis: Option<&'static str>,
     /// A single search run scored on every fold (#492); see [`SrRun`].
     pub sr_run: Option<SrRun>,
+    /// #1214: the locked ranges this run does not open, each up to its lookback
+    /// embargo: the barriers of the SR run's switch gate.
+    pub gate_barriers: Vec<crate::regime_gate::Barrier>,
     pub spec: Option<TargetSpec>,
     pub gbm_trees: usize,
     pub seed: u32,
@@ -451,6 +460,7 @@ impl Default for Options {
             sr_wall_seconds: None,
             sr_wall_basis: None,
             sr_run: None,
+            gate_barriers: Vec::new(),
             spec: None,
             gbm_trees: DEFAULT_GBM_TREES,
             seed: 0,
@@ -1806,14 +1816,22 @@ fn run_ladder_rungs(p: &Panel, folds: &[Fold], opts: &Options) -> Result<Report,
 
     // symbolic regression: one search run scored on every fold, or the caller's column
     let sr = if let Some(sr_run) = &opts.sr_run {
-        let tree = crate::expr::parse(&sr_run.expression, &sr_run.variables)
-            .map_err(|e| format!("cannot parse '{}': {}", sr_run.expression, e))?;
+        let parse = |src: &str| crate::expr::parse(src, &sr_run.variables).map_err(|e| format!("cannot parse '{}': {}", src, e));
+        // #1214: a switch holds the on branch where the gate state of the row is on: the
+        // state of the store row from the gate rows of the whole store, never the fold rows.
+        let (tree, gate_state) = match &sr_run.switch {
+            Some(sw) => {
+                let state = crate::expr::input(sr_run.variables.len());
+                (crate::expr::node(crate::expr::Op::If, vec![state, parse(&sw.on)?, parse(&sw.off)?]), Some(switch_states(p, &sw.gate, &opts.gate_barriers)?))
+            }
+            None => (parse(&sr_run.expression)?, None),
+        };
         let cols: Vec<&[f64]> = sr_run
             .variables
             .iter()
             .map(|v| p.col(v).ok_or_else(|| format!("variable '{}' is not in the data", v)))
             .collect::<Result<_, _>>()?;
-        let mut row = vec![0.0f64; cols.len()];
+        let mut row = vec![0.0f64; cols.len() + 1];
         let mut r = Rung::new("symbolic_regression", "model");
         r.pos = vec![0.0; n];
         r.score = vec![f64::NAN; n];
@@ -1824,6 +1842,9 @@ fn run_ladder_rungs(p: &Panel, folds: &[Fold], opts: &Options) -> Result<Report,
             for (k, &i) in f.test.iter().enumerate() {
                 for (c, col) in cols.iter().enumerate() {
                     row[c] = col[i];
+                }
+                if let Some(states) = &gate_state {
+                    row[cols.len()] = states[i];
                 }
                 let sc = crate::expr::eval(&tree, &row);
                 r.score[s + k] = sc;
@@ -2402,6 +2423,35 @@ pub struct Input {
     pub features: Vec<String>,
 }
 
+/// #1214: the `rcsr-gate-state/1` state of every panel row: 1 on, 0 off, NaN for
+/// a row inside a barrier or without a finite time. The panel holds every row of
+/// the store sorted by (group, time), so the rows of each group meet the kernel
+/// in time order and no fold or label decides which rows the gate reads.
+fn switch_states(p: &Panel, gate: &crate::regime_gate::GateSpec, barriers: &[crate::regime_gate::Barrier]) -> Result<Vec<f64>, String> {
+    let cols: Vec<&[f64]> = gate
+        .columns
+        .iter()
+        .map(|c| p.col(c).ok_or_else(|| format!("the switch gate column '{}' is not in the data", c)))
+        .collect::<Result<_, _>>()?;
+    let mut tape = crate::regime_gate::GateTape::new(gate, barriers.to_vec());
+    let mut row = vec![0.0f64; cols.len()];
+    let mut out = Vec::with_capacity(p.len());
+    for i in 0..p.len() {
+        let state = tape.step_with(p.group[i], p.time[i], || {
+            for (k, c) in cols.iter().enumerate() {
+                row[k] = c[i];
+            }
+            crate::expr::eval(&gate.tree, &row)
+        })?;
+        out.push(match state {
+            Some(true) => 1.0,
+            Some(false) => 0.0,
+            None => f64::NAN,
+        });
+    }
+    Ok(out)
+}
+
 /// Load the columns the ladder needs from a CSV or a `.rcsb` store.
 pub fn load_panel(inp: &Input, opts: &Options) -> Result<Panel, String> {
     let declared_ret = opts
@@ -2441,6 +2491,11 @@ pub fn load_panel(inp: &Input, opts: &Options) -> Result<Panel, String> {
         for v in &sr.variables {
             if !inp.features.is_empty() && !inp.features.contains(v) {
                 extras.push(v.clone());
+            }
+        }
+        for c in sr.switch.iter().flat_map(|s| s.gate.columns.iter()) {
+            if !sr.variables.contains(c) && !inp.features.contains(c) && !extras.contains(c) {
+                extras.push(c.clone());
             }
         }
     }
@@ -2534,6 +2589,7 @@ Long-only baseline ladder on one panel, one set of folds and one cost model.\n\
   --trend-donchian-cols <a,b,...> columns of trend_donchian (default don20,don96,mtf_4h_donchian_pos,mtf_1d_donchian_pos)\n\
   --target-spec <file>      target spec file: per-side cost (cost_bps / 2), return units (log is converted with exp_m1), return column and horizon; also the zero-parameter rung (scale column must be in the panel)\n\
   --sr-run <run.json>       one search run (rcsr --objective ... --json-out) scored on every fold with the run's fixed threshold;\n\
+                            a composed run (rcsr compose) is priced as its switch (objective.finalist.switch): the gate state of each store row under rcsr-gate-state/1, from every row of the store (never the fold rows), the held branch long above 0; a label, target, return or construction gate column exits 5;\n\
                             a run that priced a band or a minimum hold is priced with it: half-width objective.spec.band_resolved as recorded, objective.spec.min_holding, every fold starts flat (sr_run.policy band);\n\
                             a fold whose test starts before the run's last seen row + purge is refused (exit 3; for a --split-table run: a fold that a kept training or validation row reaches with its label window or reads within the run embargo after it)\n\
                             prices objective.finalist.expression_exact, else the rounded expression (sr_run.expression_source);\n\
@@ -2771,6 +2827,16 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
     if opts.cost_grid.is_empty() {
         opts.cost_grid = vec![opts.cost_bps];
     }
+    // #1214: a switch gate column of the label family, the target, its return column or a construction column exits 5.
+    if let Some(sw) = opts.sr_run.as_ref().and_then(|s| s.switch.as_ref()) {
+        let specs: Vec<&TargetSpec> = opts.spec.iter().collect();
+        let mut names: Vec<String> = vec![target.clone()];
+        names.extend(ret.iter().cloned());
+        names.extend(opts.spec.iter().flat_map(|s| [Some(s.column.clone()), s.return_column.clone()]).flatten());
+        if let Some(why) = crate::regime_gate::gate_column_leak(&sw.gate.columns, &specs, &names, false) {
+            return Err((5, format!("--sr-run objective.finalist.switch: {}", why)));
+        }
+    }
     let text = std::fs::read_to_string(&windows).map_err(|e| input_err(format!("{}: {}", windows, e)))?;
     let rows = protocol::parse_windows_csv(&text, Some(&scheme)).map_err(input_err)?;
     let resolved = crate::lockbox::resolve_retired(lockbox_arg.as_deref(), lockbox_embargo_arg.as_deref(), &data_path, retired_arg.as_deref()).map_err(|e| (e.exit, e.message))?;
@@ -2856,6 +2922,10 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
         group,
         features,
     };
+    opts.gate_barriers = guard
+        .iter()
+        .map(|&(s, e)| crate::regime_gate::Barrier { start: s, end: e + (resolved.embargo.seconds as f64).max(opts.purge_seconds), kind: crate::regime_gate::BarrierKind::Locked })
+        .collect();
     let panel = load_panel(&inp, &opts).map_err(input_err)?;
     let mut folds = make_folds(&panel, &rows, opts.purge_seconds, &guard, resolved.embargo.seconds as f64).map_err(input_err)?;
     if let Some(sr) = &mut opts.sr_run {

@@ -544,6 +544,16 @@ A pooled mean hides regimes. Report the strategy per regime with `rcsr walkforwa
 * Any label set works as a calendar: rows `label,start,end`, UTC half-open, no overlap.
 * An always-long book has zero alpha against the equal-weight benchmark in every stratum. A positive alpha in one stratum and a negative one in another is the result to read, not the pooled mean.
 
+
+### A stateful gate needs the whole readable prefix (#1214)
+
+A regime gate with a hysteresis band or a minimum dwell has state: a value inside the band holds the previous state, so the state of a row can depend on every earlier row of its group. A gate that restarts at each window, slice or fold start ties the state to the split, and one dropped row shifts every later flip of a dwell. The engine therefore reads every gate under one rule, `rcsr-gate-state/1`, in compose, the `--pnl-mask` validation and test books, walk-forward, the ladder, `--reselect-run` and the sealed read:
+
+* The gate rows are every row of the data file with a finite time, per group in file order. The gate reads its own columns only, never a label, and no row filter removes a gate row: the state of a row is the same in every command.
+* The state at a window start comes from one pass over the whole readable prefix. Each window reports it as `gate.start` (warm-up rows, first and last warm-up time, groups, groups on, groups inside a running dwell).
+* A locked range the command does not open, with its lookback embargo, is never read; the state restarts after it. A sealed read opens its own range only, so its warm-up is the development rows before the locked start.
+* A selection read (validation rows, `--reselect-run`) never reads a test interval or its embargo, so a validation interval after a test interval restarts its gate after the embargo. Out-of-sample pricing reads every earlier readable row.
+
 ### Cross-sectional context is a PIT join, not a survivor list
 
 `rcsr enrich --features cross` produces equal-weight market state, breadth,

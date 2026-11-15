@@ -158,11 +158,15 @@ fn cell(k: i64, j: usize, starts: &[i64]) -> Cell {
 /// Three symbols on an hourly grid; `y` is the target, `r` its return column and
 /// `lbl_h24a_y` a label-family column no gate may read.
 fn write_csv(dir: &Path, name: &str, row: impl Fn(i64, usize) -> Cell) -> String {
+    write_csv_step(dir, name, STEP, row)
+}
+
+fn write_csv_step(dir: &Path, name: &str, step: i64, row: impl Fn(i64, usize) -> Cell) -> String {
     let mut out = String::from("t,s,x1,x2,g,h,r,y,lbl_h24a_y\n");
     for k in 0..STAMPS as i64 {
         for (j, sym) in SYMBOLS.iter().enumerate() {
             let c = row(k, j);
-            out.push_str(&format!("{},{},{},{},{},{},{},{},{}\n", T0 + STEP * k, sym, c.x1, c.x2, c.g, c.h, c.r, c.r, c.r));
+            out.push_str(&format!("{},{},{},{},{},{},{},{},{}\n", T0 + step * k, sym, c.x1, c.x2, c.g, c.h, c.r, c.r, c.r));
         }
     }
     let path = dir.join(name);
@@ -171,13 +175,21 @@ fn write_csv(dir: &Path, name: &str, row: impl Fn(i64, usize) -> Cell) -> String
 }
 
 const SPEC_OBJECT: &str = "{\"column\":\"y\",\"name\":\"raw_target\",\"kind\":\"forward_return\",\"deprecated\":false,\"return_column\":\"r\",\
-     \"return_units\":\"simple\",\"horizon_seconds\":3600,\"entry_offset_seconds\":0,\"delay_seconds\":0,\"entry_price\":\"open\",\"exit_price\":\"close\",\
+     \"return_units\":\"simple\",\"horizon_seconds\":HORIZON,\"entry_offset_seconds\":0,\"delay_seconds\":0,\"entry_price\":\"open\",\"exit_price\":\"close\",\
      \"offset\":0.0,\"scale\":{\"kind\":\"constant\",\"value\":1.0},\"clip\":null,\"units\":\"return\",\"cost_bps\":null,\"cost_in_label\":false,\
      \"construction_columns\":[],\"note\":null}";
 
 fn write_spec(dir: &Path) -> String {
-    let path = dir.join("s.json");
-    std::fs::write(&path, format!("{{\"schema\":\"rcsr-target-spec/1\",\"targets\":[{}]}}", SPEC_OBJECT)).unwrap();
+    write_spec_horizon(dir, STEP)
+}
+
+fn spec_object(horizon: i64) -> String {
+    SPEC_OBJECT.replace("HORIZON", &horizon.to_string())
+}
+
+fn write_spec_horizon(dir: &Path, horizon: i64) -> String {
+    let path = dir.join(format!("s{horizon}.json"));
+    std::fs::write(&path, format!("{{\"schema\":\"rcsr-target-spec/1\",\"targets\":[{}]}}", spec_object(horizon))).unwrap();
     path.to_string_lossy().into_owned()
 }
 
@@ -244,23 +256,23 @@ struct Composed {
     ts: i64,
 }
 
-fn composed_with(tag: &str, row: impl Fn(i64, usize, &[i64]) -> Cell) -> Composed {
+fn composed_with(tag: &str, row: impl Fn(i64, usize, &[i64]) -> Cell, split: &[&str]) -> Composed {
     let (scratch, dir) = scratch(tag);
     let spec = write_spec(&dir);
     let plain = write_csv(&dir, "plain.csv", |k, j| cell(k, j, &[]));
     let probe = pool_run(&dir, "probe.json", &plain, &spec, &TEMPORAL, &[], &["x1"]);
     let (vs, ts) = slice_starts(&probe);
     let data = write_csv(&dir, "d.csv", |k, j| row(k, j, &[vs, ts]));
-    let bull = pool_run(&dir, "bull.json", &data, &spec, &TEMPORAL, &["--pnl-mask", "g"], &["x1"]);
-    let bear = pool_run(&dir, "bear.json", &data, &spec, &TEMPORAL, &["--pnl-mask", "0 - g"], &["0 - x1"]);
+    let bull = pool_run(&dir, "bull.json", &data, &spec, split, &["--pnl-mask", "g"], &["x1"]);
+    let bear = pool_run(&dir, "bear.json", &data, &spec, split, &["--pnl-mask", "0 - g"], &["0 - x1"]);
     let menu = write_menu(&dir, BAND, DWELL);
     let run = dir.join("composed.json").to_string_lossy().into_owned();
-    let j = json(&compose(&data, &spec, &TEMPORAL, &["--gates", &menu, "--bull", &bull, "--bear", &bear, "--json", "--out", &run]));
+    let j = json(&compose(&data, &spec, split, &["--gates", &menu, "--bull", &bull, "--bear", &bear, "--json", "--out", &run]));
     Composed { _scratch: scratch, dir, data, spec, run, j, vs, ts }
 }
 
 fn composed(tag: &str) -> Composed {
-    composed_with(tag, cell)
+    composed_with(tag, cell, &TEMPORAL)
 }
 
 fn stamp(k: i64) -> i64 {
@@ -374,7 +386,7 @@ fn hand_run(dir: &Path, name: &str, expr: &str, mask: Option<&str>, switch: Opti
          \"pareto\":[{{\"archive_rank\":1,\"expression\":{e},\"expression_exact\":{e},\"complexity\":1}}]}}",
         T0,
         stamp(5),
-        SPEC_OBJECT,
+        spec_object(STEP),
         spec,
         finalist,
         e = rcsr::devlog::text(expr)
@@ -502,7 +514,7 @@ fn gate_state_ignores_labels_and_row_drops() {
         }
         c
     };
-    for (tag, fixture) in [("sg-labels-a", composed("sg-labels-a")), ("sg-labels-b", composed_with("sg-labels-b", damaged))] {
+    for (tag, fixture) in [("sg-labels-a", composed("sg-labels-a")), ("sg-labels-b", composed_with("sg-labels-b", damaged, &["--split", "temporal", "--validation-frac", "0.3", "--test-frac", "0.2", "--fill", "drop"]))] {
         let c = fixture;
         let usable = usable_states(&c.data);
         let (v0, v1) = ((num(&arr(&c.j, &["split", "validation_time"])[0], &[]) as i64 - T0) / STEP, (c.last_validation() - T0) / STEP);
@@ -524,25 +536,25 @@ fn gate_state_ignores_labels_and_row_drops() {
 
 #[test]
 fn selection_states_do_not_read_test_rows() {
+    // Daily stamps: the automatic embargo after a test interval (127 days for columns without a
+    // lookback rule) fits between the test interval and the validation interval.
+    const DAY: i64 = 86_400;
+    let day = |k: i64| T0 + DAY * k;
     let (_s, dir) = scratch("sg-intervals");
-    let spec = write_spec(&dir);
+    let spec = write_spec_horizon(&dir, DAY);
     let table = dir.join("t.csv");
-    std::fs::write(
-        &table,
-        format!("split_id,role,start,end\ns,train,{},{}\ns,test,{},{}\ns,validation,{},{}\n", stamp(0), stamp(150), stamp(160), stamp(220), stamp(240), stamp(330)),
-    )
-    .unwrap();
+    std::fs::write(&table, format!("split_id,role,start,end\ns,train,{},{}\ns,test,{},{}\ns,validation,{},{}\n", day(0), day(150), day(160), day(220), day(360), day(450))).unwrap();
     let table = table.to_string_lossy().into_owned();
     let split = ["--split-table", table.as_str(), "--split-id", "s"];
-    let data = write_csv(&dir, "d.csv", |k, j| cell(k, j, &[240]));
+    let data = write_csv_step(&dir, "d.csv", DAY, |k, j| cell(k, j, &[360]));
     let bull = pool_run(&dir, "bull.json", &data, &spec, &split, &["--pnl-mask", "g"], &["x1"]);
     let bear = pool_run(&dir, "bear.json", &data, &spec, &split, &["--pnl-mask", "0 - g"], &["0 - x1"]);
     let menu = write_menu(&dir, BAND, DWELL);
     let args = ["--gates", menu.as_str(), "--bull", bull.as_str(), "--bear", bear.as_str(), "--json"];
     let base = json(&compose(&data, &spec, &split, &args));
     // The gate column of every test row changes; the training, validation and other rows do not.
-    let other = write_csv(&dir, "other.csv", |k, j| {
-        let mut c = cell(k, j, &[240]);
+    let other = write_csv_step(&dir, "other.csv", DAY, |k, j| {
+        let mut c = cell(k, j, &[360]);
         if (160..220).contains(&k) {
             c.h = -c.h * 3.0;
         }
@@ -554,10 +566,12 @@ fn selection_states_do_not_read_test_rows() {
     }
     // The validation state restarts at the first row after the test interval plus the embargo.
     let embargo = num(&base, &["split", "embargo_seconds"]) as i64;
-    let restart = (stamp(220) + embargo + STEP - 1) / STEP * STEP - T0;
+    let restart = (day(220) + embargo - T0 + DAY - 1) / DAY;
+    assert!(restart < 360, "embargo {embargo}");
     let start = at(&base, &["compose", "chosen", "validation", "regime", "start"]);
-    assert_eq!(num(start, &["warmup_first_time"]), (T0 + restart) as f64, "embargo {embargo}");
-    assert_eq!(num(start, &["warmup_rows"]), (3 * (stamp(240) - T0 - restart) / STEP) as f64);
+    assert_eq!(num(start, &["warmup_first_time"]), day(restart) as f64, "embargo {embargo}");
+    assert_eq!(num(start, &["warmup_rows"]), (3 * (360 - restart)) as f64);
+    assert_eq!(num(start, &["groups"]), 3.0);
 }
 
 #[test]
