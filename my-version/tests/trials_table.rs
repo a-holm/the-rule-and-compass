@@ -240,7 +240,7 @@ fn table_metrics_match_hand_values() {
         }
         let calmar = net10 / -mdd;
         let alpha = mean(&(0..net.len()).map(|t| net[t] - e[t] * bh[t]).collect::<Vec<_>>()) * ppy;
-        let groups_pos = [0..6usize, 6..12].iter().filter(|r| net[r.clone()].iter().sum::<f64>() > 0.0).count();
+        let groups_pos = [0..6usize, 6..12].into_iter().filter(|r| net[r.clone()].iter().sum::<f64>() > 0.0).count();
         let m = at(row(&j, i), &["metrics"]);
         for (name, want) in [
             ("net10", net10),
