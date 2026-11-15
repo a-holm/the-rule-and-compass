@@ -380,7 +380,8 @@ INPUT:
                              of a group starts flat and pays its exit; the
                              hindsight bound is taken on those runs. The
                              validation and test books apply the same mask.
-                             CPU only: --gpu exits 2. Needs --fitness pnl;
+                             --gpu scores it on the device, except with
+                             --band-units sd (exit 2). Needs --fitness pnl;
                              the book hash covers it, so a resume needs the
                              same mask
   --pnl-mask-band h         hysteresis of --pnl-mask (default 0, finite, >= 0):
