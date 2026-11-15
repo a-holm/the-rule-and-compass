@@ -690,5 +690,5 @@ fn trials_default_output_is_unchanged() {
     assert_eq!(code(&compare), 0, "{}", stderr(&compare));
     let mut bytes = campaign.stdout.clone();
     bytes.extend_from_slice(&compare.stdout);
-    assert_eq!(rcsr::manifest::sha256_hex(&bytes), "PINNED_FROM_BASE");
+    assert_eq!(rcsr::manifest::sha256_hex(&bytes), "21cde625be2b0f3b294574b3a3bd59184770d9b1411823a72b4ecd2e436314d9");
 }
