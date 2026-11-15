@@ -3,7 +3,10 @@
 # mode: run-bin (only with *: the cargo bin <binary> itself runs under memcheck; the rest of the line is its argument list) | skip (not run under memcheck) | api-errors-no (run alone with --report-api-errors no) | no-cuda (only with *: the binary runs and must make no CUDA call)
 #       | no-cuda-app-only (only with *: as no-cuda, run with --target-processes application-only; for a binary whose child processes make no CUDA call either)
 # app-only (only with *: the test process runs under memcheck with --target-processes application-only and gets the normal verdict; its children are not traced, the reason names what they do)
-# A test binary whose sources spawn a process needs a skip, no-cuda-app-only or app-only star line (tests/sanitizer_plan.rs); a binary with app-only may also name api-errors-no tests.
+# device (only with *: the binary calls CUDA by design and runs with the default --target-processes all and the normal verdict; the runner treats it like an unlisted binary)
+# Every test binary (each tests/<name>.rs, lib and each bin-<name>) has exactly one * line (tests/sanitizer_plan.rs).
+# A test binary whose sources spawn a process needs a skip, no-cuda-app-only or app-only star line (tests/sanitizer_plan.rs); a binary with app-only or device may also name skip and api-errors-no tests.
+# A no-cuda or no-cuda-app-only binary whose sources name a device entry point (DEVICE_TOKENS in tests/sanitizer_plan.rs) needs `ok-token: <token>` in its reason for each such token, stating why that use does not reach the device. A marker is not evidence that the binary is CPU-only: the memcheck pass decides.
 # An api-errors-no test is still memchecked; only driver API error reporting is off, for that test only.
 gpu_memory_plan a_refused_device_allocation_is_reported_with_its_bytes api-errors-no  provokes a cudaMalloc out-of-memory on purpose
 gpu_ring        stale_cuda_error_does_not_fail_the_transport           api-errors-no  provokes a cudaMalloc out-of-memory on purpose
@@ -32,7 +35,7 @@ cuda_kernel_args       *  no-cuda  text lint of src/cuda sources; no CUDA call
 cv                     *  no-cuda  CPU-only tests; no CUDA call
 derivatives            *  no-cuda  CPU-only tests; no CUDA call
 diagnostics            *  no-cuda  CPU-only tests; no CUDA call
-dispatch_cli           *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs); no CUDA call; memcheck runs with --target-processes application-only because the binary spawns processes and the default all crashes the sanitizer on a process tree (#910)
+dispatch_cli           *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs); no CUDA call; memcheck runs with --target-processes application-only because the binary spawns processes and the default all crashes the sanitizer on a process tree (#910); ok-token: "--dispatch" (a refusal test: the child exits at argument checking)
 eval_soa               *  no-cuda  CPU-only tests; no CUDA call
 fit_portfolio          *  no-cuda  CPU fits and a mock GPU fitter; no CUDA call
 fit_portfolio_bench    *  no-cuda  its tests are ignored (measurement or external data): 0 tests run and none calls CUDA
@@ -49,12 +52,12 @@ panel_pit              *  no-cuda  CPU-only tests; no CUDA call
 parse                  *  no-cuda  CPU-only tests; no CUDA call
 pinned_cell            *  no-cuda-app-only  its tests are ignored (measurement or external data): 0 tests run; the rcsr child runs with RCSR_GPU=0; memcheck runs with --target-processes application-only because the binary spawns processes and the default all crashes the sanitizer on a process tree (#910)
 prep_pipeline          *  no-cuda  CPU-only tests; no CUDA call
-projection             *  no-cuda  CPU-only tests; no CUDA call
+projection             *  no-cuda  CPU-only tests; no CUDA call; ok-token: gpu: true (a Config field in a CPU unit test; the fit stays on the host)
 projection_alloc       *  no-cuda  CPU-only tests; no CUDA call
 reject_constant        *  no-cuda  CPU-only tests; no CUDA call
 risk                   *  no-cuda  CPU-only tests; no CUDA call
 robust_selection      *  no-cuda  CPU-only tests; no CUDA call
-sanitizer_plan         *  no-cuda  CPU-only tests; no CUDA call
+sanitizer_plan         *  no-cuda  CPU-only tests; no CUDA call; ok-token: DispatchMode::Device; ok-token: device_pnl: true; ok-token: .device_pnl = true; ok-token: gpu: true; ok-token: RCSR_GPU=1; ok-token: rcsr_on_device; ok-token: skip_without_device; ok-token: rcsr::gpu::; ok-token: rcsr::backend::probe (the lint's own token list and fixtures)
 scratch                *  no-cuda-app-only  the child is the test binary itself, CPU only; no CUDA call; memcheck runs with --target-processes application-only because the binary spawns processes and the default all crashes the sanitizer on a process tree (#910)
 signed_gpu             *  no-cuda  CPU fits and mock backends only; the device signed fit runs in gpu_fit (signed_arm_projects_the_device_proposal_exactly)
 simplify_sound         *  no-cuda  CPU-only tests; no CUDA call
@@ -74,8 +77,8 @@ panel_spread           *  no-cuda-app-only  no CUDA call in the test process or 
 verksted_tools         *  no-cuda-app-only  no CUDA call in the test process or its children (bash scripts, git, grep: no /dev/nvidia open under strace -f); memcheck with --target-processes all crashes in the sanitizer (SIGSEGV)
 cpu_makes_no_device_call *  app-only  the test process calls CUDA: default_run_opens_the_device_when_one_exists probes the device (rcsr::backend::probe) as the positive control, so memcheck attaches and gives a verdict; the explicit CPU commands open no /dev/nvidia (strace -f). The children run under strace, which memcheck cannot trace under the default all, so with application-only the one default-dispatch rcsr child of the control run is not sanitized
 dispatch_reproducible  *  app-only  the test process probes the device (rcsr::gpu::probe) and runs under memcheck with --target-processes application-only (the default all crashes the sanitizer on a process tree, #910); its rcsr children are not traced and run without the sanitizer injection environment (tests/common/rcsr.rs): the device search of two_auto_runs_give_one_front_and_one_route_ledger and the calibrate --gpu children of a_calibrated_file_gives_equal_fronts_and_its_own_hash run natively; the rcsr run-bin lines cover calibrate and a device search, gpu_fit covers device searches in-process
-final_seal             *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0, so no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); memcheck with --target-processes all crashed in the sanitizer (rc 139)
-launchers              *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0, so no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); memcheck with --target-processes all crashed or hung (rc 139, rc 124)
+final_seal             *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0, so no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); memcheck with --target-processes all crashed in the sanitizer (rc 139); ok-token: "--gpu" (a seal-verify refusal test)
+launchers              *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0, so no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); memcheck with --target-processes all crashed or hung (rc 139, rc 124); ok-token: "--gpu" (a flag-presence check on help text)
 numeric_flags_cli      *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0, so no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); memcheck with --target-processes all crashed in the sanitizer (rc 139)
 ablation               *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs), so no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); memcheck with --target-processes application-only does not trace the children
 bench_cli              *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs), so no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); memcheck with --target-processes application-only does not trace the children
@@ -99,7 +102,7 @@ metric_fit             *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=
 metrics_direction      *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs), so no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); memcheck with --target-processes application-only does not trace the children
 nulls                  *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs), so no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); memcheck with --target-processes application-only does not trace the children
 oof_sr                 *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs), so no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); memcheck with --target-processes application-only does not trace the children
-pnl_fitness            *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs), so no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); memcheck with --target-processes application-only does not trace the children
+pnl_fitness            *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs), so no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); memcheck with --target-processes application-only does not trace the children; ok-token: "--gpu" (a usage-error test refused before any device work)
 book_target            *  app-only  the device module (#971) runs device searches in the test process, which runs under memcheck with --target-processes application-only (the default all crashes the sanitizer on a process tree, #910); its rcsr children are not traced: the CPU tests run them with RCSR_GPU=0 (tests/common/rcsr.rs) and the device CLI child of cli_device_search_prices_label_free_book_rows runs natively
 projection_cli         *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs), so no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); memcheck with --target-processes application-only does not trace the children
 protocol               *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs), so no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); memcheck with --target-processes application-only does not trace the children
@@ -114,17 +117,17 @@ selection              *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=
 slope_pairs            *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs), so no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); memcheck with --target-processes application-only does not trace the children
 split_warning          *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs), so no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); memcheck with --target-processes application-only does not trace the children
 store                  *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs), so no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); memcheck with --target-processes application-only does not trace the children
-store_estimator        *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs), so no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); memcheck with --target-processes application-only does not trace the children
+store_estimator        *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs), so no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); memcheck with --target-processes application-only does not trace the children; ok-token: gpu: true (a Config field in a CPU test; the fit stays on the host)
 target_spec            *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs), so no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); memcheck with --target-processes application-only does not trace the children
 trajectory             *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs), so no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); memcheck with --target-processes application-only does not trace the children
 validation             *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs), so no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); memcheck with --target-processes application-only does not trace the children
-xs_rank                *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs), so no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); memcheck with --target-processes application-only does not trace the children
+xs_rank                *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs), so no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); memcheck with --target-processes application-only does not trace the children; ok-token: "--device-pnl" (flags refused or run with RCSR_GPU=0 in untraced children)
 walkforward_locked     *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs), so no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); memcheck with --target-processes application-only does not trace the children
-rcsr_command_lint      *  no-cuda  text lint of tests/*.rs; no CUDA call
-cpu_config_lint        *  no-cuda  text lint of tests/*.rs; no CUDA call
+rcsr_command_lint      *  no-cuda  text lint of tests/*.rs; no CUDA call; ok-token: rcsr_on_device (text inside a lint message)
+cpu_config_lint        *  no-cuda  text lint of tests/*.rs; no CUDA call; ok-token: gpu: true (text inside a lint fixture)
 device_launches        *  no-cuda-app-only  report-struct tests plus one rcsr child with RCSR_GPU=0 and --cpu; no CUDA call in the test process or its child (no /dev/nvidia open under strace -f)
-device_skip_lint       *  no-cuda  text lint of tests/*.rs and src/*.rs; no CUDA call (no /dev/nvidia open under strace -f)
-require_device         *  no-cuda-app-only  tests skip_without_device in child processes of the test binary; no CUDA call in the test process or its children (no /dev/nvidia open under strace -f)
+device_skip_lint       *  no-cuda  text lint of tests/*.rs and src/*.rs; no CUDA call (no /dev/nvidia open under strace -f); ok-token: skip_without_device (text inside a lint message and fixtures)
+require_device         *  no-cuda-app-only  tests skip_without_device in child processes of the test binary; no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); ok-token: skip_without_device (runs in untraced children of the test binary)
 stdin_write_lint       *  no-cuda-app-only  text lint plus an sh child that exits early; no CUDA call in the test process or its child (no /dev/nvidia open under strace -f)
 window_stats           *  no-cuda  CPU enrich with GpuMode::Off; no CUDA call in the two tests or the three ignored ones (no /dev/nvidia open under strace -f)
 complexity             *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs) and every search config states gpu: false, so no CUDA call in the test process or its children (no /dev/nvidia open under strace -f); memcheck with --target-processes application-only does not trace the children
@@ -158,15 +161,15 @@ gpu_refusal_cli        *  app-only  the test process runs under memcheck with --
 gpu_ring               *  app-only  the test process runs under memcheck with --target-processes application-only (the default all crashes the sanitizer on a process tree, #910); its rcsr children are not traced and run without the sanitizer injection environment (tests/common/rcsr.rs); device commands of children are covered by the rcsr run-bin lines, device kernels in-process by gpu_fit
 gpu_tiled              *  app-only  the test process runs under memcheck with --target-processes application-only (the default all crashes the sanitizer on a process tree, #910); its rcsr children are not traced and run without the sanitizer injection environment (tests/common/rcsr.rs); device commands of children are covered by the rcsr run-bin lines, device kernels in-process by gpu_fit
 mtf_gpu                *  app-only  the test process runs under memcheck with --target-processes application-only (the default all crashes the sanitizer on a process tree, #910); its rcsr children are not traced and run without the sanitizer injection environment (tests/common/rcsr.rs); device commands of children are covered by the rcsr run-bin lines, device kernels in-process by gpu_fit
-objective_cli          *  no-cuda-app-only  the test process makes no CUDA call (memcheck ends at rc 255 without an instrumented API call); its rcsr children are not traced and run without the sanitizer injection environment (tests/common/rcsr.rs), so their device runs are unsanitized here and covered by the rcsr run-bin lines; the default all crashes the sanitizer on a process tree (#910)
+objective_cli          *  no-cuda-app-only  the test process makes no CUDA call (memcheck ends at rc 255 without an instrumented API call); its rcsr children are not traced and run without the sanitizer injection environment (tests/common/rcsr.rs), so their device runs are unsanitized here and covered by the rcsr run-bin lines; the default all crashes the sanitizer on a process tree (#910); ok-token: "--gpu" (device runs happen in untraced rcsr children); ok-token: "--dispatch" (device runs happen in untraced rcsr children); ok-token: rcsr_on_device (device runs happen in untraced rcsr children); ok-token: skip_without_device (the test process makes no CUDA call (see the line reason))
 panel_v2               *  app-only  the test process runs under memcheck with --target-processes application-only (the default all crashes the sanitizer on a process tree, #910); its rcsr children are not traced and run without the sanitizer injection environment (tests/common/rcsr.rs); device commands of children are covered by the rcsr run-bin lines, device kernels in-process by gpu_fit
-pnl_fitness_ab         *  no-cuda-app-only  the test process makes no CUDA call (memcheck ends at rc 255 without an instrumented API call); its rcsr children are not traced and run without the sanitizer injection environment (tests/common/rcsr.rs), so their device runs are unsanitized here and covered by the rcsr run-bin lines; the default all crashes the sanitizer on a process tree (#910)
+pnl_fitness_ab         *  no-cuda-app-only  the test process makes no CUDA call (memcheck ends at rc 255 without an instrumented API call); its rcsr children are not traced and run without the sanitizer injection environment (tests/common/rcsr.rs), so their device runs are unsanitized here and covered by the rcsr run-bin lines; the default all crashes the sanitizer on a process tree (#910); ok-token: "--gpu" (the gpu arm runs in an untraced rcsr child); ok-token: "--dispatch" (the gpu arm runs in an untraced rcsr child)
 pnl_fitness_gpu        *  app-only  the test process runs under memcheck with --target-processes application-only (the default all crashes the sanitizer on a process tree, #910); its rcsr children are not traced and run without the sanitizer injection environment (tests/common/rcsr.rs); device commands of children are covered by the rcsr run-bin lines, device kernels in-process by gpu_fit
 projection_gpu_search  *  app-only  the test process runs under memcheck with --target-processes application-only (the default all crashes the sanitizer on a process tree, #910); its rcsr children are not traced and run without the sanitizer injection environment (tests/common/rcsr.rs); device commands of children are covered by the rcsr run-bin lines, device kernels in-process by gpu_fit
 registry               *  app-only  the test process runs under memcheck with --target-processes application-only (the default all crashes the sanitizer on a process tree, #910); its rcsr children are not traced and run without the sanitizer injection environment (tests/common/rcsr.rs); device commands of children are covered by the rcsr run-bin lines, device kernels in-process by gpu_fit
 seeds                  *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs); no CUDA call; memcheck runs with --target-processes application-only because the binary spawns processes and the default all crashes the sanitizer on a process tree (#910)
 selection_afp          *  app-only  the test process runs under memcheck with --target-processes application-only (the default all crashes the sanitizer on a process tree, #910); its rcsr children are not traced and run without the sanitizer injection environment (tests/common/rcsr.rs); device commands of children are covered by the rcsr run-bin lines, device kernels in-process by gpu_fit
-selection_lexicase     *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs) and every in-process search sets gpu false, so no CUDA call in the test process or its children; memcheck with --target-processes application-only does not trace the children
+selection_lexicase     *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs) and every in-process search sets gpu false, so no CUDA call in the test process or its children; memcheck with --target-processes application-only does not trace the children; ok-token: "--gpu" (a usage-error test refused before any device work)
 walkforward            *  app-only  the test process calls CUDA: missing_score_device_pnl_reduction_reads_the_same_book prices the book on the device (--device-pnl); every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs) and is not traced; memcheck runs with --target-processes application-only because the binary spawns processes and the default all crashes the sanitizer on a process tree (#910)
 occam_code             *  no-cuda  CPU-only tests; no CUDA call; the binary spawns no process
 occam_measure          *  no-cuda  its tests are ignored (measurement or external data): 0 tests run and none calls CUDA
@@ -184,5 +187,40 @@ panel_lock_record      *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=
 lock_record_golden     *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs); no CUDA call; memcheck runs with --target-processes application-only because the binary spawns processes and the default all crashes the sanitizer on a process tree (#910)
 selection_occam             *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs), so no CUDA call in the test process or its children; memcheck with --target-processes application-only does not trace the children
 regimes                *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs), so no CUDA call in the test process or its children; memcheck with --target-processes application-only does not trace the children
-switch                 *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs), so no CUDA call in the test process or its children; memcheck with --target-processes application-only does not trace the children
-compose                *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs), so no CUDA call in the test process or its children; memcheck with --target-processes application-only does not trace the children
+switch                 *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs), so no CUDA call in the test process or its children; memcheck with --target-processes application-only does not trace the children; ok-token: "--gpu" (a refusal test)
+compose                *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs), so no CUDA call in the test process or its children; memcheck with --target-processes application-only does not trace the children; ok-token: "--gpu" (a refusal test)
+baselines                  *  device  tests run on the device
+bench                      *  device  tests run on the device
+bench_gpu                  *  device  tests run on the device
+classification_gpu         *  device  tests run on the device
+device_inf_check           *  device  tests run on the device
+enrich_gpu                 *  device  tests run on the device
+enrich_gpu_budget          *  device  tests run on the device
+enrich_ledger              *  device  tests run on the device
+eval_protocol              *  device  tests run on the device
+features_gpu               *  device  tests run on the device
+gpu_alloc_guard            *  device  tests run on the device
+gpu_arena                  *  device  tests run on the device
+gpu_fault_injection        *  device  tests run on the device
+gpu_fit_polish             *  device  tests run on the device
+gpu_fit_rows               *  device  tests run on the device
+gpu_interquartile          *  device  tests run on the device
+gpu_max                    *  device  tests run on the device
+gpu_median                 *  device  tests run on the device
+gpu_order_rank_score       *  device  tests run on the device
+gpu_overlap                *  device  tests run on the device
+gpu_parity                 *  device  tests run on the device
+gpu_persistent             *  device  tests run on the device
+gpu_pipeline_consistency   *  device  tests run on the device
+gpu_rank                   *  device  tests run on the device
+gui                        *  device  tests run on the device
+island_parallel            *  device  tests run on the device
+logloss_gpu                *  device  tests run on the device
+panel_gpu                  *  device  tests run on the device
+pnl_gpu                    *  device  tests run on the device
+postfix_loop               *  device  tests run on the device
+sealed_device_pnl          *  device  tests run on the device
+seeds_gpu                  *  device  tests run on the device
+trend_gpu                  *  device  tests run on the device
+walkforward_gpu            *  device  tests run on the device
+wf_batch                   *  device  tests run on the device
