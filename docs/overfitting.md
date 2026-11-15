@@ -638,6 +638,10 @@ rcsr trials --wf wide/reports/wf-*.json --baseline ladder.json \
 * PBO by CSCV over the same series (`--pbo-blocks`, default 16). With fewer than 2 distinct varying series, SPA and PBO are skipped with a reason.
 * MinBTL: `(E[max_N] / SR)^2` years at the clustered `N_eff` for the best finalist's annual Sharpe, against the span of the series (`min_btl_years`, `span_years`).
 
+#### CPCV paths (`rcsr trials --cpcv-assemble`)
+
+A walk-forward report scores one out-of-sample path; a regime that lies in the first training years is never tested. Combinatorial purged cross-validation (López de Prado 2018, ch. 12) gives each configuration phi = C(N-1, k-1) complete paths over the whole development span. `rcsr protocol cpcv` writes the C(N, k) splits, one search and one walk-forward (`--pool-reset-flat`) run per split, and `rcsr trials --cpcv-assemble <reports...> --splits splits.csv --out-dir paths` joins the per-split test series: path j of group g takes the j-th split, in lexicographic order, that tests g, and every group is one book segment that starts flat and pays its final exit. The split reports must agree on the guarded fields above except `window_definition` (exit 2 naming the field); each path file carries `window_definition` = the CPCV scheme hash, so `rcsr trials --wf paths/path_*.json other/path_*.json` reads the paths of every configuration like walk-forward reports. The assembly summary gives the path Sharpe distribution, path nets, the share of positive paths and per-group nets of one configuration; PBO by CSCV (Bailey, Borwein, López de Prado and Zhu 2017) compares configurations and comes from `rcsr trials --wf` over their paths. Details: [`docs/walkforward.md`](walkforward.md#cpcv).
+
 #### Paired comparison (`rcsr trials --compare A B`)
 
 `A` is the lever and `B` the reference; each is one report or a comma-separated list (one per seed). With `X_t` the mean over the side's seeds of `pooled.period_net[t]`, the series is `d_t = A_t - B_t`. One resampled index path is applied to `d_t`, so the pairing of the two books holds in every draw.
