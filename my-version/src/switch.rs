@@ -759,7 +759,7 @@ USAGE:
   The k-switch bound V_k is the best net of any time-level switch between A
   and B with at most k switches; it bounds every time-level gate with at most
   k flips. It is a pruning bound, not evidence of an edge. A band, a minimum
-  hold, --pnl-mask and --gpu exit 2. See docs/walkforward.md.
+  hold, --pnl-mask, --pnl-excess and --gpu exit 2. See docs/walkforward.md.
 "
 }
 
@@ -805,6 +805,7 @@ pub fn claim(args: &[String]) -> Vec<String> {
             "--pnl-mask" | "--pnl-mask-band" | "--pnl-mask-dwell" => {
                 fail(&format!("{}: the sweep prices the unmasked book; the gate is the mask", flag))
             }
+            "--pnl-excess" if false => fail("--pnl-excess: the sweep prices the absolute book that walkforward --expr reproduces"),
             _ => {
                 rest.push(args[i].clone());
                 i += 1;

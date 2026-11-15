@@ -690,7 +690,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--objective mse|pnl|sharpe|log_growth] [--position long_only|top_tercile] [--threshold f]
      [--cost-bps f | --cost-override f] [--slippage-bps f] [--cash-return f] [--funding col]
      [--max-position f] [--min-trades n] [--min-holding n] [--band B] [--band-units score|sd] [--allow-short]
-     [--fitness metric|pnl] [--pnl-blocks K] [--pnl-block-lambda L] [--pnl-mask expr] [--pnl-mask-band h] [--pnl-mask-dwell D] [--book-target col]
+     [--fitness metric|pnl] [--pnl-blocks K] [--pnl-block-lambda L] [--pnl-mask expr] [--pnl-mask-band h] [--pnl-mask-dwell D] [--pnl-excess none|xs-mean] [--book-target col]
 |pnl]
      [--equivalence-z z] [--noise-lag n|auto]
      [--allow-lockbox] [--lockbox START,END|none] [--lockbox-embargo SECONDS] [--retired retired.json] [--ledger file] [--arm name] [--target-spec file] [--allow-target-structure] [--require-clean-inputs]
@@ -846,6 +846,7 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
   regret plus `--pnl-block-lambda` (default 1.0) times their standard deviation, so a formula
   that earns in one regime only scores worse; the device computes it bit for bit like the CPU.
   `--pnl-mask <expr>` (with `--pnl-mask-band h` and `--pnl-mask-dwell D`) scores only the rows inside a causal regime gate, so bull and bear specialists can be searched: rows outside are flat, every run of on rows starts flat and pays its exit, and the validation and test books apply the same mask (CPU only; `docs/optimisation.md`).
+  `--pnl-excess xs-mean` (default `none`) scores the excess over the equal-weight mean return of the training rows at each timestamp instead of over cash, so the fitness pays for timing and selection relative to the cross-section, not for market beta; the validation and test books, robust selection and walk-forward stay absolute and `objective.validation` and `objective.test` gain `xs_excess_net` (needs `--fitness pnl` and `--cash-return 0`; `docs/optimisation.md`).
   `--book-target COL` prices the book on another label of the same target spec (fit on `--target`); a row with a NaN fit label and a finite book return stays in the book and leaves the constant fit.
   `--reject-fixed-position` (off by default) rejects trees whose position cannot depend on the
   inputs, such as `gauss(c * x)` or `exp(c * x)` at threshold 0, before the constant fit and keeps them

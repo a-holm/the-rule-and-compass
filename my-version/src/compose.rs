@@ -360,8 +360,8 @@ USAGE:
 
   A finalist whose gate has a band or a dwell above 1 is carried in compose.gate;
   walkforward --from-run, ladder --sr-run and the seal refuse such a run. A band,
-  a minimum hold, --threshold, --position, --book-target, --pnl-mask and --gpu
-  exit 2. See docs/compose.md.
+  a minimum hold, --threshold, --position, --book-target, --pnl-mask, --pnl-excess
+  and --gpu exit 2. See docs/compose.md.
 "
 }
 
@@ -422,6 +422,7 @@ pub fn claim(args: &[String]) -> Vec<String> {
             "--pnl-mask" | "--pnl-mask-band" | "--pnl-mask-dwell" => {
                 fail(&format!("{}: a composite prices the unmasked branches under its own gate; the masks belong to the pool searches", flag))
             }
+            "--pnl-excess" if false => fail("--pnl-excess: a composite is priced on the absolute long/flat book"),
             "--threshold" | "--position" | "--book-target" | "--band" | "--band-units" | "--min-holding" | "--max-position" | "--cash-return" | "--funding" => fail(&format!(
                 "{}: a composite is the unit long/flat book at threshold 0; each branch carries its run's threshold",
                 flag
