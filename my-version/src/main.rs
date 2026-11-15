@@ -1255,6 +1255,8 @@ CHECKPOINTS:
                              other data, target spec or backend. Another
                              build is accepted and recorded
   --reselect-run <run.json>  the same from a run.json front (expression_exact);
+                             with --select-rule occam it reads pareto[].occam_tree
+                             (exit 2 if absent);
                              split and train rows must match the data
 
 RUN INTEGRITY (#140):
