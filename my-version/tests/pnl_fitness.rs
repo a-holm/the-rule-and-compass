@@ -2458,3 +2458,48 @@ fn resume_needs_the_same_excess() {
     usage_error(&resume(&[]), "fitness");
     usage_error(&resume(&["--pnl-excess", "none"]), "fitness");
 }
+
+/// An interval split (two training segments, a validation and a test interval)
+/// with a regime mask: the xs-mean fitness, the masked books and `xs_excess_net`.
+#[test]
+fn xs_mean_runs_with_a_split_table_and_a_mask() {
+    let (_scratch, dir) = scratch();
+    let data = write_panel_csv(&dir);
+    let spec = write_panel_spec(&dir);
+    let step = |k: i64| T0 + 900 * k;
+    let table = dir.join("splits.csv");
+    std::fs::write(
+        &table,
+        format!(
+            "split_id,role,start,end\na,train,{},{}\na,validation,{},{}\na,train,{},{}\na,test,{},{}\n",
+            step(0),
+            step(150),
+            step(150),
+            step(200),
+            step(200),
+            step(300),
+            step(300),
+            step(400)
+        ),
+    )
+    .unwrap();
+    let table = table.to_string_lossy().into_owned();
+    let out = rcsr_cmd::rcsr()
+        .args([
+            "--data", &data, "--target", "y", "--vars", "x1,x2", "--time", "t", "--group-by", "sym", "--split-table", &table,
+            "--split-id", "a", "--target-spec", &spec, "--cpu", "--no-dev-log", "--seed", "3", "--generations", "10", "--pop",
+            "32", "--metric", "squared", "--json", "--quiet", "--objective", "pnl", "--cost-bps", "5", "--fitness", "pnl",
+            "--pnl-excess", "xs-mean", "--pnl-mask", "x1 + 0.3",
+        ])
+        .output()
+        .unwrap();
+    let j = json(&out);
+    assert_eq!(at(&j, &["split", "mode"]).as_str(), Some("temporal-intervals"));
+    assert_eq!(at(&j, &["search_fitness", "excess"]).as_str(), Some("xs_mean"));
+    assert!(num(&j, &["search_fitness", "mask", "off_rows"]) > 0.0);
+    for slot in ["validation", "test"] {
+        let b = at(&j, &["objective", slot]);
+        assert!(num(b, &["xs_excess_net"]).is_finite(), "{slot}");
+        assert!(num(b, &["mask", "on_share"]) < 1.0, "{slot}");
+    }
+}
