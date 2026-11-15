@@ -11596,6 +11596,19 @@ OPTIONS:
                              position, so total variation includes |p_end-q_start|.
                              Windows from a --windows splits table always reset
                              at a gap between test intervals
+  --period-grid score|target the periods of the pooled series (default score:
+                             a period where some row has a finite score and
+                             target). target: a period where some test row has
+                             a finite target before the gate, the same for every
+                             formula and gate on one store; a period where the
+                             book prices no row (no finite score, gate off)
+                             books net 0. The book does not change: cost,
+                             turnover, trades and the sum of period_net equal
+                             the score report. Adds pooled.grid (rule, periods,
+                             empty_periods) and pooled.period_rows; rcsr trials
+                             and --cpcv-assemble guard pooled.grid.rule. Use it
+                             for CPCV splits and for comparing formulas with
+                             different NaN coverage or gates
   --periods-per-year <f>     annualisation override. Default: 31536000 / S, S the
                              label horizon, or the label stride when the
                              spec has a wider stride_seconds (target spec, else

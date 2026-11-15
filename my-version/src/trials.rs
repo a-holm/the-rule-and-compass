@@ -44,7 +44,8 @@ Campaign trial accounting from walk-forward reports (pooled.period_net), or a pa
 comparison of two runs. A and B are each one report or a comma-separated list (one per seed).\n\
 \n\
 CPCV paths (--cpcv-assemble, #1174): the walk-forward reports of one configuration, one per split\n\
-of a `rcsr protocol cpcv` table (--splits), each priced with --pool-reset-flat. A report belongs to\n\
+of a `rcsr protocol cpcv` table (--splits), each priced with --pool-reset-flat (and --period-grid target, so\n\
+the splits of a group share its period grid whatever NaN coverage or gate their formulas have). A report belongs to\n\
 the split with its test intervals. Path j of group g takes the j-th split, in lexicographic order of\n\
 the test groups, that tests g (López de Prado 2018, ch. 12); every group of a path is one book\n\
 segment that starts flat and pays its final exit. Writes <dir>/path_<j>.json in the walk-forward\n\
@@ -52,13 +53,14 @@ schema (pooled.period_time, pooled.period_net, window_definition = the CPCV sche
 --wf reads them) and the summary (rcsr-cpcv-summary/1: per-path net, Sharpe and max drawdown,\n\
 the path Sharpe distribution, the share of positive paths, per-group net) to --summary or stdout.\n\
 A missing or extra split report, a report of no split, reset_flat not true, or reports that differ\n\
-in cost, purge, annualization, threshold rule, policy or a group's period grid exit 2 naming the\n\
-split or field.\n\
+in cost, purge, annualization, threshold rule, policy, period grid rule (pooled.grid.rule) or a group's\n\
+period grid exit 2 naming the split or field. Target-grid reports add pooled.grid and pooled.period_rows\n\
+to every path and the empty periods per path and per group to the summary.\n\
 \n\
 Campaign (--wf):\n\
   --wf <files...>        walk-forward --json reports with identical windows, cost, threshold rule (threshold.quantile, threshold.fixed,\n\
                          threshold.fit, threshold.cut_min_entries, threshold.cut_blocks, threshold.cut_lambda), policy\n\
-                         and period grid\n\
+                         and period grid (pooled.grid.rule, absent for the score grid, and pooled.period_time)\n\
   --baseline <file>      rcsr ladder --emit-series report; the best of cash, buy_and_hold, constant_long_flat,\n\
                          best_single_feature and any trend rung by mean is the SPA benchmark\n\
   --baseline-rung <name> use this rung as the SPA benchmark instead\n\
@@ -99,7 +101,11 @@ pub(crate) const GUARDS: &[&[&str]] = &[
     &["policy", "name"],
     &["policy", "band_width"],
     &["policy", "min_hold"],
+    GRID_RULE,
 ];
+
+/// #1199: the period grid rule of `walkforward --period-grid`; a report without it is the score grid.
+pub(crate) const GRID_RULE: &[&str] = &["pooled", "grid", "rule"];
 
 /// The fitted-cut rule of `walkforward --threshold-fit` (#1094). Reports written without the flag, and before it
 /// existed, read all four as `null` and match each other. `--threshold-arms` skips these paths only.
@@ -222,6 +228,8 @@ fn require_same(a: &Wf, b: &Wf, arms: bool) -> Res<()> {
         if x != y {
             let hint = if FIT_GUARDS.contains(g) {
                 "; pass --threshold-arms to compare a fitted cut with a fixed cut"
+            } else if g == &GRID_RULE {
+                "; price every report with the same walkforward --period-grid (null is the score grid)"
             } else {
                 ""
             };
