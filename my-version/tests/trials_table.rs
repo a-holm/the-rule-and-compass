@@ -1,5 +1,7 @@
 //! #1177: `rcsr trials --table`, the multi-metric candidate table.
 
+#[path = "common/cpcv_series.rs"]
+mod cpcv_series;
 #[path = "common/rcsr.rs"]
 mod rcsr_cmd;
 #[path = "common/scratch.rs"]
@@ -691,4 +693,94 @@ fn trials_default_output_is_unchanged() {
     let mut bytes = campaign.stdout.clone();
     bytes.extend_from_slice(&compare.stdout);
     assert_eq!(rcsr::manifest::sha256_hex(&bytes), "21cde625be2b0f3b294574b3a3bd59184770d9b1411823a72b4ecd2e436314d9");
+}
+
+// ---------------------------------------------------------------------------
+// CPCV path rows (#1236)
+// ---------------------------------------------------------------------------
+
+/// The paths of a CPCV(4, 2) assembly of synthetic split reports with every series, the
+/// split reports and the scheme.
+fn cpcv_paths(dir: &Path) -> (Vec<String>, Vec<Json>, rcsr::cpcv::Scheme) {
+    let (table, scheme) = cpcv_series::write_table(dir);
+    let reports = cpcv_series::write_reports(dir, "wf", &scheme, &|_| cpcv_series::ALL);
+    let out = dir.join("paths");
+    let (o, sm) = (out.to_string_lossy().into_owned(), dir.join("summary.json").to_string_lossy().into_owned());
+    let mut args = vec!["trials", "--cpcv-assemble"];
+    args.extend(reports.iter().map(String::as_str));
+    args.extend_from_slice(&["--splits", &table, "--out-dir", &o, "--summary", &sm]);
+    let r = run(&args);
+    assert_eq!(code(&r), 0, "{}", stderr(&r));
+    let paths = (1..=scheme.paths()).map(|j| out.join(format!("path_{j}.json")).to_string_lossy().into_owned()).collect();
+    (paths, reports.iter().map(|p| read_json(p)).collect(), scheme)
+}
+
+fn bear_cell(x: &Json) -> &Json {
+    items(at(x, &["strata"])).iter().find(|c| at(c, &["label"]).as_str() == Some("bear")).expect("a bear stratum")
+}
+
+#[test]
+fn cpcv_path_table_metrics_match_group_series() {
+    let (_s, dir) = scratch("table-cpcv");
+    let (paths, wf, scheme) = cpcv_paths(&dir);
+    let cal = cpcv_series::write_calendar(&dir);
+    let mut args = vec!["trials", "--wf"];
+    args.extend(paths.iter().map(String::as_str));
+    args.extend(["--table", "--regimes", &cal, "--draws", "50"]);
+    let j = stdout_json(&run(&args));
+    assert_eq!(items(at(&j, &["rows"])).len(), 3);
+    let ppy = 8760.0;
+    let bear_from = cpcv_series::day("2021-01-07") as f64;
+    let assign = rcsr::cpcv::assignment(&scheme.test_sets, scheme.groups.len());
+    for k in 0..paths.len() {
+        let v = |key: &str| cpcv_series::path_values(&wf, &scheme, k, key);
+        let (net, cost, exposure, bh, time) = (v("period_net"), v("period_cost"), v("period_exposure"), v("period_bh_net"), v("period_time"));
+        let ann = |idx: &[usize], f: &dyn Fn(usize) -> f64| idx.iter().map(|&t| f(t)).sum::<f64>() / idx.len() as f64 * ppy;
+        let all: Vec<usize> = (0..net.len()).collect();
+        let bull: Vec<usize> = all.iter().copied().filter(|&t| time[t] < bear_from).collect();
+        let bear: Vec<usize> = all.iter().copied().filter(|&t| time[t] >= bear_from).collect();
+        assert!(!bull.is_empty() && !bear.is_empty());
+        let groups_pos = (0..scheme.groups.len())
+            .filter(|&g| cpcv_series::group_values(&wf[assign[g][k]], &scheme.groups[g], "period_net").iter().sum::<f64>() > 0.0)
+            .count();
+        let want = [
+            ("net10", ann(&all, &|t| net[t])),
+            ("net20", ann(&all, &|t| net[t] - cost[t])),
+            ("exposure", mean(&exposure)),
+            ("entry_times", cpcv_series::path_entry_times(&wf, &scheme, k)),
+            ("alpha_bh", ann(&all, &|t| net[t] - exposure[t] * bh[t])),
+            ("groups_pos", groups_pos as f64),
+            ("bull_net", ann(&bull, &|t| net[t])),
+            ("bear_excess", ann(&bear, &|t| net[t]) - ann(&bear, &|t| bh[t])),
+        ];
+        let x = row(&j, k);
+        for (name, w) in want {
+            let got = num(x, &["metrics", name]);
+            assert!((got - w).abs() <= 1e-12, "path {} {name}: table {got} group series {w}", k + 1);
+        }
+        let w = ann(&bear, &|t| net[t] - exposure[t] * bh[t]);
+        let got = num(bear_cell(x), &["alpha_bh"]);
+        assert!((got - w).abs() <= 1e-12, "path {} alpha_bh:bear: table {got} group series {w}", k + 1);
+    }
+}
+
+#[test]
+fn pilot_rule_runs_on_cpcv_paths() {
+    let (_s, dir) = scratch("table-cpcv-pilot");
+    let (paths, _, _) = cpcv_paths(&dir);
+    let cal = cpcv_series::write_calendar(&dir);
+    let rule = write_text(&dir, "rule.json", cpcv_series::PILOT_RULE);
+    let mut args = vec!["trials", "--wf"];
+    args.extend(paths.iter().map(String::as_str));
+    args.extend(["--table", "--rule", &rule, "--regimes", &cal, "--draws", "50"]);
+    let j = stdout_json(&run(&args));
+    assert_eq!(items(at(&j, &["rows"])).len(), 3);
+    for i in 0..3 {
+        let x = row(&j, i);
+        assert!(items(at(x, &["unavailable"])).is_empty(), "row {i}: {:?}", at(x, &["unavailable"]));
+        for m in cpcv_series::PILOT_METRICS {
+            assert!(num(x, &["metrics", m]).is_finite(), "row {i}: {m}");
+        }
+        assert!(num(bear_cell(x), &["alpha_bh"]).is_finite(), "row {i}: alpha_bh:bear");
+    }
 }

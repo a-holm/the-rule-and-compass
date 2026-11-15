@@ -2749,6 +2749,11 @@ mod members {
     fn fixture(tag: &str) -> Fixture {
         let scratch = Scratch::new(tag);
         let dir = scratch.path().to_path_buf();
+        let data = write(&dir, "panel.csv", &panel_csv());
+        Fixture { _scratch: scratch, dir, data }
+    }
+
+    fn panel_csv() -> String {
         let mut csv = String::from("ts,sym,x,target\n");
         for i in 0..600i64 {
             for (s, sym) in ["A", "B", "C"].iter().enumerate() {
@@ -2758,8 +2763,7 @@ mod members {
                 csv.push_str(&format!("{},{},{},{}\n", i * 3600, sym, x, y));
             }
         }
-        let data = write(&dir, "panel.csv", &csv);
-        Fixture { _scratch: scratch, dir, data }
+        csv
     }
 
     fn write(dir: &Path, name: &str, text: &str) -> String {
@@ -2848,7 +2852,7 @@ mod members {
                 }
                 assert_eq!(get(&all, &["pooled", "period_net"]), get(&members[0], &["series", "period_net"]));
             } else {
-                let plain = wf(&f.data, &[vec!["--front", &run], variant.clone()].concat());
+                let plain = wf(&f.data, &[vec!["--front", &run, "--emit-series"], variant.clone()].concat());
                 for k in ["candidates", "windows", "economics"] {
                     assert_eq!(get(&all, &[k]), get(&plain, &[k]), "{variant:?}: {k}");
                 }
@@ -2959,6 +2963,39 @@ mod members {
         assert_eq!((entries[at(30.0)], stamp[at(30.0)]), (3.0, 1.0));
         assert_eq!(stamp.iter().sum::<f64>(), 2.0);
     }
+
+    /// #1236: `windows[].entry_times` under `--emit-series`, through the library so the
+    /// report holds no path and no timing.
+    #[test]
+    fn emit_series_window_entry_times_sum_to_pooled() {
+        use rcsr::walkforward::{self, ProtocolOptions};
+        let t = rcsr::data::parse_table(&panel_csv()).unwrap();
+        let mut s = super::spec(
+            "x",
+            vec![
+                super::window("w1", 0.0, 1_080_000.0, 1_083_600.0, 1_440_000.0),
+                super::window("w2", 0.0, 1_440_000.0, 1_443_600.0, 1_800_000.0),
+                super::window("w3", 0.0, 1_800_000.0, 1_803_600.0, 2_160_000.0),
+            ],
+        );
+        s.group = Some("sym".to_string());
+        s.threshold_fixed = Some(0.0);
+        s.cost_bps = 9.765625;
+        s.horizon = 3600.0;
+        s.periods_per_year = Some(8760.0);
+        let plain = walkforward::run_table_with(&t, &s, "panel", &ProtocolOptions::default()).unwrap().hashed_json();
+        assert_eq!(rcsr::manifest::sha256_hex(plain.as_bytes()), PINNED_PLAIN_REPORT, "the report without --emit-series");
+        let p = Json::parse(plain.trim()).unwrap();
+        assert!(items(get(&p, &["windows"])).iter().all(|w| w.get("entry_times").is_none()));
+        let emit = ProtocolOptions { emit_series: true, ..ProtocolOptions::default() };
+        let j = Json::parse(walkforward::run_table_with(&t, &s, "panel", &emit).unwrap().hashed_json().trim()).unwrap();
+        let per: Vec<f64> = items(get(&j, &["windows"])).iter().map(|w| get(w, &["entry_times"]).as_f64().unwrap()).collect();
+        assert_eq!(per.len(), 3);
+        assert!(per.iter().all(|&v| v > 0.0), "{per:?}");
+        assert_eq!(per.iter().sum::<f64>(), get(&j, &["pooled", "entry_times"]).as_f64().unwrap());
+    }
+
+    const PINNED_PLAIN_REPORT: &str = "ab322d39470888d46f39b5f4a56372cb29fae75c22473b411fa589a26eeca269";
 
     /// Buy and hold of the rows the book prices: long on every row of a symbol in a
     /// window, the entry paid on its first row and the exit on its last.
