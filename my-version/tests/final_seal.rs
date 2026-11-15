@@ -1317,3 +1317,70 @@ fn ladder_masked_run_refusal_precedes_the_ledger() {
     assert!(!Path::new(&out).exists(), "a refused read writes no report");
     assert!(!std::fs::read_to_string(&l).unwrap().contains("baseline_read"));
 }
+
+/// A target spec for column `y` (horizon 1800 s, rows 3600 s apart) with the given return units and stride.
+fn units_spec(dir: &Path, name: &str, units: &str, stride: f64) -> String {
+    let text = format!(
+        "{{\"schema\":\"rcsr-target-spec/1\",\"targets\":[{{\"column\":\"y\",\"name\":\"y\",\
+         \"kind\":\"forward_return\",\"deprecated\":false,\"return_column\":\"y\",\"return_units\":\"{units}\",\
+         \"horizon_seconds\":1800,\"stride_seconds\":{stride},\"entry_offset_seconds\":0,\"delay_seconds\":0,\
+         \"entry_price\":\"open\",\"exit_price\":\"close\",\"offset\":0.0,\
+         \"scale\":{{\"kind\":\"constant\",\"value\":1.0}},\"clip\":null,\"units\":\"log_return\",\
+         \"cost_bps\":5,\"cost_in_label\":false,\"construction_columns\":[],\"note\":null}}]}}"
+    );
+    let path = dir.join(name);
+    std::fs::write(&path, text).unwrap();
+    s(&path)
+}
+
+fn spec_wf(data: &str, ledger: &str, spec: &str, window: &str, extra: &[&str]) -> (i32, String, String) {
+    let mut a = vec![
+        "walkforward", "--data", data, "--target", "y", "--target-spec", spec, "--time", "ts", "--expr", "x", "--json",
+        "--ledger", ledger, "--window", window,
+    ];
+    a.extend_from_slice(extra);
+    rcsr(&a)
+}
+
+/// Seals a development run under `base`, then reads it under `other` (refused) and under `base` (the control).
+fn spec_change_is_refused(name: &str, base: (&str, f64), other: (&str, f64)) {
+    let (_scratch, dir) = scratch(name);
+    let data = store(&dir, "d.csv");
+    let (a, b) = (units_spec(&dir, "a.json", base.0, base.1), units_spec(&dir, "b.json", other.0, other.1));
+    let (dev_window, locked) = (window("dev", 0, 150, 160, 250), window("locked", 0, 250, 300, 400));
+
+    let both = s(&dir.join("both.jsonl"));
+    for spec in [&a, &b] {
+        let (code, _, err) = spec_wf(&data, &both, spec, &dev_window, &[]);
+        assert_eq!(code, 0, "{}", err);
+    }
+    let ids = event_field(&both, "candidate", "id");
+    let specs = event_field(&both, "candidate", "spec_sha256");
+    assert_eq!((ids.len(), specs.len()), (2, 2), "{:?}", ids);
+    assert_ne!(ids[0], ids[1]);
+    assert_ne!(specs[0], specs[1]);
+
+    let (l, sealed) = (s(&dir.join("sealed.jsonl")), s(&dir.join("sealed.json")));
+    let (code, _, err) = spec_wf(&data, &l, &a, &dev_window, &[]);
+    assert_eq!(code, 0, "{}", err);
+    let (code, _, err) = rcsr(&["protocol", "seal", "--final", "--ledger", &l, "--out", &sealed]);
+    assert_eq!(code, 0, "{}", err);
+    let locked_flags = ["--locked-test", "--sealed", sealed.as_str()];
+    let (code, _, err) = spec_wf(&data, &l, &b, &locked, &locked_flags);
+    assert_eq!(code, 3, "{}", err);
+    assert!(err.contains("is not in the sealed list"), "{}", err);
+    assert_eq!(test_reads(&l), 0);
+    let (code, _, err) = spec_wf(&data, &l, &a, &locked, &locked_flags);
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(test_reads(&l), 1);
+}
+
+#[test]
+fn locked_read_under_another_stride_is_refused() {
+    spec_change_is_refused("stride-id", ("simple", 3600.0), ("simple", 2700.0));
+}
+
+#[test]
+fn locked_read_under_other_return_units_is_refused() {
+    spec_change_is_refused("units-id", ("simple", 3600.0), ("log", 3600.0));
+}
