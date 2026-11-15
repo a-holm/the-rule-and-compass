@@ -1226,7 +1226,7 @@ fn threshold_fit_binds_the_sealed_read() {
 }
 
 fn masked_run(dir: &Path) -> String {
-    let h = 5 * H;
+    let h = H;
     let run = format!(
         r#"{{"tool":"rcsr","variables":["x"],
         "target_spec":{{"column":"y","name":"y","kind":"forward_return","deprecated":false,
@@ -1249,7 +1249,7 @@ fn masked_run(dir: &Path) -> String {
 
 fn run_wf(data: &str, ledger: &str, run: &str, window: &str, extra: &[&str]) -> (i32, String, String) {
     let mut a = vec![
-        "walkforward", "--data", data, "--time", "ts", "--from-run", run, "--periods-per-year", "365", "--json",
+        "walkforward", "--data", data, "--time", "ts", "--from-run", run, "--json",
         "--ledger", ledger, "--window", window,
     ];
     a.extend_from_slice(extra);
