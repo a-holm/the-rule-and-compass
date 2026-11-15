@@ -521,7 +521,7 @@ pub fn protocol_usage() -> &'static str {
       START and END are UTC midnights; the N groups have equal length in whole
       days (within one day) over the span with the locked holes removed. The
       training rows of every split are trimmed by the label purge P before and
-      the embargo after every test group, the last share F of each training
+      the embargo after every test group, and the last share F of each training
       group is a validation interval purged on both sides. --embargo-seconds auto
       (the default) is the larger of P and the longest lookback of the --vars
       columns at a bar of B seconds (rule rcsr-lookback/1; needs --vars and
