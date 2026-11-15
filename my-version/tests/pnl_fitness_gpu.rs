@@ -2178,18 +2178,13 @@ fn device_mask_cli_runs_on_the_gpu() {
 }
 
 /// CPU (4 threads) against device generations per second of a masked
-/// `--fitness pnl` search: 16 groups of 12,500 hourly rows, 8 variables, the
-/// gate of `regime_gate::hysteresis_states` (band 0.02, dwell 168) on a slow
-/// series. Per run two warm-up generations, then the timed ones, for 8 blocks
-/// plain and 8 blocks with a minimum hold of 12. Prints the numbers; asserts
-/// no time.
-#[test]
-#[ignore]
-fn long_pnl_mask_search_throughput_cpu_against_device() {
-    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
-    if !device_present() {
-        return;
-    }
+/// `--fitness pnl` search with 8 blocks and minimum hold `hold`: 16 groups of
+/// 12,500 hourly rows, 8 variables, the gate of `regime_gate::hysteresis_states`
+/// (band 0.02, dwell 168) on a slow series. Three runs: the CPU, the device with
+/// the default CPU constant fit, and the device with the device fit arm. Each
+/// run has two warm-up generations, then the timed ones. Prints the numbers;
+/// asserts no time.
+fn mask_search_throughput(hold: usize) {
     const GROUPS: usize = 16;
     const ROWS: usize = 12_500;
     const NVARS: usize = 8;
@@ -2216,47 +2211,80 @@ fn long_pnl_mask_search_throughput_cpu_against_device() {
     let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
     let cpus = status.lines().find(|l| l.starts_with("Cpus_allowed_list:")).map_or("unknown", |l| l.split_whitespace().last().unwrap_or("unknown"));
     println!("rows {n} ({GROUPS} groups x {ROWS} hourly), {NVARS} vars, gate on share {share:.3}, cpus allowed {cpus}, fit_stream_source none");
-    for hold in [1usize, 12] {
-        let sp = band_spec(1, 0.0, BandUnits::Score, hold);
-        let mask = BookMask { on: &on, identity: "throughput" };
-        let b = Arc::new(FitnessBook::with_segments(&slice, &sp, 3600.0, 8, 1.0, &[], Some(mask)).expect("a profitable masked book"));
-        for gpu in [false, true] {
-            let marks: Arc<Mutex<Vec<(usize, f64)>>> = Arc::default();
-            let m = marks.clone();
-            let cfg = Config {
-                generations: 12,
-                pop: 64,
-                islands: 8,
-                seed: 7,
-                metric: Metric::Squared,
-                fitness: Fitness::LongPnl(b.clone()),
-                gpu,
-                gpu_required: gpu,
-                gpu_notes: false,
-                dispatch: if gpu { rcsr::dispatch::DispatchMode::Device } else { rcsr::dispatch::DispatchMode::Auto },
-                threads: 4,
-                threads_explicit: true,
-                front_observer: Some(Arc::new(move |g, secs, _: &rcsr::pareto::Archive| m.lock().unwrap().push((g, secs)))),
-                ..Default::default()
-            };
-            let out = search::run(&cfg, &sample, &sample);
-            let marks = marks.lock().unwrap();
-            let warm = marks.iter().find(|(g, _)| *g == 2).map(|(_, s)| *s).expect("two warm-up generations");
-            let &(last_gen, last) = marks.last().expect("generations ran");
-            let timed = (last_gen - 2) as f64;
-            let (device_programs, kernel_s) = out.gpu.as_ref().map_or((0, 0.0), |g| (g.accounting.programs, g.accounting.kernel_s));
+    let sp = band_spec(1, 0.0, BandUnits::Score, hold);
+    let mask = BookMask { on: &on, identity: "throughput" };
+    let b = Arc::new(FitnessBook::with_segments(&slice, &sp, 3600.0, 8, 1.0, &[], Some(mask)).expect("a profitable masked book"));
+    let arms = [
+        ("cpu, 4 threads", false, rcsr::fit::FitStrategy::Exact),
+        ("device, cpu fit", true, rcsr::fit::FitStrategy::Exact),
+        ("device, device fit", true, rcsr::fit::FitStrategy::Gpu),
+    ];
+    for (name, gpu, fit_strategy) in arms {
+        let marks: Arc<Mutex<Vec<(usize, f64)>>> = Arc::default();
+        let m = marks.clone();
+        let cfg = Config {
+            generations: 12,
+            pop: 64,
+            islands: 8,
+            seed: 7,
+            metric: Metric::Squared,
+            fitness: Fitness::LongPnl(b.clone()),
+            gpu,
+            gpu_required: gpu,
+            gpu_notes: false,
+            dispatch: if gpu { rcsr::dispatch::DispatchMode::Device } else { rcsr::dispatch::DispatchMode::Auto },
+            fit_strategy,
+            threads: 4,
+            threads_explicit: true,
+            front_observer: Some(Arc::new(move |g, secs, _: &rcsr::pareto::Archive| m.lock().unwrap().push((g, secs)))),
+            ..Default::default()
+        };
+        let out = search::run(&cfg, &sample, &sample);
+        let marks = marks.lock().unwrap();
+        let warm = marks.iter().find(|(g, _)| *g == 2).map(|(_, s)| *s).expect("two warm-up generations");
+        let &(last_gen, last) = marks.last().expect("generations ran");
+        let timed = (last_gen - 2) as f64;
+        println!(
+            "hold {hold} {name}: backend {:?} ({:?}), {timed} timed generations in {:.3} s, {:.4} generations/s; {} programs scored in {last:.3} s ({:.1} programs/s)",
+            out.backend,
+            out.backend_reason,
+            last - warm,
+            timed / (last - warm),
+            out.candidates_evaluated,
+            out.candidates_evaluated as f64 / last
+        );
+        if let Some(g) = &out.gpu {
+            let gens = &g.generations;
             println!(
-                "hold {hold} {}: backend {:?} ({:?}), {} timed generations in {:.3} s, {:.4} generations/s; {} programs scored in {:.3} s ({:.1} programs/s), device programs {device_programs}, device kernel {kernel_s:.3} s",
-                if gpu { "device" } else { "cpu, 4 threads" },
-                out.backend,
-                out.backend_reason,
-                timed,
-                last - warm,
-                timed / (last - warm),
-                out.candidates_evaluated,
-                last,
-                out.candidates_evaluated as f64 / last
+                "hold {hold} {name}: device programs {}, kernel {:.3} s, accounting wall {:.3} s, host {:.3} s; fits on the device {}, on the cpu {}, fallback seconds {:.3}, fit fallback seconds {:.3}, full +inf checks {}",
+                g.accounting.programs,
+                g.accounting.kernel_s,
+                g.accounting.wall_s,
+                g.accounting.host_s,
+                g.fit_gpu,
+                g.fit_fallback,
+                gens.iter().map(|s| s.fallback_seconds).sum::<f64>(),
+                gens.iter().map(|s| s.fit_fallback_seconds).sum::<f64>(),
+                gens.iter().map(|s| s.nonfinite_full).sum::<usize>()
             );
         }
+    }
+}
+
+#[test]
+#[ignore]
+fn long_pnl_mask_search_throughput_cpu_against_device() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    if device_present() {
+        mask_search_throughput(1);
+    }
+}
+
+#[test]
+#[ignore]
+fn long_pnl_mask_search_throughput_cpu_against_device_with_a_hold() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    if device_present() {
+        mask_search_throughput(12);
     }
 }
