@@ -368,10 +368,12 @@ fn assert_exact_blocks(f: &Fixture, b: &FitnessBook, trees: &[Node]) -> usize {
         let cpu = b.block_totals(&pred);
         let want = b.fitness_of(&cpu);
         assert_eq!(blocks[k].len(), cpu.len());
+        // The device flag is the whole candidate's (`long_pnl_block_totals_for_tests`).
+        let any_bad = cpu.iter().any(|t| t.nonfinite);
         for (j, (d, c)) in blocks[k].iter().zip(&cpu).enumerate() {
             assert_eq!(d.flips, c.flips, "program {k} block {j} flips");
             assert_eq!(d.exits, c.exits, "program {k} block {j} exits");
-            assert_eq!(d.nonfinite, c.nonfinite, "program {k} block {j} non-finite");
+            assert_eq!(d.nonfinite, any_bad, "program {k} block {j} non-finite");
             assert_eq!(d.gross.to_bits(), c.gross.to_bits(), "program {k} block {j} gross {} vs {}", d.gross, c.gross);
         }
         assert_eq!(batch.values[k].to_bits(), want.to_bits(), "program {k} fitness {} vs {}", batch.values[k], want);

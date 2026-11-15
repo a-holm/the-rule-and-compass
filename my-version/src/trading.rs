@@ -3609,7 +3609,7 @@ mod block_tests {
     fn refusals_name_the_block_problem() {
         let s = panel(&[40, 40]);
         assert!(FitnessBook::with_blocks(&s, &spec(), 900.0, 0, 1.0).is_err());
-        assert!(FitnessBook::with_blocks(&s, &spec(), 900.0, 9, 1.0).is_err());
+        assert!(FitnessBook::with_blocks(&s, &spec(), 900.0, 65, 1.0).is_err());
         assert!(FitnessBook::with_blocks(&s, &spec(), 900.0, 2, -1.0).is_err());
         assert!(FitnessBook::with_blocks(&s, &spec(), 900.0, 2, f64::NAN).is_err());
         assert!(FitnessBook::with_blocks(&s, &spec(), 900.0, 41, 1.0).is_err());
