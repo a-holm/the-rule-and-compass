@@ -639,3 +639,73 @@ fn cal_rows(path: &str) -> Vec<CalRow> {
         .map(|(label, a, b)| CalRow { label, start: rcsr::data::parse_time(&a).unwrap(), end: rcsr::data::parse_time(&b).unwrap() })
         .collect()
 }
+
+/// #1199: `panel_csv` with a column `z` that equals `x` except NaN for every symbol on hours
+/// `[200, 260)`, so a book on `z` has 60 empty periods on the target grid.
+fn gap_panel_csv(dir: &Path) -> String {
+    let mut text = String::from("ts,sym,x,z,g,target\n");
+    for i in 0..HOURS {
+        let m = 0.5 + frac(i as f64 * 0.618_033_988_749_894_9);
+        let g = if (i / 7) % 2 == 0 { m } else { -m };
+        for (k, sym) in ["A", "B", "C"].iter().enumerate() {
+            let k = k as i64;
+            let x = ((i * 37 + k * 11) % 17) as f64 - 8.0;
+            let y = 0.0003 * x + (((i * 13 + k * 5) % 7) as f64 - 3.0) * 0.0004;
+            let z = if (200..260).contains(&i) { String::new() } else { x.to_string() };
+            text.push_str(&format!("{},{},{},{},{},{}\n", T0 + i * H, sym, x, z, g, y));
+        }
+    }
+    let p = dir.join("gap.csv");
+    std::fs::write(&p, text).unwrap();
+    s(&p)
+}
+
+#[test]
+fn regime_strata_on_the_target_grid() {
+    let (_s, dir) = scratch("regimes-grid");
+    let data = gap_panel_csv(&dir);
+    let iso = |h: i64| rcsr::protocol::iso((T0 + h * H) as f64) + "Z";
+    let cal = dir.join("cal.csv");
+    std::fs::write(&cal, format!("label,start,end\nbull,{},{}\nbear,{},{}\n", iso(100), iso(230), iso(230), iso(450))).unwrap();
+    let run_grid = |expr: &str| {
+        let w = window();
+        let c = s(&cal);
+        json_of(&run(&[
+            "walkforward", "--data", &data, "--target", "target", "--expr", expr, "--vars", "x,z", "--time", "ts", "--group-by", "sym",
+            "--window", &w, "--threshold-fixed", "0", "--cost-bps", "10", "--periods-per-year", "8760", "--json", "--period-grid", "target",
+            "--regimes", &c, "--regime-expr", "g",
+        ]))
+    };
+    let z = run_grid("z");
+    let x = run_grid("x");
+    let periods = (HOURS - 100) as usize;
+    assert_eq!(num(&z, &["pooled", "grid", "empty_periods"]), 60.0);
+    for key in ["period_net", "period_time", "period_rows", "period_gross", "period_exposure", "period_entries", "period_bh"] {
+        assert_eq!(series(&z, &["pooled", key]).len(), periods, "pooled.{key} has the grid's length");
+    }
+    let net = series(&z, &["pooled", "period_net"]);
+    let gross = series(&z, &["pooled", "period_gross"]);
+    let rows = series(&z, &["pooled", "period_rows"]);
+    for key in ["period_net", "period_gross", "period_exposure", "period_entries", "period_bh"] {
+        let v = series(&z, &["pooled", key]);
+        assert!(rows.iter().zip(&v).all(|(&r, &x)| r > 0.0 || x == 0.0), "pooled.{key} is 0 on an empty period");
+    }
+    let cal_strata = items(&z, &["regimes", "calendar", "strata"]);
+    let expr_strata = items(&items(&z, &["regimes", "expressions"])[0], &["strata"]);
+    let cost: f64 = gross.iter().zip(&net).map(|(g, n)| g - n).sum();
+    for strata in [cal_strata, expr_strata] {
+        assert_eq!(strata.iter().map(|x| num(x, &["periods"])).sum::<f64>(), periods as f64);
+        let net_sum: f64 = strata.iter().map(|x| num(x, &["net_sum"])).sum();
+        let cost_sum: f64 = strata.iter().map(|x| num(x, &["cost_sum"])).sum();
+        assert!((net_sum - net.iter().sum::<f64>()).abs() < 1e-12, "strata sum to pooled: {net_sum}");
+        assert!((cost_sum - cost).abs() < 1e-12, "{cost_sum} vs {cost}");
+    }
+    // The state of an empty period comes from the calendar or the expression at its
+    // timestamp, so a formula with full coverage gets the same strata periods.
+    let x_expr = items(&items(&x, &["regimes", "expressions"])[0], &["strata"]);
+    for (a, b) in [(cal_strata, items(&x, &["regimes", "calendar", "strata"])), (expr_strata, x_expr)] {
+        let p = |v: &[Json]| v.iter().map(|s| (at(s, &["label"]).as_str().unwrap().to_string(), num(s, &["periods"]))).collect::<Vec<_>>();
+        assert_eq!(p(a), p(b));
+    }
+    assert_eq!(num(stratum(cal_strata, "bull"), &["periods"]), 130.0);
+}
