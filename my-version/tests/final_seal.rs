@@ -1225,6 +1225,119 @@ fn threshold_fit_binds_the_sealed_read() {
     assert_eq!(test_reads(&l), 1);
 }
 
+/// #1214: a store with a gate column `h` (alternate 13-hour blocks) and the
+/// declared locked test at hours 300..400.
+fn switch_store(dir: &Path, name: &str) -> String {
+    let path = dir.join(name);
+    let mut csv = String::from("ts,x,h,y\n");
+    for i in 0..400i64 {
+        let x = ((i * 37) % 17) as f64 - 8.0;
+        let h = if (i / 13) % 2 == 0 { 0.5 } else { -0.5 } + 0.01 * ((i * 7) % 5) as f64;
+        let y = 0.0003 * x + (((i * 13) % 7) as f64 - 3.0) * 0.0004;
+        csv.push_str(&format!("{},{},{},{}\n", T0 + i * H, x, h, y));
+    }
+    std::fs::write(&path, csv).unwrap();
+    let d = s(&path);
+    lockbox::write_sidecar(&d, &Lockbox { start: T0 + 300 * H, end: T0 + 400 * H }, "test").unwrap();
+    d
+}
+
+/// A composed-style run.json whose finalist is the switch of gate `h` (band,
+/// dwell) holding `on` where the state is on and `off` elsewhere.
+fn switch_run(dir: &Path, name: &str, band: f64, dwell: usize, on: &str, off: &str) -> String {
+    let spec = "{\"column\":\"y\",\"name\":\"y\",\"kind\":\"forward_return\",\"deprecated\":false,\"return_column\":null,\"return_units\":\"simple\",\
+         \"horizon_seconds\":3600,\"entry_offset_seconds\":0,\"delay_seconds\":0,\"entry_price\":\"open\",\"exit_price\":\"close\",\"offset\":0.0,\
+         \"scale\":{\"kind\":\"constant\",\"value\":1.0},\"clip\":null,\"units\":\"return\",\"cost_bps\":null,\"cost_in_label\":false,\"construction_columns\":[],\"note\":null}";
+    let display = format!("if(greater(h, 0), {on}, {off})");
+    let sw = format!(
+        "{{\"gate\":{{\"schema\":\"rcsr-gate/1\",\"expr\":\"h\",\"columns\":[\"h\"],\"band\":{band},\"dwell\":{dwell},\"state_rule\":\"rcsr-gate-state/1\"}},\"on\":\"{on}\",\"off\":\"{off}\"}}"
+    );
+    let body = format!(
+        "{{\"tool\":\"rcsr\",\"target\":\"y\",\"variables\":[\"x\"],\"split\":{{\"mode\":\"temporal\",\"train_time\":[{},{}],\"required_purge_seconds\":3600}},\
+         \"target_spec\":{spec},\"search\":{{\"candidates_evaluated\":3}},\
+         \"objective\":{{\"spec\":{{\"threshold\":0.0,\"per_side_bps\":5.0,\"max_position\":1.0,\"cash_return\":0.0,\"min_holding\":1}},\"cost\":{{\"source\":\"flag\"}},\
+         \"finalist\":{{\"expression\":\"{display}\",\"expression_exact\":\"{display}\",\"switch\":{sw}}}}},\
+         \"pareto\":[{{\"archive_rank\":1,\"composite_id\":0,\"type\":\"C1\",\"expression\":\"{display}\",\"expression_exact\":\"{display}\",\"complexity\":5,\"pruned\":false,\"switch\":{sw}}}]}}",
+        T0,
+        T0 + 100 * H
+    );
+    let path = dir.join(name);
+    std::fs::write(&path, body).unwrap();
+    s(&path)
+}
+
+fn switch_wf(data: &str, ledger: &str, run: &str, extra: &[&str]) -> (i32, String, String) {
+    let mut a = vec![
+        "walkforward", "--data", data, "--target", "y", "--time", "ts", "--cost-bps", "5", "--json", "--ledger", ledger,
+        "--from-run", run,
+    ];
+    a.extend_from_slice(extra);
+    rcsr(&a)
+}
+
+fn candidate_of(out: &str) -> String {
+    out.split("\"candidate_id\":\"").nth(1).expect("candidate_id").split('"').next().unwrap().to_string()
+}
+
+#[test]
+fn locked_read_prices_a_stateful_composite_once() {
+    let (_scratch, dir) = scratch("switch-read");
+    let data = switch_store(&dir, "d.csv");
+    let run = switch_run(&dir, "switch.json", 0.02, 3, "x", "-1.0");
+    let (l, sealed) = (s(&dir.join("ledger.jsonl")), s(&dir.join("sealed.json")));
+    let dev = window("dev", 0, 150, 160, 250);
+    let (code, out, err) = switch_wf(&data, &l, &run, &["--window", &dev]);
+    assert_eq!(code, 0, "{}", err);
+    assert!(out.contains("\"source\":\"objective.finalist.switch\""), "{}", out);
+    let (code, _, err) = rcsr(&["protocol", "seal", "--final", "--ledger", &l, "--out", &sealed]);
+    assert_eq!(code, 0, "{}", err);
+    let locked = window("locked", 0, 250, 300, 400);
+    let read = |extra: &[&str]| {
+        let mut a = vec!["--locked-test", "--sealed", sealed.as_str(), "--window", locked.as_str()];
+        a.extend_from_slice(extra);
+        switch_wf(&data, &l, &run, &a)
+    };
+    let (code, out, err) = read(&[]);
+    assert_eq!(code, 0, "{}", err);
+    let j = rcsr::devlog::Json::parse(out.trim()).expect("json report");
+    let w = match j.get("windows") {
+        Some(rcsr::devlog::Json::Arr(a)) => a[0].clone(),
+        _ => panic!("windows"),
+    };
+    let start = w.get("gate").and_then(|g| g.get("start")).expect("windows[0].gate.start");
+    let last = start.get("warmup_last_time").and_then(|v| v.as_f64()).unwrap();
+    assert!(last < (T0 + 300 * H) as f64, "the warm-up ends before the locked start: {last}");
+    assert_eq!(last, (T0 + 299 * H) as f64, "the purge rows before the locked start are read for the gate");
+    assert!(w.get("gate").and_then(|g| g.get("regime")).is_some(), "the locked read prices the switch");
+    assert_eq!(test_reads(&l), 1);
+    let (code, _, err) = read(&[]);
+    assert_eq!(code, 3, "a second read is refused: {}", err);
+    assert_eq!(test_reads(&l), 1);
+    let sha = recorded_read_sha(&l);
+    let (code, _, err) = read(&["--verify-read", "--expect-report-sha256", &sha]);
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(test_reads(&l), 1, "verify appends no read");
+}
+
+#[test]
+fn procedure_spec_binds_the_gate() {
+    let (_scratch, dir) = scratch("switch-binding");
+    let data = switch_store(&dir, "d.csv");
+    let l = s(&dir.join("ledger.jsonl"));
+    let dev = window("dev", 0, 150, 160, 250);
+    let mut ids = Vec::new();
+    for (name, band, dwell, on, off) in [("base.json", 0.02, 3, "x", "-1.0"), ("dwell.json", 0.02, 6, "x", "-1.0"), ("band.json", 0.03, 3, "x", "-1.0"), ("swap.json", 0.02, 3, "-1.0", "x")] {
+        let run = switch_run(&dir, name, band, dwell, on, off);
+        let (code, out, err) = switch_wf(&data, &l, &run, &["--window", &dev]);
+        assert_eq!(code, 0, "{name}: {}", err);
+        ids.push(candidate_of(&out));
+    }
+    let mut distinct = ids.clone();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(distinct.len(), 4, "{ids:?}");
+}
+
 fn masked_run(dir: &Path) -> String {
     let h = H;
     let run = format!(
