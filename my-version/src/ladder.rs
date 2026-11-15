@@ -335,10 +335,16 @@ pub struct SrRun {
     pub fold_oof: Vec<(String, bool)>,
 }
 
+/// #1216: the refusal of a run that priced a regime mask.
+pub const MASK_REFUSAL: &str = "the run priced a regime mask (objective.spec.pnl_mask): the SR rung prices the raw formula and cannot price a mask; walkforward --from-run prices it";
+
 impl SrRun {
     pub fn load(path: &str) -> Result<SrRun, String> {
         let run = crate::run_json::RunFile::load(path)?;
         let book = run.band_book()?;
+        if run.mask.is_some() {
+            return Err(MASK_REFUSAL.to_string());
+        }
         if book.position != crate::trading::PositionMap::Threshold {
             return Err("the run priced the top_tercile book: the SR rung prices the threshold rule only".to_string());
         }
@@ -2538,6 +2544,7 @@ Long-only baseline ladder on one panel, one set of folds and one cost model.\n\
                             a fold whose test starts before the run's last seen row + purge is refused (exit 3; for a --split-table run: a fold that a kept training or validation row reaches with its label window or reads within the run embargo after it)\n\
                             prices objective.finalist.expression_exact, else the rounded expression (sr_run.expression_source);\n\
                             --locked-test refuses a rounded source (exit 3)\n\
+                            a run that priced --pnl-mask (objective.spec.pnl_mask) is refused (exit 2): the rung prices the raw formula; walkforward --from-run prices the mask\n\
   --allow-in-sample         with --sr-run: drop in-sample folds from every rung and label them oof:false\n\
   --sr-score <col>          out-of-fold symbolic-regression score column from the caller (labelled oof=caller)\n\
   --sr-evals <n>            candidate evaluations of the symbolic-regression run\n\
@@ -2725,7 +2732,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             return Err(usage_err("--sr-run and --sr-score are alternatives".to_string()));
         }
         let sr = SrRun::load(path).map_err(|e| {
-            if e.contains(crate::run_json::INTERIM_REFUSAL) {
+            if e.contains(crate::run_json::INTERIM_REFUSAL) || e.contains(MASK_REFUSAL) {
                 usage_err(format!("--sr-run {}", e))
             } else {
                 input_err(format!("--sr-run {}", e))

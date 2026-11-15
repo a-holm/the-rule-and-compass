@@ -1293,4 +1293,26 @@ fn masked_and_unmasked_runs_get_different_candidate_ids() {
     let (code, _, err) = run_wf(&data, &l2, &run, &locked, &["--unmasked", "--locked-test", "--sealed", &sealed]);
     assert_eq!(code, 3, "{}", err);
     assert!(err.contains("is not in the sealed list"), "{}", err);
+
+#[path = "common/masked_run.rs"]
+mod masked_run;
+
+/// #1216: a masked `--sr-run` is refused before the ledger or the read marker is touched.
+#[test]
+fn ladder_masked_run_refusal_precedes_the_ledger() {
+    let (_scratch, dir, d, w, out, l, sealed) = ladder_fixture("ladder-masked");
+    let run = s(&dir.join("masked.run.json"));
+    std::fs::write(&run, masked_run::run_json(true, T0 as f64, (T0 + 300 * H) as f64)).unwrap();
+    let marker = format!("{d}.locked_reads.jsonl");
+    let before = (std::fs::read(&l).unwrap(), std::fs::read(&marker).ok());
+    let (code, _, err) = rcsr(&[
+        "ladder", "--data", &d, "--target", "y", "--time", "ts", "--group", "sym", "--features", "f1,f2",
+        "--windows", &w, "--scheme", "locked", "--purge-seconds", "7200", "--gbm-trees", "10", "--draws", "50",
+        "--max-fit-rows", "600", "--out", &out, "--locked-test", "--ledger", &l, "--sealed", &sealed, "--sr-run", &run,
+    ]);
+    assert_eq!(code, 2, "{}", err);
+    assert!(err.contains("pnl_mask"), "{}", err);
+    assert_eq!((std::fs::read(&l).unwrap(), std::fs::read(&marker).ok()), before, "the ledger and the marker stay as they were");
+    assert!(!Path::new(&out).exists(), "a refused read writes no report");
+    assert!(!std::fs::read_to_string(&l).unwrap().contains("baseline_read"));
 }
