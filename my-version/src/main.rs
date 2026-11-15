@@ -233,6 +233,10 @@ USAGE:
   rcsr switch <--fitness pnl run flags> --a <expr|flat> --b <expr|flat> --gate <expr>...
                               the exact gate-cut profile of if(greater(g, c), A, B)
                               and the k-switch bound on the training rows
+  rcsr compose <--fitness pnl run flags> --gates <menu.json> --bull <run.json>...
+               --bear <run.json>... [--all-weather <run.json>...] [--out <run.json>]
+                              regime-switching composites of the pools from a
+                              pre-registered gate menu, chosen on validation rows
   rcsr audit --data <file> --target <col> [--time <col>] [--horizon N] [--json]
              [--lockbox <START,END|none>]
              [--target-spec <file>]
@@ -2782,6 +2786,8 @@ fn main() {
     }
     // #1185: `rcsr switch` builds the training book of a --fitness pnl run and stops before the search.
     let args: Vec<String> = if args.first().map(|s| s.as_str()) == Some("switch") { rcsr::switch::claim(&args[1..]) } else { args };
+    // #1181: `rcsr compose` builds the rows of a --fitness pnl run and stops before the search.
+    let args: Vec<String> = if args.first().map(|s| s.as_str()) == Some("compose") { rcsr::compose::claim(&args[1..]) } else { args };
     // #124: a reusable Rust walk-forward evaluator over the column store.
     if matches!(
         args.first().map(|s| s.as_str()),
@@ -4645,6 +4651,16 @@ fn main() {
             enforce_gate_columns(flag, columns, &specs, &target_names, allow_target_structure);
         }
     }
+    // #1181: the gate and branch columns of `rcsr compose` pass the same checks.
+    if let Some(cp) = rcsr::compose::request() {
+        if lags > 0 || lag_set_src.is_some() || fill != data::FillMethod::None || outlier_iqr.is_some() || smooth > 0 {
+            trading_usage("rcsr compose reads the raw columns of the rows: --lags, --lag-set, --fill, --outlier-iqr and --smooth would change them");
+        }
+        let specs: Vec<&target::TargetSpec> = target_resolved.iter().chain(book_resolved.iter()).map(|r| &r.spec).collect();
+        for (flag, columns) in cp.column_sets() {
+            enforce_gate_columns(flag, &columns, &specs, &target_names, allow_target_structure);
+        }
+    }
 
     // #71/#112: the guard and the backing choice happen before any resident
     // Table or search sample is built. A CSV estimate uses the table's shape
@@ -4913,6 +4929,9 @@ fn main() {
                         }
                         if let Some(sw) = rcsr::switch::request() {
                             pnames.extend(sw.columns());
+                        }
+                        if let Some(cp) = rcsr::compose::request() {
+                            pnames.extend(cp.columns());
                         }
                     }
                     pnames.sort();
@@ -5629,7 +5648,8 @@ fn main() {
             cross_section: top_tercile,
             book_rows: book_resolved.is_some(),
             mask: gate_spec.clone(),
-            train_values: rcsr::switch::request().map_or_else(Vec::new, |sw| sw.columns()),
+            train_values: rcsr::switch::request().map(|sw| sw.columns()).or_else(|| rcsr::compose::request().map(|cp| cp.columns())).unwrap_or_default(),
+            slice_values: rcsr::compose::request().is_some(), // #1181
         });
         if gate_spec.is_some() && top_tercile {
             trading_usage("--pnl-mask prices the long/flat threshold book: it cannot combine with --position top_tercile");
@@ -5814,6 +5834,9 @@ fn main() {
             }
             if let Some(sw) = rcsr::switch::request() {
                 embargo_columns.extend(sw.columns());
+            }
+            if let Some(cp) = rcsr::compose::request() {
+                embargo_columns.extend(cp.columns());
             }
             let (embargo, source, column) = rcsr::intervals::resolve_embargo(flag, purge, &embargo_columns, bar).unwrap_or_else(|e| trading_usage(&e));
             Some(rcsr::intervals::IntervalSplit::new(declared, purge, embargo, source, column))
@@ -6319,6 +6342,34 @@ fn main() {
             "error: --select-by validation needs a validation slice;              add --validation-frac <f>"
         );
         std::process::exit(EXIT_USAGE);
+    }
+    // #1181: `rcsr compose` composes the pools on these rows and exits before the search.
+    if let Some(cp) = rcsr::compose::request() {
+        rcsr::compose::start(cp, &command, &prepared, fitness_book.as_deref(), trading_spec.as_ref(), &rcsr::compose::Inputs {
+            target: &target_names[0],
+            target_sha: target_sha.as_deref(),
+            target_spec_json: &target_spec_json,
+            split_json: &format!(
+                "{{\"mode\":{},\"train_rows\":{}{},\"test_rows\":{}{}{}{}}}",
+                jstr(prepared.report.mode),
+                prepared.train.len(),
+                if prepared.report.validation_rows > 0 { format!(",\"validation_rows\":{}", prepared.report.validation_rows) } else { String::new() },
+                prepared.test.len(),
+                target::split_purge_json(&prepared.report),
+                split_time_json(prepared.keys.as_ref()),
+                interval_split.as_ref().map_or_else(String::new, |s| s.json_fields(&split_table_sha))
+            ),
+            objective,
+            cost: trading_cost.clone(),
+            min_group_step,
+            horizon_seconds: target_horizon,
+            robust: robust_params,
+            cuts: interval_cuts.as_deref(),
+            interval_split: interval_split.as_ref(),
+            ops: &cfg.ops,
+            vars: &vars,
+            book_target: book_resolved.is_some(),
+        });
     }
 
     // #14: implicit relations. The target becomes one more input (normalised

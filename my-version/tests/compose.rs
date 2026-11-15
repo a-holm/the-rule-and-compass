@@ -259,7 +259,7 @@ fn composite_prices_the_same_in_walkforward() {
     assert_eq!(num(&at(&arr(&report, &["windows"])[0], &["metrics"]), &["rows"]), test_rows as f64);
     // The printed expression priced directly on the validation rows is the composite's validation book.
     let wv_out = p.dir.join("wv.json").to_string_lossy().into_owned();
-    let w = format!("v,{},{},{},{}", T0, first_val, first_val, last_val + 1);
+    let w = format!("v,{},{},{},{}", T0, first_val - STEP, first_val, last_val + 1);
     let wv = rcsr(&[
         "walkforward", "--data", &p.data, "--target", "y", "--target-spec", &p.spec, "--expr", &expr, "--vars", "g,x1,x2", "--time", "t", "--group-by", "s",
         "--window", &w, "--threshold-fixed", "0", "--cost-bps", "5", "--out", &wv_out,
@@ -347,7 +347,7 @@ fn compose_counts_every_composite() {
         let m = at(&r, &["inference", "multiple_testing"]).clone();
         (num(&m, &["trials"]), s(&m, &["n_trials_source"]).to_string())
     };
-    let inside = format!("v,{},{},{},{}", T0, first_val, first_val, last_val + 1);
+    let inside = format!("v,{},{},{},{}", T0, first_val - STEP, first_val, last_val + 1);
     assert_eq!(trials(&inside, &["--allow-in-sample-windows"]), (n as f64, "run.candidates_evaluated".to_string()));
     let test_rows = num(&j, &["test_rows"]) as i64;
     let k_test = STAMPS as i64 - test_rows / 3;

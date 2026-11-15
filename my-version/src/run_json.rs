@@ -55,6 +55,10 @@ pub struct FrontMember {
 /// #855: the refusal for a run.json written by an `--interim-chunk` run.
 pub const INTERIM_REFUSAL: &str = "run.json comes from an --interim-chunk run: it holds no report; use the run.json of the last chunk";
 
+/// #1181: the refusal for a composed run whose finalist gate has a band or a dwell.
+pub const CARRIED_GATE_REFUSAL: &str = "run.json comes from rcsr compose with a finalist gate that has a band or a dwell (compose.gate.carried): \
+     its gate state is not a row expression, so the finalist expression would price another book; objective.test holds the composite's own test book";
+
 #[derive(Clone, Debug)]
 pub struct RunFile {
     pub path: String,
@@ -125,6 +129,9 @@ impl RunFile {
         let j = Json::parse(text.trim()).ok_or_else(|| "not a run.json document".to_string())?;
         if matches!(j.get("interim"), Some(Json::Bool(true))) {
             return Err(INTERIM_REFUSAL.to_string());
+        }
+        if matches!(j.get("compose").and_then(|c| c.get("gate")).and_then(|g| g.get("carried")), Some(Json::Bool(true))) {
+            return Err(CARRIED_GATE_REFUSAL.to_string());
         }
         let variables = match j.get("variables") {
             Some(Json::Arr(a)) => a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
