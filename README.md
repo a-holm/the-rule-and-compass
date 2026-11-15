@@ -270,7 +270,7 @@ The verdict (`ablation/verdict.json`, `ablation/verdict.md`) says ship or drop p
 
 ### Campaign trial accounting
 
-`rcsr trials --wf <reports...> --baseline ladder.json` counts the finalists of a campaign from the pooled out-of-fold series (`pooled.period_net`) of their walk-forward reports: distinct books, single-linkage clusters at `|rho| >= --cluster-rho` as the effective trial count, the DSR at that count, at 10x and at the nominal count, SPA against the best long-only baseline (`rcsr ladder --emit-series`), PBO by CSCV and MinBTL. `rcsr trials --compare A B` compares two runs, or two sets of seeds, with a paired stationary block bootstrap of the per-period difference and a seed-spread z. Reports must agree on the threshold rule, including the fitted-cut fields (`threshold.fit`, `threshold.cut_min_entries`, `threshold.cut_blocks`, `threshold.cut_lambda`); `--threshold-arms` lets a fitted-cut and a fixed-cut report be compared as separate arms. See [`docs/overfitting.md`](docs/overfitting.md#314-campaign-trial-accounting-rcsr-trials).
+`rcsr trials --wf <reports...> --baseline ladder.json` counts the finalists of a campaign from the pooled out-of-fold series (`pooled.period_net`) of their walk-forward reports: distinct books, single-linkage clusters at `|rho| >= --cluster-rho` as the effective trial count, the DSR at that count, at 10x and at the nominal count, SPA against the best long-only baseline (`rcsr ladder --emit-series`), PBO by CSCV and MinBTL. `rcsr trials --compare A B` compares two runs, or two sets of seeds, with a paired stationary block bootstrap of the per-period difference and a seed-spread z. Reports must agree on the threshold rule, including the fitted-cut fields (`threshold.fit`, `threshold.cut_min_entries`, `threshold.cut_blocks`, `threshold.cut_lambda`); `--threshold-arms` lets a fitted-cut and a fixed-cut report be compared as separate arms. `rcsr trials --wf <reports...> --table --rule rule.json` (#1177) builds the multi-metric candidate table: one row per series with net at each cost multiple, Sharpe, Sortino, Calmar, drawdown, exposure, entry times, exposure-matched alpha, PSR, positive groups, regime strata and the null quantile; hard gates, then the Pareto front, the average rank with the Friedman statistic and a diversity cap pick the candidates, and every pick gets DSR at `N_eff`, `10 N_eff` and the nominal count (`--prior-trials` adds earlier trials), MinBTL, the Harvey-Liu haircut and StepM and BH-FDR verdicts. The rule file is hashed into the output, and a report with a locked read or locked-range periods exits 2. See [`docs/overfitting.md`](docs/overfitting.md#314-campaign-trial-accounting-rcsr-trials).
 
 Regime strata (#1175): `rcsr protocol regimes` writes a bull, bear and sideways calendar from daily closes (ex-post by default, `--mode causal` for a causal label; locked ranges are written `not_dated`). `rcsr walkforward --regimes calendar.csv --regime-expr <expr>` and `rcsr trials --regimes calendar.csv` report the pooled periods per stratum with switch counts, exposure and alpha against the equal-weight series. Without the flags the output is byte-identical. See [`docs/walkforward.md`](docs/walkforward.md) and [`docs/time-series.md`](docs/time-series.md).
 
@@ -691,7 +691,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--objective mse|pnl|sharpe|log_growth] [--position long_only|top_tercile] [--threshold f]
      [--cost-bps f | --cost-override f] [--slippage-bps f] [--cash-return f] [--funding col]
      [--max-position f] [--min-trades n] [--min-holding n] [--band B] [--band-units score|sd] [--allow-short]
-     [--fitness metric|pnl] [--pnl-blocks K] [--pnl-block-lambda L] [--pnl-mask expr] [--pnl-mask-band h] [--pnl-mask-dwell D] [--pnl-excess none|xs-mean] [--book-target col]
+     [--fitness metric|pnl] [--pnl-blocks K] [--pnl-block-lambda L] [--pnl-stat mean-sd|mean-semi|cvar] [--pnl-cvar-q q] [--pnl-mask expr] [--pnl-mask-band h] [--pnl-mask-dwell D] [--pnl-excess none|xs-mean] [--book-target col]
 |pnl]
      [--equivalence-z z] [--noise-lag n|auto]
      [--allow-lockbox] [--lockbox START,END|none] [--lockbox-embargo SECONDS] [--retired retired.json] [--ledger file] [--arm name] [--target-spec file] [--allow-target-structure] [--require-clean-inputs]
@@ -842,10 +842,15 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
   (`search_fitness.scorer_backend` `cuda`); it equals the CPU book on the device's own `f32`
   predictions bit for bit, and every reported value stays exact CPU `f64`. Resume needs the
   same cost, threshold, band, band units, minimum hold and rows (an sd-unit checkpoint written
-  before the one-pass sd of #945 does not resume). `--pnl-blocks K` (1 to 8, default 1 = off) cuts the training
-  timestamps into `K` blocks, scores each as its own long/flat book and ranks by the mean block
-  regret plus `--pnl-block-lambda` (default 1.0) times their standard deviation, so a formula
-  that earns in one regime only scores worse; the device computes it bit for bit like the CPU.
+  before the one-pass sd of #945 does not resume). `--pnl-blocks K` (1 to 64, default 1 = off) cuts the training
+  timestamps into `K` blocks, scores each as its own long/flat book and ranks by a statistic of
+  the block regrets, so a formula that earns in one regime only scores worse. `--pnl-stat`
+  picks it: `mean-sd` (default) the mean plus `--pnl-block-lambda` (default 1.0) times their
+  standard deviation, `mean-semi` the mean plus lambda times the downside semi-deviation of the
+  block captures (only blocks that lose against cash cost), `cvar` the mean of the worst
+  `ceil(q K)` blocks (`--pnl-cvar-q q`, default 0.25). With many blocks use lambda about
+  `2 / sqrt(K)`: lambda `t / sqrt(K)` keeps the t-statistic test level `t` across block counts.
+  The device computes every statistic bit for bit like the CPU.
   `--pnl-mask <expr>` (with `--pnl-mask-band h` and `--pnl-mask-dwell D`) scores only the rows inside a causal regime gate, so bull and bear specialists can be searched: rows outside are flat, every run of on rows starts flat and pays its exit, and the validation and test books apply the same mask (CPU only; `docs/optimisation.md`).
   `--pnl-excess xs-mean` (default `none`) scores the excess over the equal-weight mean return of the training rows at each timestamp instead of over cash, so the fitness pays for timing and selection relative to the cross-section, not for market beta; the validation and test books, robust selection and walk-forward stay absolute and `objective.validation` and `objective.test` gain `xs_excess_net` (needs `--fitness pnl` and `--cash-return 0`; `docs/optimisation.md`).
   `--book-target COL` prices the book on another label of the same target spec (fit on `--target`); a row with a NaN fit label and a finite book return stays in the book and leaves the constant fit.
