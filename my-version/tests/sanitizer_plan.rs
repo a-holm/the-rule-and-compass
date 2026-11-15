@@ -335,6 +335,20 @@ fn spawns_a_process(text: &str) -> bool {
     })
 }
 
+/// The `[[bin]] name` whose `path` is `src/bin/<stem>.rs`, when Cargo.toml declares one.
+fn cargo_bin_name(root: &Path, stem: &str) -> Option<String> {
+    let manifest = fs::read_to_string(root.join("Cargo.toml")).unwrap_or_default();
+    let mut name = None;
+    for line in manifest.lines().map(str::trim) {
+        if let Some(n) = line.strip_prefix("name = \"").and_then(|r| r.strip_suffix('"')) {
+            name = Some(n.to_string());
+        } else if line == format!("path = \"src/bin/{stem}.rs\"") {
+            return name;
+        }
+    }
+    None
+}
+
 /// Test executables and the source text that decides whether they spawn: each `tests/<name>.rs` with its `#[path]` modules,
 /// `lib` (every file of src/ outside src/bin and main.rs), `bin-<name>` (src/main.rs is `bin-rcsr`, src/bin/<x>.rs is `bin-<x>`).
 fn spawn_units(root: &Path) -> Vec<(Vec<String>, String)> {
@@ -359,7 +373,11 @@ fn spawn_units(root: &Path) -> Vec<(Vec<String>, String)> {
             units.push((vec!["bin-rcsr".to_string()], text));
         } else if f.parent() == Some(&src.join("bin")) {
             let stem = f.file_stem().expect("stem").to_string_lossy().to_string();
-            units.push((vec![format!("bin-{stem}"), format!("bin-{}", stem.replace('_', "-"))], text));
+            let mut names = vec![format!("bin-{stem}"), format!("bin-{}", stem.replace('_', "-"))];
+            if let Some(declared) = cargo_bin_name(root, &stem) {
+                names.push(format!("bin-{declared}"));
+            }
+            units.push((names, text));
         } else if !f.starts_with(src.join("bin")) {
             lib.push_str(&text);
         }
@@ -437,10 +455,16 @@ fn src_unit_tests_that_spawn_need_an_application_only_line() {
     assert!(spawners_not_app_only("lib * skip why\nbin-tool_x * app-only why\n", &dir).is_empty());
 }
 
-/// Test executables with no `*` plan line, or with more than one: `(names, count)`.
+/// Test executables with no `*` plan line, or with more than one: `(name, count)`.
 fn star_line_counts(plan: &str, root: &Path) -> Vec<(String, usize)> {
-    let _ = (plan, root);
-    Vec::new()
+    let lines = parse(plan).expect("plan parses");
+    spawn_units(root)
+        .into_iter()
+        .map(|(names, _)| {
+            let n = lines.iter().filter(|l| l.test == "*" && l.mode != "run-bin" && names.contains(&l.binary)).count();
+            (names[0].clone(), n)
+        })
+        .collect()
 }
 
 /// Names of test executables that have no `*` plan line.
@@ -469,12 +493,40 @@ fn presence_errors(plan: &str, root: &Path) -> Vec<String> {
     errors
 }
 
-const DEVICE_TOKENS: &[&str] = &[];
+/// A device entry point in a test source. A `no-cuda*` plan line that names a binary containing one needs `ok-token: <token>` in its reason.
+const DEVICE_TOKENS: &[&str] = &[
+    "DispatchMode::Device",
+    "device_pnl: true",
+    ".device_pnl = true",
+    "\"--device-pnl\"",
+    "gpu: true",
+    "\"--gpu\"",
+    "\"--dispatch\"",
+    "RCSR_GPU=1",
+    "rcsr_on_device",
+    "skip_without_device",
+    "rcsr::gpu::",
+    "rcsr::backend::probe",
+];
 
-/// `binary: token` for every device token in a `no-cuda*` binary whose plan reason lacks `ok-token: <token>`.
+/// `binary: token` for every device token in a `no-cuda*` test binary whose plan reason lacks `ok-token: <token>`.
 fn undeclared_device_tokens(plan: &str, root: &Path) -> Vec<String> {
-    let _ = (plan, root);
-    Vec::new()
+    let lines = parse(plan).expect("plan parses");
+    let mut bad = Vec::new();
+    for (names, text) in spawn_units(root) {
+        if names[0] == "lib" || names[0].starts_with("bin-") {
+            continue;
+        }
+        let code: String = text.lines().filter(|l| !l.trim_start().starts_with("//")).flat_map(|l| [l, "\n"]).collect();
+        for l in lines.iter().filter(|l| l.test == "*" && l.mode.starts_with("no-cuda") && names.contains(&l.binary)) {
+            for token in DEVICE_TOKENS {
+                if code.contains(token) && !l.args.contains(&format!("ok-token: {token}")) {
+                    bad.push(format!("{}: {token}", l.binary));
+                }
+            }
+        }
+    }
+    bad
 }
 
 #[test]
