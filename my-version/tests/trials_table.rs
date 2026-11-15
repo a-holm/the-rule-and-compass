@@ -1,6 +1,12 @@
 //! #1177: `rcsr trials --table`, the multi-metric candidate table.
 
-#[path = "common/cpcv_series.rs"]
+#[\"annualization\":{{\"periods_per_year\":{},\"method\":\"explicit\"}},{}{}\
+\"pooled\":{{{}}}}}",
+        windows.join(","),
+        fx.ppy,
+        fx.protocol.as_ref().map_or(String::new(), |p| format!("\"protocol\":{p},")),
+        fx.selection.as_ref().map_or(String::new(), |s| format!("\"selection\":{s},")),
+ath = "common/cpcv_series.rs"]
 mod cpcv_series;
 #[path = "common/rcsr.rs"]
 mod rcsr_cmd;
@@ -108,6 +114,8 @@ struct Fx {
     windows: Vec<(f64, f64)>,
     /// The raw `protocol` object, when the report carries one.
     protocol: Option<String>,
+    /// The raw `selection` object, when the report carries one.
+    selection: Option<String>,
     ppy: f64,
     time: Vec<f64>,
 }
@@ -126,6 +134,7 @@ impl Fx {
             trades: None,
             windows: vec![(T0 as f64, end)],
             protocol: None,
+            selection: None,
             ppy: 8760.0,
             time,
         }
@@ -162,11 +171,12 @@ fn write_fx(dir: &Path, name: &str, fx: &Fx) -> String {
 \"cost\":{{\"per_side_bps\":10,\"source\":\"flag\",\"return_units\":\"log\"}},\
 \"policy\":{{\"name\":\"threshold\",\"band_width\":0,\"min_hold\":1}},\
 \"threshold\":{{\"quantile\":0.5,\"fixed\":null}},\
-\"annualization\":{{\"periods_per_year\":{},\"method\":\"explicit\"}},{}\
+\"annualization\":{{\"periods_per_year\":{},\"method\":\"explicit\"}},{}{}\
 \"pooled\":{{{}}}}}",
         windows.join(","),
         fx.ppy,
         fx.protocol.as_ref().map_or(String::new(), |p| format!("\"protocol\":{p},")),
+        fx.selection.as_ref().map_or(String::new(), |s| format!("\"selection\":{s},")),
         pooled
     );
     let path = dir.join(format!("{name}.json"));
@@ -338,6 +348,7 @@ fn diversity_cap_skips_near_duplicates() {
     let picks: Vec<usize> = items(at(&j, &["picks"])).iter().map(|p| num(p, &["row"]) as usize).collect();
     assert_eq!(picks, vec![0, 2, 3], "{j:?}");
     let skipped = at(row(&j, 1), &["skipped"]);
+    assert_eq!(at(skipped, &["reason"]).as_str(), Some("diversity"));
     assert_eq!(num(skipped, &["row"]), 0.0);
     assert!(num(skipped, &["rho"]) >= 0.7);
     assert!(matches!(at(row(&j, 4), &["pick"]), Json::Null));
@@ -784,3 +795,434 @@ fn pilot_rule_runs_on_cpcv_paths() {
         assert!(num(bear_cell(x), &["alpha_bh"]).is_finite(), "row {i}: alpha_bh:bear");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Frozen sealed-read thresholds and the composite cap (#1237)
+// ---------------------------------------------------------------------------
+
+/// 2020-01-01T00:00:00Z.
+const F0: i64 = 1_577_836_800;
+const DAY: i64 = 86_400;
+const F_NET1: [f64; 6] = [0.01, -0.02, 0.03, 0.00, -0.01, 0.02];
+const F_NET2: [f64; 6] = [0.02, 0.01, -0.03, 0.01, 0.00, -0.02];
+const SHA_S1: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+const SHA_S2: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+const SHA_S3: &str = "3333333333333333333333333333333333333333333333333333333333333333";
+const SCHEME: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const SPLITS: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+/// One path report of fixture F: CPCV(3, 2) with groups G1 = days 0-2, G2 = days 2-4 and
+/// G3 = days 4-6 from 2020-01-01, splits s1 = (G1, G2), s2 = (G1, G3), s3 = (G2, G3), six
+/// daily periods; path 1 takes s1, s1, s2 and path 2 takes s2, s3, s3.
+#[derive(Clone)]
+struct FPath {
+    index: usize,
+    net: Vec<f64>,
+    cost: Option<Vec<f64>>,
+    bps: f64,
+    splits_sha: &'static str,
+    test_groups: usize,
+    segments: [(&'static str, &'static str); 3],
+}
+
+fn f_path(index: usize) -> FPath {
+    let (net, segments) = if index == 1 {
+        (F_NET1, [("s1", SHA_S1), ("s1", SHA_S1), ("s2", SHA_S2)])
+    } else {
+        (F_NET2, [("s2", SHA_S2), ("s3", SHA_S3), ("s3", SHA_S3)])
+    };
+    FPath { index, net: net.to_vec(), cost: None, bps: 10.0, splits_sha: SPLITS, test_groups: 2, segments }
+}
+
+fn write_f_path(dir: &Path, name: &str, p: &FPath) -> String {
+    let segs: Vec<String> = (0..3)
+        .map(|g| {
+            let (split, sha) = p.segments[g];
+            let (a, b) = (F0 + 2 * DAY * g as i64, F0 + 2 * DAY * (g as i64 + 1));
+            format!(
+                "{{\"group\":\"G{}\",\"start\":{a},\"end\":{b},\"split\":\"{split}\",\"report\":\"wf_{split}.json\",\"report_sha256\":\"{sha}\",\
+\"expression\":[\"x\"],\"periods\":2,\"net\":{}}}",
+                g + 1,
+                p.net[2 * g] + p.net[2 * g + 1]
+            )
+        })
+        .collect();
+    let time: Vec<f64> = (0..6).map(|d| (F0 + DAY * d) as f64).collect();
+    let cost = p.cost.as_ref().map_or(String::new(), |c| format!(",\"period_cost\":[{}]", arr(c)));
+    let text = format!(
+        "{{\"tool\":\"rcsr\",\"mode\":\"cpcv_path\",\"schema\":\"rcsr-cpcv-path/1\",\"window_definition\":\"{SCHEME}\",\
+\"purge\":{{\"horizon_seconds\":86400,\"embargo_seconds\":0}},\"cost_model\":{{\"per_side_bps\":{bps},\"round_trip_bps\":{rt}}},\
+\"cost\":{{\"per_side_bps\":{bps},\"source\":\"flag\"}},\
+\"annualization\":{{\"periods_per_year\":365,\"method\":\"explicit\",\"source\":\"explicit\",\"period_seconds\":86400}},\
+\"threshold\":{{\"quantile\":0.5,\"fixed\":0}},\"policy\":{{\"name\":\"threshold\",\"band_width\":0,\"min_hold\":1}},\
+\"book\":{{\"missing_score\":\"flat\"}},\"pooled_seam\":{{\"reset_flat\":true,\"seam_cost\":0,\"seam_trades\":0}},\
+\"cpcv\":{{\"scheme_sha256\":\"{SCHEME}\",\"splits_sha256\":\"{splits}\",\"groups\":3,\"test_groups\":{k},\"splits\":3,\"paths\":2,\
+\"path\":{index},\"seam_rule\":\"flat\",\"segments\":[{segs}]}},\
+\"pooled\":{{\"periods\":6,\"periods_per_year\":365,\"period_net\":[{net}],\"period_time\":[{time}]{cost}}}}}\n",
+        bps = p.bps,
+        rt = 2.0 * p.bps,
+        splits = p.splits_sha,
+        k = p.test_groups,
+        index = p.index,
+        segs = segs.join(","),
+        net = arr(&p.net),
+        time = arr(&time),
+    );
+    write_text(dir, name, &text)
+}
+
+/// The two path files of fixture F as written by `write_f_path`.
+fn f_paths(dir: &Path, tag: &str, edit: &dyn Fn(&mut FPath)) -> Vec<String> {
+    [1usize, 2]
+        .iter()
+        .map(|&k| {
+            let mut p = f_path(k);
+            edit(&mut p);
+            write_f_path(dir, &format!("{tag}_path_{k}.json"), &p)
+        })
+        .collect()
+}
+
+fn f_rule(cpcv: (usize, usize), s4_percentile: u32, floor: f64) -> String {
+    format!(
+        "{{\"schema\":\"rcsr-trials-rule/1\",\"pick\":1,\"freeze\":{{\"cpcv\":[{},{}],\"cost_bps\":10,\
+\"s4\":{{\"window_days\":3,\"percentile\":{s4_percentile}}},\"p1\":{{\"window_days\":2,\"percentile\":10}},\
+\"drawdown_cap\":{{\"window_days\":3,\"percentile\":90,\"floor\":{floor}}}}}}}",
+        cpcv.0, cpcv.1
+    )
+}
+
+/// Two candidate rows on an hourly grid from 2020-09-13 (outside fixture F's days).
+fn freeze_rows(dir: &Path) -> Vec<String> {
+    (0..2u32).map(|k| write_fx(dir, &format!("row{k}"), &Fx::new(centred_noise(200, 60 + k, 0.01)))).collect()
+}
+
+fn write_map(dir: &Path, name: &str, rows: &[(&str, &[String], Option<&str>)]) -> String {
+    let list: Vec<String> = rows
+        .iter()
+        .map(|(row, paths, run)| {
+            let files: Vec<String> = paths.iter().map(|p| format!("\"{p}\"")).collect();
+            let run = run.map_or(String::new(), |r| format!(",\"run\":\"{r}\""));
+            format!("{{\"row\":\"{row}\",\"configuration\":\"F\",\"paths\":[{}]{run}}}", files.join(","))
+        })
+        .collect();
+    write_text(dir, name, &format!("{{\"schema\":\"rcsr-trials-freeze-map/1\",\"rows\":[{}]}}", list.join(",")))
+}
+
+fn freeze_run(rows: &[String], rule: &str, map: &str, extra: &[&str]) -> Output {
+    let mut args = vec!["trials", "--wf"];
+    args.extend(rows.iter().map(String::as_str));
+    args.extend(["--table", "--rule", rule, "--freeze-map", map, "--draws", "20"]);
+    args.extend_from_slice(extra);
+    run(&args)
+}
+
+/// The `freeze` object of the first pick of a table over fixture F.
+fn f_freeze(tag: &str, rule_text: &str, edit: &dyn Fn(&mut FPath)) -> Json {
+    let (_s, dir) = scratch(tag);
+    let rows = freeze_rows(&dir);
+    let paths = f_paths(&dir, "f", edit);
+    let rule = write_text(&dir, "rule.json", rule_text);
+    let map = write_map(&dir, "map.json", &[(rows[0].as_str(), &paths[..], None)]);
+    let j = stdout_json(&freeze_run(&rows, &rule, &map, &[]));
+    let picks = items(at(&j, &["picks"]));
+    assert_eq!(picks.len(), 1);
+    assert_eq!(num(&picks[0], &["row"]), 0.0);
+    at(&picks[0], &["freeze"]).clone()
+}
+
+fn close(got: f64, want: f64, what: &str) {
+    assert!((got - want).abs() <= 1e-12, "{what}: {got} vs {want}");
+}
+
+#[test]
+fn nearest_rank_matches_hand_ranks() {
+    let want: [(usize, [usize; 5]); 3] = [(1, [1, 1, 1, 1, 1]), (8, [1, 1, 3, 8, 8]), (10, [1, 1, 3, 9, 10])];
+    for (n, ranks) in want {
+        for (p, k) in [1u32, 10, 30, 90, 99].iter().zip(ranks) {
+            assert_eq!(rcsr::inference::nearest_rank(n, *p), k, "n {n} P {p}");
+        }
+    }
+}
+
+#[test]
+fn freeze_window_enumerator_matches_hand_windows() {
+    let days = |d: &[i64]| d.iter().map(|x| (F0 + DAY * x) as f64).collect::<Vec<f64>>();
+    let t = days(&[0, 1, 2, 3, 4, 5]);
+    let end = (F0 + 6 * DAY) as f64;
+    let d = DAY as f64;
+    assert_eq!(rcsr::trials_freeze::windows(&t, end, 3.0 * d), vec![(0, 3), (1, 4), (2, 5), (3, 6)]);
+    assert_eq!(rcsr::trials_freeze::windows(&t, end, 2.0 * d), vec![(0, 2), (1, 3), (2, 4), (3, 5), (4, 6)]);
+    assert!(rcsr::trials_freeze::windows(&t, end, 7.0 * d).is_empty());
+    // A gap: a window holds the periods of its calendar span only.
+    assert_eq!(rcsr::trials_freeze::windows(&days(&[0, 1, 4, 5]), end, 3.0 * d), vec![(0, 2), (1, 2)]);
+}
+
+#[test]
+fn drawdown_tree_matches_sequential_push() {
+    let mut rng = Mt::new(77);
+    let mut x: Vec<f64> = (0..300).map(|_| 0.02 * gauss(&mut rng)).collect();
+    x[150] = -1.0;
+    let tree = rcsr::trials_freeze::DrawdownTree::new(&x);
+    let mut ranges: Vec<(usize, usize)> = vec![(0, 300), (0, 1), (299, 300), (10, 10)];
+    for a in (0..300).step_by(7) {
+        ranges.extend((a + 1..=300).step_by(5).map(|b| (a, b)));
+    }
+    for (a, b) in ranges {
+        let mut d = rcsr::risk::Drawdown::identity();
+        for &v in &x[a..b] {
+            d.push(v);
+        }
+        let q = tree.query(a, b);
+        assert_eq!(q.n, d.n, "[{a}, {b})");
+        if b > a {
+            close(q.max_drawdown(), d.max_drawdown(), &format!("[{a}, {b})"));
+        }
+    }
+}
+
+#[test]
+fn freeze_windows_match_naive_loop() {
+    let w_days = 30u32;
+    let span = (DAY * w_days as i64) as f64;
+    for seed in 0..3u32 {
+        let mut rng = Mt::new(500 + seed);
+        let mut time = Vec::new();
+        let mut h = 0i64;
+        while time.len() < 2000 {
+            if !(seed == 1 && (700..760).contains(&h)) {
+                time.push((T0 + STEP * h) as f64);
+            }
+            h += 1;
+        }
+        let x: Vec<f64> = (0..2000).map(|t| 0.01 * gauss(&mut rng) - if t % 97 == 0 { 0.05 } else { 0.0 }).collect();
+        let end = time[1999] + STEP as f64;
+        let got = rcsr::trials_freeze::rolling_windows(&time, &x, end, w_days);
+        let mut want: Vec<(usize, usize, f64, f64)> = Vec::new();
+        for i in 0..time.len() {
+            if time[i] + span > end {
+                continue;
+            }
+            let idx: Vec<usize> = (0..time.len()).filter(|&j| time[j] >= time[i] && time[j] < time[i] + span).collect();
+            let m = idx.iter().map(|&j| x[j]).sum::<f64>() / idx.len() as f64;
+            let (mut equity, mut peak, mut dd) = (1.0f64, 1.0f64, 0.0f64);
+            for &j in &idx {
+                equity *= 1.0 + x[j];
+                peak = peak.max(equity);
+                dd = dd.min(equity / peak - 1.0);
+            }
+            want.push((idx[0], idx[idx.len() - 1] + 1, m, -dd));
+        }
+        assert!(want.len() > 1000, "seed {seed}: {} windows", want.len());
+        assert_eq!(got.len(), want.len(), "seed {seed}: window count");
+        for (k, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert_eq!((g.start, g.end), (w.0, w.1), "seed {seed} window {k}");
+            close(g.mean, w.2, &format!("seed {seed} window {k} mean"));
+            close(g.drawdown, w.3, &format!("seed {seed} window {k} drawdown"));
+        }
+    }
+}
+
+#[test]
+fn freeze_s4_floor_matches_hand_value() {
+    for (p, rank, value) in [(30u32, 3.0, -0.01 / 3.0 * 365.0), (10, 1.0, -0.02 / 3.0 * 365.0)] {
+        let f = f_freeze("freeze-s4", &f_rule((3, 2), p, 0.025), &|_| {});
+        let s4 = at(&f, &["s4_floor"]);
+        assert_eq!((num(s4, &["window_days"]), num(s4, &["percentile"])), (3.0, p as f64));
+        assert_eq!((num(s4, &["windows"]), num(s4, &["rank"])), (8.0, rank), "P{p}");
+        close(num(s4, &["value"]), value, &format!("S4 P{p}"));
+    }
+    close(-0.01 / 3.0 * 365.0, -1.2166666666666667, "hand value P30");
+    close(-0.02 / 3.0 * 365.0, -2.4333333333333333, "hand value P10");
+}
+
+#[test]
+fn freeze_p1_floor_matches_hand_value() {
+    let f = f_freeze("freeze-p1", &f_rule((3, 2), 30, 0.025), &|_| {});
+    let p1 = at(&f, &["p1_floor"]);
+    assert_eq!((num(p1, &["windows"]), num(p1, &["rank"])), (10.0, 1.0));
+    close(num(p1, &["value"]), -3.65, "P1 floor");
+}
+
+#[test]
+fn freeze_drawdown_cap_matches_hand_value() {
+    for (floor, value) in [(0.025, 0.03), (0.20, 0.20)] {
+        let f = f_freeze("freeze-d9", &f_rule((3, 2), 30, floor), &|_| {});
+        let cap = at(&f, &["drawdown_cap"]);
+        assert_eq!((num(cap, &["windows"]), num(cap, &["rank"])), (8.0, 8.0));
+        close(num(cap, &["percentile_value"]), 0.03, "D9 percentile");
+        assert_eq!(num(cap, &["floor"]), floor);
+        close(num(cap, &["value"]), value, &format!("D9 cap at floor {floor}"));
+    }
+}
+
+#[test]
+fn freeze_reprices_paths_to_cost_bps() {
+    let rule = f_rule((3, 2), 30, 0.025);
+    let base = f_freeze("freeze-cost-base", &rule, &|_| {});
+    let repriced = f_freeze("freeze-cost-5bp", &rule, &|p| {
+        p.bps = 5.0;
+        p.net = p.net.iter().map(|x| x + 0.001).collect();
+        p.cost = Some(vec![0.001; 6]);
+    });
+    for (key, field) in [("s4_floor", "value"), ("p1_floor", "value"), ("drawdown_cap", "percentile_value"), ("drawdown_cap", "value")] {
+        close(num(&repriced, &[key, field]), num(&base, &[key, field]), &format!("{key}.{field}"));
+    }
+    assert_eq!(num(&repriced, &["cost_bps"]), 10.0);
+    // A path priced at another cost without period_cost cannot be repriced.
+    let (_s, dir) = scratch("freeze-cost-missing");
+    let rows = freeze_rows(&dir);
+    let paths = f_paths(&dir, "f", &|p| p.bps = 5.0);
+    let rule = write_text(&dir, "rule.json", &rule);
+    let map = write_map(&dir, "map.json", &[(rows[0].as_str(), &paths[..], None)]);
+    let o = freeze_run(&rows, &rule, &map, &[]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).contains("pooled.period_cost") && stderr(&o).contains(&paths[0]), "{}", stderr(&o));
+}
+
+#[test]
+fn freeze_refuses_bad_population() {
+    let (_s, dir) = scratch("freeze-population");
+    let rows = freeze_rows(&dir);
+    let good = f_paths(&dir, "good", &|_| {});
+    let rule = write_text(&dir, "rule.json", &f_rule((3, 2), 30, 0.025));
+    let refused = |name: &str, rule: &str, paths: &[String], extra: &[&str], needles: &[&str]| {
+        let map = write_map(&dir, &format!("{name}.json"), &[(rows[0].as_str(), paths, None)]);
+        let o = freeze_run(&rows, rule, &map, extra);
+        assert_eq!(code(&o), 2, "{name}: {}", stderr(&o));
+        for n in needles {
+            assert!(stderr(&o).contains(n), "{name}: '{n}' not in {}", stderr(&o));
+        }
+    };
+    refused("missing", &rule, &good[..1], &[], &["cpcv.path 2"]);
+    let twice = f_paths(&dir, "twice", &|p| p.index = 1);
+    refused("twice", &rule, &[good[0].clone(), twice[1].clone()], &[], &["cpcv.path", &twice[1]]);
+    let other = f_paths(&dir, "other", &|p| p.splits_sha = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
+    refused("tables", &rule, &[good[0].clone(), other[1].clone()], &[], &["cpcv.splits_sha256", &other[1]]);
+    let shas = f_paths(&dir, "shas", &|p| {
+        if p.index == 2 {
+            p.segments[0] = ("s2", SHA_S3);
+        }
+    });
+    refused("report", &rule, &[good[0].clone(), shas[1].clone()], &[], &["report_sha256", "s2"]);
+    let k1 = write_text(&dir, "rule_k1.json", &f_rule((3, 1), 30, 0.025));
+    refused("test_groups", &k1, &good, &[], &["cpcv.test_groups", "freeze.cpcv"]);
+    refused("locked", &rule, &good, &["--locked-test", "2020-01-05,2020-01-06"], &[&good[0], "locked"]);
+    let map = write_map(&dir, "ok.json", &[(rows[0].as_str(), &good[..], None)]);
+    let o = freeze_run(&rows, &rule, &map, &[]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+}
+
+#[test]
+fn freeze_needs_map_and_rule() {
+    let (_s, dir) = scratch("freeze-map");
+    let rows = freeze_rows(&dir);
+    let paths = f_paths(&dir, "f", &|_| {});
+    let rule = write_text(&dir, "rule.json", &f_rule((3, 2), 30, 0.025));
+    let other = write_map(&dir, "other.json", &[(rows[1].as_str(), &paths[..], None)]);
+    let o = freeze_run(&rows, &rule, &other, &[]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).contains("has no entry in --freeze-map") && stderr(&o).contains("row0"), "{}", stderr(&o));
+    let mut args = vec!["trials", "--wf"];
+    args.extend(rows.iter().map(String::as_str));
+    let o = run(&[&args[..], &["--table", "--rule", &rule, "--draws", "20"][..]].concat());
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).contains("the rule has freeze: give --freeze-map"), "{}", stderr(&o));
+    let o = run(&[&args[..], &["--table", "--pick", "1", "--freeze-map", &other, "--draws", "20"][..]].concat());
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).contains("--freeze-map needs a rule with freeze"), "{}", stderr(&o));
+}
+
+#[test]
+fn freeze_output_carries_rule_and_map_sha() {
+    let (_s, dir) = scratch("freeze-sha");
+    let rows = freeze_rows(&dir);
+    let paths = f_paths(&dir, "f", &|_| {});
+    let rule = write_text(&dir, "rule.json", &f_rule((3, 2), 30, 0.025));
+    let run_json = write_text(&dir, "final.run.json", "{\"tool\":\"rcsr\",\"pareto\":[{\"expression\":\"x\",\"expression_exact\":\"x\"}]}\n");
+    let map = write_map(&dir, "map.json", &[(rows[0].as_str(), &paths[..], Some(run_json.as_str()))]);
+    let j = stdout_json(&freeze_run(&rows, &rule, &map, &[]));
+    let sha = |p: &str| rcsr::manifest::sha256_hex(&std::fs::read(p).unwrap());
+    let top = at(&j, &["freeze"]);
+    assert_eq!(at(top, &["schema"]).as_str(), Some("rcsr-trials-freeze/1"));
+    assert_eq!(at(top, &["rule_sha256"]).as_str(), at(&j, &["rule", "sha256"]).as_str());
+    assert_eq!(at(top, &["rule_sha256"]).as_str(), Some(sha(&rule).as_str()));
+    assert_eq!(at(top, &["map"]).as_str(), Some(map.as_str()));
+    assert_eq!(at(top, &["map_sha256"]).as_str(), Some(sha(&map).as_str()));
+    let f = at(&items(at(&j, &["picks"]))[0], &["freeze"]);
+    assert_eq!(at(f, &["configuration"]).as_str(), Some("F"));
+    assert_eq!((num(f, &["cost_bps"]), num(f, &["periods_per_year"]), num(f, &["period_seconds"])), (10.0, 365.0, 86400.0));
+    let pop = at(f, &["population"]);
+    assert_eq!((num(pop, &["groups"]), num(pop, &["test_groups"]), num(pop, &["paths"])), (3.0, 2.0, 2.0));
+    assert_eq!((at(pop, &["splits_sha256"]).as_str(), at(pop, &["scheme_sha256"]).as_str()), (Some(SPLITS), Some(SCHEME)));
+    let files = items(at(pop, &["files"]));
+    assert_eq!(files.len(), 2);
+    for (k, file) in files.iter().enumerate() {
+        assert_eq!(at(file, &["file"]).as_str(), Some(paths[k].as_str()));
+        assert_eq!(at(file, &["sha256"]).as_str(), Some(sha(&paths[k]).as_str()));
+        assert_eq!((num(file, &["path"]), num(file, &["periods"])), ((k + 1) as f64, 6.0));
+    }
+    assert_eq!(at(f, &["run"]).as_str(), Some(run_json.as_str()));
+    assert_eq!(at(f, &["run_sha256"]).as_str(), Some(sha(&run_json).as_str()));
+    // Without a run in the map the pick has no run hash.
+    let bare = write_map(&dir, "bare.json", &[(rows[0].as_str(), &paths[..], None)]);
+    let j = stdout_json(&freeze_run(&rows, &rule, &bare, &[]));
+    assert!(matches!(at(&items(at(&j, &["picks"]))[0], &["freeze", "run_sha256"]), Json::Null));
+}
+
+#[test]
+fn max_composites_caps_composite_picks() {
+    let (_s, dir) = scratch("max-composites");
+    let marker = |t: &str| format!("{{\"composite\":{{\"source\":\"rcsr compose\",\"type\":\"{t}\",\"form\":\"if(gate, f, cash)\",\"gate\":\"g\"}}}}");
+    let rows: Vec<String> = [("A", None), ("B", Some("C1")), ("C", Some("C2")), ("D", None)]
+        .iter()
+        .enumerate()
+        .map(|(k, (name, kind))| {
+            let mut fx = Fx::new(centred_noise(400, 80 + k as u32, 0.01));
+            fx.selection = kind.map(marker);
+            write_fx(&dir, name, &fx)
+        })
+        .collect();
+    let rule = write_text(&dir, "rule.json", "{\"schema\":\"rcsr-trials-rule/1\",\"pick\":3,\"diversity_rho\":1,\"max_composites\":1}");
+    let mut args = vec!["trials", "--wf"];
+    args.extend(rows.iter().map(String::as_str));
+    args.extend(["--table", "--rule", &rule, "--draws", "20"]);
+    let j = stdout_json(&run(&args));
+    let picks: Vec<usize> = items(at(&j, &["picks"])).iter().map(|p| num(p, &["row"]) as usize).collect();
+    assert_eq!(picks, vec![0, 1, 3], "{j:?}");
+    let skipped = at(row(&j, 2), &["skipped"]);
+    assert_eq!(at(skipped, &["reason"]).as_str(), Some("max_composites"));
+    assert_eq!(num(skipped, &["limit"]), 1.0);
+    assert!(matches!(at(row(&j, 0), &["composite"]), Json::Null));
+    assert_eq!(at(row(&j, 1), &["composite", "type"]).as_str(), Some("C1"));
+    assert_eq!(at(row(&j, 2), &["composite", "source"]).as_str(), Some("rcsr compose"));
+    assert_eq!(num(&j, &["rule", "max_composites"]), 1.0);
+    // Without the cap the walk picks the first three rows.
+    let plain = write_text(&dir, "plain.json", "{\"schema\":\"rcsr-trials-rule/1\",\"pick\":3,\"diversity_rho\":1}");
+    let mut args = vec!["trials", "--wf"];
+    args.extend(rows.iter().map(String::as_str));
+    args.extend(["--table", "--rule", &plain, "--draws", "20"]);
+    let j = stdout_json(&run(&args));
+    let picks: Vec<usize> = items(at(&j, &["picks"])).iter().map(|p| num(p, &["row"]) as usize).collect();
+    assert_eq!(picks, vec![0, 1, 2]);
+}
+
+/// A flag-built rule without `freeze` and `max_composites`, pinned to the rule hash of the
+/// integration base before #1237.
+#[test]
+fn rule_sha_unchanged_without_new_keys() {
+    let (_s, dir) = scratch("rule-sha");
+    let (paths, _) = five_series(&dir);
+    let mut args = vec!["trials", "--wf"];
+    args.extend(paths.iter().map(String::as_str));
+    args.extend([
+        "--table", "--pareto", "net10:max,sharpe:max", "--rank", "net10,sortino", "--pick", "3", "--diversity-rho", "0.7",
+        "--min-front", "2", "--cost-multiples", "1,3", "--draws", "20",
+    ]);
+    let j = stdout_json(&run(&args));
+    let rule = at(&j, &["rule"]);
+    assert!(rule.get("freeze").is_none() && rule.get("max_composites").is_none(), "{rule:?}");
+    assert_eq!(at(rule, &["sha256"]).as_str(), Some(PINNED_FLAG_RULE_SHA), "{rule:?}");
+}
+
+const PINNED_FLAG_RULE_SHA: &str = "0000000000000000000000000000000000000000000000000000000000000000";

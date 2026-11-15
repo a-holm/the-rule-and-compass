@@ -172,6 +172,11 @@ pub fn sharpe_per_period(x: &[f64]) -> f64 {
     }
 }
 
+pub fn nearest_rank(n: usize, percentile: u32) -> usize {
+    let _ = (n, percentile);
+    0
+}
+
 /// Type-7 quantile of an ascending slice.
 pub fn quantile_sorted(sorted: &[f64], q: f64) -> f64 {
     let n = sorted.len();

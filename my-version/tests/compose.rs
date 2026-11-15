@@ -482,3 +482,42 @@ fn compose_help_lists_its_options() {
     let top = rcsr(&["--help"]);
     assert!(String::from_utf8_lossy(&top.stdout).contains("rcsr compose"));
 }
+
+/// #1237: a walk-forward of a composed run states the composite (D19); the same run.json
+/// without its compose block gives the report of the build before the marker.
+#[test]
+fn from_run_of_compose_marks_composite() {
+    let p = planted(&BULL, &BEAR);
+    let menu = write_menu(&p.dir, "menu.json", &[("g", "000", "g", 0.0, 1)], None);
+    let out = p.dir.join("composed.json").to_string_lossy().into_owned();
+    let j = json(&compose(&p.data, &p.spec, &["--gates", &menu, "--bull", &p.bull, "--top", "3", "--json", "--out", &out]));
+    assert_eq!(s(&j, &["compose", "chosen", "type"]), "C1");
+    let Json::Obj(fields) = &j else { panic!("run.json is an object") };
+    let plain: Vec<(String, Json)> = fields.iter().filter(|(k, _)| k != "compose").cloned().collect();
+    let plain_path = p.dir.join("plain.json").to_string_lossy().into_owned();
+    std::fs::write(&plain_path, format!("{}\n", rcsr::cpcv::to_json(&Json::Obj(plain)))).unwrap();
+    let test_rows = num(&j, &["test_rows"]) as i64;
+    let k_test = STAMPS as i64 - test_rows / SYMBOLS.len() as i64;
+    let first_val = num(&arr(&j, &["split", "validation_time"])[0], &[]) as i64;
+    let w = format!("t,{},{},{},{}", T0, first_val, T0 + STEP * k_test, T0 + STEP * STAMPS as i64);
+    let report = |run: &str, name: &str| -> Json {
+        let path = p.dir.join(name).to_string_lossy().into_owned();
+        let o = rcsr(&["walkforward", "--data", &p.data, "--target", "y", "--from-run", run, "--time", "t", "--group-by", "s", "--window", &w, "--out", &path]);
+        assert_eq!(code(&o), 0, "{}", stderr(&o));
+        Json::parse(std::fs::read_to_string(&path).unwrap().trim()).unwrap()
+    };
+    let plain = report(&plain_path, "wf_plain.json");
+    let plain_sha = s(&plain, &["protocol", "report_sha256"]).to_string();
+    eprintln!("plain report sha256 {plain_sha}");
+    let composed = report(&out, "wf_composed.json");
+    let m = at(&composed, &["selection", "composite"]);
+    assert_eq!(s(m, &["source"]), "rcsr compose");
+    assert_eq!(s(m, &["type"]), "C1");
+    assert_eq!(s(m, &["form"]), s(&j, &["compose", "chosen", "form"]));
+    assert_eq!(s(m, &["gate"]), "g");
+    assert!(at(&plain, &["selection"]).get("composite").is_none());
+    assert_eq!(at(&composed, &["pooled"]), at(&plain, &["pooled"]), "the marker changes no number");
+    assert_eq!(plain_sha, PINNED_PLAIN_FROM_RUN);
+}
+
+const PINNED_PLAIN_FROM_RUN: &str = "0000000000000000000000000000000000000000000000000000000000000000";
