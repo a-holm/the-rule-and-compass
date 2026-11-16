@@ -592,6 +592,30 @@ fn walk(dir: &Path, data: &str, extra: &[&str]) -> Json {
     read_json(&out_path)
 }
 
+/// A `--from-run` report without its run identity: `selection.run`, `selection.run_sha256`
+/// and `protocol.report_sha256`, which covers the run hash.
+fn without_run(j: &Json) -> Json {
+    let drop = |v: &Json, keys: &[&str]| match v {
+        Json::Obj(m) => Json::Obj(m.iter().filter(|(k, _)| !keys.contains(&k.as_str())).cloned().collect()),
+        other => other.clone(),
+    };
+    match j {
+        Json::Obj(m) => Json::Obj(
+            m.iter()
+                .map(|(k, v)| {
+                    let v = match k.as_str() {
+                        "selection" => drop(v, &["run", "run_sha256"]),
+                        "protocol" => drop(v, &["report_sha256"]),
+                        _ => v.clone(),
+                    };
+                    (k.clone(), v)
+                })
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 /// The report without timing members, numbers masked.
 fn digits_stripped(j: &Json) -> String {
     assert!(matches!(j, Json::Obj(_)), "report is not an object");
@@ -643,7 +667,11 @@ fn from_run_without_a_band_keeps_the_threshold_book() {
     let b = walk(&dir, &data, &["--from-run", &old_path, "--window", &w]);
     assert_eq!(at(&a, &["policy", "name"]).as_str(), Some("threshold"));
     assert_eq!(num(&a, &["policy", "min_hold"]), 1.0);
-    assert_eq!(digits_stripped(&a), digits_stripped(&b));
+    // #1238: each report names its own run file; the book is the same.
+    let sha = |p: &str| rcsr::manifest::sha256_hex(&std::fs::read(p).unwrap());
+    assert_eq!(at(&a, &["selection", "run_sha256"]).as_str(), Some(sha(&plain).as_str()));
+    assert_eq!(at(&b, &["selection", "run_sha256"]).as_str(), Some(sha(&old_path).as_str()));
+    assert_eq!(digits_stripped(&without_run(&a)), digits_stripped(&without_run(&b)));
     assert_eq!(at(&a, &["windows"]), at(&b, &["windows"]));
 }
 
