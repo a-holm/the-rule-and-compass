@@ -140,7 +140,7 @@ rcsr --data dev.rcsb --target lbl_h24a_y --target-spec dev.targets.json --vars b
   --pop 64 --islands 4 --generations 300 --max-complexity 7 --ops add,sub,mul,greater,min,max,tanh --json --out gate_s07.run.json
 ```
 
-`--fitness pnl`, `--select-rule robust` and `--cpu` are implied. `--vars` is required and lists the gate's variables only; the branches may read other columns.
+`--fitness pnl`, `--select-rule robust` and `--cpu` are implied. `--vars` is required and lists the gate's variables only; the branches may read other columns. `--json` prints the composed run.json, `--out <file>` writes it, and without `--json` the summary of compose is printed.
 
 ### Branches
 
