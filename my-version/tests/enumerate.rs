@@ -7,6 +7,7 @@ mod rcsr_cmd;
 mod scratch;
 
 use rcsr::devlog::Json;
+use rcsr::{data, store};
 use scratch::Scratch;
 use std::path::{Path, PathBuf};
 use std::process::Output;
@@ -287,7 +288,16 @@ fn enumerate_refuses_what_it_cannot_price() {
         (vec!["--ops", OPS10, "--pnl-mask", "x3"], "--pnl-mask"),
         (vec!["--ops", OPS10, "--cash-return", "0.0001"], "--cash-return"),
         (vec!["--ops", OPS10, "--missing-score", "hold"], "--missing-score"),
+        (vec!["--ops", OPS10, "--pnl-mask-band", "0.1"], "--pnl-mask-band"),
+        (vec!["--ops", OPS10, "--pnl-mask-dwell", "3"], "--pnl-mask-dwell"),
+        (vec!["--ops", OPS10, "--band-units", "sd"], "--band-units"),
         (vec!["--ops", OPS10, "--seed-expr", "x1"], "--seed-expr"),
+        (vec!["--ops", OPS10, "--seed-file", "seeds.txt"], "--seed-file"),
+        (vec!["--ops", OPS10, "--eval-expr", "x1"], "--eval-expr"),
+        (vec!["--ops", OPS10, "--resume", "run.ckpt"], "--resume"),
+        (vec!["--ops", OPS10, "--save", "run.ckpt"], "--save"),
+        (vec!["--ops", OPS10, "--reselect", "run.ckpt"], "--reselect"),
+        (vec!["--ops", OPS10, "--reselect-run", "run.json"], "--reselect-run"),
         (vec!["--ops", "add,if"], "'if'"),
         (vec!["--max-size", "3"], "--ops"),
         (vec!["--ops", OPS10, "--fitness", "metric"], "--fitness"),
@@ -321,4 +331,34 @@ fn enumerate_reads_no_locked_row() {
     assert_eq!(code(&o), code(&searched), "{}", stderr(&o));
     assert!(stderr(&searched).to_lowercase().contains("lockbox"), "{}", stderr(&searched));
     assert!(stderr(&o).to_lowercase().contains("lockbox"), "{}", stderr(&o));
+}
+
+/// `--sample-rows` exits 2 before any row is read: the class optimum and the
+/// shared-time-shift null are claims about every training row of a contiguous series.
+#[test]
+fn enumerate_refuses_sample_rows() {
+    let (_s, dir) = scratch();
+    let (csv, spec) = (write_csv(&dir, Panel::Planted), write_spec(&dir));
+    let table = data::parse_table(&std::fs::read_to_string(&csv).unwrap()).unwrap();
+    let rcsb = dir.join("d.rcsb").to_string_lossy().into_owned();
+    store::write_store(&rcsb, &table, 251).unwrap();
+    let (out, seeds) = (dir.join("e.json").to_string_lossy().into_owned(), dir.join("seeds.txt").to_string_lossy().into_owned());
+    let files = |dir: &Path| {
+        let mut names: Vec<String> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        names
+    };
+    let before = files(&dir);
+    // A row count below the store's 2,400 rows and one above it: the flag is what is refused.
+    for n in ["1000", "999999"] {
+        let o = enumerate(&rcsb, &spec, &["--ops", OPS10, "--sample-rows", n, "--out", &out, "--emit-seeds", &seeds, "--json"]);
+        let err = stderr(&o);
+        assert_eq!(code(&o), 2, "--sample-rows {n}: {err}");
+        assert!(err.contains("--sample-rows") && err.contains("rcsr enumerate"), "--sample-rows {n}: {err}");
+        assert!(!err.contains("sampling (explicit)"), "--sample-rows {n}: {err}");
+        assert!(stdout(&o).is_empty());
+        assert_eq!(files(&dir), before, "the refusal writes nothing");
+    }
+    let o = enumerate(&rcsb, &spec, &["--ops", OPS10, "--json"]);
+    assert_eq!(code(&o), 0, "the store runs without --sample-rows: {}", stderr(&o));
 }
