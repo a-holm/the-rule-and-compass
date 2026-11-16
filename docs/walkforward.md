@@ -768,7 +768,7 @@ Every locked read stores `binding_sha256` in its ledger line: the SHA-256 of the
 
 ## Two books and a gate (`rcsr switch`, #1185)
 
-A formula that trades one book in one market regime and another book in the other has the form `if(greater(g, c), A, B)`. `rcsr switch` computes two exact quantities for two fixed books and a gate on the training rows: the gate-cut profile of the composite at every cut `c`, and the k-switch hindsight bound of the pair.
+A formula that trades one book in one market regime and another book in the other has the form `if(greater(g, c), A, B)`. `--sample-rows` exits 2 here: gate state runs over every row of the data file (#1247). `rcsr switch` computes two exact quantities for two fixed books and a gate on the training rows: the gate-cut profile of the composite at every cut `c`, and the k-switch hindsight bound of the pair.
 
 ```sh
 rcsr switch --data dev.rcsb --target lbl_h1_y --target-spec dev.targets.json --vars "$VIEW" \

@@ -283,6 +283,8 @@ INPUT:
                              block, manifest and dev log. Mutually exclusive
                              with --force; n >= the row count is a full load
                              and must still fit the budget
+                             Exit 2 with --pnl-mask, rcsr compose and
+                             rcsr switch (gate states need every row)
   --target <col>[,<col>..]   target column; a comma-separated list enables
                              multi-output regression (one shared shape, one
                              fitted constant vector per output). See
@@ -4691,6 +4693,24 @@ fn main() {
             Some(spec)
         }
     };
+    // #1247: gate state is a row-to-row recursion over every row of the data file; a hash sample breaks it.
+    if sample_rows.is_some() {
+        let gated = if gate_spec.is_some() {
+            Some("--pnl-mask")
+        } else if rcsr::switch::request().is_some() {
+            Some("rcsr switch")
+        } else if rcsr::compose::request().is_some() {
+            Some("rcsr compose")
+        } else {
+            None
+        };
+        if let Some(what) = gated {
+            trading_usage(&format!(
+                "--sample-rows with {}: the gate states are computed over the sampled rows, not over the data file; drop --sample-rows or load the full store",
+                what
+            ));
+        }
+    }
     // #1185: every column `rcsr switch` reads passes the --pnl-mask checks before any row is read.
     if let Some(sw) = rcsr::switch::request() {
         if lags > 0 || lag_set_src.is_some() || fill != data::FillMethod::None || outlier_iqr.is_some() || smooth > 0 {
