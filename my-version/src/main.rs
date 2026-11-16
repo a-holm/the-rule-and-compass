@@ -289,6 +289,7 @@ INPUT:
                              and must still fit the budget
                              Exit 2 with --pnl-mask, rcsr compose and
                              rcsr switch (gate states need every row)
+                             and with rcsr enumerate (every training row)
   --target <col>[,<col>..]   target column; a comma-separated list enables
                              multi-output regression (one shared shape, one
                              fitted constant vector per output). See
