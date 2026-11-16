@@ -462,7 +462,7 @@ fn from_composed(path: &str) -> Result<Request, Fail> {
     for (k, (j, made)) in listed.iter().zip(&composites).enumerate() {
         let same = j.get("id").and_then(Json::as_usize) == Some(made.id)
             && j.get("expression").and_then(Json::as_str) == Some(made.text.as_str())
-            && j.get("type").and_then(Json::as_str) == Some(made.kind.label());
+            && j.get("type").and_then(Json::as_str) == Some(req.type_label(made.kind));
         if !same {
             return Err(bad(format!("compose.composites[{}] is not the composite the menu and the members give ('{}')", k, made.text)));
         }
@@ -496,6 +496,15 @@ impl Request {
     /// The menu gates, whose `rcsr-gate-state/1` states the validation and test slices carry.
     pub fn state_gates(&self) -> Vec<GateSpec> {
         self.menu.gates.iter().map(|g| g.gate.clone()).collect()
+    }
+
+    /// #1182: the composite type of the code: a searched gate makes a C1 or C2 a C3.
+    fn type_label(&self, kind: Kind) -> &'static str {
+        if self.searched.is_some() && kind != Kind::C0 {
+            "C3"
+        } else {
+            kind.label()
+        }
     }
 
     /// Every column read, gate columns first, in order of first use.
@@ -1235,7 +1244,7 @@ pub fn compose(req: &Request, book: &FitnessBook, slices: &Slices, ctx: &Context
                 "{{\"id\":{},\"rank\":{},\"type\":{},\"form\":{},\"gate\":{},\"codeword\":{},\"on\":{},\"off\":{},\"expression\":{},\"complexity\":{},\"bits\":{},\"pruned\":{},\"bound_gain\":{},\"validation\":{}}}",
                 c.id,
                 rank[c.id],
-                text(c.kind.label()),
+                text(req.type_label(c.kind)),
                 text(c.kind.form()),
                 c.gate.map_or("null".to_string(), |g| text(&req.menu.gates[g].name)),
                 c.gate.map_or("null".to_string(), |g| text(&req.menu.gates[g].codeword)),
@@ -1359,7 +1368,7 @@ pub fn compose(req: &Request, book: &FitnessBook, slices: &Slices, ctx: &Context
         chosen_k.map_or("null".to_string(), |k| ids[k].to_string()),
         chosen_gate.map_or("null".to_string(), gate_json),
         c.id,
-        text(c.kind.label()),
+        text(req.type_label(c.kind)),
         text(c.kind.form()),
         chosen_gate.map_or("null".to_string(), |g| text(&g.name)),
         text(&c.text),
@@ -1427,7 +1436,7 @@ pub fn compose(req: &Request, book: &FitnessBook, slices: &Slices, ctx: &Context
                 "{{\"archive_rank\":{},\"composite_id\":{},\"type\":{},\"expression\":{},\"expression_exact\":{},\"complexity\":{},\"bits\":{},\"pruned\":{}{}{}}}",
                 rank[i],
                 i,
-                text(k.kind.label()),
+                text(req.type_label(k.kind)),
                 text(&k.text),
                 text(&k.text),
                 num(complexity[i]),
@@ -1485,7 +1494,7 @@ pub fn compose(req: &Request, book: &FitnessBook, slices: &Slices, ctx: &Context
     };
     summary.push_str(&format!(
         "finalist {} {}{} (bits {:.1}): {}\n",
-        c.kind.label(),
+        req.type_label(c.kind),
         c.kind.form(),
         chosen_gate.map_or(String::new(), |g| format!(" gate {}", g.name)),
         bits[c.id],

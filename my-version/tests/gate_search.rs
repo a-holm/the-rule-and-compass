@@ -209,7 +209,8 @@ fn gate_search_recovers_planted_gate() {
     let j = json(&o);
     assert_eq!(s(&j, &["gate_search", "schema"]), "rcsr-gate-search/1");
     assert_eq!(num(&j, &["gate_search", "generations"]), 100.0);
-    assert_eq!(s(&j, &["compose", "chosen", "type"]), "C2");
+    assert_eq!(s(&j, &["compose", "chosen", "type"]), "C3");
+    assert_eq!(s(&j, &["compose", "chosen", "form"]), "if(gate, f_on, f_off)");
     let sw = at(&j, &["objective", "finalist", "switch"]);
     assert_eq!(s(sw, &["gate", "state_rule"]), "rcsr-gate-state/1");
     assert_eq!((s(sw, &["on"]), s(sw, &["off"])), ("x1", "0 - x1"));
@@ -273,8 +274,11 @@ fn cash_branch_is_flat() {
     let j = json(&gate_search(&p, &p.data, "g,h", &args));
     assert_eq!(s(&j, &["gate_search", "form"]), "C1");
     assert_eq!(num(&j, &["gate_search", "branches_train", "off", "net"]), 0.0);
+    for c in arr(&j, &["compose", "composites"]) {
+        assert_eq!((s(c, &["type"]), s(c, &["form"])), ("C3", "if(gate, f, cash)"));
+    }
     for m in arr(&j, &["pareto"]) {
-        assert_eq!(s(m, &["type"]), "C1");
+        assert_eq!(s(m, &["type"]), "C3");
         assert_eq!(s(m, &["switch", "off"]), "-1.0");
     }
     for slice in ["validation", "test"] {
