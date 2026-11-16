@@ -2329,8 +2329,7 @@ fn lexicase_fails_a_required_gpu_run() {
     let (sample, b) = search_fixture();
     let cfg = Config { selection: search::Selection::Lexicase, ..required_config(&b, true) };
     let err = search::run_seeded_checked(&cfg, &sample, &sample, &[]).err().expect("a required lexicase run must fail");
-    assert!(err.starts_with(search::GPU_REQUIRED_PREFIX), "{err}");
-    assert!(err.contains("lexicase"), "{err}");
+    assert!(err.contains("lexicase") && err.contains("--gpu"), "{err}");
 }
 
 #[test]

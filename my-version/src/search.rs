@@ -468,8 +468,8 @@ pub struct Config {
     /// #604: an explicit `--gpu` (or `--dispatch device`). A device failure
     /// after the start-up probe ends the run with an error instead of
     /// continuing on the CPU. The two start-up refusals the CLI turns into
-    /// exit 2 (lexicase selection, a masked sd-unit book) end the run too. Not
-    /// a search setting.
+    /// exit 2 (lexicase selection, refused by the search up front, and a masked
+    /// sd-unit book) end the run too. Not a search setting.
     pub gpu_required: bool,
     /// #26: print the one-line `# gpu: ...` note. The CLI clears this with
     /// `--quiet`, which promises an empty stderr for machine-readable output.
@@ -8585,7 +8585,10 @@ fn run_search(
     } else if cfg.selection == Selection::Lexicase {
         // #1023: the device returns no per-case errors; lexicase runs on the CPU.
         let reason = "--selection lexicase reads per-case errors the device scorer does not return";
-        gpu_refused(cfg, reason, true, &mut backend_reason)?;
+        if cfg.gpu_notes {
+            eprintln!("# gpu: off ({})", reason);
+        }
+        backend_reason = Some(reason.to_string());
         None
     } else {
         // #230: the evaluator still has no native rank scorer, but the exact
