@@ -367,3 +367,19 @@ fn enumerate_refuses_sample_rows() {
     let o = enumerate(&rcsb, &spec, &["--ops", OPS10, "--json"]);
     assert_eq!(code(&o), 0, "the store runs without --sample-rows: {}", stderr(&o));
 }
+
+/// A gate search written before the subcommand is refused: `--gate-search` takes its
+/// flags first, and the plain class report would drop the gate search without a word.
+#[test]
+fn enumerate_refuses_a_gate_search_before_the_subcommand() {
+    let (_s, dir) = scratch();
+    let (data, spec) = (write_csv(&dir, Panel::Planted), write_spec(&dir));
+    let mut args = vec!["--gate-search", "--branch-on", "cash", "--branch-off", "x1", "enumerate"];
+    args.extend(run_flags(&data, &spec));
+    args.extend(["--ops", "add,sub", "--max-size", "2", "--json"]);
+    let o = rcsr(&args);
+    let err = stderr(&o);
+    assert_eq!(code(&o), 2, "{err}");
+    assert!(err.contains("--gate-search") && err.contains("rcsr enumerate"), "{err}");
+    assert!(stdout(&o).is_empty());
+}
