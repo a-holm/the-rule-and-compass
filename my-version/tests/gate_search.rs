@@ -204,7 +204,7 @@ fn gate_search_recovers_planted_gate() {
         &p,
         &p.data,
         "g,h,x2",
-        &["--branch-on", "x1", "--branch-off", "0 - x1", "--seed", "3", "--generations", "100", "--pop", "32", "--islands", "2", "--max-complexity", "5", "--ops", "add,sub,mul", "--json"],
+        &["--branch-on", "x1", "--branch-off", "0 - x1", "--seed", "3", "--generations", "100", "--patience", "0", "--pop", "32", "--islands", "2", "--max-complexity", "5", "--ops", "add,sub,mul", "--json"],
     );
     let j = json(&o);
     assert_eq!(s(&j, &["gate_search", "schema"]), "rcsr-gate-search/1");
@@ -419,7 +419,7 @@ fn gate_search_is_deterministic_and_keeps_branches_frozen() {
     plain.extend_from_slice(&SHORT);
     let o = rcsr(&plain);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
-    assert!(!String::from_utf8_lossy(&o.stdout).contains("gate_search"));
+    assert!(!String::from_utf8_lossy(&o.stdout).contains("\"gate_search\":"), "a plain run has no gate_search block");
 }
 
 #[test]
