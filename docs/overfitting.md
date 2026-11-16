@@ -716,6 +716,49 @@ A walk-forward report scores one out-of-sample path; a regime that lies in the f
 * Seed spread: the per-seed metric is the mean period net times `periods_per_year`; `delta` is the mean over `A` seeds minus the mean over `B` seeds; `s_seed` is the pooled within-side standard deviation (`df = nA + nB - 2`) or `--s-seed`; `z = delta / (s_seed sqrt(1/nA + 1/nB))`. With fewer than 2 seeds on a side and no `--s-seed`, `z` is null and `z_reason` says why.
 * The same file on both sides, a missing or non-finite series, or reports that differ in cost, annualisation, windows, threshold rule (the guarded fields above) or grid exit 2 and name the field. `--threshold-arms` lets A and B differ in the four fit fields.
 
+### 3.15 Sealed-read verdict (`rcsr protocol verdict`, #1238)
+
+The broad pilot reads every sealed candidate once over the lock and judges it by a pre-registered table (broad-pilot design 8.3): good, promising, not confirmed or falsified. The verdict reads the thresholds that the candidate table froze per pick before the seal (decision D18, #1237) and recomputes nothing from development data after the read. `rcsr trials --table` refuses locked reports, so the verdict is its own command on its own inputs.
+
+```sh
+# after the candidate table with frozen thresholds is written (#1237)
+rcsr protocol freeze --ledger L --role thresholds --file table.json
+rcsr protocol freeze --ledger L --role subwindows --file subwindows.csv
+rcsr protocol freeze --ledger L --role years --file years.csv
+rcsr protocol seal --ledger L --final --max-reads 3 --out locked_candidates.json
+rcsr walkforward ... --from-run final.run.json --locked-test --ledger L --sealed locked_candidates.json \
+  --emit-series --bootstrap 10000 --json --out read-1.json
+rcsr protocol regimes ... --after-read --ledger L --sealed locked_candidates.json --expect-reads 3 --out regimes_lock.csv
+rcsr protocol verdict --ledger L --sealed locked_candidates.json --thresholds table.json \
+  --read read-1.json --read read-2.json --read read-3.json --subwindows subwindows.csv --pristine-label pristine \
+  --years years.csv --regimes regimes_lock.csv --out verdict.json --markdown verdict.md
+```
+
+* Freeze: `rcsr protocol freeze --ledger L --role ROLE --file PATH` appends `{"event":"freeze","role":ROLE,"sha256":H,"bytes":N}`; the event holds no path, since a path spelling changes nothing. Roles: `thresholds` (the `rcsr-trials-table/1` output with the top-level and per-pick `freeze` objects), `development` (a development table for D2 and D3, when PBO comes from another table than the one that picks), `subwindows` and `years` (calendars `label,start,end`). A file that its role cannot read exits 2. One file per role; a second freeze of a role, a freeze after any seal and a freeze after any locked read exit 1 and leave the ledger as it was. `protocol verify` and `seal --final` read the event.
+* Inputs: the ledger (a broken chain or a cut line exits 1), the final sealed list (its SHA-256 is the final seal's), every frozen file (its SHA-256 and byte count equal its `freeze` event, the event lies before the final seal, every frozen role is passed and every passed file is frozen), the locked reads and the lock calendar of `rcsr protocol regimes --after-read` (its SHA-256 equals a `regime_dating` event after the final seal). Nothing else is opened: the CPCV path files and run files that the table names stay closed.
+* Binding: a read needs `protocol.test_read` true, a file whose text without the unhashed members (`protocol`, `batch_timings`, `scan`, `ledger`, `selection.run`, `split.fit_label`) hashes to its `protocol.report_sha256`, its `protocol.candidate_id` in the sealed list, a `test_read` event of that candidate with that hash, and `selection.run_sha256` equal to the `freeze.run_sha256` of exactly one pick. A `--from-run` report carries `selection.run` and `selection.run_sha256` like a `--front` report; the hash covers the SHA-256, not the path, and the candidate id does not depend on it. The read cost (`cost_model.per_side_bps`) and `annualization.periods_per_year` must equal the pick's frozen values, because the floors and the cap hold at that cost and annualisation. A read that fails any check exits 2 and names the input; a pick bound by two reads exits 2. Pick 1 is the primary: a primary without a read exits 2, another pick without a read is reported as not read.
+* Series: `pooled.period_time`, `period_net` (x, net at the read cost), `period_cost` (c), `period_exposure` (e), `period_bh_net` (b, buy-and-hold of the same rows) and `inference.bootstrap` (`p_mean_positive`, `block_len`, `draws`, `seed`); a missing field exits 2 naming it (run the read with `--emit-series --bootstrap N`). Strata use `Calendar::assign` on `period_time`, the rule of the table. `ann(v)` is the mean of `v` times `periods_per_year`.
+
+| gate | value | pass |
+|---|---|---|
+| S1 | `ann(x)`, `ann(x - c)` (10 and 20 bp) | both > 0 |
+| S2 | `ann(x - e b)` | > 0 |
+| S3 | compounding max drawdown of x (`risk::Drawdown`) | `-max_drawdown <=` frozen `drawdown_cap.value` |
+| S4 | `ann(x)` | `>=` frozen `s4_floor.value` |
+| S5 | `inference.bootstrap.p_mean_positive` | `<= 0.05` |
+| R1 | bull periods of the lock calendar: `ann(x)`, `ann(x - c)`, `ann(x - e b)` | first two > 0, third >= 0 |
+| R2 | bear periods: `ann(x) - ann(b)`, `ann(x - e b)` | both >= 0 |
+| P1 | periods with `--pristine-label` in the subwindows calendar: `ann(x)` | `>=` frozen `p1_floor.value` |
+| D1 | `picks[k].dsr.value` (DSR at N_eff) | `>= 0.95` |
+| D2 | `spa.p_consistent` of the development table, else the thresholds table | `<= 0.05` |
+| D3 | `pbo.value` of the same table | `<= 0.2` |
+
+* A stratum without a period fails R1, R2 or P1 with reason `no periods`; a missing table value fails D1, D2 or D3 with a reason. Verdict, in this order: `good` when every gate passes; `promising` when S1 at 10 bp, S2, S4, S5 at p <= 0.10, D2 and DSR >= 0.80 pass; `not_confirmed` when `ann(x) >= 0`; `falsified` otherwise.
+* Secondaries: when the primary is good, the S5 p of the secondary reads get Holm-adjusted p-values (`secondaries.holm`, each read `tested` true with `p_holm`); otherwise `tested` is false and their numbers stay as context. They never change the primary's verdict.
+* Report-only lines per read: the full lock and each part of the subwindows calendar (the prior-look and the pristine part), the years calendar and the strata of the lock calendar, each with net at 10 and 20 bp, Sharpe, alpha, max drawdown, exposure, entries (sum of `period_entry_stamp`), buy-and-hold, cash (0) and a circular block-bootstrap p with the read's block length, draws and seed (the full lock repeats the read's `p_mean_positive`); DSR at `--dsr-trials` (default 51, the campaign's distinct books) of the full lock and every part except the pristine one, with the single-series variance of the table; `bits`, `p_occam` and `p_family` copied from the frozen table row (null when the row has none).
+* Benchmarks: cash at 0 and buy-and-hold of the same rows. No interest-rate, bond or stablecoin-yield input exists.
+* Output `rcsr-verdict/1`: the ledger, sealed-list, frozen-file, rule and lock-calendar SHA-256, `candidates[]` (pick, role, candidate id, run and read report SHA-256, gates, verdict, parts, years, strata, report-only lines) and `secondaries`, plus a Markdown summary. Same inputs give the same bytes. Exit 1 on a ledger fault, 2 on a refused binding or input, 3 on an I/O error.
+
 ## 4. What `rcsr` reports today
 
 `rcsr trials --regimes calendar.csv` (#1175) adds a `regimes` array to every member and a top-level `regimes_calendar` (sha256, rows, labels). Each stratum holds periods, net mean and Sharpe at the report cost and at twice it, exposure, entries and alpha against the cost-free equal-weight series (no risk-free rate). Members need `pooled.period_gross`, `period_exposure`, `period_entries` and `period_bh`, written by `rcsr walkforward --period-series`. Strata are descriptive and add no trials. The flag is refused with `--compare`. Without it the output is unchanged.

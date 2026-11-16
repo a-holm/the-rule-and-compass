@@ -908,6 +908,10 @@ __device__ __forceinline__ float rc_exec_row(const unsigned int *__restrict__ co
    in step with `trading::FITNESS_MAX_BLOCKS` and `FITNESS_BLOCK_SHIFT`. */
 #define RC_PNL_MAX_BLOCKS 8
 #define RC_PNL_BLOCK_SHIFT 2
+/* #1244: bit 5 of a flags byte marks a row outside the regime mask
+   (`trading::FITNESS_MASK_OFF`). The scorers never interpret such a row and
+   never hold it long, so a non-finite score there decides nothing. */
+#define RC_PNL_MASK_OFF 32
 /* #1178: most time blocks of a book (`trading::FITNESS_BOOK_MAX_BLOCKS`); a
    book with more than RC_PNL_MAX_BLOCKS reads its block ids from a byte array
    and scores in the RC_PNL_WIDE_BLOCKS instantiation. */
@@ -1625,7 +1629,10 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_kernel(
  * #1178: a book of 9 to 64 blocks reads its block ids from the byte array
  * `bids` and scores in the NB == RC_PNL_WIDE_BLOCKS instantiation with the
  * runtime block count `blk.nb`; a warp step that spans several blocks takes
- * the counts of each block present with one ballot per block. */
+ * the counts of each block present with one ballot per block.
+ *
+ * #1244: a row with RC_PNL_MASK_OFF is flat and finite without an interpreter
+ * call (`FitnessBook::force_flat`), and so is the carry from it. */
 typedef struct RcPnlTotals {
     double gross;
     unsigned long long flips;
@@ -1851,7 +1858,7 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) pnl_score_kernel(
             ? seg_start + RC_PNL_SEGMENT_ROWS
             : rows;
         unsigned int carry = 0u;
-        if (seg_start > 0) {
+        if (seg_start > 0 && !(flags[seg_start - 1] & RC_PNL_MASK_OFF)) {
             const float q = rc_exec_row(code, cols, n, (int)(seg_start - 1));
             carry = rc_pnl_long(q, threshold) ? 1u : 0u;
         }
@@ -1870,13 +1877,14 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) pnl_score_kernel(
             float pred = 0.0f;
             unsigned int f = 0u, wb = 0u;
             if (in) {
-                pred = rc_exec_row(code, cols, n, (int)row);
                 f = flags[row];
+                if (!(f & RC_PNL_MASK_OFF)) pred = rc_exec_row(code, cols, n, (int)row);
                 if (NB > RC_PNL_MAX_BLOCKS) wb = bids[row];
             }
+            const int live = in && !(f & RC_PNL_MASK_OFF);
             const int fin = isfinite(pred);
-            const int pos = in && fin && (double)pred > threshold;
-            bad |= in && !fin;
+            const int pos = live && fin && (double)pred > threshold;
+            bad |= live && !fin;
             const unsigned int m = __ballot_sync(0xffffffffu, pos);
             const unsigned int fst = __ballot_sync(0xffffffffu, (f & 1u) != 0u);
             const unsigned int lst = __ballot_sync(0xffffffffu, (f & 2u) != 0u);
@@ -1965,7 +1973,9 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) pnl_score_kernel(
  * row included, saturating at K). A row enters when its prediction is finite
  * and `(double)pred > threshold + b`, keeps a long position while finite and
  * `> threshold - b` or while `h < K`, and the first row of every run (group
- * or time block) starts flat: `BandParams::next` row for row.
+ * or time block) starts flat: `BandParams::next` row for row. #1244: a row
+ * with RC_PNL_MASK_OFF is not interpreted and neither enters nor stays, the
+ * step of `BandParams::next` on the score `f64::MIN`.
  *
  * The block walks the segments in rounds of RC_PNL_WARPS: in round `r` warp
  * `w` takes segment `r * RC_PNL_WARPS + w`, the same segments in the same
@@ -2144,13 +2154,14 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) pnl_band_kernel(
                 float pred = 0.0f;
                 unsigned int f = 0u;
                 if (in) {
-                    pred = rc_exec_row(code, cols, n, (int)row);
                     f = flags[row];
+                    if (!(f & RC_PNL_MASK_OFF)) pred = rc_exec_row(code, cols, n, (int)row);
                 }
+                const int live = in && !(f & RC_PNL_MASK_OFF);
                 const int fin = isfinite(pred);
-                bad |= in && !fin;
-                const unsigned int ent = __ballot_sync(0xffffffffu, in && fin && (double)pred > hi);
-                const unsigned int stay = __ballot_sync(0xffffffffu, in && fin && (double)pred > lo);
+                bad |= live && !fin;
+                const unsigned int ent = __ballot_sync(0xffffffffu, live && fin && (double)pred > hi);
+                const unsigned int stay = __ballot_sync(0xffffffffu, live && fin && (double)pred > lo);
                 const unsigned int fst = __ballot_sync(0xffffffffu, (f & 1u) != 0u);
                 const int nv = (int)min((long long)32, seg_end - base);
                 if (lane == (step & 31)) {

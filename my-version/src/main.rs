@@ -395,7 +395,8 @@ INPUT:
                              over every row of the data file from each group's
                              first row (never a label or a row filter); the
                              validation rows never read a test interval.
-                             CPU only: --gpu exits 2. Needs --fitness pnl;
+                             --gpu scores it on the device, except with
+                             --band-units sd (exit 2). Needs --fitness pnl;
                              the book hash covers it, so a resume needs the
                              same mask
   --pnl-mask-band h         hysteresis of --pnl-mask (default 0, finite, >= 0):
@@ -4417,8 +4418,8 @@ fn main() {
     }
     cfg.dispatch = dispatch_mode;
 
-    if pnl_mask_arg.is_some() && gpu_explicit == Some(true) {
-        trading_usage("--pnl-mask with --gpu: the device long_pnl book carries no regime mask; omit --gpu to run on the CPU");
+    if pnl_mask_arg.is_some() && gpu_explicit == Some(true) && trade_band_units.as_deref().map(str::trim) == Some("sd") {
+        trading_usage("--pnl-mask with --band-units sd and --gpu: the device sd reads every row, not the rows inside the mask; use --band-units score or omit --gpu to run on the CPU");
     }
     let gpu_probe = if gpu_explicit == Some(false) {
         backend::Probe::not_probed("--cpu/--no-gpu (device not probed)")
@@ -11876,7 +11877,9 @@ OPTIONS:
                              band exit 2; a label, target, return or construction
                              gate column exits 5. Such a run writes
                              selection.composite: source, type, form and gate of its
-                             compose.chosen (#1237); other reports carry no marker
+                             compose.chosen (#1237); other reports carry no marker.
+                             The selection block carries run and run_sha256 (the
+                             SHA-256 of the file, inside the report hash; #1238)
   --threshold-quantile <q>   exact type-7 training/validation score quantile
                              (default {DEFAULT_QUANTILE}); selected by order-preserving
                              radix count, so theta is bit-identical to numpy
@@ -13403,13 +13406,16 @@ fn run_walkforward(args: &[String]) -> ! {
             }
         }
     }
-    let report = match walkforward::run_path_with(&data_path, &spec, &popts) {
+    let mut report = match walkforward::run_path_with(&data_path, &spec, &popts) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("error: {}", e);
             std::process::exit(if e.contains("overlapping returns") || e.contains("purge gap") || e.contains("are not in time order") || e.starts_with("--periods-per-year") || e.starts_with("missing stride_seconds") || e.starts_with("stride_seconds") { EXIT_USAGE } else { EXIT_INPUT });
         }
     };
+    if let (Some(path), Some(run)) = (&from_run_path, &front_run) {
+        report.from_run = Some(walkforward::RunRef { run: path.clone(), run_sha256: run.sha256.clone() });
+    }
     if spec.threshold_fixed.is_none() {
         for c in &report.candidates {
             let constant = expr::parse(c, &report.variables)

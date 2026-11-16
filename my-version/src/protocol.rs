@@ -1,4 +1,4 @@
-//! Evaluation protocol: windows, candidate ledger, "rcsr protocol <windows|seal|verify|retire|candidates|selectors> ...ed list, one-read lockbox.
+//! Evaluation protocol: windows, candidate ledger, sealed list, one-read lockbox, frozen inputs and the sealed-read verdict (`rcsr protocol <windows|seal|verify|retire|candidates|selectors|freeze|verdict>`).
 //!
 //! Four tiers: training fits, validation selects, development out-of-sample
 //! evaluates the procedure, and a locked test is read once per sealed
@@ -31,6 +31,8 @@
 //! * `seal`: the SHA-256 of `locked_candidates.json`, written before any read.
 //! * `test_read`: one locked read (`id`, `report_sha256`, `read_count`,
 //!   `test_read:true`).
+//! * `freeze` (#1238): the `role`, `sha256` and `bytes` of a file the sealed-read
+//!   verdict reads, recorded before any seal or read; one file per role.
 //!
 //! A locked read needs a `seal` line whose hash matches the sealed file, an id
 //! inside that file, no earlier `test_read` for the id, and the same data and
@@ -402,6 +404,8 @@ pub enum Event {
         locked_test: Option<LockedRange>,
         binding_sha256: Option<String>,
     },
+    /// #1238: a file the sealed-read verdict reads, frozen before the seal.
+    Freeze { role: String, sha256: String, bytes: u64 },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -522,6 +526,11 @@ impl Ledger {
                     locked_test: LockedRange::parse(&line),
                     binding_sha256: field_str(&line, "binding_sha256"),
                 },
+                "freeze" => Event::Freeze {
+                    role: need("role")?,
+                    sha256: need("sha256")?,
+                    bytes: field_u64(&line, "bytes").ok_or_else(|| fault_field(p, n, &kind, "bytes"))?,
+                },
                 other => return Err(format!("unknown ledger event '{}'", other)),
             });
         }
@@ -561,6 +570,34 @@ impl Ledger {
             params_sha256,
             range.json()
         ))
+    }
+
+    /// #1238: why `role` cannot be frozen now: the ledger has a seal or a locked
+    /// read, or the role holds a file already.
+    pub fn freeze_refusal(&self, role: &str) -> Result<(), String> {
+        self.verify_chain()?;
+        let events = self.events()?;
+        if events.iter().any(|e| matches!(e, Event::Seal { .. })) {
+            return Err("the ledger has a seal: files are frozen before the seal".to_string());
+        }
+        if events.iter().any(|e| matches!(e, Event::TestRead { .. } | Event::BaselineRead { .. })) {
+            return Err("the ledger has a locked read: files are frozen before any read".to_string());
+        }
+        let frozen = events.iter().find_map(|e| match e {
+            Event::Freeze { role: r, sha256, .. } if r == role => Some(sha256),
+            _ => None,
+        });
+        match frozen {
+            Some(sha) => Err(format!("role {} is frozen already (sha256 {}); one file per role", role, sha)),
+            None => Ok(()),
+        }
+    }
+
+    /// #1238: append the freeze event of a file the sealed-read verdict reads:
+    /// role, SHA-256 and byte count, no path.
+    pub fn record_freeze(&self, role: &str, sha256: &str, bytes: u64) -> Result<(), String> {
+        self.freeze_refusal(role)?;
+        self.append(&format!("\"event\":\"freeze\",\"role\":{},\"sha256\":\"{}\",\"bytes\":{}", esc(role), sha256, bytes))
     }
 
     /// Record a development candidate. Returns its id.
@@ -1198,7 +1235,7 @@ pub fn procedure_spec(spec: &crate::walkforward::EvalSpec, o: &crate::walkforwar
 pub const LEDGER_FAULT_EXIT: i32 = 1;
 
 fn protocol_usage() -> &'static str {
-    "rcsr protocol <windows|seal|verify|retire|candidates|selectors|regimes|cpcv> ...
+    "rcsr protocol <windows|seal|verify|retire|candidates|selectors|regimes|cpcv|freeze|verdict> ...
 
   windows [--purge-seconds N] [--out FILE]
       Write the UTC windows table (default purge 219600 s: 1 h entry + 60 h label).
@@ -1246,7 +1283,49 @@ fn protocol_usage() -> &'static str {
       final read. Run `rcsr protocol regimes --help` for the rule and the flags.
   candidates --ledger FILE
       List the candidates without a locked read.
+  freeze --ledger FILE --role thresholds|development|subwindows|years --file PATH
+      #1238: record the SHA-256 and byte count of a file the sealed-read verdict
+      reads (the candidate table with the frozen thresholds of #1237, a
+      development table for D2 and D3, the subwindows and years calendars) as a
+      freeze event, before the seal; the event holds no path. A file its role
+      cannot read exits 2. One file per role: a second freeze of a role, a freeze
+      after any seal and a freeze after any locked read exit 1.
 "
+}
+
+/// `rcsr protocol freeze --ledger FILE --role ROLE --file PATH` (#1238). Exit 2 for
+/// a bad argument or a file its role cannot read, 3 for an unreadable file, 1 when
+/// the ledger refuses the freeze.
+fn freeze_cli(args: &[String]) -> ! {
+    let fail = |msg: String, code: i32| -> ! {
+        eprintln!("error: {}", msg);
+        std::process::exit(code)
+    };
+    let (mut ledger, mut role, mut file) = (None, None, None);
+    let mut i = 0;
+    while i < args.len() {
+        let value = args.get(i + 1).cloned().unwrap_or_else(|| fail(format!("{} requires a value", args[i]), 2));
+        match args[i].as_str() {
+            "--ledger" => ledger = Some(value),
+            "--role" => role = Some(value),
+            "--file" => file = Some(value),
+            other => fail(format!("unknown option '{}' for protocol freeze\n\n{}", other, protocol_usage()), 2),
+        }
+        i += 2;
+    }
+    let need = |v: Option<String>, flag: &str| v.unwrap_or_else(|| fail(format!("protocol freeze needs {}", flag), 2));
+    let (ledger, role, file) = (need(ledger, "--ledger"), need(role, "--role"), need(file, "--file"));
+    if !crate::verdict::ROLES.contains(&role.as_str()) {
+        fail(format!("--role {}: unknown role; one of {}", role, crate::verdict::ROLES.join(", ")), 2);
+    }
+    let bytes = std::fs::read(&file).unwrap_or_else(|e| fail(format!("{}: {}", file, e), 3));
+    let l = Ledger::new(&ledger);
+    l.freeze_refusal(&role).unwrap_or_else(|e| fail(e, LEDGER_FAULT_EXIT));
+    crate::verdict::check_frozen(&role, &bytes).unwrap_or_else(|e| fail(format!("--file {}: {}", file, e), 2));
+    let sha = sha256_hex(&bytes);
+    l.record_freeze(&role, &sha, bytes.len() as u64).unwrap_or_else(|e| fail(e, LEDGER_FAULT_EXIT));
+    println!("frozen {} sha256 {} bytes {}", role, sha, bytes.len());
+    std::process::exit(0)
 }
 
 /// `rcsr protocol ...`.
@@ -1256,7 +1335,7 @@ pub fn run(args: &[String]) -> ! {
         std::process::exit(code)
     };
     if args.is_empty() || args.iter().any(|a| a == "-h" || a == "--help") {
-        print!("{}{}", protocol_usage(), crate::cpcv::protocol_usage());
+        print!("{}{}{}", protocol_usage(), crate::verdict::usage(), crate::cpcv::protocol_usage());
         std::process::exit(if args.is_empty() { 2 } else { 0 });
     }
     if args[0] == "regimes" {
@@ -1264,6 +1343,12 @@ pub fn run(args: &[String]) -> ! {
     }
     if args[0] == "cpcv" {
         crate::cpcv::protocol_cli(&args[1..]);
+    }
+    if args[0] == "freeze" {
+        freeze_cli(&args[1..]);
+    }
+    if args[0] == "verdict" {
+        crate::verdict::run(&args[1..]);
     }
     let mut purge = DEFAULT_PURGE_SECONDS;
     let mut out: Option<String> = None;

@@ -435,6 +435,7 @@ it is also used for choices, there is no holdout.
 **Verify.**
 
 * The chosen expression is written down before the lockbox run.
+* Every file the verdict of the locked read uses (the candidate table with its frozen thresholds, a development table, the subwindows and years calendars) is frozen in the ledger with `rcsr protocol freeze` before the final seal. `rcsr protocol verdict` refuses a file whose SHA-256 differs from its freeze event or whose freeze follows the seal, and the lock calendar must be the one `rcsr protocol regimes --after-read` recorded (`docs/overfitting.md` 3.15).
 * `--eval-expr` output names the metric and reports `train_error` / `test_error`
   separately; the test side is the lockbox rows.
 * `tests/reports.rs::json_stays_valid_when_a_report_is_requested` and the
