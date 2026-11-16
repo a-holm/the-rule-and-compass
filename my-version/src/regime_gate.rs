@@ -163,6 +163,18 @@ pub fn hysteresis_states(values: &[f64], group: &[u64], band: f64, dwell: usize)
     out
 }
 
+/// #1182: [`hysteresis_states`] over the values `value(i)` with the groups
+/// numbered `0..groups`, into `out`; a gate search prices many cuts of one gate.
+pub fn hysteresis_states_dense(value: impl Fn(usize) -> f64, group: &[u32], groups: usize, band: f64, dwell: usize, out: &mut [bool]) {
+    let mut state: Vec<Option<(bool, usize)>> = vec![None; groups];
+    for (i, o) in out.iter_mut().enumerate() {
+        let g = group[i] as usize;
+        let next = transition(state[g], value(i), band, dwell);
+        state[g] = Some(next);
+        *o = next.0;
+    }
+}
+
 /// One step of the kernel: `(state, rows held)` after a row of value `value`,
 /// from the group's `(state, rows held)` before it (`None` at its first row).
 fn transition(prev: Option<(bool, usize)>, value: f64, band: f64, dwell: usize) -> (bool, usize) {
@@ -792,6 +804,18 @@ mod tests {
         // dwell 2: each group keeps its first state for 2 rows and flips at its third row
         let s = hysteresis_states(&v, &g, 0.0, 2);
         assert_eq!(s, vec![true, false, true, false, false, true]);
+    }
+
+    #[test]
+    fn dense_groups_give_the_hashed_kernel_states() {
+        let ids = [7u64, 3, 7, 9, 3, 3, 7, 9, 9, 7, 3, 7];
+        let dense: Vec<u32> = ids.iter().map(|g| [7u64, 3, 9].iter().position(|h| h == g).unwrap() as u32).collect();
+        let v = [0.5, -0.03, -0.5, 0.01, f64::NAN, 0.4, 0.0, -0.2, 0.3, 0.02, -0.6, -0.01];
+        for (band, dwell) in [(0.0, 1), (0.02, 1), (0.0, 3), (0.02, 2)] {
+            let mut out = vec![false; v.len()];
+            hysteresis_states_dense(|i| v[i], &dense, 3, band, dwell, &mut out);
+            assert_eq!(out, hysteresis_states(&v, &ids, band, dwell), "band {band} dwell {dwell}");
+        }
     }
 
     #[test]

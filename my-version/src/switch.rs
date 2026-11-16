@@ -755,7 +755,7 @@ USAGE:
   The k-switch bound V_k is the best net of any time-level switch between A
   and B with at most k switches; it bounds every time-level gate with at most
   k flips. It is a pruning bound, not evidence of an edge. A band, a minimum
-  hold, --pnl-mask, --pnl-excess, --pnl-stat, --pnl-cvar-q and --gpu exit 2.
+  hold, --pnl-mask, --sample-rows, --pnl-excess, --pnl-stat, --pnl-cvar-q and --gpu exit 2.
   See docs/walkforward.md.
 "
 }

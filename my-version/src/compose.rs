@@ -187,7 +187,7 @@ pub struct Member {
 }
 
 /// The split fields every input run and the compose invocation must share.
-const SPLIT_KEYS: [&str; 12] = [
+pub(crate) const SPLIT_KEYS: [&str; 12] = [
     "mode",
     "train_rows",
     "validation_rows",
@@ -265,7 +265,7 @@ fn load_run(pool: Pool, path: &str, top: usize, index: usize, members: &mut Vec<
 }
 
 /// The split field `key` of two split objects differs (absent on both is equal).
-fn split_differs(a: &Json, b: &Json, key: &str) -> bool {
+pub(crate) fn split_differs(a: &Json, b: &Json, key: &str) -> bool {
     a.get(key) != b.get(key)
 }
 
@@ -280,6 +280,24 @@ pub struct Request {
     pub out: Option<String>,
     /// #1214: `--reselect-run` of a composed run: the choice reruns over the run's composites.
     pub reselect: Option<Reselect>,
+    /// #1182: the menu holds the gates of a gate search, one composite each.
+    pub searched: Option<Searched>,
+}
+
+/// #1182: what a gate search hands the choice: its trial count, the bits of
+/// every member and composite (a searched gate pays its expression and its
+/// cut), and the `gate_search` objects of the run.json.
+#[derive(Clone, Debug)]
+pub struct Searched {
+    pub candidates_evaluated: u64,
+    pub generations: usize,
+    pub member_bits: Vec<(f64, bool)>,
+    pub bits: Vec<f64>,
+    pub code: String,
+    /// The top-level `gate_search` object.
+    pub json: String,
+    /// Fields each pareto entry gains, by composite id, each starting with a comma.
+    pub pareto_extra: Vec<String>,
 }
 
 static REQUEST: std::sync::OnceLock<Request> = std::sync::OnceLock::new();
@@ -418,8 +436,24 @@ fn from_composed(path: &str) -> Result<Request, Fail> {
             branch: s("branch")?,
         });
     }
-    let req = Request { menu, runs, members, top: c.get("top").and_then(Json::as_usize).unwrap_or(0), json: false, out: None, reselect: None };
+    let searched = doc.get("gate_search").map(|gs| Searched {
+        candidates_evaluated: doc.get("search").and_then(|s| s.get("candidates_evaluated")).and_then(Json::as_f64).map_or(0, |v| v as u64),
+        generations: doc.get("generations_run").and_then(Json::as_usize).unwrap_or(0),
+        member_bits: Vec::new(),
+        bits: Vec::new(),
+        code: String::new(),
+        json: json_text(gs),
+        pareto_extra: Vec::new(),
+    });
+    let mut req = Request { menu, runs, members, top: c.get("top").and_then(Json::as_usize).unwrap_or(0), json: false, out: None, reselect: None, searched };
     let composites = enumerate(&req);
+    if let (Some(s), Some(Json::Arr(pareto))) = (req.searched.as_mut(), doc.get("pareto")) {
+        let extra = |id: usize| {
+            let entry = pareto.iter().find(|m| m.get("composite_id").and_then(Json::as_usize) == Some(id));
+            entry.and_then(|m| m.get("gate_search")).map_or(String::new(), |g| format!(",\"gate_search\":{}", json_text(g)))
+        };
+        s.pareto_extra = (0..composites.len()).map(extra).collect();
+    }
     let listed = list(c.get("composites"), "composites")?;
     if listed.len() != composites.len() {
         return Err(bad(format!("compose.composites holds {} entries; the menu and the members give {}", listed.len(), composites.len())));
@@ -428,7 +462,7 @@ fn from_composed(path: &str) -> Result<Request, Fail> {
     for (k, (j, made)) in listed.iter().zip(&composites).enumerate() {
         let same = j.get("id").and_then(Json::as_usize) == Some(made.id)
             && j.get("expression").and_then(Json::as_str) == Some(made.text.as_str())
-            && j.get("type").and_then(Json::as_str) == Some(made.kind.label());
+            && j.get("type").and_then(Json::as_str) == Some(req.type_label(made.kind));
         if !same {
             return Err(bad(format!("compose.composites[{}] is not the composite the menu and the members give ('{}')", k, made.text)));
         }
@@ -462,6 +496,15 @@ impl Request {
     /// The menu gates, whose `rcsr-gate-state/1` states the validation and test slices carry.
     pub fn state_gates(&self) -> Vec<GateSpec> {
         self.menu.gates.iter().map(|g| g.gate.clone()).collect()
+    }
+
+    /// #1182: the composite type of the code: a searched gate makes a C1 or C2 a C3.
+    fn type_label(&self, kind: Kind) -> &'static str {
+        if self.searched.is_some() && kind != Kind::C0 {
+            "C3"
+        } else {
+            kind.label()
+        }
     }
 
     /// Every column read, gate columns first, in order of first use.
@@ -548,7 +591,7 @@ USAGE:
   run's pruning, bits and code kept); the split must match the run (exit 2).
 
   A band, a minimum hold, --threshold, --position, --book-target, --pnl-mask,
-  --pnl-excess, --pnl-stat, --pnl-cvar-q and --gpu exit 2. A pool run whose
+  --sample-rows, --pnl-excess, --pnl-stat, --pnl-cvar-q and --gpu exit 2. A pool run whose
   member carries a switch exits 2 (nested switch); a run with
   compose.gate.carried and no switch exits 3. See docs/compose.md.
 "
@@ -656,7 +699,7 @@ fn claim_with(args: &[String], reselect: Option<&str>) -> Vec<String> {
             if let Err(e) = check_runs_agree(&runs) {
                 exit_with(e);
             }
-            Request { menu, runs, members, top, json, out, reselect: None }
+            Request { menu, runs, members, top, json, out, reselect: None, searched: None }
         }
     };
     if !rest.iter().any(|a| a == "--fitness") {
@@ -757,6 +800,16 @@ pub fn enumerate(req: &Request) -> Vec<Composite> {
         push(Kind::C0, None, Some(m), None);
     }
     for g in 0..req.menu.gates.len() {
+        // #1182: a searched gate has the one composite its frozen branches fix.
+        if req.searched.is_some() {
+            match (bull.first(), bear.first()) {
+                (Some(&a), Some(&b)) => push(Kind::C2, Some(g), Some(a), Some(b)),
+                (Some(&a), None) => push(Kind::C1On, Some(g), Some(a), None),
+                (None, Some(&b)) => push(Kind::C1Off, Some(g), None, Some(b)),
+                (None, None) => {}
+            }
+            continue;
+        }
         for &m in &bull {
             push(Kind::C1On, Some(g), Some(m), None);
         }
@@ -779,7 +832,7 @@ struct SliceVals {
 }
 
 /// State groups of a slice: per group, and per training segment when there are several.
-fn state_groups(rows: &TradingRows, starts: &[f64]) -> Vec<u64> {
+pub(crate) fn state_groups(rows: &TradingRows, starts: &[f64]) -> Vec<u64> {
     let mut ids: HashMap<(u64, usize), u64> = HashMap::new();
     rows.group
         .iter()
@@ -926,9 +979,10 @@ pub fn compose(req: &Request, book: &FitnessBook, slices: &Slices, ctx: &Context
         let tree = expr::parse(&c.text, &columns).map_err(|e| (2, format!("composite {}: cannot parse '{}': {}", c.id, c.text, e)))?;
         complexity.push(complexity_model.complexity(&tree));
     }
-    let (member_bits, bits) = match &req.reselect {
-        Some(r) => (r.member_bits.clone(), r.bits.clone()),
-        None => {
+    let (member_bits, bits) = match (&req.reselect, &req.searched) {
+        (Some(r), _) => (r.member_bits.clone(), r.bits.clone()),
+        (None, Some(s)) => (s.member_bits.clone(), s.bits.clone()),
+        (None, None) => {
             let mut member_bits: Vec<(f64, bool)> = Vec::with_capacity(req.members.len());
             for m in &req.members {
                 let run = &req.runs[m.run];
@@ -1190,7 +1244,7 @@ pub fn compose(req: &Request, book: &FitnessBook, slices: &Slices, ctx: &Context
                 "{{\"id\":{},\"rank\":{},\"type\":{},\"form\":{},\"gate\":{},\"codeword\":{},\"on\":{},\"off\":{},\"expression\":{},\"complexity\":{},\"bits\":{},\"pruned\":{},\"bound_gain\":{},\"validation\":{}}}",
                 c.id,
                 rank[c.id],
-                text(c.kind.label()),
+                text(req.type_label(c.kind)),
                 text(c.kind.form()),
                 c.gate.map_or("null".to_string(), |g| text(&req.menu.gates[g].name)),
                 c.gate.map_or("null".to_string(), |g| text(&req.menu.gates[g].codeword)),
@@ -1269,10 +1323,13 @@ pub fn compose(req: &Request, book: &FitnessBook, slices: &Slices, ctx: &Context
     let pruned_count = pruned.iter().filter(|&&p| p).count();
     let eligible_count = members.iter().filter(|m| m.eligible).count();
     let chosen_gate = c.gate.map(|g| &req.menu.gates[g]);
+    // #1182: a gate search counts every gate it scored, not only the front.
+    let trials = req.searched.as_ref().map_or(composites.len() as u64, |s| s.candidates_evaluated);
+    let formula = if req.searched.is_some() { "searched gates x 1" } else { "gates x (bull x bear + bull + bear) + all_weather" };
     let compose_json = format!(
         "{{\"schema\":\"{}\",\"menu\":{{\"path\":{},\"sha256\":{},\"schema\":\"{}\",\"switch_budget\":{},\"gates\":[{}]}},\"code\":{},\
          \"top\":{},\"runs\":[{}],\"members\":[{}],\
-         \"count\":{{\"gates\":{},\"bull\":{},\"bear\":{},\"all_weather\":{},\"formula\":\"gates x (bull x bear + bull + bear) + all_weather\",\"composites\":{}}},\
+         \"count\":{{\"gates\":{},\"bull\":{},\"bear\":{},\"all_weather\":{},\"formula\":{},\"composites\":{}}},\
          \"candidates_evaluated\":{},\"pruned\":{},\"scored\":{},\"usable\":{},\"rows\":{{\"train\":{},\"validation\":{},\"test\":{}}},\
          \"selection\":{{\"rule\":\"robust\",\"blocks\":{},\"se_z\":{},\"block_len\":{},\"blocks_source\":{},\"regime_condition\":\"alpha_on >= 0 and alpha_off >= 0 on the validation rows (C1 and C2)\",\"eligible\":{},\"verdict\":\"{}\",\"chosen\":{}}},\
          \"gate\":{},\
@@ -1285,7 +1342,7 @@ pub fn compose(req: &Request, book: &FitnessBook, slices: &Slices, ctx: &Context
         MENU_SCHEMA,
         req.menu.switch_budget.map_or("null".to_string(), |k| k.to_string()),
         req.menu.gates.iter().map(gate_json).collect::<Vec<_>>().join(","),
-        req.reselect.as_ref().map_or_else(|| code.json(), |r| r.code.clone()),
+        req.reselect.as_ref().map(|r| r.code.clone()).or_else(|| req.searched.as_ref().map(|s| s.code.clone())).unwrap_or_else(|| code.json()),
         req.top,
         runs_json.join(","),
         members_json.join(","),
@@ -1293,8 +1350,9 @@ pub fn compose(req: &Request, book: &FitnessBook, slices: &Slices, ctx: &Context
         n_bull,
         n_bear,
         n_aw,
+        text(formula),
         composites.len(),
-        composites.len(),
+        trials,
         pruned_count,
         ids.len(),
         usable.len(),
@@ -1310,7 +1368,7 @@ pub fn compose(req: &Request, book: &FitnessBook, slices: &Slices, ctx: &Context
         chosen_k.map_or("null".to_string(), |k| ids[k].to_string()),
         chosen_gate.map_or("null".to_string(), gate_json),
         c.id,
-        text(c.kind.label()),
+        text(req.type_label(c.kind)),
         text(c.kind.form()),
         chosen_gate.map_or("null".to_string(), |g| text(&g.name)),
         text(&c.text),
@@ -1349,7 +1407,7 @@ pub fn compose(req: &Request, book: &FitnessBook, slices: &Slices, ctx: &Context
         constant: trading::is_constant(&tree),
         fixed_position: trading::fixed_position(&tree, &ctx.spec),
         fixed_position_realised: validation_stats.as_ref().ok().and_then(|s| trading::realised_position(s.exposure, &ctx.spec)),
-        candidates: composites.len(),
+        candidates: trials as usize,
         usable: usable.len(),
         edge_rejected: None,
         expression: c.text.clone(),
@@ -1375,16 +1433,17 @@ pub fn compose(req: &Request, book: &FitnessBook, slices: &Slices, ctx: &Context
         .map(|&i| {
             let k = &composites[i];
             format!(
-                "{{\"archive_rank\":{},\"composite_id\":{},\"type\":{},\"expression\":{},\"expression_exact\":{},\"complexity\":{},\"bits\":{},\"pruned\":{}{}}}",
+                "{{\"archive_rank\":{},\"composite_id\":{},\"type\":{},\"expression\":{},\"expression_exact\":{},\"complexity\":{},\"bits\":{},\"pruned\":{}{}{}}}",
                 rank[i],
                 i,
-                text(k.kind.label()),
+                text(req.type_label(k.kind)),
                 text(&k.text),
                 text(&k.text),
                 num(complexity[i]),
                 num(bits[i]),
                 pruned[i],
-                switch_of(req, k).map_or(String::new(), |s| format!(",\"switch\":{}", s.json()))
+                switch_of(req, k).map_or(String::new(), |s| format!(",\"switch\":{}", s.json())),
+                req.searched.as_ref().and_then(|s| s.pareto_extra.get(i)).map_or("", String::as_str)
             )
         })
         .collect();
@@ -1392,7 +1451,7 @@ pub fn compose(req: &Request, book: &FitnessBook, slices: &Slices, ctx: &Context
     let test_rows = Json::parse(ctx.split_json).and_then(|s| s.get("test_rows").and_then(Json::as_usize)).unwrap_or(0);
     let run_json = format!(
         "{{\"tool\":\"rcsr\",\"version\":{},\"command\":{},\"target\":{},\"variables\":[{}],\"train_rows\":{},\"test_rows\":{},\"split\":{},\"target_spec\":{},\
-         \"generations_run\":0,\"search\":{{\"candidates_evaluated\":{}}},\"objective\":{},\"compose\":{},\"pareto\":[{}]}}",
+         \"generations_run\":{},\"search\":{{\"candidates_evaluated\":{}}},\"objective\":{},\"compose\":{}{},\"pareto\":[{}]}}",
         text(env!("CARGO_PKG_VERSION")),
         text(ctx.command),
         text(ctx.target),
@@ -1401,29 +1460,41 @@ pub fn compose(req: &Request, book: &FitnessBook, slices: &Slices, ctx: &Context
         test_rows,
         ctx.split_json,
         ctx.target_spec_json,
-        composites.len(),
+        req.searched.as_ref().map_or(0, |s| s.generations),
+        trials,
         finalist_with_switch(report.json("cpu", None), switch_of(req, c).as_ref()),
         compose_json,
+        req.searched.as_ref().map_or(String::new(), |s| format!(",\"gate_search\":{}", s.json)),
         pareto.join(",")
     );
 
-    let mut summary = format!(
-        "rcsr compose: {} composites ({} gates x ({} bull x {} bear + {} + {}) + {} all-weather), {} pruned, {} usable on {} validation rows; verdict {}\n",
-        composites.len(),
-        req.menu.gates.len(),
-        n_bull,
-        n_bear,
-        n_bull,
-        n_bear,
-        n_aw,
-        pruned_count,
-        usable.len(),
-        slices.validation.rows.time.len(),
-        verdict
-    );
+    let mut summary = match &req.searched {
+        Some(s) => format!(
+            "rcsr --gate-search: {} searched gates from {} candidates, {} usable on {} validation rows; verdict {}\n",
+            composites.len(),
+            s.candidates_evaluated,
+            usable.len(),
+            slices.validation.rows.time.len(),
+            verdict
+        ),
+        None => format!(
+            "rcsr compose: {} composites ({} gates x ({} bull x {} bear + {} + {}) + {} all-weather), {} pruned, {} usable on {} validation rows; verdict {}\n",
+            composites.len(),
+            req.menu.gates.len(),
+            n_bull,
+            n_bear,
+            n_bull,
+            n_bear,
+            n_aw,
+            pruned_count,
+            usable.len(),
+            slices.validation.rows.time.len(),
+            verdict
+        ),
+    };
     summary.push_str(&format!(
         "finalist {} {}{} (bits {:.1}): {}\n",
-        c.kind.label(),
+        req.type_label(c.kind),
         c.kind.form(),
         chosen_gate.map_or(String::new(), |g| format!(" gate {}", g.name)),
         bits[c.id],
@@ -1475,7 +1546,7 @@ fn finalist_with_switch(objective: String, sw: Option<&regime_gate::Switch>) -> 
 /// Bits of a branch tree under the #1184 code, and whether the tree is its own
 /// codeword. A constant no tier holds is written at the code's precision (the
 /// exact-label candidate of [`CodeSpec::candidates`]).
-fn tree_bits(code: &CodeSpec, tree: &Node) -> Result<(f64, bool), String> {
+pub(crate) fn tree_bits(code: &CodeSpec, tree: &Node) -> Result<(f64, bool), String> {
     match code.description_bits(tree) {
         Ok(b) => Ok((b.total, true)),
         Err(e) => code.candidates(tree).into_iter().max_by_key(|c| c.tier).map(|c| (c.bits.total, false)).ok_or(e),
@@ -1486,7 +1557,8 @@ fn tree_bits(code: &CodeSpec, tree: &Node) -> Result<(f64, bool), String> {
 fn check_against(req: &Request, ctx: &Context) -> Result<(), Fail> {
     let split = Json::parse(ctx.split_json).ok_or((2, "the split of this invocation is not JSON".to_string()))?;
     let per_side = ctx.spec.per_side_bps();
-    for r in &req.runs {
+    // #1182: an expression branch of a gate search has no run (an empty path).
+    for r in req.runs.iter().filter(|r| !r.path.is_empty()) {
         let differ = |what: String| usage(format!("{} '{}' differs from this invocation in {}", r.pool.flag(), r.path, what));
         if r.target.as_deref() != Some(ctx.target) {
             return differ(format!("target ({:?} vs '{}')", r.target, ctx.target));
@@ -1527,13 +1599,18 @@ pub struct Inputs<'a> {
 /// Composes the pools on the training, validation and test rows the search
 /// parser prepared, and exits.
 pub fn start(req: &Request, command: &str, prepared: &crate::data::Prepared, book: Option<&FitnessBook>, tspec: Option<&TradingSpec>, inputs: &Inputs) -> ! {
+    start_split(req, command, prepared.trading.as_ref(), book, tspec, inputs)
+}
+
+/// #1182: [`start`] on the trading rows `split` (a gate search hands its own copy).
+pub fn start_split(req: &Request, command: &str, split: Option<&crate::data::TradingSplit>, book: Option<&FitnessBook>, tspec: Option<&TradingSpec>, inputs: &Inputs) -> ! {
     if inputs.book_target {
         fail("--book-target: the composite prices the return column of the fit label");
     }
     if !inputs.objective.is_trading() {
         fail("the choice ranks the validation P&L book: add --objective pnl|sharpe|log_growth");
     }
-    let (Some(book), Some(tspec), Some(split)) = (book, tspec, prepared.trading.as_ref()) else {
+    let (Some(book), Some(tspec), Some(split)) = (book, tspec, split) else {
         fail("no training book");
     };
     let (Some(train), Some(validation)) = (split.train.as_ref(), split.validation.as_ref()) else {
