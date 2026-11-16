@@ -575,3 +575,13 @@ fn from_run_of_compose_marks_composite() {
 }
 
 const PINNED_PLAIN_FROM_RUN: &str = "22e9d27e4d0f59c0e35b4597d6265b71bf343a8cb8a1b0f01309b9437079ebe2";
+
+#[test]
+fn compose_refuses_masked_sd_band_run() {
+    let p = planted(&BULL, &BEAR);
+    let masked = pool_run(&p.dir, "masked-sd.json", &p.data, &p.spec, &["--pnl-mask", "g", "--band", "0.5", "--band-units", "sd"], &BULL);
+    let menu = write_menu(&p.dir, "menu.json", &[("g", "000", "g", 0.0, 1)], None);
+    let o = compose(&p.data, &p.spec, &["--gates", &menu, "--bull", &masked]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).contains("priced a band or a minimum hold"), "{}", stderr(&o));
+}

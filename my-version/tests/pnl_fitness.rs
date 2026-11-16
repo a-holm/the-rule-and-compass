@@ -2660,20 +2660,20 @@ fn masked_sd_run_reports_the_training_band() {
         let Some(sd) = v.get("band_sd").and_then(Json::as_f64) else { continue };
         let on = masked_train_scores(&j, &data, at(m, &["expression_exact"]).as_str().unwrap());
         let want = trading::score_sd(&on).sd.unwrap();
-        assert_eq!(sd.to_bits(), want.to_bits(), "{}", at(m, &["expression_exact"]).as_str().unwrap());
-        assert_eq!(num(v, &["band_resolved"]).to_bits(), (0.5 * want).to_bits());
+        assert!(close(sd, want), "{} rows {} sd {sd} want {want}", at(m, &["expression_exact"]).as_str().unwrap(), on.len());
+        assert!(close(num(v, &["band_resolved"]), 0.5 * want));
         seen += 1;
     }
     assert!(seen >= 2, "{seen} members with an sd");
     let exact = at(&j, &["objective", "finalist", "expression_exact"]).as_str().unwrap();
     let on = masked_train_scores(&j, &data, exact);
     let sd = trading::score_sd(&on);
-    let band = (0.5 * sd.sd.unwrap()).to_bits();
+    assert_eq!(num(&j, &["objective", "spec", "band_sd_rows"]), on.len() as f64);
+    let band = num(&j, &["objective", "spec", "band_resolved"]).to_bits();
     assert_eq!(num(&j, &["objective", "spec", "band_sd_rows"]), sd.rows as f64);
-    assert_eq!(num(&j, &["objective", "spec", "band_resolved"]).to_bits(), band);
-    for slot in ["validation", "test"] {
-        assert_eq!(num(&j, &["objective", slot, "band_resolved"]).to_bits(), band, "{slot}");
-    }
+    assert!(close(f64::from_bits(band), 0.5 * sd.sd.unwrap()));
+    let member = pareto(&j).iter().find(|m| at(m, &["expression_exact"]).as_str() == Some(exact)).expect("the finalist is on the front");
+    assert_eq!(num(at(member, &["validation_book"]), &["band_resolved"]).to_bits(), band);
 }
 
 #[test]
@@ -2698,7 +2698,8 @@ fn walkforward_from_masked_sd_run_uses_the_training_band() {
     let exact = at(&j, &["objective", "finalist", "expression_exact"]).as_str().unwrap();
     let want = 0.5 * trading::score_sd(&masked_train_scores(&j, &data, exact)).sd.unwrap();
     let Json::Arr(windows) = at(&report, &["windows"]) else { panic!("windows") };
-    assert_eq!(num(&windows[0], &["band", "band_width"]).to_bits(), want.to_bits());
+    assert_eq!(num(&windows[0], &["band", "band_width"]).to_bits(), num(&j, &["objective", "spec", "band_resolved"]).to_bits());
+    assert!(close(num(&windows[0], &["band", "band_width"]), want));
 }
 
 /// The book hash of a masked sd-unit book on `slice(&[400, 400])` before #1246.
@@ -2752,4 +2753,46 @@ fn masked_sd_checkpoint_from_before_the_fix_refuses_resume() {
     let old_cp = dir.join("before.rcsr");
     std::fs::write(&old_cp, old).unwrap();
     usage_error(&resume(&old_cp.to_string_lossy()), "fitness");
+}
+
+#[test]
+fn masked_sd_band_is_one_definition_across_books() {
+    let s = slice(&[400, 400]);
+    let on = alternate_mask(&s, 50);
+    let scores: Vec<f64> = (0..s.ret.len()).map(|i| if on[i] { if i % 2 == 0 { 5.0 } else { -5.0 } } else { 0.0 }).collect();
+    let sp = band_spec(0.5, trading::BandUnits::Sd, 1);
+    let book = masked(&s, &sp, 2, &on).unwrap();
+    let off_bits: Vec<bool> = book.flags().iter().map(|f| f & trading::FITNESS_MASK_OFF != 0).collect();
+    assert_eq!(off_bits, on.iter().map(|o| !o).collect::<Vec<bool>>());
+    let member = BandSpec::from_training_masked(BandUnits::Sd, 0.5, &scores, &s.rows.time, book.flags());
+    let on_scores: Vec<f64> = scores.iter().zip(&on).filter(|(_, &o)| o).map(|(&p, _)| p).collect();
+    let want = trading::score_sd(&on_scores);
+    assert_eq!(member.sd.map(f64::to_bits), want.sd.map(f64::to_bits));
+    assert_eq!(member.sd_rows, Some(on_scores.len()));
+    assert_eq!(book.resolve_band(&scores).to_bits(), member.resolved.to_bits());
+    assert_eq!(member.resolved.to_bits(), (0.5 * want.sd.unwrap()).to_bits());
+    let last_on = (0..on.len()).rev().find(|&i| on[i]).unwrap();
+    assert_eq!(member.sd_max_time, Some(s.rows.time[last_on]));
+    let all = BandSpec::from_training(BandUnits::Sd, 0.5, &scores, &s.rows.time);
+    assert_ne!(all.resolved.to_bits(), member.resolved.to_bits());
+}
+
+#[test]
+fn masked_sd_edge_cases_give_no_band() {
+    let time: Vec<f64> = (0..6).map(|i| i as f64).collect();
+    let band = |scores: &[f64], flags: &[u8]| BandSpec::from_training_masked(BandUnits::Sd, 1.0, scores, &time, flags);
+    let off = trading::FITNESS_MASK_OFF;
+    let all_off = band(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[off; 6]);
+    assert_eq!((all_off.sd, all_off.resolved, all_off.sd_rows, all_off.sd_max_time), (None, 0.0, Some(0), None));
+    let one_on = band(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[off, off, 0, off, off, off]);
+    assert_eq!((one_on.sd, one_on.resolved, one_on.sd_rows), (None, 0.0, Some(1)));
+    let constant = band(&[9.0, 1.0, 4.0, 4.0, 4.0, 2.0], &[off, off, 0, 0, 0, off]);
+    assert_eq!((constant.sd, constant.resolved, constant.sd_rows), (None, 0.0, Some(3)));
+    let score = BandSpec::from_training_masked(BandUnits::Score, 0.3, &[1.0], &time, &[0]);
+    assert_eq!(score, BandSpec::score(0.3));
+}
+
+/// The interpreter and the test recomputation may differ by a rounding in a score.
+fn close(a: f64, b: f64) -> bool {
+    (a - b).abs() <= 1e-12 * a.abs().max(b.abs())
 }
