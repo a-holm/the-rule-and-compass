@@ -2288,3 +2288,98 @@ fn long_pnl_mask_search_throughput_cpu_against_device_with_a_hold() {
         mask_search_throughput(12);
     }
 }
+
+fn masked_sd_search_book() -> (Sample, Arc<FitnessBook>) {
+    let (sample, _) = search_fixture();
+    let g = fixture(&[0, 600, 1200, 1800], 2_400, 17);
+    let b = Arc::new(masked(&g, &band_spec(1, 0.5, BandUnits::Sd, 3), 1, &[], &alternate_mask(g.n)));
+    (sample, b)
+}
+
+#[test]
+fn a_masked_book_fails_a_required_gpu_run() {
+    if !device_present() {
+        return;
+    }
+    let (sample, b) = masked_sd_search_book();
+    let err = search::run_seeded_checked(&required_config(&b, true), &sample, &sample, &[])
+        .err()
+        .expect("a required GPU run of a masked sd book must fail");
+    assert!(err.starts_with(search::GPU_REQUIRED_PREFIX), "{err}");
+    assert!(err.contains("--pnl-mask"), "{err}");
+}
+
+#[test]
+fn a_masked_book_falls_back_labelled_in_auto_mode() {
+    if !device_present() {
+        return;
+    }
+    let (sample, b) = masked_sd_search_book();
+    let out = search::run_seeded_checked(&required_config(&b, false), &sample, &sample, &[]).expect("auto mode runs on the CPU");
+    assert_eq!(out.backend, rcsr::backend::Kind::Cpu);
+    assert!(out.backend_reason.expect("labelled").contains("--pnl-mask"));
+    assert!(!out.archive.items.is_empty());
+}
+
+#[test]
+fn lexicase_fails_a_required_gpu_run() {
+    if !device_present() {
+        return;
+    }
+    let (sample, b) = search_fixture();
+    let cfg = Config { selection: search::Selection::Lexicase, ..required_config(&b, true) };
+    let err = search::run_seeded_checked(&cfg, &sample, &sample, &[]).err().expect("a required lexicase run must fail");
+    assert!(err.starts_with(search::GPU_REQUIRED_PREFIX), "{err}");
+    assert!(err.contains("lexicase"), "{err}");
+}
+
+#[test]
+fn lexicase_falls_back_labelled_in_auto_mode() {
+    if !device_present() {
+        return;
+    }
+    let (sample, b) = search_fixture();
+    let cfg = Config { selection: search::Selection::Lexicase, ..required_config(&b, false) };
+    let out = search::run_seeded_checked(&cfg, &sample, &sample, &[]).expect("auto mode runs on the CPU");
+    assert_eq!(out.backend, rcsr::backend::Kind::Cpu);
+    assert!(out.backend_reason.expect("labelled").contains("lexicase"));
+    assert!(!out.archive.items.is_empty());
+}
+
+#[test]
+fn a_kept_long_pnl_refusal_stays_labelled_under_gpu_required() {
+    if !device_present() {
+        return;
+    }
+    let (sample, b) = search_fixture();
+    let cfg = Config { fit_rows: 500, fit_strategy: rcsr::fit::FitStrategy::Exact, ..required_config(&b, true) };
+    let out = search::run_seeded_checked(&cfg, &sample, &sample, &[]).expect("a kept refusal stays on the CPU");
+    assert_eq!(out.backend, rcsr::backend::Kind::Cpu);
+    assert!(out.backend_reason.expect("labelled").contains("--fit-samples/--fit-rows"));
+}
+
+#[derive(Debug)]
+struct ThresholdLayer;
+
+impl rcsr::trading::PositionLayer for ThresholdLayer {
+    fn positions(&self, pred: &[f64]) -> Vec<f64> {
+        pred.iter().map(|&p| if p > 0.0 { f64::MAX } else { f64::MIN }).collect()
+    }
+    fn identity(&self) -> String {
+        "threshold-layer".to_string()
+    }
+}
+
+#[test]
+fn a_layered_book_is_refused_by_the_device_upload() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    let f = fixture(&STARTS_SMALL, 16_401, 11);
+    let layered = book(&f, 1).with_layer(Arc::new(ThresholdLayer)).expect("a plain book takes a layer");
+    assert!(layered.has_layer());
+    let Some(mut ev) = GpuEvaluator::new(&f.cols, f.n, VARS, &f.y) else {
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
+        return;
+    };
+    assert_eq!(ev.set_pnl_book(&layered).unwrap_err(), rcsr::gpu::LONG_PNL_LAYERED);
+    ev.set_pnl_book(&book(&f, 1)).expect("a plain book still uploads");
+}

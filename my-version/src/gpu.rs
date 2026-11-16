@@ -540,6 +540,10 @@ pub const LONG_PNL_TILED: &str = "long_pnl fitness needs resident training rows 
 pub const LONG_PNL_MASKED_SD: &str =
     "--pnl-mask with --band-units sd is priced on the CPU: the device sd reads every row, not the rows inside the mask";
 
+/// #1245: why a book with a position layer (`--gate-search`) cannot be uploaded.
+pub const LONG_PNL_LAYERED: &str =
+    "the long_pnl fitness book has a position layer (--gate-search) and the device book carries none";
+
 /// #604: prefix of an injected device refusal (test hook, see [`injected_fault`]).
 pub const INJECTED_REFUSAL: &str = "injected fault: the device refused ";
 
@@ -1948,6 +1952,9 @@ impl GpuEvaluator {
         }
         if book.is_masked() && book.band_units() == crate::trading::BandUnits::Sd {
             return Err(LONG_PNL_MASKED_SD.to_string());
+        }
+        if book.has_layer() {
+            return Err(LONG_PNL_LAYERED.to_string());
         }
         if book.len() as u64 != self.n_rows {
             return Err(format!(

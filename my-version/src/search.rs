@@ -467,7 +467,9 @@ pub struct Config {
     pub gpu: bool,
     /// #604: an explicit `--gpu` (or `--dispatch device`). A device failure
     /// after the start-up probe ends the run with an error instead of
-    /// continuing on the CPU. Not a search setting.
+    /// continuing on the CPU. The two start-up refusals the CLI turns into
+    /// exit 2 (lexicase selection, a masked sd-unit book) end the run too. Not
+    /// a search setting.
     pub gpu_required: bool,
     /// #26: print the one-line `# gpu: ...` note. The CLI clears this with
     /// `--quiet`, which promises an empty stderr for machine-readable output.
@@ -3520,6 +3522,26 @@ fn gpu_lost(
         return Err(format!("{}{}", GPU_REQUIRED_PREFIX, reason));
     }
     *backend_reason = Some(reason);
+    Ok(())
+}
+
+/// #1245: a start-up refusal. `fails_required` marks the refusals that an
+/// explicit `--gpu` turns into exit 2 on the CLI; under `gpu_required` they end
+/// the run like a lost device. Every other refusal keeps the labelled CPU path.
+#[cfg(feature = "cuda")]
+fn gpu_refused(
+    cfg: &Config,
+    reason: &str,
+    fails_required: bool,
+    backend_reason: &mut Option<String>,
+) -> Result<(), String> {
+    if fails_required && cfg.gpu_required {
+        return Err(format!("{}{}", GPU_REQUIRED_PREFIX, reason));
+    }
+    if cfg.gpu_notes {
+        eprintln!("# gpu: off ({})", reason);
+    }
+    *backend_reason = Some(reason.to_string());
     Ok(())
 }
 
@@ -8563,10 +8585,7 @@ fn run_search(
     } else if cfg.selection == Selection::Lexicase {
         // #1023: the device returns no per-case errors; lexicase runs on the CPU.
         let reason = "--selection lexicase reads per-case errors the device scorer does not return";
-        if cfg.gpu_notes {
-            eprintln!("# gpu: off ({})", reason);
-        }
-        backend_reason = Some(reason.to_string());
+        gpu_refused(cfg, reason, true, &mut backend_reason)?;
         None
     } else {
         // #230: the evaluator still has no native rank scorer, but the exact
@@ -8613,10 +8632,7 @@ fn run_search(
         } else {
             match gpu_blocker(cfg, train) {
                 Some(reason) => {
-                    if cfg.gpu_notes {
-                        eprintln!("# gpu: off ({})", reason);
-                    }
-                    backend_reason = Some(reason.to_string());
+                    gpu_refused(cfg, reason, reason == crate::gpu::LONG_PNL_MASKED_SD, &mut backend_reason)?;
                     None
                 }
                 None => {
