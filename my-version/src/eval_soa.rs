@@ -493,7 +493,7 @@ pub fn apply_rows(op: Op, a: &[f64], b: &[f64], out: &mut [f64]) -> bool {
     macro_rules! binary {
         ($ins:expr, $($i:ident),*) => {
             match $ins {
-                $(Instr::$i => map2(out, a, b, |x, y| apply_binary(Instr::$i, x, y)),)*
+                $(Instr::$i => map2(out, a, b, |x, y| apply_binary(Instr::$i, y, x)),)*
                 _ => return false,
             }
         };

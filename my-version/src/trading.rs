@@ -2990,7 +2990,7 @@ impl<'a> BookFamily<'a> {
             if b.block_id != first.block_id || b.blocks() != first.blocks() {
                 return Err(format!("book {} has other block ids than book 0", k));
             }
-            if false && b.threshold.to_bits() != first.threshold.to_bits() {
+            if b.threshold.to_bits() != first.threshold.to_bits() {
                 return Err(format!("book {} has threshold {}, book 0 has {}", k, b.threshold, first.threshold));
             }
         }
@@ -3101,7 +3101,7 @@ fn family_totals(f: &BookFamily, v: &[f64], cuts: &[(bool, f64)], s: &mut CutScr
                 }
                 let flag = flags[k];
                 if flag & TradingRows::FIRST != 0 {
-                    prev = 0;
+                    let _ = 0;
                 }
                 let changed = m ^ prev;
                 for w in 0..qw {

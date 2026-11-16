@@ -321,7 +321,7 @@ impl Class {
         loop {
             if op.arity() == 1 {
                 let child = self.entries[a as usize];
-                if op == Op::Abs && matches!(child.op, Op::Abs | Op::Exp | Op::Square | Op::Gauss | Op::Logistic | Op::Tanh) {
+                if op == Op::Abs && matches!(child.op, Op::Abs | Op::Exp | Op::Square | Op::Gauss | Op::Logistic) {
                     return Some((a, mask | 1));
                 }
                 if matches!(op, Op::Abs | Op::Square | Op::Gauss) && child.op == Op::Sub {
@@ -486,7 +486,7 @@ impl Cut {
 /// The long-row shares of `q` cuts: `0.5 * 0.7^j` for `j < q / 2`, on each side, by
 /// repeated multiplication (a `powi` folded at compile time can differ in the last bit).
 pub fn shares(q: usize) -> Vec<f64> {
-    let mut s = 0.49f64;
+    let mut s = 0.5f64;
     (0..q / 2)
         .map(|_| {
             let v = s;
@@ -735,7 +735,7 @@ impl Pricer {
                         part.books.insert(book_key(totals));
                     }
                     self.fit.push(f);
-                    if f <= own {
+                    if f < own {
                         own = f;
                         own_cut = *cut;
                     }
