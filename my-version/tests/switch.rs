@@ -289,7 +289,7 @@ fn switch_help_lists_its_options() {
     assert!(String::from_utf8_lossy(&top.stdout).contains("rcsr switch"));
 }
 
-/// `x1` and the return of row `(k, j)` of [`write_csv`].
+/// `x1` and the log return of row `(k, j)` of [`write_csv`]; the book prices `exp_m1` of it.
 fn row(k: usize, j: usize) -> (f64, f64) {
     let i = (k + 40) as f64 * 3.0 + j as f64;
     let x1 = frac(i * 0.618_033_988_749_894_9) - 0.5;
@@ -314,7 +314,7 @@ fn switch_json_reports_excess_label() {
     assert_eq!(at(&xs, &["excess"]).as_str(), Some("xs_mean"));
     let stamps = num(&xs, &["timestamps"]) as usize;
     assert_eq!(num(&xs, &["train_rows"]), 3.0 * stamps as f64);
-    let mean = |k: usize| (0..SYMBOLS.len()).map(|j| row(k, j).1).sum::<f64>() / SYMBOLS.len() as f64;
+    let mean = |k: usize| (0..SYMBOLS.len()).map(|j| row(k, j).1.exp_m1()).sum::<f64>() / SYMBOLS.len() as f64;
     let profile = |j: &Json| arr(&arr(j, &["gates"])[0], &["grid", "profile"]).clone();
     let (pn, px) = (profile(&none), profile(&xs));
     assert_eq!(pn.len(), 7);
@@ -400,5 +400,5 @@ fn switch_none_output_is_unchanged() {
     assert_eq!(got, (PINNED_SWITCH_JSON.to_string(), PINNED_SWITCH_TEXT.to_string()), "the default switch report (JSON, text) changed");
 }
 
-const PINNED_SWITCH_JSON: &str = "unset";
-const PINNED_SWITCH_TEXT: &str = "unset";
+const PINNED_SWITCH_JSON: &str = "f3730568d93d2314a5ae579e2c46f82e3fd0c0dd830349ec1dd740f2cd74dd31";
+const PINNED_SWITCH_TEXT: &str = "66f71ce9c94ea5e5dfb3591156bf77ee46b34b0a069fdb1a7753b3a4b605023f";

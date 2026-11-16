@@ -21,7 +21,7 @@
 use crate::data::TradingSlice;
 use crate::devlog::{num, text};
 use crate::regime_gate::GateSpec;
-use crate::trading::{FitnessBook, FitnessTotals, TradingRows};
+use crate::trading::{BlockStat, FitnessBook, FitnessTotals, PnlExcess, TradingRows};
 use crate::trading_gpu::order_key_f64;
 
 /// Order key of a gate value: `None` for NaN; `-0.0` equals `+0.0`; `-inf` and
@@ -755,8 +755,15 @@ USAGE:
   The k-switch bound V_k is the best net of any time-level switch between A
   and B with at most k switches; it bounds every time-level gate with at most
   k flips. It is a pruning bound, not evidence of an edge. A band, a minimum
-  hold, --pnl-mask, --sample-rows, --pnl-excess, --pnl-stat, --pnl-cvar-q and --gpu exit 2.
-  See docs/walkforward.md.
+  hold, --pnl-mask, --sample-rows and --gpu exit 2.
+
+  --pnl-stat and --pnl-cvar-q set the statistic of the block fitness (book.stat
+  and book.cvar_q, omitted under mean-sd). Under --pnl-excess xs-mean (report
+  excess: xs_mean) net, gross, fitness, the bound and every gain are on the
+  excess per row (r - m_t) - funding, m_t the equal-weight mean return of the
+  training rows at the row's timestamp; flips, exits, long rows and the seam
+  pairs are those of the absolute book, and walkforward --expr does not
+  reproduce the nets. See docs/walkforward.md.
 "
 }
 
@@ -802,8 +809,6 @@ pub fn claim(args: &[String]) -> Vec<String> {
             "--pnl-mask" | "--pnl-mask-band" | "--pnl-mask-dwell" => {
                 fail(&format!("{}: the sweep prices the unmasked book; the gate is the mask", flag))
             }
-            "--pnl-excess" => fail("--pnl-excess: the sweep prices the absolute book that walkforward --expr reproduces"),
-            "--pnl-stat" | "--pnl-cvar-q" => fail(&format!("{}: the sweep reports the mean-sd block fitness", flag)),
             _ => {
                 rest.push(args[i].clone());
                 i += 1;
@@ -1017,6 +1022,26 @@ pub fn report(req: &Request, book: &FitnessBook, slice: &TradingSlice, values: &
         ctx.per_side_bps,
         threshold
     );
+    // #1232: the fitness flags, named only when they are not the default.
+    let excess = book.excess_mode();
+    let stat = book.stat();
+    if excess != PnlExcess::None {
+        text_out.push_str(&format!(
+            "excess: {} (net, gross, fitness and bound are on (r - m_t) - funding; not reproducible by walkforward --expr)\n",
+            excess.name()
+        ));
+    }
+    match stat {
+        BlockStat::MeanSd => {}
+        BlockStat::Cvar(q) => text_out.push_str(&format!("fitness statistic: cvar (q {}) of the block regrets\n", num(q))),
+        s => text_out.push_str(&format!("fitness statistic: {} of the block regrets\n", s.name())),
+    }
+    let excess_json = if excess == PnlExcess::None { String::new() } else { format!(",\"excess\":{}", text(excess.name())) };
+    let stat_json = match stat {
+        BlockStat::MeanSd => String::new(),
+        BlockStat::Cvar(q) => format!(",\"stat\":\"cvar\",\"cvar_q\":{}", num(q)),
+        s => format!(",\"stat\":{}", text(s.name())),
+    };
     text_out.push_str(&format!("A {:<40} net {}\nB {:<40} net {}\n", req.a.source(), num(net_a), req.b.source(), num(net_b)));
     text_out.push_str(&format!(
         "bound (pruning bound, not evidence; {} gap pairs, {}):",
@@ -1114,10 +1139,11 @@ pub fn report(req: &Request, book: &FitnessBook, slice: &TradingSlice, values: &
         }
     }
     let json = format!(
-        "{{\"schema\":\"rcsr-switch/1\",\"rows\":\"train\",\"target\":{},\"train_rows\":{},\"groups\":{},\"timestamps\":{},\"time_first\":{},\"time_last\":{},\
-         \"book\":{{\"per_side_bps\":{},\"threshold\":{},\"blocks\":{},\"lambda\":{},\"min_trades\":{},\"segments\":{}}},{},{},\
+        "{{\"schema\":\"rcsr-switch/1\",\"rows\":\"train\"{},\"target\":{},\"train_rows\":{},\"groups\":{},\"timestamps\":{},\"time_first\":{},\"time_last\":{},\
+         \"book\":{{\"per_side_bps\":{},\"threshold\":{},\"blocks\":{},\"lambda\":{},\"min_trades\":{},\"segments\":{}{}}},{},{},\
          \"bound\":{{\"label\":\"pruning_bound\",\"is_evidence\":false,\"applies_to\":\"time-level gates\",\"exact\":{},\"gap_pairs\":{},\"timestamps\":{},\"reference\":{},\"free\":{},\"free_gain\":{},\"k\":[{}]}},\
          \"gates\":[{}]}}",
+        excess_json,
         text(ctx.target),
         n,
         groups,
@@ -1130,6 +1156,7 @@ pub fn report(req: &Request, book: &FitnessBook, slice: &TradingSlice, values: &
         num(book.lambda()),
         book.min_trades(),
         ctx.segments,
+        stat_json,
         side_json("a", &req.a, &ta, a_nonfinite),
         side_json("b", &req.b, &tb, b_nonfinite),
         bound.gap_pairs == 0,
@@ -1165,7 +1192,7 @@ pub fn run(req: &Request, book: &FitnessBook, slice: &TradingSlice, values: &[Ve
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::trading::{BlockStat, BookMask, PnlExcess, TradingSpec};
+    use crate::trading::{BookMask, TradingSpec};
     use std::collections::BTreeMap;
 
     struct Mix(u64);

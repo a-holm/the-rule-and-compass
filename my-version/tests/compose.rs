@@ -301,7 +301,7 @@ fn replays_in_walkforward(p: &Planted, extra: &[&str]) -> Json {
     j
 }
 
-/// The return of row `(k, j)` of [`write_csv`].
+/// The log return of row `(k, j)` of [`write_csv`]; the book prices `exp_m1` of it.
 fn ret(k: i64, j: usize) -> f64 {
     let i = (k + 40) as f64 * 3.0 + j as f64;
     let noise = frac(i * 0.324_717_957_244_746) - 0.5;
@@ -334,7 +334,7 @@ fn compose_xs_mean_reports_excess_net() {
             0.0
         }
     };
-    let mean = |k: i64| (0..SYMBOLS.len()).map(|jj| ret(k, jj)).sum::<f64>() / SYMBOLS.len() as f64;
+    let mean = |k: i64| (0..SYMBOLS.len()).map(|jj| ret(k, jj).exp_m1()).sum::<f64>() / SYMBOLS.len() as f64;
     let held = |k0: i64, k1: i64| -> f64 { (k0..=k1).map(|k| (0..SYMBOLS.len()).map(|jj| pos(k, jj)).sum::<f64>() * mean(k)).sum() };
     let k0 = (num(&arr(&j, &["split", "validation_time"])[0], &[]) as i64 - T0) / STEP;
     let k1 = (num(&arr(&j, &["split", "validation_time"])[1], &[]) as i64 - T0) / STEP;
@@ -510,8 +510,8 @@ fn compose_none_output_is_unchanged() {
     assert_eq!(got, (PINNED_COMPOSE_JSON.to_string(), PINNED_COMPOSE_TEXT.to_string()), "the default compose output (run.json, summary) changed");
 }
 
-const PINNED_COMPOSE_JSON: &str = "unset";
-const PINNED_COMPOSE_TEXT: &str = "unset";
+const PINNED_COMPOSE_JSON: &str = "246fd7729f55a5c2fa1f1c877c9eaf502f8d30f0a68b9492fe64c49c685bc550";
+const PINNED_COMPOSE_TEXT: &str = "25d6add1c7bfa1316484cc48bd3db1c2db6bba1cca8bf8a0e911a44411046357";
 
 #[test]
 fn hysteresis_gate_is_carried() {
