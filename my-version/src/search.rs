@@ -3975,8 +3975,8 @@ fn long_pnl_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
     let Some(book) = cfg.fitness.book() else {
         return Some("the long_pnl fitness book was not rebuilt");
     };
-    if book.is_masked() {
-        return Some("--pnl-mask is priced on the CPU: the device book carries no regime mask");
+    if book.is_masked() && book.band_units() == crate::trading::BandUnits::Sd {
+        return Some(crate::gpu::LONG_PNL_MASKED_SD);
     }
     if book.has_layer() {
         return Some("--gate-search is priced on the CPU: the device book carries no gate layer");
@@ -4662,7 +4662,8 @@ fn score_tree_checked(tree: &Node, data: &EvalSample, cfg: &Config) -> f64 {
 /// The compiled program and the tile kernel are the ones [`PredBuf::fill`]
 /// uses, and every row value depends on its own row only, so a row range gives
 /// the bits of the full call. The book and the plain metric read the same
-/// buffer through the same functions. A non-finite prediction makes the book
+/// buffer through the same functions. A non-finite prediction (#1244: on a row
+/// inside the regime mask of a masked book) makes the book
 /// score `+inf` (`totals` sets `nonfinite`) and every plain unweighted metric
 /// too (`score_with_constants`). With `min_trades >= 1` and no row above the
 /// threshold the book counts no flip, so the score is `+inf` without it.
@@ -4693,13 +4694,14 @@ fn score_tree_checked_work(tree: &Node, data: &EvalSample, cfg: &Config) -> (f64
         let PredBuf { pred, scratch } = &mut *buf;
         pred.clear();
         pred.resize(s.len(), 0.0);
+        let mask = mask_flags(cfg);
         let mut long = false;
         let mut start = 0;
         while start < s.len() {
             let end = (start + CHECK_CHUNK).min(s.len());
             crate::eval_soa::eval_rows_into(&program, cols, start, end, pred, scratch);
-            for &p in &pred[start..end] {
-                if !p.is_finite() {
+            for (k, &p) in pred[start..end].iter().enumerate() {
+                if !p.is_finite() && decides(mask, start + k) {
                     work.early = 1;
                     work.early_rows = end as u64;
                     return (f64::INFINITY, work);
@@ -4720,11 +4722,23 @@ fn score_tree_checked_work(tree: &Node, data: &EvalSample, cfg: &Config) -> (f64
     })
 }
 
+/// #1244: the flags of a regime-masked fitness book; `None` without a mask.
+fn mask_flags(cfg: &Config) -> Option<&[u8]> {
+    cfg.fitness.book().filter(|b| b.is_masked()).map(|b| b.flags())
+}
+
+/// #1244: whether the prediction of row `i` can decide the score: every row
+/// without a mask, the rows inside the regime mask with one.
+fn decides(mask: Option<&[u8]>, i: usize) -> bool {
+    mask.map_or(true, |f| f.get(i).map_or(true, |&b| b & crate::trading::FITNESS_MASK_OFF == 0))
+}
+
 /// #500/#589: whether a non-finite prediction in the first rows decides the
-/// score. `Some(true)`: the first rows hold one, which makes the full score
-/// `+inf` for the plain metrics and the P&L book. `Some(false)`: the prefix is
-/// finite and the full pass decides. `None`: the score does not follow that
-/// rule (implicit, weighted, multi-output), so the full pass always runs.
+/// score. `Some(true)`: the first rows hold one (#1244: on a row inside the
+/// regime mask of a masked book), which makes the full score `+inf` for the
+/// plain metrics and the P&L book. `Some(false)`: the prefix is finite and the
+/// full pass decides. `None`: the score does not follow that rule (implicit,
+/// weighted, multi-output), so the full pass always runs.
 fn nonfinite_prefix(tree: &Node, data: &EvalSample, cfg: &Config) -> Option<bool> {
     let s = data.sample;
     if s.is_empty()
@@ -4734,15 +4748,16 @@ fn nonfinite_prefix(tree: &Node, data: &EvalSample, cfg: &Config) -> Option<bool
     {
         return None;
     }
+    let mask = mask_flags(cfg);
     let rows = s.x.len().min(INF_PROBE_ROWS);
     if let Some(cols) = &data.cols {
         if let Some(program) = crate::eval_soa::compile(tree) {
             let mut pred = vec![0.0; rows];
             crate::eval_soa::eval_batch(&program, cols, rows, &mut pred);
-            return Some(pred.iter().any(|p| !p.is_finite()));
+            return Some(pred.iter().enumerate().any(|(i, p)| !p.is_finite() && decides(mask, i)));
         }
     }
-    Some(s.x.iter().take(rows).any(|row| !eval(tree, row).is_finite()))
+    Some(s.x.iter().take(rows).enumerate().any(|(i, row)| decides(mask, i) && !eval(tree, row).is_finite()))
 }
 
 /// #500: the prefix decides the score and the run keeps no descriptor
@@ -13627,6 +13642,58 @@ mod tests {
         assert_eq!(long_pnl_blocker(&slope_cpu_fit, &train), None);
     }
 
+    /// #1244: the device scores a regime-masked book, so the mask adds no blocker to
+    /// any configuration; only a masked sd-unit band names its own reason.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn masked_book_adds_no_long_pnl_blocker() {
+        use crate::trading::{BandSpec, BandUnits, BookMask, FitnessBook, TradingRows, TradingSpec};
+        let (train, view, plain) = label_free_book_rows(400);
+        let n = train.len();
+        // The plain book has no cash and no funding, so its excess is the return.
+        let slice = crate::data::TradingSlice {
+            rows: TradingRows { time: (0..n).map(|i| 3600.0 * i as f64).collect(), group: vec![0; n], funding: Vec::new() },
+            ret: plain.excess().to_vec(),
+        };
+        let on: Vec<bool> = (0..n).map(|i| (i / 25) % 2 == 0).collect();
+        let build = |spec: &TradingSpec, masked: bool| {
+            let mask = masked.then_some(BookMask { on: &on, identity: "unit" });
+            std::sync::Arc::new(FitnessBook::with_segments(&slice, spec, 3600.0, 1, 1.0, &[], mask).expect("a profitable book"))
+        };
+        let spec = TradingSpec { cost_bps: 2.0, ..Default::default() };
+        assert_eq!(build(&spec, false).hash(), plain.hash(), "the rebuild is the plain book");
+        let masked = build(&spec, true);
+        assert!(masked.is_masked());
+        let base = label_free_config(&view, &plain);
+        let configs = [
+            base.clone(),
+            Config { metric: Metric::Slope, ..base.clone() },
+            Config { metric: Metric::Slope, fit_strategy: crate::fit::FitStrategy::Exact, ..base.clone() },
+            Config { fit_view: None, ..base.clone() },
+            Config { fit_view: None, metric: Metric::Median, ..base.clone() },
+            Config { fit_view: None, fit_rows: 100, fit_strategy: crate::fit::FitStrategy::Exact, ..base.clone() },
+            Config { fit_view: None, fit_rows: 100, ..base.clone() },
+            Config { fit_view: None, predictor_samples: Some(40), ..base.clone() },
+            Config { gpu: false, dispatch: crate::dispatch::DispatchMode::Auto, ..base.clone() },
+        ];
+        for (k, cfg) in configs.iter().enumerate() {
+            let with = |b: &std::sync::Arc<FitnessBook>| Config { fitness: Fitness::LongPnl(b.clone()), ..cfg.clone() };
+            for rows in [&train, &view] {
+                assert_eq!(long_pnl_blocker(&with(&masked), rows), long_pnl_blocker(&with(&plain), rows), "config {k}, {} rows", rows.len());
+                assert_eq!(gpu_blocker(&with(&masked), rows), gpu_blocker(&with(&plain), rows), "config {k}, {} rows", rows.len());
+            }
+        }
+        let band = |units: BandUnits, hold: usize| TradingSpec {
+            band: BandSpec { units, resolved: if units == BandUnits::Score { 0.3 } else { 0.0 }, ..BandSpec::score(0.3) },
+            min_holding: hold,
+            ..spec.clone()
+        };
+        let with = |b: std::sync::Arc<FitnessBook>| Config { fitness: Fitness::LongPnl(b), ..base.clone() };
+        assert_eq!(long_pnl_blocker(&with(build(&band(BandUnits::Score, 12), true)), &train), None);
+        assert_eq!(long_pnl_blocker(&with(build(&band(BandUnits::Sd, 12), false)), &train), None);
+        assert_eq!(long_pnl_blocker(&with(build(&band(BandUnits::Sd, 12), true)), &train), Some(crate::gpu::LONG_PNL_MASKED_SD));
+    }
+
     /// #971: with a fit view the device fits the CPU fit rows: the whole view, or the
     /// `--fit-rows` draw from it, and the constants equal the CPU fit on those rows.
     #[cfg(feature = "cuda")]
@@ -13983,6 +14050,45 @@ mod tests {
         let (got, work) = score_tree_checked_work(&tree, &view, &cfg);
         assert_eq!(got.to_bits(), f64::INFINITY.to_bits());
         assert_eq!(work, CheckWork::default());
+    }
+
+    /// #1244: under a regime mask a non-finite prediction outside the mask
+    /// decides nothing: the prefix probe and the checked pass read the rows
+    /// inside the mask only, and give the bits of `score_tree`.
+    #[test]
+    fn masked_nonfinite_checks_read_the_rows_inside_the_mask() {
+        let (s, plain) = checked_fixture(1, 1, true);
+        let n = s.len();
+        let on: Vec<bool> = (0..n).map(|i| !(i < 10 || (19_990..20_010).contains(&i) || i == n - 1)).collect();
+        let slice = crate::data::TradingSlice {
+            rows: crate::trading::TradingRows { time: (0..n).map(|i| 900.0 * i as f64).collect(), group: vec![0; n], funding: Vec::new() },
+            ret: s.y.clone(),
+        };
+        let spec = crate::trading::TradingSpec { cost_bps: 1.0, min_trades: 1, ..Default::default() };
+        let mask = crate::trading::BookMask { on: &on, identity: "unit" };
+        let book = crate::trading::FitnessBook::with_segments(&slice, &spec, 900.0, 1, 1.0, &[], Some(mask)).unwrap();
+        let cfg = Config { fitness: Fitness::LongPnl(std::sync::Arc::new(book)), ..plain };
+        let view = EvalSample::new(&s, &cfg);
+        let un = |op: Op, a: Node| node(op, vec![a]);
+        // Non-finite at rows 0, 20,000 and the last row, each outside the mask.
+        for tree in [input(2), input(3), input(4)] {
+            let exact = score_tree(&tree, &view, &cfg);
+            assert!(exact.is_finite(), "{tree:?}: {exact}");
+            assert_eq!(nonfinite_prefix(&tree, &view, &cfg), Some(false), "{tree:?}");
+            assert!(!prefix_is_non_finite(&tree, &view, &cfg), "{tree:?}");
+            let (got, work) = score_tree_checked_work(&tree, &view, &cfg);
+            assert_eq!(got.to_bits(), exact.to_bits(), "{tree:?}");
+            assert_eq!(work, CheckWork::default(), "{tree:?}");
+        }
+        // Non-finite inside the mask: in the prefix, and at row 25,000.
+        let ln = un(Op::Ln, input(0));
+        assert_eq!(nonfinite_prefix(&ln, &view, &cfg), Some(true));
+        assert_eq!(score_tree(&ln, &view, &cfg), f64::INFINITY);
+        let late = un(Op::Exp, un(Op::Exp, input(5)));
+        assert_eq!(nonfinite_prefix(&late, &view, &cfg), Some(false));
+        assert_eq!(score_tree(&late, &view, &cfg), f64::INFINITY);
+        let (got, work) = score_tree_checked_work(&late, &view, &cfg);
+        assert_eq!((got, work.early), (f64::INFINITY, 1));
     }
 
     /// A run clock for the device searches built in tests (a clock read inside a

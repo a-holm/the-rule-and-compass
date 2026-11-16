@@ -2131,7 +2131,10 @@ fn mask_flags_name_their_reason() {
     let missing = run(&data, &spec, &["--fitness", "pnl", "--pnl-mask", "nope"]);
     assert_eq!(code(&missing), 3, "{}", stderr(&missing));
     assert!(stderr(&missing).contains("mask column") && stderr(&missing).contains("nope"), "{}", stderr(&missing));
-    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-mask", "g", "--gpu"]), "--pnl-mask with --gpu");
+    usage_error(
+        &run(&data, &spec, &["--fitness", "pnl", "--pnl-mask", "g", "--band", "0.5", "--band-units", "sd", "--gpu"]),
+        "--pnl-mask with --band-units sd and --gpu",
+    );
     usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-mask", "0 - g", "--position", "top_tercile"]), "top_tercile");
 }
 
@@ -2563,9 +2566,18 @@ fn xs_mean_flags_name_their_reason() {
     // One symbol: every timestamp has one row, so no row has a relative return.
     let single = write_csv(&dir, 900);
     usage_error(&run(&single, &write_spec(&dir), &["--fitness", "pnl", "--pnl-excess", "xs-mean"]), "no profitable long/flat path");
-    for sub in ["switch", "compose"] {
-        let o = rcsr_cmd::rcsr().args([sub, "--pnl-excess", "xs-mean"]).output().unwrap();
-        usage_error(&o, "--pnl-excess");
+}
+
+/// #1232: `rcsr switch` and `rcsr compose` take the fitness flags; without
+/// their inputs they exit 2 for the missing input, not for the flag.
+#[test]
+fn compose_and_switch_accept_pnl_excess() {
+    for (sub, missing) in [("switch", "--a <expr|flat> is required"), ("compose", "--gates <menu.json> is required")] {
+        for flags in [&["--pnl-excess", "xs-mean"][..], &["--pnl-stat", "mean-semi"], &["--pnl-stat", "cvar", "--pnl-cvar-q", "0.5"]] {
+            let o = rcsr_cmd::rcsr().arg(sub).args(flags).output().unwrap();
+            usage_error(&o, missing);
+            assert!(!stderr(&o).contains(&format!("{}:", flags[0])), "{sub} {flags:?}: {}", stderr(&o));
+        }
     }
 }
 
