@@ -872,3 +872,46 @@ fn cpcv_emit_series_end_to_end() {
         assert!(num(bear, &["alpha_bh"]).is_finite(), "alpha_bh:bear");
     }
 }
+
+/// #1237: split reports of a composed configuration (`selection.composite` of
+/// `walkforward --from-run`) give every path the composite type of each group in path order;
+/// one plain report among composed ones exits 2 naming it.
+#[test]
+fn cpcv_assemble_carries_composite_marker() {
+    let s = Scratch::new("cpcv-composite");
+    let dir = s.path();
+    let (table, scheme) = cpcv_series::write_table(dir);
+    let types = ["C0", "C1", "C2"];
+    let mark = |report: &str, kind: &str| {
+        let text = std::fs::read_to_string(report).unwrap();
+        let marker = format!(
+            "{{\"mode\":\"walkforward\",\"selection\":{{\"composite\":{{\"source\":\"rcsr compose\",\"type\":\"{kind}\",\"form\":\"f\",\"gate\":null}}}},"
+        );
+        let text = text.replacen("{\"mode\":\"walkforward\",", &marker, 1);
+        assert!(text.contains("\"composite\""));
+        std::fs::write(report, text).unwrap();
+    };
+    let reports = cpcv_series::write_reports(dir, "wf", &scheme, &|_| cpcv_series::NONE);
+    for (k, r) in reports.iter().enumerate() {
+        mark(r, types[k % 3]);
+    }
+    let paths = dir.join("paths");
+    ok(&assemble(&table, &reports, &paths, &dir.join("summary.json")));
+    let assign = cpcv::assignment(&scheme.test_sets, scheme.groups.len());
+    for j in 0..scheme.paths() {
+        let p = read_json(&paths.join(format!("path_{}.json", j + 1)));
+        let want: Vec<&str> = (0..scheme.groups.len()).map(|g| types[assign[g][j] % 3]).collect();
+        assert_eq!(at(&p, &["composite", "source"]).as_str(), Some("rcsr compose"));
+        let got: Vec<&str> = arr(&p, &["composite", "types"]).iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(got, want, "path {}", j + 1);
+        let segs: Vec<&str> = arr(&p, &["cpcv", "segments"]).iter().map(|x| at(x, &["composite_type"]).as_str().unwrap()).collect();
+        assert_eq!(segs, want, "path {} segments", j + 1);
+    }
+    let mixed = cpcv_series::write_reports(dir, "mixed", &scheme, &|_| cpcv_series::NONE);
+    for (k, r) in mixed.iter().enumerate().filter(|(k, _)| *k != 2) {
+        mark(r, types[k % 3]);
+    }
+    let o = assemble(&table, &mixed, &dir.join("mixed_paths"), &dir.join("mixed_summary.json"));
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).contains("selection.composite") && stderr(&o).contains(&mixed[2]), "{}", stderr(&o));
+}
