@@ -40,8 +40,23 @@ where
     cmd
 }
 
+/// #1262: the empty directory every child starts in, one per test process. A bare relative name in a
+/// child's arguments then cannot find a stray file in the caller's directory. A test that needs
+/// another directory calls `.current_dir(..)` on the returned command.
+fn empty_cwd() -> &'static std::path::Path {
+    static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("rcsr-child-cwd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).expect("create the empty child working directory");
+        dir
+    })
+}
+
 fn child(program: &str) -> Command {
-    without_injection(Command::new(program), std::env::vars_os())
+    let mut cmd = without_injection(Command::new(program), std::env::vars_os());
+    cmd.current_dir(empty_cwd());
+    cmd
 }
 
 /// `rcsr` with `RCSR_GPU=0`: no device probe, no CUDA context.

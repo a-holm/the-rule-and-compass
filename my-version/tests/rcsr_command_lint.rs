@@ -81,3 +81,29 @@ fn the_matcher_flags_a_bare_spawn_and_not_the_other_binaries() {
     assert!(!uses_the_binary_path("// Command::new(env!(\"CARGO_BIN_EXE_rcsr\"))"));
     assert!(!uses_the_binary_path("rcsr_cmd::rcsr()"));
 }
+
+/// The body of `fn child` in the helper source: from its signature to the next top-level `}`.
+fn child_body(helper: &str) -> Option<&str> {
+    let start = helper.find("fn child(")?;
+    let rest = &helper[start..];
+    let end = rest.find("\n}\n")?;
+    Some(&rest[..end])
+}
+
+/// #1262: every spawn goes through `child()`, so a `current_dir` call there gives every child a
+/// working directory that holds no stray file named like a relative argument.
+#[test]
+fn the_helper_child_sets_a_working_directory() {
+    let helper = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(HELPER)).unwrap();
+    let body = child_body(&helper).unwrap_or_else(|| panic!("{HELPER}: fn child not found"));
+    assert!(body.contains(".current_dir("), "{HELPER}: fn child must call .current_dir( (#1262)");
+}
+
+#[test]
+fn the_child_matcher_finds_the_body_and_its_cwd_call() {
+    let with = "fn child(p: &str) -> Command {\n    let mut c = Command::new(p);\n    c.current_dir(d);\n    c\n}\n\nfn other() {}\n";
+    let without = "fn child(p: &str) -> Command {\n    Command::new(p)\n}\n\nfn other() { x.current_dir(d); }\n";
+    assert!(child_body(with).unwrap().contains(".current_dir("));
+    assert!(!child_body(without).unwrap().contains(".current_dir("));
+    assert!(child_body("fn other() {}\n").is_none());
+}
