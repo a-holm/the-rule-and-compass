@@ -12,7 +12,7 @@ available; a build without the feature, or a machine with no usable device,
 falls back to the CPU with a recorded reason. An explicit `--gpu` never
 falls back: a device failure after the probe (a refused `long_pnl` fitness book,
 a failed batch, a pipeline error) exits 2 for `device_memory` reasons and 6
-otherwise, and the run writes no result. A failure that stops the run at a
+otherwise, and the run writes no result. Two start-up refusals end a library run the same way when `Config::gpu_required` is set (the CLI refuses both earlier, exit 2): `--selection lexicase` and a `--pnl-mask` book with `--band-units sd`; every other refusal keeps the labelled CPU path. `GpuEvaluator::set_pnl_book` refuses a book with a `--gate-search` position layer (`LONG_PNL_LAYERED`). A failure that stops the run at a
 generation boundary leaves the last checkpoint, so `--resume --gpu` continues. The default build remains pure
 `std` with no dependencies and no CUDA requirement.
 
