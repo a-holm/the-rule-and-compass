@@ -548,7 +548,7 @@ USAGE:
   run's pruning, bits and code kept); the split must match the run (exit 2).
 
   A band, a minimum hold, --threshold, --position, --book-target, --pnl-mask,
-  --pnl-excess, --pnl-stat, --pnl-cvar-q and --gpu exit 2. A pool run whose
+  --sample-rows, --pnl-excess, --pnl-stat, --pnl-cvar-q and --gpu exit 2. A pool run whose
   member carries a switch exits 2 (nested switch); a run with
   compose.gate.carried and no switch exits 3. See docs/compose.md.
 "
