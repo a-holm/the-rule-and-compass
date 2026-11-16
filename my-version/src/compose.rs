@@ -28,7 +28,7 @@ use crate::occam::{self, CodeSpec};
 use crate::regime_gate::{self, GateSpec, Regime};
 use crate::selection::{RobustMember, RobustMeta, RobustParams, RobustSelection};
 use crate::switch;
-use crate::trading::{self, FitnessBook, PathStats, TradingRows, TradingSpec};
+use crate::trading::{self, BlockStat, FitnessBook, PathStats, PnlExcess, TradingRows, TradingSpec};
 use std::collections::HashMap;
 
 pub const SCHEMA: &str = "rcsr-compose/1";
@@ -173,6 +173,56 @@ pub struct PoolRun {
     pub split: Json,
     pub candidates_evaluated: Option<u64>,
     pub front_size: usize,
+    /// #1232: the fitness excess the run was searched under.
+    pub pnl_excess: PnlExcess,
+    /// #1232: the block statistic the run was searched under.
+    pub stat: BlockStat,
+}
+
+impl PoolRun {
+    /// #1232: the `compose.runs[]` fields of the fitness, omitted for none and mean-sd.
+    fn fitness_json(&self) -> String {
+        let excess = if self.pnl_excess == PnlExcess::None { String::new() } else { format!(",\"pnl_excess\":{}", text(self.pnl_excess.name())) };
+        let stat = match self.stat {
+            BlockStat::MeanSd => String::new(),
+            BlockStat::Cvar(q) => format!(",\"stat\":\"cvar\",\"cvar_q\":{}", num(q)),
+            s => format!(",\"stat\":{}", text(s.name())),
+        };
+        excess + &stat
+    }
+}
+
+/// #1232: a block statistic as the refusals name it.
+fn stat_label(stat: BlockStat) -> String {
+    match stat {
+        BlockStat::Cvar(q) => format!("cvar q {}", num(q)),
+        s => s.name().to_string(),
+    }
+}
+
+/// #1232: the fitness of a pool from its excess, statistic and cvar share
+/// fields; an absent excess reads as none, an absent statistic as mean-sd.
+fn fitness_of(excess: Option<&Json>, stat: Option<&Json>, cvar_q: Option<&Json>) -> Result<(PnlExcess, BlockStat), String> {
+    let excess = match excess {
+        None | Some(Json::Null) => PnlExcess::None,
+        Some(v) => PnlExcess::parse(v.as_str().unwrap_or_default()).map_err(|e| format!("pnl_excess: {}", e))?,
+    };
+    let stat = match stat {
+        None | Some(Json::Null) => BlockStat::MeanSd,
+        Some(v) => BlockStat::parse(v.as_str().unwrap_or_default(), cvar_q.and_then(Json::as_f64).unwrap_or(f64::NAN)).map_err(|e| format!("stat: {}", e))?,
+    };
+    Ok((excess, stat))
+}
+
+/// #1232: the fitness a run was searched under: `objective.spec.pnl_excess` and
+/// `search_fitness.stat` with `search_fitness.cvar_q`.
+pub(crate) fn run_fitness(doc: &Json) -> Result<(PnlExcess, BlockStat), String> {
+    let fitness = doc.get("search_fitness");
+    fitness_of(
+        doc.get("objective").and_then(|o| o.get("spec")).and_then(|s| s.get("pnl_excess")),
+        fitness.and_then(|f| f.get("stat")),
+        fitness.and_then(|f| f.get("cvar_q")),
+    )
 }
 
 /// One pool member: a front member of an input run.
@@ -249,6 +299,7 @@ fn load_run(pool: Pool, path: &str, top: usize, index: usize, members: &mut Vec<
         let branch = if book.threshold == 0.0 { e.clone() } else { format!("({}) - ({:?})", e, book.threshold) };
         members.push(Member { run: index, archive_rank: *rank, expression_exact: e.clone(), columns, branch });
     }
+    let (pnl_excess, stat) = run_fitness(&doc).map_err(bad)?;
     Ok(PoolRun {
         pool,
         path: path.to_string(),
@@ -261,6 +312,8 @@ fn load_run(pool: Pool, path: &str, top: usize, index: usize, members: &mut Vec<
         split: doc.get("split").cloned().unwrap_or(Json::Null),
         candidates_evaluated: run.candidates_evaluated,
         front_size: front.len(),
+        pnl_excess,
+        stat,
     })
 }
 
@@ -407,6 +460,7 @@ fn from_composed(path: &str) -> Result<Request, Fail> {
             }
             _ => None,
         };
+        let (pnl_excess, stat) = fitness_of(r.get("pnl_excess"), r.get("stat"), r.get("cvar_q")).map_err(|e| bad(format!("compose.runs[{}].{}", k, e)))?;
         runs.push(PoolRun {
             pool,
             path: r.get("path").and_then(Json::as_str).unwrap_or_default().to_string(),
@@ -419,6 +473,8 @@ fn from_composed(path: &str) -> Result<Request, Fail> {
             split: doc.get("split").cloned().unwrap_or(Json::Null),
             candidates_evaluated: r.get("candidates_evaluated").and_then(Json::as_f64).map(|v| v as u64),
             front_size: r.get("front_size").and_then(Json::as_usize).unwrap_or(0),
+            pnl_excess,
+            stat,
         });
     }
     let mut members = Vec::new();
@@ -535,6 +591,9 @@ USAGE:
   Every input run must share the target, the target spec, the per-side cost
   and the split (mode, row counts, train and validation time, purge, split id,
   intervals, embargo) with this invocation; a difference exits 2 naming it.
+  Its fitness must match too: objective.spec.pnl_excess (absent: none) equals
+  --pnl-excess, and search_fitness.stat and cvar_q (absent: mean-sd) equal
+  --pnl-stat and --pnl-cvar-q.
 
   --gates <menu.json>      the pre-registered gate menu (rcsr-gate-menu/1):
                            {\"schema\":\"rcsr-gate-menu/1\",\"switch_budget\":k|null,
@@ -564,6 +623,9 @@ USAGE:
   member with the run's threshold subtracted; the composite threshold is 0.
   With switch_budget k, a C1 or C2 pair whose k-switch bound gain over its better
   branch on the training rows is not positive is pruned (counted, not scored).
+  The bound and the branch nets are on the training book's excess: under
+  --pnl-excess xs-mean on (r - m_t) - funding, m_t the equal-weight mean of the
+  training rows at the row's timestamp.
 
   Choice (training and validation rows only): the robust rule of --select-rule
   robust on the validation rows, plus alpha over exposure-matched buy-and-hold
@@ -573,7 +635,11 @@ USAGE:
   the finalist is fixed. The report gives per gate state net, exposure,
   buy-and-hold and alpha, gate switches per year and mean dwell, the cost paid
   in switch periods against the total cost, each branch alone and the best
-  all-weather member on the same rows.
+  all-weather member on the same rows. The choice ranks absolute net and alpha
+  under every fitness flag: --pnl-excess xs-mean adds xs_excess_net (the net
+  over the equal-weight timestamp mean of the slice) to every priced book and
+  compose.chosen.excess, and is never ranked; --pnl-stat and --pnl-cvar-q are
+  checked against the pools and read nowhere else.
 
   Every C1 and C2 composite is a switch: run.json carries objective.finalist.switch
   and pareto[].switch (gate, on branch, off branch), and pareto lists every
@@ -591,7 +657,7 @@ USAGE:
   run's pruning, bits and code kept); the split must match the run (exit 2).
 
   A band, a minimum hold, --threshold, --position, --book-target, --pnl-mask,
-  --sample-rows, --pnl-excess, --pnl-stat, --pnl-cvar-q and --gpu exit 2. A pool run whose
+  --sample-rows and --gpu exit 2. A pool run whose
   member carries a switch exits 2 (nested switch); a run with
   compose.gate.carried and no switch exits 3. See docs/compose.md.
 "
@@ -661,8 +727,6 @@ fn claim_with(args: &[String], reselect: Option<&str>) -> Vec<String> {
             "--pnl-mask" | "--pnl-mask-band" | "--pnl-mask-dwell" => {
                 fail(&format!("{}: a composite prices the unmasked branches under its own gate; the masks belong to the pool searches", flag))
             }
-            "--pnl-excess" => fail("--pnl-excess: a composite is priced on the absolute long/flat book"),
-            "--pnl-stat" | "--pnl-cvar-q" => fail(&format!("{}: a composite is priced on the net of its long/flat book, not on a block statistic", flag)),
             "--threshold" | "--position" | "--book-target" | "--band" | "--band-units" | "--min-holding" | "--max-position" | "--cash-return" | "--funding" => fail(&format!(
                 "{}: a composite is the unit long/flat book at threshold 0; each branch carries its run's threshold",
                 flag
@@ -733,6 +797,12 @@ fn check_runs_agree(runs: &[PoolRun]) -> Result<(), Fail> {
             if split_differs(&first.split, &r.split, key) {
                 return differ(&format!("split.{}", key));
             }
+        }
+        if r.pnl_excess != first.pnl_excess {
+            return differ(&format!("objective.spec.pnl_excess ({} vs {})", first.pnl_excess.name(), r.pnl_excess.name()));
+        }
+        if r.stat != first.stat {
+            return differ(&format!("search_fitness.stat ({} vs {})", stat_label(first.stat), stat_label(r.stat)));
         }
     }
     Ok(())
@@ -909,13 +979,14 @@ fn pred(c: &Composite, v: &SliceVals) -> Vec<f64> {
 fn book_json(s: &Result<PathStats, String>) -> String {
     match s {
         Ok(s) => format!(
-            "\"net\":{},\"sharpe\":{},\"exposure\":{},\"trades\":{},\"total_cost\":{},\"buy_and_hold_net\":{}",
+            "\"net\":{},\"sharpe\":{},\"exposure\":{},\"trades\":{},\"total_cost\":{},\"buy_and_hold_net\":{}{}",
             num(s.net_pnl),
             num(s.sharpe),
             num(s.exposure),
             s.trades,
             num(s.total_cost),
-            num(s.buy_and_hold.net_pnl)
+            num(s.buy_and_hold.net_pnl),
+            s.xs_excess_net.map_or(String::new(), |v| format!(",\"xs_excess_net\":{}", num(v)))
         ),
         Err(e) => format!("\"unusable\":{}", text(e)),
     }
@@ -969,7 +1040,7 @@ struct Scored {
 
 /// The composed run.json and the text summary.
 pub fn compose(req: &Request, book: &FitnessBook, slices: &Slices, ctx: &Context) -> Result<(String, String), Fail> {
-    check_against(req, ctx)?;
+    check_against(req, ctx, book.stat())?;
     let columns = req.columns();
     let code = CodeSpec::v1(ctx.ops, ctx.vars.len());
     let composites = enumerate(req);
@@ -1184,7 +1255,7 @@ pub fn compose(req: &Request, book: &FitnessBook, slices: &Slices, ctx: &Context
         .iter()
         .map(|r| {
             format!(
-                "{{\"pool\":{},\"path\":{},\"sha256\":{},\"threshold\":{},\"per_side_bps\":{},\"mask\":{},\"front_size\":{},\"candidates_evaluated\":{}}}",
+                "{{\"pool\":{},\"path\":{},\"sha256\":{},\"threshold\":{},\"per_side_bps\":{},\"mask\":{},\"front_size\":{},\"candidates_evaluated\":{}{}}}",
                 text(r.pool.name()),
                 text(&r.path),
                 text(&r.sha256),
@@ -1192,7 +1263,8 @@ pub fn compose(req: &Request, book: &FitnessBook, slices: &Slices, ctx: &Context
                 num(r.per_side_bps),
                 r.mask.as_ref().map_or("null".to_string(), |g| format!("{{\"expr\":{},\"band\":{},\"dwell\":{}}}", text(&g.source), num(g.band), g.dwell)),
                 r.front_size,
-                r.candidates_evaluated.map_or("null".to_string(), |n| n.to_string())
+                r.candidates_evaluated.map_or("null".to_string(), |n| n.to_string()),
+                r.fitness_json()
             )
         })
         .collect();
@@ -1326,6 +1398,8 @@ pub fn compose(req: &Request, book: &FitnessBook, slices: &Slices, ctx: &Context
     // #1182: a gate search counts every gate it scored, not only the front.
     let trials = req.searched.as_ref().map_or(composites.len() as u64, |s| s.candidates_evaluated);
     let formula = if req.searched.is_some() { "searched gates x 1" } else { "gates x (bull x bear + bull + bear) + all_weather" };
+    // #1232: omitted under none, so the default run.json is unchanged.
+    let excess_json = if ctx.spec.pnl_excess == PnlExcess::None { String::new() } else { format!(",\"excess\":{}", text(ctx.spec.pnl_excess.name())) };
     let compose_json = format!(
         "{{\"schema\":\"{}\",\"menu\":{{\"path\":{},\"sha256\":{},\"schema\":\"{}\",\"switch_budget\":{},\"gates\":[{}]}},\"code\":{},\
          \"top\":{},\"runs\":[{}],\"members\":[{}],\
@@ -1334,7 +1408,7 @@ pub fn compose(req: &Request, book: &FitnessBook, slices: &Slices, ctx: &Context
          \"selection\":{{\"rule\":\"robust\",\"blocks\":{},\"se_z\":{},\"block_len\":{},\"blocks_source\":{},\"regime_condition\":\"alpha_on >= 0 and alpha_off >= 0 on the validation rows (C1 and C2)\",\"eligible\":{},\"verdict\":\"{}\",\"chosen\":{}}},\
          \"gate\":{},\
          \"chosen\":{{\"id\":{},\"type\":{},\"form\":{},\"gate\":{},\"expression\":{},\"complexity\":{},\"bits\":{},\
-         \"validation\":{{{},\"regime\":{}}},\"test\":{{{},\"regime\":{}}},\"train_seam\":{},\"branches\":[{}],\"best_all_weather\":{}}},\
+         \"validation\":{{{},\"regime\":{}}},\"test\":{{{},\"regime\":{}}},\"train_seam\":{},\"branches\":[{}],\"best_all_weather\":{}{}}},\
          \"composites\":[{}]}}",
         SCHEMA,
         text(&req.menu.path),
@@ -1381,6 +1455,7 @@ pub fn compose(req: &Request, book: &FitnessBook, slices: &Slices, ctx: &Context
         seam_json,
         branches_json.join(","),
         best_aw_json,
+        excess_json,
         composites_json.join(",")
     );
 
@@ -1492,6 +1567,12 @@ pub fn compose(req: &Request, book: &FitnessBook, slices: &Slices, ctx: &Context
             verdict
         ),
     };
+    if ctx.spec.pnl_excess != PnlExcess::None {
+        summary.push_str(&format!(
+            "excess: {} (the choice ranks absolute net and alpha; the pruning bound is on the training excess; xs_excess_net is reported)\n",
+            ctx.spec.pnl_excess.name()
+        ));
+    }
     summary.push_str(&format!(
         "finalist {} {}{} (bits {:.1}): {}\n",
         req.type_label(c.kind),
@@ -1502,7 +1583,15 @@ pub fn compose(req: &Request, book: &FitnessBook, slices: &Slices, ctx: &Context
     ));
     let line = |name: &str, s: &Result<PathStats, String>, r: Option<&Result<Regime, String>>| -> String {
         let mut out = match s {
-            Ok(s) => format!("{}: net {} sharpe {} exposure {} cost {}", name, num(s.net_pnl), num(s.sharpe), num(s.exposure), num(s.total_cost)),
+            Ok(s) => format!(
+                "{}: net {} sharpe {} exposure {} cost {}{}",
+                name,
+                num(s.net_pnl),
+                num(s.sharpe),
+                num(s.exposure),
+                num(s.total_cost),
+                s.xs_excess_net.map_or(String::new(), |v| format!(" xs_excess_net {}", num(v)))
+            ),
             Err(e) => format!("{}: unusable ({})", name, e),
         };
         if let Some(Ok(r)) = r {
@@ -1553,8 +1642,11 @@ pub(crate) fn tree_bits(code: &CodeSpec, tree: &Node) -> Result<(f64, bool), Str
     }
 }
 
-/// The input runs share the target, the target spec, the cost and the split of this invocation.
-fn check_against(req: &Request, ctx: &Context) -> Result<(), Fail> {
+/// The input runs share the target, the target spec, the cost and the split of
+/// this invocation, and (#1232) the fitness excess and block statistic `stat`
+/// they were searched under. A gate search freezes its branches and ranks by
+/// its own statistic, so its branch runs keep any fitness.
+fn check_against(req: &Request, ctx: &Context, stat: BlockStat) -> Result<(), Fail> {
     let split = Json::parse(ctx.split_json).ok_or((2, "the split of this invocation is not JSON".to_string()))?;
     let per_side = ctx.spec.per_side_bps();
     // #1182: an expression branch of a gate search has no run (an empty path).
@@ -1573,6 +1665,15 @@ fn check_against(req: &Request, ctx: &Context) -> Result<(), Fail> {
             if split_differs(&r.split, &split, key) {
                 return differ(format!("split.{}", key));
             }
+        }
+        if req.searched.is_some() {
+            continue;
+        }
+        if r.pnl_excess != ctx.spec.pnl_excess {
+            return differ(format!("objective.spec.pnl_excess ({} vs --pnl-excess {})", r.pnl_excess.name(), ctx.spec.pnl_excess.name()));
+        }
+        if r.stat != stat {
+            return differ(format!("search_fitness.stat ({} vs --pnl-stat {})", stat_label(r.stat), stat_label(stat)));
         }
     }
     Ok(())
