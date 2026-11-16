@@ -2904,7 +2904,11 @@ pub struct BookFamily<'a> {
 /// #1257: the buffers of [`BookFamily::cut_totals`], kept between calls.
 #[derive(Clone, Debug, Default)]
 pub struct CutScratch {
+    /// The long bits of every row of a segment.
     masks: Vec<u64>,
+    /// The non-finite bits of every row of a segment that can overflow.
+    bad: Vec<u64>,
+    /// The lanes of two books.
     lanes: Vec<f64>,
     warps: Vec<f64>,
     counts: Vec<u64>,
@@ -2912,7 +2916,7 @@ pub struct CutScratch {
 }
 
 /// Byte `i` of entry `m` is bit `i` of `m`: eight cut counters in one word.
-const BYTE_SPREAD: [u64; 256] = {
+static BYTE_SPREAD: [u64; 256] = {
     let mut t = [0u64; 256];
     let mut m = 0;
     while m < 256 {
@@ -2928,13 +2932,13 @@ const BYTE_SPREAD: [u64; 256] = {
     t
 };
 
-/// Word `i` of entry `m` is all ones where bit `i` of `m` is set.
-const NIBBLE_MASKS: [[u64; 4]; 16] = {
-    let mut t = [[0u64; 4]; 16];
+/// Word `i` of entry `m` is all ones where bit `i` of the byte `m` is set.
+static BYTE_MASKS: [[u64; 8]; 256] = {
+    let mut t = [[0u64; 8]; 256];
     let mut m = 0;
-    while m < 16 {
+    while m < 256 {
         let mut i = 0;
-        while i < 4 {
+        while i < 8 {
             if (m >> i) & 1 == 1 {
                 t[m][i] = u64::MAX;
             }
@@ -2944,6 +2948,12 @@ const NIBBLE_MASKS: [[u64; 4]; 16] = {
     }
     t
 };
+
+/// The block id of every row of a one-block book.
+static NO_BLOCK_IDS: [u8; FITNESS_SEGMENT_ROWS] = [0; FITNESS_SEGMENT_ROWS];
+
+/// Below this magnitude of a value and a cut constant, `v - c` and `c - v` are finite.
+const NO_OVERFLOW: f64 = f64::MAX / 4.0;
 
 /// Adds the byte counters of `acc` into `dst` (one counter per cut) and clears them.
 fn flush_cut_counts(acc: &mut [u64; 8], dst: &mut [u64]) {
@@ -3006,51 +3016,178 @@ impl<'a> BookFamily<'a> {
     /// `c - v[i]` for a below cut `(false, c)`; 1 to 64 cuts. One walk over each
     /// segment finds the long bits of every cut (one `u64` per row) and the
     /// integer counts; then each book adds its `excess` into the lanes of
-    /// [`FitnessBook::block_totals`] in ascending row order. A short row adds
-    /// `+0.0`, which leaves a lane unchanged: a sum that starts at `+0.0` under
-    /// round to nearest is never `-0.0`.
+    /// [`FitnessBook::block_totals`], every lane in ascending row order. A short
+    /// row adds `+0.0`, which leaves a lane unchanged: a sum that starts at
+    /// `+0.0` under round to nearest is never `-0.0`.
     pub fn cut_totals(&self, v: &[f64], cuts: &[(bool, f64)], scratch: &mut CutScratch, out: &mut Vec<FitnessTotals>) {
         #[cfg(target_arch = "x86_64")]
-        {
-            if is_x86_feature_detected!("avx") {
-                // SAFETY: the feature is detected above and the function is
-                // annotated `target_feature(enable = "avx")`.
-                unsafe { family_totals_avx(self, v, cuts, scratch, out) };
-                return;
-            }
-        }
-        family_totals(self, v, cuts, scratch, out);
+        let avx = is_x86_feature_detected!("avx");
+        #[cfg(not(target_arch = "x86_64"))]
+        let avx = false;
+        family_totals(self, v, cuts, scratch, out, avx);
     }
 }
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx")]
-unsafe fn family_totals_avx(f: &BookFamily, v: &[f64], cuts: &[(bool, f64)], s: &mut CutScratch, out: &mut Vec<FitnessTotals>) {
-    family_totals(f, v, cuts, s, out)
+/// The long bits of the rows `v` against padded cuts (NaN constants are never
+/// long), and when `bad` is given their non-finite bits.
+fn long_bits(v: &[f64], cs: &[f64; 64], above: &[bool; 64], groups: usize, t: f64, masks: &mut [u64], mut bad: Option<&mut [u64]>) {
+    for (r, &x) in v.iter().enumerate() {
+        let (mut m, mut nf) = (0u64, 0u64);
+        for j in 0..4 * groups {
+            let p = if above[j] { x - cs[j] } else { cs[j] - x };
+            let fin = p.is_finite();
+            m |= ((fin & (p > t)) as u64) << j;
+            nf |= ((!fin) as u64) << j;
+        }
+        masks[r] = m;
+        if let Some(b) = bad.as_deref_mut() {
+            b[r] = nf;
+        }
+    }
 }
 
-#[inline(always)]
-fn family_totals(f: &BookFamily, v: &[f64], cuts: &[(bool, f64)], s: &mut CutScratch, out: &mut Vec<FitnessTotals>) {
+/// [`long_bits`] four cuts at a time, for rows and cuts below [`NO_OVERFLOW`],
+/// where every `v - c` and `c - v` is finite: the same subtraction and
+/// comparison per cut.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn long_bits_avx(v: &[f64], cs: &[f64; 64], above: &[bool; 64], groups: usize, t: f64, masks: &mut [u64]) {
+    use std::arch::x86_64::*;
+    let (mut c, mut sel) = ([_mm256_setzero_pd(); 16], [_mm256_setzero_pd(); 16]);
+    for g in 0..groups {
+        c[g] = _mm256_loadu_pd(cs.as_ptr().add(4 * g));
+        let s: [f64; 4] = std::array::from_fn(|i| if above[4 * g + i] { f64::from_bits(u64::MAX) } else { 0.0 });
+        sel[g] = _mm256_loadu_pd(s.as_ptr());
+    }
+    let tv = _mm256_set1_pd(t);
+    for (r, &x) in v.iter().enumerate() {
+        let xv = _mm256_set1_pd(x);
+        let mut m = 0u64;
+        for g in 0..groups {
+            let p = _mm256_blendv_pd(_mm256_sub_pd(c[g], xv), _mm256_sub_pd(xv, c[g]), sel[g]);
+            m |= (_mm256_movemask_pd(_mm256_cmp_pd::<_CMP_GT_OQ>(p, tv)) as u64) << (4 * g);
+        }
+        masks[r] = m;
+    }
+}
+
+/// Adds the excess of one book (`e1` empty) or two books to their lanes, lane by
+/// lane: rows `lane, lane + 32, ...` add into registers in ascending row order,
+/// sixteen cuts at a time, and a change of block moves the registers to the
+/// lanes of the new block.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn add_lanes_avx(e0: &[f64], e1: &[f64], masks: &[u64], ids: &[u8], qp: usize, l0: &mut [f64], l1: &mut [f64]) {
+    use std::arch::x86_64::*;
+    let rows = e0.len();
+    let two = !e1.is_empty();
+    assert!(masks.len() >= rows && ids.len() >= rows && (!two || e1.len() == rows) && l0.len() == l1.len() && qp % 16 == 0);
+    let nb = l0.len() / (FITNESS_LANES * qp);
+    let table = BYTE_MASKS.as_ptr();
+    for chunk in (0..qp).step_by(16) {
+        for lane in 0..FITNESS_LANES.min(rows) {
+            let mut cur = ids[lane] as usize;
+            assert!(cur < nb);
+            let mut at = (cur * FITNESS_LANES + lane) * qp + chunk;
+            let (mut a, mut b) = ([_mm256_setzero_pd(); 4], [_mm256_setzero_pd(); 4]);
+            for g in 0..4 {
+                a[g] = _mm256_loadu_pd(l0.as_ptr().add(at + 4 * g));
+                b[g] = _mm256_loadu_pd(l1.as_ptr().add(at + 4 * g));
+            }
+            let mut r = lane;
+            while r < rows {
+                let blk = *ids.get_unchecked(r) as usize;
+                if blk != cur {
+                    assert!(blk < nb);
+                    for g in 0..4 {
+                        _mm256_storeu_pd(l0.as_mut_ptr().add(at + 4 * g), a[g]);
+                        _mm256_storeu_pd(l1.as_mut_ptr().add(at + 4 * g), b[g]);
+                    }
+                    cur = blk;
+                    at = (cur * FITNESS_LANES + lane) * qp + chunk;
+                    for g in 0..4 {
+                        a[g] = _mm256_loadu_pd(l0.as_ptr().add(at + 4 * g));
+                        b[g] = _mm256_loadu_pd(l1.as_ptr().add(at + 4 * g));
+                    }
+                }
+                let m = *masks.get_unchecked(r) >> chunk;
+                let lo = table.add((m & 255) as usize) as *const f64;
+                let hi = table.add(((m >> 8) & 255) as usize) as *const f64;
+                let s = [_mm256_loadu_pd(lo), _mm256_loadu_pd(lo.add(4)), _mm256_loadu_pd(hi), _mm256_loadu_pd(hi.add(4))];
+                let x0 = _mm256_broadcast_sd(e0.get_unchecked(r));
+                for g in 0..4 {
+                    a[g] = _mm256_add_pd(a[g], _mm256_and_pd(x0, s[g]));
+                }
+                if two {
+                    let x1 = _mm256_broadcast_sd(e1.get_unchecked(r));
+                    for g in 0..4 {
+                        b[g] = _mm256_add_pd(b[g], _mm256_and_pd(x1, s[g]));
+                    }
+                }
+                r += FITNESS_LANES;
+            }
+            for g in 0..4 {
+                _mm256_storeu_pd(l0.as_mut_ptr().add(at + 4 * g), a[g]);
+                _mm256_storeu_pd(l1.as_mut_ptr().add(at + 4 * g), b[g]);
+            }
+        }
+    }
+}
+
+/// [`add_lanes_avx`] for one book, row by row.
+fn add_lanes(excess: &[f64], masks: &[u64], ids: &[u8], qp: usize, lanes: &mut [f64]) {
+    for (r, (&e, &m)) in excess.iter().zip(masks).enumerate() {
+        let base = (ids[r] as usize * FITNESS_LANES + r % FITNESS_LANES) * qp;
+        let e = e.to_bits();
+        for (j, a) in lanes[base..base + qp].iter_mut().enumerate() {
+            *a += f64::from_bits(e & BYTE_MASKS[((m >> (j & !7)) & 255) as usize][j & 7]);
+        }
+    }
+}
+
+/// Folds the lanes of every block of one book (`lanes`) and adds them to the warps of segment `seg`.
+fn fold_lanes(lanes: &mut [f64], warps: &mut [f64], nb: usize, qp: usize, seg: usize) {
+    for b in 0..nb {
+        let l = &mut lanes[b * FITNESS_LANES * qp..(b + 1) * FITNESS_LANES * qp];
+        let mut half = FITNESS_LANES / 2;
+        while half >= 1 {
+            for i in 0..half {
+                for j in 0..qp {
+                    l[i * qp + j] += l[(i + half) * qp + j];
+                }
+            }
+            half /= 2;
+        }
+        let w = &mut warps[(b * FITNESS_WARPS + seg % FITNESS_WARPS) * qp..][..qp];
+        for j in 0..qp {
+            w[j] += l[j];
+        }
+    }
+}
+
+fn family_totals(f: &BookFamily, v: &[f64], cuts: &[(bool, f64)], s: &mut CutScratch, out: &mut Vec<FitnessTotals>, avx: bool) {
     let first = f.books[0];
     let n = first.len();
     assert_eq!(v.len(), n, "book family: {} values for {} rows", v.len(), n);
     let q = cuts.len();
     assert!((1..=64).contains(&q), "book family: 1 to 64 cuts, got {}", q);
-    let qp = q.div_ceil(4) * 4;
-    let qw = q.div_ceil(8);
-    let valid = if q == 64 { u64::MAX } else { (1u64 << q) - 1 };
+    let qp = q.div_ceil(16) * 16;
+    let (qw, groups) = (q.div_ceil(8), q.div_ceil(4));
     let nb = first.blocks();
     let nbooks = f.books.len();
     let t = first.threshold;
-    // Padded cuts are NaN: never long, and their non-finite bits are masked off.
+    // Padded cuts are NaN: never long, and their non-finite bits are dropped.
     let mut cs = [f64::NAN; 64];
     let mut above = [false; 64];
     for (j, &(a, c)) in cuts.iter().enumerate() {
         above[j] = a;
         cs[j] = c;
     }
+    let valid = if q == 64 { u64::MAX } else { (1u64 << q) - 1 };
+    let cuts_small = cuts.iter().all(|c| c.1.abs() < NO_OVERFLOW);
     let ids: &[u8] = &first.block_id;
     let flags: &[u8] = &first.flags;
+    let lanes_len = nb * FITNESS_LANES * qp;
     s.counts.clear();
     s.counts.resize(3 * nb * q, 0);
     s.nonfinite.clear();
@@ -3058,39 +3195,43 @@ fn family_totals(f: &BookFamily, v: &[f64], cuts: &[(bool, f64)], s: &mut CutScr
     s.warps.clear();
     s.warps.resize(nbooks * nb * FITNESS_WARPS * qp, 0.0);
     s.lanes.clear();
-    s.lanes.resize(nb * FITNESS_LANES * qp, 0.0);
+    s.lanes.resize(2 * lanes_len, 0.0);
     s.masks.clear();
     s.masks.resize(FITNESS_SEGMENT_ROWS, 0);
+    s.bad.clear();
+    s.bad.resize(FITNESS_SEGMENT_ROWS, 0);
     let mut prev = 0u64;
     let mut seg_start = 0usize;
     let mut seg = 0usize;
     while seg_start < n {
         let seg_end = (seg_start + FITNESS_SEGMENT_ROWS).min(n);
         let rows = seg_end - seg_start;
+        let vs = &v[seg_start..seg_end];
+        let seg_ids: &[u8] = if ids.is_empty() { &NO_BLOCK_IDS[..rows] } else { &ids[seg_start..seg_end] };
+        let finite = cuts_small && vs.iter().all(|x| x.abs() < NO_OVERFLOW);
+        #[cfg(target_arch = "x86_64")]
+        let fast = avx && finite;
+        #[cfg(not(target_arch = "x86_64"))]
+        let fast = false;
+        if fast {
+            #[cfg(target_arch = "x86_64")]
+            // SAFETY: `fast` implies the AVX feature was detected by `cut_totals`.
+            unsafe {
+                long_bits_avx(vs, &cs, &above, groups, t, &mut s.masks[..rows]);
+            }
+        } else {
+            long_bits(vs, &cs, &above, groups, t, &mut s.masks[..rows], (!finite).then_some(&mut s.bad[..rows]));
+        }
         {
             let (flips, rest) = s.counts.split_at_mut(nb * q);
             let (exits, longs) = rest.split_at_mut(nb * q);
             let (mut acc_long, mut acc_flip) = ([0u64; 8], [0u64; 8]);
             let mut held = 0u32;
-            let mut cur = if ids.is_empty() { 0 } else { ids[seg_start] as usize };
+            let mut cur = seg_ids[0] as usize;
             let mut nf_cur = 0u64;
             for r in 0..rows {
-                let k = seg_start + r;
-                let x = v[k];
-                let (mut m, mut nf) = (0u64, 0u64);
-                for g in 0..qp / 4 {
-                    let (mut bits, mut bad) = (0u64, 0u64);
-                    for i in 0..4 {
-                        let j = 4 * g + i;
-                        let p = if above[j] { x - cs[j] } else { cs[j] - x };
-                        let fin = p.is_finite();
-                        bits |= ((fin & (p > t)) as u64) << i;
-                        bad |= ((!fin) as u64) << i;
-                    }
-                    m |= bits << (4 * g);
-                    nf |= bad << (4 * g);
-                }
-                let b = if ids.is_empty() { 0 } else { ids[k] as usize };
+                let m = s.masks[r];
+                let b = seg_ids[r] as usize;
                 if b != cur || held == 255 {
                     flush_cut_counts(&mut acc_long, &mut longs[cur * q..(cur + 1) * q]);
                     flush_cut_counts(&mut acc_flip, &mut flips[cur * q..(cur + 1) * q]);
@@ -3099,7 +3240,7 @@ fn family_totals(f: &BookFamily, v: &[f64], cuts: &[(bool, f64)], s: &mut CutScr
                     cur = b;
                     held = 0;
                 }
-                let flag = flags[k];
+                let flag = flags[seg_start + r];
                 if flag & TradingRows::FIRST != 0 {
                     prev = 0;
                 }
@@ -3116,49 +3257,41 @@ fn family_totals(f: &BookFamily, v: &[f64], cuts: &[(bool, f64)], s: &mut CutScr
                         e &= e - 1;
                     }
                 }
-                nf_cur |= nf & valid;
+                if !finite {
+                    nf_cur |= s.bad[r] & valid;
+                }
                 prev = m;
-                s.masks[r] = m;
             }
             flush_cut_counts(&mut acc_long, &mut longs[cur * q..(cur + 1) * q]);
             flush_cut_counts(&mut acc_flip, &mut flips[cur * q..(cur + 1) * q]);
             s.nonfinite[cur] |= nf_cur;
         }
-        let seg_ids: &[u8] = if ids.is_empty() { &[] } else { &ids[seg_start..seg_end] };
-        for (bk, book) in f.books.iter().enumerate() {
-            let lanes = &mut s.lanes;
-            lanes.fill(0.0);
-            let excess = &book.excess[seg_start..seg_end];
-            for r in 0..rows {
-                let b = if seg_ids.is_empty() { 0 } else { seg_ids[r] as usize };
-                let base = (b * FITNESS_LANES + r % FITNESS_LANES) * qp;
-                let acc = &mut lanes[base..base + qp];
-                let e = excess[r].to_bits();
-                let m = s.masks[r];
-                for (g, a) in acc.chunks_exact_mut(4).enumerate() {
-                    let sel = &NIBBLE_MASKS[((m >> (4 * g)) & 15) as usize];
-                    a[0] += f64::from_bits(e & sel[0]);
-                    a[1] += f64::from_bits(e & sel[1]);
-                    a[2] += f64::from_bits(e & sel[2]);
-                    a[3] += f64::from_bits(e & sel[3]);
+        let masks = &s.masks[..rows];
+        let mut bk = 0;
+        while bk < nbooks {
+            let pair = avx && bk + 1 < nbooks;
+            let (l0, l1) = s.lanes.split_at_mut(lanes_len);
+            l0.fill(0.0);
+            let e0 = &f.books[bk].excess[seg_start..seg_end];
+            if avx {
+                let e1: &[f64] = if pair { &f.books[bk + 1].excess[seg_start..seg_end] } else { &[] };
+                if pair {
+                    l1.fill(0.0);
                 }
+                #[cfg(target_arch = "x86_64")]
+                // SAFETY: `avx` is the feature detected by `cut_totals`.
+                unsafe {
+                    add_lanes_avx(e0, e1, masks, seg_ids, qp, l0, l1);
+                }
+            } else {
+                add_lanes(e0, masks, seg_ids, qp, l0);
             }
-            for b in 0..nb {
-                let l = &mut lanes[b * FITNESS_LANES * qp..(b + 1) * FITNESS_LANES * qp];
-                let mut half = FITNESS_LANES / 2;
-                while half >= 1 {
-                    for i in 0..half {
-                        for j in 0..qp {
-                            l[i * qp + j] += l[(i + half) * qp + j];
-                        }
-                    }
-                    half /= 2;
-                }
-                let w = &mut s.warps[((bk * nb + b) * FITNESS_WARPS + seg % FITNESS_WARPS) * qp..][..qp];
-                for j in 0..qp {
-                    w[j] += l[j];
-                }
+            let warps = &mut s.warps;
+            fold_lanes(l0, &mut warps[bk * nb * FITNESS_WARPS * qp..(bk + 1) * nb * FITNESS_WARPS * qp], nb, qp, seg);
+            if pair {
+                fold_lanes(l1, &mut warps[(bk + 1) * nb * FITNESS_WARPS * qp..(bk + 2) * nb * FITNESS_WARPS * qp], nb, qp, seg);
             }
+            bk += if pair { 2 } else { 1 };
         }
         seg += 1;
         seg_start = seg_end;
@@ -4640,15 +4773,17 @@ mod book_family_tests {
             .collect()
     }
 
-    /// `count` cuts on alternating sides: 0, -0, constants where `v - c` or
-    /// `c - v` overflows, a value of `v` (ties), and values of `v` spread over its ranks.
-    fn cut_list(v: &[f64], count: usize) -> Vec<(bool, f64)> {
+    /// `count` cuts on alternating sides: with `overflow` first the constants
+    /// where `v - c` or `c - v` overflows, then 0, -0, a value of `v` (ties) and
+    /// values of `v` spread over its ranks.
+    fn cut_list(v: &[f64], count: usize, overflow: bool) -> Vec<(bool, f64)> {
         let mut sorted = v.to_vec();
         sorted.sort_by(|a, b| a.total_cmp(b));
-        let special = [0.0, -0.0, -1.5e308, 1.5e308, sorted[sorted.len() / 3]];
+        let tie = sorted[sorted.len() / 3];
+        let special: Vec<f64> = if overflow { vec![-1.5e308, 1.5e308, 0.0, -0.0, tie] } else { vec![0.0, -0.0, tie] };
         (0..count)
             .map(|j| {
-                let c = if count > 2 && j < special.len() { special[j] } else { sorted[(j * 7_919 + 13) % sorted.len()] };
+                let c = if j < special.len() { special[j] } else { sorted[(j * 7_919 + 13) % sorted.len()] };
                 (j % 2 == 0, c)
             })
             .collect()
@@ -4673,8 +4808,8 @@ mod book_family_tests {
                 let books = family_books(&s, blocks, threshold, 19);
                 let refs: Vec<&FitnessBook> = books.iter().collect();
                 for (kind, v) in vectors.iter().enumerate() {
-                    for count in [2usize, 16, 64] {
-                        let cuts = cut_list(v, count);
+                    for (count, overflow) in [(2usize, false), (2, true), (16, false), (16, true), (64, false), (64, true)] {
+                        let cuts = cut_list(v, count, overflow);
                         let mut want: Vec<Vec<FitnessTotals>> = Vec::new();
                         for book in &refs {
                             for &(above, c) in &cuts {
@@ -4682,20 +4817,28 @@ mod book_family_tests {
                                 want.push(book.block_totals(&pred));
                             }
                         }
-                        for size in [1usize, 20] {
-                            BookFamily::new(refs[..size].to_vec()).unwrap().cut_totals(v, &cuts, &mut scratch, &mut out);
-                            assert_eq!(out.len(), size * count * blocks);
-                            for b in 0..size {
-                                for j in 0..count {
-                                    for k in 0..blocks {
-                                        let (got, exp) = (&out[(b * count + j) * blocks + k], &want[b * count + j][k]);
-                                        checked += 1;
-                                        nonfinite += exp.nonfinite as usize;
-                                        long += (exp.long_rows > 0) as usize;
-                                        if !same(got, exp) {
-                                            mismatches.push(format!(
-                                                "blocks {blocks}, threshold {threshold}, values {kind}, {count} cuts, family {size}, book {b}, cut {j}, block {k}: {got:?} vs {exp:?}"
-                                            ));
+                        // Families of 1, 3 and 20 books; the detected kernels and the portable ones.
+                        for size in [1usize, 3, 20] {
+                            let family = BookFamily::new(refs[..size].to_vec()).unwrap();
+                            for portable in [false, true] {
+                                if portable {
+                                    family_totals(&family, v, &cuts, &mut scratch, &mut out, false);
+                                } else {
+                                    family.cut_totals(v, &cuts, &mut scratch, &mut out);
+                                }
+                                assert_eq!(out.len(), size * count * blocks);
+                                for b in 0..size {
+                                    for j in 0..count {
+                                        for k in 0..blocks {
+                                            let (got, exp) = (&out[(b * count + j) * blocks + k], &want[b * count + j][k]);
+                                            checked += 1;
+                                            nonfinite += exp.nonfinite as usize;
+                                            long += (exp.long_rows > 0) as usize;
+                                            if !same(got, exp) {
+                                                mismatches.push(format!(
+                                                    "blocks {blocks}, threshold {threshold}, values {kind}, {count} cuts (overflow {overflow}), family {size}, portable {portable}, book {b}, cut {j}, block {k}: {got:?} vs {exp:?}"
+                                                ));
+                                            }
                                         }
                                     }
                                 }

@@ -516,6 +516,7 @@ fn below_between(lo: f64, hi: f64) -> f64 {
     }
 }
 
+#[cfg(test)]
 fn multi_select(v: &mut [f64], base: usize, ranks: &[usize], out: &mut Vec<(usize, f64)>) {
     if ranks.is_empty() {
         return;
@@ -526,6 +527,61 @@ fn multi_select(v: &mut [f64], base: usize, ranks: &[usize], out: &mut Vec<(usiz
     out.push((ranks[m], *pivot));
     multi_select(left, base, &ranks[..m], out);
     multi_select(right, base + r + 1, &ranks[m + 1..], out);
+}
+
+/// #1257: the values at positions `ranks` (ascending, distinct, below
+/// `values.len()`) of `values` sorted by `f64::total_cmp`. The 16 high bits of
+/// the order key bin the values; only the bins that hold a wanted position are
+/// gathered into `scratch` and selected. A position of the total order is one
+/// bit pattern, so every exact selection returns the same values.
+fn select_ranks(values: &[f64], ranks: &[usize], scratch: &mut Vec<f64>) -> Vec<(usize, f64)> {
+    let bin = |v: f64| {
+        let b = v.to_bits();
+        let key = if b >> 63 == 1 { !b } else { b | (1 << 63) };
+        (key >> 48) as usize
+    };
+    let mut count = vec![0usize; 1 << 16];
+    for &v in values {
+        count[bin(v)] += 1;
+    }
+    // (rank, bin, position inside the bin) of every wanted rank.
+    let mut want: Vec<(usize, usize, usize)> = Vec::with_capacity(ranks.len());
+    let (mut below, mut b) = (0usize, 0usize);
+    for &r in ranks {
+        while below + count[b] <= r {
+            below += count[b];
+            b += 1;
+        }
+        want.push((r, b, r - below));
+    }
+    // Gather offsets of the wanted bins, at most one per rank.
+    let mut slot = vec![u8::MAX; 1 << 16];
+    let mut start: Vec<usize> = Vec::new();
+    let mut total = 0usize;
+    for &(_, b, _) in &want {
+        if slot[b] == u8::MAX {
+            slot[b] = start.len() as u8;
+            start.push(total);
+            total += count[b];
+        }
+    }
+    scratch.clear();
+    scratch.resize(total, 0.0);
+    let mut next = start.clone();
+    for &v in values {
+        let s = slot[bin(v)];
+        if s != u8::MAX {
+            scratch[next[s as usize]] = v;
+            next[s as usize] += 1;
+        }
+    }
+    want.iter()
+        .map(|&(r, b, local)| {
+            let lo = start[slot[b] as usize];
+            let (_, v, _) = scratch[lo..lo + count[b]].select_nth_unstable_by(local, |x, y| x.total_cmp(y));
+            (r, *v)
+        })
+        .collect()
 }
 
 fn push_unique(cuts: &mut Vec<Cut>, c: Cut) {
@@ -572,11 +628,7 @@ pub fn grid(values: &[f64], q: usize, scratch: &mut Vec<f64>) -> Vec<Cut> {
     }
     ranks.sort_unstable();
     ranks.dedup();
-    scratch.clear();
-    scratch.extend_from_slice(values);
-    let mut found: Vec<(usize, f64)> = Vec::with_capacity(ranks.len());
-    multi_select(scratch, 0, &ranks, &mut found);
-    found.sort_unstable_by_key(|p| p.0);
+    let found = select_ranks(values, &ranks, scratch);
     let at = |r: usize| found[found.binary_search_by_key(&r, |p| p.0).expect("every needed rank is selected")].1;
     for &s in &sh {
         let t = n - k_of(s);
@@ -2598,6 +2650,51 @@ mod tests {
                 Source::Priced
             })
             .collect()
+    }
+
+    /// #1257: the binned selection of the cut grid returns the values of a full
+    /// sort by `total_cmp`, bit for bit, as the #1183 selection does.
+    #[test]
+    fn grid_selection_equals_a_full_sort() {
+        let mut rng = Rng(77);
+        let n = 3 * 8_192 + 77;
+        let vectors: Vec<Vec<f64>> = vec![
+            (0..n).map(|_| rng.gauss()).collect(),
+            (0..n).map(|i| if i % 13 == 0 { [0.0, -0.0][i % 2] } else { (rng.gauss() * 8.0).round() / 8.0 }).collect(),
+            (0..n).map(|i| if i % 3 == 0 { [1.7e308, -1.7e308, 5e-324, -1e-300][i % 4] } else { rng.gauss() * 1e154 }).collect(),
+            (0..n).map(|_| 1.0 + rng.unit() * 1e-12).collect(),
+            (0..40).map(|_| rng.gauss()).collect(),
+            vec![2.5, -0.0, 0.0, 2.5],
+        ];
+        let mut scratch = Vec::new();
+        for (k, v) in vectors.iter().enumerate() {
+            let len = v.len();
+            let mut sorted = v.clone();
+            sorted.sort_by(|a, b| a.total_cmp(b));
+            let mut rank_sets: Vec<Vec<usize>> = vec![(0..len).step_by(len / 37 + 1).chain([len - 1]).collect()];
+            for q in [2usize, 16, 64] {
+                let mut r: Vec<usize> = Vec::new();
+                for s in shares(q) {
+                    let t = ((s * len as f64).round() as usize).clamp(1, len - 1);
+                    r.extend([t - 1, t, len - t - 1, len - t]);
+                }
+                rank_sets.push(r);
+            }
+            for mut ranks in rank_sets {
+                ranks.sort_unstable();
+                ranks.dedup();
+                let got = select_ranks(v, &ranks, &mut scratch);
+                let mut copy = v.clone();
+                let mut reference = Vec::new();
+                multi_select(&mut copy, 0, &ranks, &mut reference);
+                reference.sort_unstable_by_key(|p| p.0);
+                assert_eq!(got.len(), ranks.len(), "vector {k}");
+                for (i, &(r, x)) in got.iter().enumerate() {
+                    assert_eq!((r, x.to_bits()), (ranks[i], sorted[r].to_bits()), "vector {k} rank {r}");
+                    assert_eq!(x.to_bits(), reference[i].1.to_bits(), "vector {k} rank {r}");
+                }
+            }
+        }
     }
 
     /// Copies per rule and root mirrors of a plan.
