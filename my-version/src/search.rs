@@ -3978,6 +3978,9 @@ fn long_pnl_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
     if book.is_masked() && book.band_units() == crate::trading::BandUnits::Sd {
         return Some(crate::gpu::LONG_PNL_MASKED_SD);
     }
+    if book.has_layer() {
+        return Some("--gate-search is priced on the CPU: the device book carries no gate layer");
+    }
     if train.is_multi() {
         return Some("multi-output objective");
     }

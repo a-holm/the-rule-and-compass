@@ -1845,6 +1845,19 @@ pub struct FitnessBook {
     stat: BlockStat,
     /// #1178: the time block of every row; empty for a single block.
     block_id: Vec<u8>,
+    /// #1182: the map from predictions to positions in front of every reduction.
+    layer: Option<std::sync::Arc<dyn PositionLayer>>,
+}
+
+/// #1182: maps a candidate's prediction vector to the positions a
+/// [`FitnessBook`] prices: above the book's threshold is long (`f64::MAX`),
+/// else flat (`f64::MIN`); a non-finite position makes the book `+inf`. A gate
+/// search reads the prediction as the gate value and returns the positions of
+/// the composite of two frozen branches.
+pub trait PositionLayer: Send + Sync + std::fmt::Debug {
+    fn positions(&self, pred: &[f64]) -> Vec<f64>;
+    /// Text that identifies the layer in the book hash.
+    fn identity(&self) -> String;
 }
 
 /// #1023: the `(group, time block)` sub-books of a [`FitnessBook`]: one per run
@@ -2116,6 +2129,7 @@ impl FitnessBook {
             excess_mode: spec.pnl_excess,
             stat: BlockStat::MeanSd,
             block_id,
+            layer: None,
         })
     }
 
@@ -2504,10 +2518,36 @@ impl FitnessBook {
         self.off_rows > 0
     }
 
+    /// #1182: the book with `layer` in front of every reduction: a prediction
+    /// vector is priced as the positions the layer maps it to. Refused on a
+    /// masked or non-plain book and on a threshold that `f64::MAX` and
+    /// `f64::MIN` do not straddle. The layer's identity joins the hash.
+    pub fn with_layer(mut self, layer: std::sync::Arc<dyn PositionLayer>) -> Result<Self, String> {
+        if self.is_masked() || !self.is_plain() || self.layer.is_some() {
+            return Err("a position layer needs a plain, unmasked book without a layer".to_string());
+        }
+        if !(self.threshold > f64::MIN && self.threshold < f64::MAX) {
+            return Err(format!("a position layer needs a threshold strictly between f64::MIN and f64::MAX, got {}", self.threshold));
+        }
+        fnv_u64(&mut self.hash, 0x6c61_7965_72u64);
+        for b in layer.identity().bytes() {
+            fnv_u64(&mut self.hash, b as u64);
+        }
+        self.layer = Some(layer);
+        Ok(self)
+    }
+
+    pub fn has_layer(&self) -> bool {
+        self.layer.is_some()
+    }
+
     /// #1180: the prediction vector with every row outside the regime mask
     /// replaced by the lowest finite score, so the book holds no position
     /// there; a non-finite score outside the mask is ignored.
     fn force_flat<'a>(&self, pred: &'a [f64]) -> std::borrow::Cow<'a, [f64]> {
+        if let Some(layer) = &self.layer {
+            return std::borrow::Cow::Owned(layer.positions(pred));
+        }
         if self.off_rows == 0 {
             return std::borrow::Cow::Borrowed(pred);
         }
@@ -2731,6 +2771,9 @@ impl FitnessBook {
                 time.len(),
                 n
             ));
+        }
+        if self.layer.is_some() {
+            return Err("cut sweep: the book prices its predictions through a gate layer".to_string());
         }
         if self.is_masked() {
             return Err("cut sweep: the book has a regime mask".to_string());
