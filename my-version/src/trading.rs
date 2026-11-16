@@ -398,6 +398,11 @@ fn tree_moments(x: &[f64]) -> Moments {
     warps[0]
 }
 
+/// #1246: the scores of the gate-on rows, in row order; off rows are holes.
+pub fn mask_on_scores(scores: &[f64], flags: &[u8]) -> Vec<f64> {
+    scores.iter().zip(flags).filter(|(_, f)| **f & FITNESS_MASK_OFF == 0).map(|(s, _)| *s).collect()
+}
+
 /// #925, #945: the training-score standard deviation behind `--band-units
 /// sd`, in one pass over the scores: [`tree_moments`] in the fixed device
 /// order, so the device reduction equals it bit for bit on the same `f32`
@@ -463,6 +468,25 @@ impl BandSpec {
             .map(|(_, &t)| t)
             .fold(None, |m: Option<f64>, t| Some(m.map_or(t, |m| m.max(t))));
         BandSpec::from_sd(units, multiple, score_sd(scores), max_time)
+    }
+
+    /// #1246: [`BandSpec::from_training`] over the gate-on rows only; `flags`
+    /// are the training book's [`FitnessBook::flags`], aligned with `scores`
+    /// and `time`.
+    pub fn from_training_masked(units: BandUnits, multiple: f64, scores: &[f64], time: &[f64], flags: &[u8]) -> BandSpec {
+        if units == BandUnits::Score {
+            return BandSpec::score(multiple);
+        }
+        assert_eq!(scores.len(), flags.len(), "scores and mask flags differ in length");
+        let on = mask_on_scores(scores, flags);
+        let max_time = scores
+            .iter()
+            .zip(time)
+            .zip(flags)
+            .filter(|((s, t), f)| *f & FITNESS_MASK_OFF == 0 && s.is_finite() && t.is_finite())
+            .map(|((_, &t), _)| t)
+            .fold(None, |m: Option<f64>, t| Some(m.map_or(t, |m| m.max(t))));
+        BandSpec::from_sd(units, multiple, score_sd(&on), max_time)
     }
 
     /// The band from a computed training-score sd and the latest time of a
@@ -1611,6 +1635,11 @@ pub const FITNESS_WARPS: usize = 8;
 /// training-score sd of [`score_sd`]. The two-pass sd of #925 added no word,
 /// so its checkpoints refuse to resume.
 pub const SCORE_SD_ALGORITHM: u64 = 2;
+/// #1246: the last word of a masked sd-unit book's hash, naming the masked sd
+/// definition (finite scores of the gate-on training rows, in row order). An
+/// earlier masked sd checkpoint priced the validation and test books with the
+/// sd of every training row, so it refuses to resume.
+pub const MASKED_SD_ALGORITHM: u64 = 1;
 /// Most time blocks whose id fits the flags byte ([`FITNESS_BLOCK_SHIFT`]), and
 /// the limit of `--select-blocks` and `--cut-blocks`. A fitness book with more
 /// blocks keeps its ids in [`FitnessBook::block_ids`] only.
@@ -2110,6 +2139,9 @@ impl FitnessBook {
         if spec.pnl_excess == PnlExcess::XsMean {
             fnv_u64(&mut hash, 0x7873_6d65_616e_u64);
         }
+        if mask.is_some() && spec.band.units == BandUnits::Sd {
+            fnv_u64(&mut hash, MASKED_SD_ALGORITHM);
+        }
         Ok(FitnessBook {
             excess,
             flags,
@@ -2501,9 +2533,7 @@ impl FitnessBook {
         match self.band_units {
             BandUnits::Score => self.band,
             BandUnits::Sd if self.off_rows > 0 => {
-                // #1180: the sd reads the rows inside the mask only.
-                let on: Vec<f64> = pred.iter().zip(&self.flags).filter(|(_, f)| *f & FITNESS_MASK_OFF == 0).map(|(p, _)| *p).collect();
-                score_sd(&on).sd.map_or(0.0, |s| self.band * s)
+                score_sd(&mask_on_scores(pred, &self.flags)).sd.map_or(0.0, |s| self.band * s)
             }
             BandUnits::Sd => score_sd(pred).sd.map_or(0.0, |s| self.band * s),
         }

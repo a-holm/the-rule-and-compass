@@ -497,7 +497,8 @@ INPUT:
   --quorum <Q>              fraction of the K members that must vote long, with --policy vote
   --band-units score|sd      how --band is read (default score). sd: b = B x the
                              sample sd of the candidate's finite scores on the
-                             training rows only; the validation and test books
+                             training rows only (with --pnl-mask, the gate-on
+                             training rows); the validation and test books
                              take that b and never compute an sd; a degenerate
                              sd gives b = 0. Needs --band (exit 2 otherwise)
   --require-validation       refuse (exit 2) when there is no validation slice
@@ -1554,19 +1555,23 @@ fn trading_usage(msg: &str) -> ! {
 
 /// #925: the spec of one member's books: an sd-unit band resolved from its
 /// predictions on the training rows, never from the rows the book prices.
+/// #1246: under a regime mask the sd reads the gate-on training rows only,
+/// as the training fitness does.
 fn member_spec(
     tspec: &rcsr::trading::TradingSpec,
     train_pred: &[f64],
     train: Option<&data::TradingSlice>,
+    train_book: Option<&rcsr::trading::FitnessBook>,
 ) -> rcsr::trading::TradingSpec {
     if tspec.band.units != rcsr::trading::BandUnits::Sd {
         return tspec.clone();
     }
     let time = train.map_or(&[][..], |t| t.rows.time.as_slice());
-    rcsr::trading::TradingSpec {
-        band: rcsr::trading::BandSpec::from_training(tspec.band.units, tspec.band.multiple, train_pred, time),
-        ..tspec.clone()
-    }
+    let band = match train_book.filter(|b| b.is_masked()) {
+        Some(b) => rcsr::trading::BandSpec::from_training_masked(tspec.band.units, tspec.band.multiple, train_pred, time, b.flags()),
+        None => rcsr::trading::BandSpec::from_training(tspec.band.units, tspec.band.multiple, train_pred, time),
+    };
+    rcsr::trading::TradingSpec { band, ..tspec.clone() }
 }
 
 /// #480: the `"fitness"` member of a Pareto entry, in exact CPU `f64` on the
@@ -7854,7 +7859,7 @@ fn main() {
             let (objective_value, validation_book_json) = match (&trading_spec, book_validation, prepared.trading.as_ref().and_then(|t| t.validation.as_ref())) {
                 (Some(tspec), Some(v), Some(slice)) => {
                     let ctx = prepared.trading.as_ref().and_then(|t| t.validation_context.as_ref());
-                    let mspec = rcsr::trading::TradingSpec { segment_starts: validation_segments.clone(), ..member_spec(tspec, &book_pred, train_slice) };
+                    let mspec = rcsr::trading::TradingSpec { segment_starts: validation_segments.clone(), ..member_spec(tspec, &book_pred, train_slice, fitness_book.as_deref()) };
                     match trading_book(&s.tree, &v.x, slice, ctx, &mspec) {
                         Ok(stats) => {
                             // #849: a fixed-position member is unusable as a finalist with the flag.
@@ -8059,7 +8064,7 @@ fn main() {
             let mut spec_of = |i: usize| {
                 let tree = &sorted[rows[i].archive_rank - 1].tree;
                 let train_pred: Vec<f64> = book_train.x.iter().map(|row| expr::eval(tree, row)).collect();
-                rcsr::trading::TradingSpec { segment_starts: validation_segments.clone(), ..member_spec(tspec, &train_pred, train_slice) }
+                rcsr::trading::TradingSpec { segment_starts: validation_segments.clone(), ..member_spec(tspec, &train_pred, train_slice, fitness_book.as_deref()) }
             };
             let picked = rcsr::selection::select_robust_specs_cuts(&metas, robust_params, interval_cuts.as_deref(), &mut spec_of, &ret, &book_rows, &mut |i| {
                 trading_pred(&sorted[rows[i].archive_rank - 1].tree, &v.x, ctx)
@@ -8101,7 +8106,7 @@ fn main() {
                 let mut words = Vec::new();
                 for c in code.candidates(tree) {
                     let train_pred: Vec<f64> = book_train.x.iter().map(|row| expr::eval(&c.tree, row)).collect();
-                    let base = member_spec(tspec, &train_pred, train_slice);
+                    let base = member_spec(tspec, &train_pred, train_slice, fitness_book.as_deref());
                     let val_pred = trading_pred(&c.tree, &v.x, vctx);
                     let Some((series, entries, hold)) = dev_books.alpha(&train_pred, &val_pred, &base) else {
                         continue;
@@ -8152,7 +8157,7 @@ fn main() {
             let tree = &sorted[top.archive_rank - 1].tree;
             // #925: the validation and test books take the band resolved on the training rows.
             let train_pred: Vec<f64> = book_train.x.iter().map(|row| expr::eval(tree, row)).collect();
-            let fspec = member_spec(tspec, &train_pred, train_slice);
+            let fspec = member_spec(tspec, &train_pred, train_slice, fitness_book.as_deref());
             let book = |sample: &data::Sample, slice: Option<&data::TradingSlice>, ctx: Option<&data::TradingContext>, segments: &[f64]| match slice {
                 Some(slice) => trading_book(tree, &sample.x, slice, ctx, &rcsr::trading::TradingSpec { segment_starts: segments.to_vec(), ..fspec.clone() }),
                 None => Err("no trading rows".to_string()),
