@@ -823,9 +823,9 @@ OPTIONS:
 
 REFUSED (exit 2): --gpu, --pnl-mask, --pnl-mask-band, --pnl-mask-dwell, --band, --band-units,
   --min-holding, --sample-rows, a non-zero --cash-return, --missing-score, --seed-expr, --seed-file,
-  --eval-expr, --resume, --save, --reselect, --reselect-run, an operator that is not unary or
-  binary, --null-shifts 1 to 18, fewer distinct shifts than R. A class with no finite member
-  exits 1.
+  --eval-expr, --resume, --save, --reselect, --reselect-run, --gate-search, --branch-on,
+  --branch-off, --gate-band, --gate-dwell, an operator that is not unary or binary,
+  --null-shifts 1 to 18, fewer distinct shifts than R. A class with no finite member exits 1.
 See docs/optimisation.md (exhaustive enumeration) and docs/overfitting.md 3.12."
 }
 
@@ -901,7 +901,8 @@ pub fn claim(args: &[String]) -> Vec<String> {
             }
             "--sample-rows" => fail("--sample-rows: the class optimum is certified over every training row and the family null shifts a contiguous series; drop --sample-rows or load the full store"),
             "--missing-score" => fail("--missing-score: a tree with a non-finite training prediction is dropped, and the validation book prices the score rule of the search"),
-            "--seed-expr" | "--seed-file" | "--eval-expr" | "--resume" | "--save" | "--reselect" | "--reselect-run" => {
+            "--seed-expr" | "--seed-file" | "--eval-expr" | "--resume" | "--save" | "--reselect" | "--reselect-run" | "--gate-search" | "--branch-on"
+            | "--branch-off" | "--gate-band" | "--gate-dwell" => {
                 fail(&format!("{}: the class is fixed by --vars, --ops and --max-size", flag))
             }
             "--vars" | "--ops" => {
