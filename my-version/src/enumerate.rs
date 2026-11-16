@@ -19,13 +19,21 @@
 //! family null rotates every group's returns by one shared fraction of its
 //! length (the rule of [`crate::baselines::shifted_positions`]), rebuilds the
 //! book and keeps the best class fitness of each shift.
+//!
+//! #1257: one pass per tree prices every cut on every book of a batch
+//! ([`BookFamily::cut_totals`], bit for bit [`FitnessBook::block_totals`]). A
+//! scored tree whose predictions are those of an earlier scored tree bit for
+//! bit ([`REUSE_RULES`]) copies its outcome, a root `sub(b, a)` derives its
+//! outcome from `sub(a, b)` when their cut grids are exact negations, and the
+//! trees that share their largest child evaluate it once. The class, its order
+//! and the report do not change.
 
 use crate::data::{Sample, TradingSlice, TradingSplit};
 use crate::devlog::{num, text, Json};
 use crate::eval_soa;
 use crate::expr::{self, Node, Op};
-use crate::trading::{BlockStat, FitnessBook, FitnessTotals, Objective, TradingRows, TradingSpec};
-use std::collections::{BTreeSet, HashSet};
+use crate::trading::{BlockStat, BookFamily, CutScratch, FitnessBook, FitnessTotals, Objective, TradingRows, TradingSpec};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub const SCHEMA: &str = "rcsr-enumerate/1";
@@ -41,8 +49,12 @@ pub const DEFAULT_TOP: usize = 50;
 pub const MIN_NULL_SHIFTS: usize = 19;
 /// Books priced together in one pass over the class.
 const BOOK_BATCH: usize = 20;
-/// Trees a worker takes at a time.
+/// Trees a worker of the reference pass takes at a time.
+#[cfg(test)]
 const CHUNK: usize = 8;
+/// #1257: the rules that copy a tree's outcome from an earlier scored tree,
+/// then the root mirror; the `work.reused` keys of the report.
+pub const REUSE_RULES: [&str; 5] = ["abs_of_nonnegative", "even_of_reversed_sub", "even_of_abs", "self_product", "root_mirror"];
 
 type Fail = (i32, String);
 
@@ -149,14 +161,52 @@ struct Entry {
     b: u32,
 }
 
+/// #1257: where the outcome of one scored tree comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Source {
+    /// Evaluated and cut on its own.
+    Priced,
+    /// The outcome of the earlier scored tree at position `twin`: their
+    /// predictions are equal bit for bit by rule `rule` of [`REUSE_RULES`] (the
+    /// first in that order that its canonical form applied).
+    Copy { twin: u32, rule: u8 },
+    /// `sub(b, a)` at the root with `sub(a, b)` scored earlier at `twin`: the
+    /// outcome follows from the twin's when the two cut grids pair up.
+    Mirror { twin: u32 },
+}
+
+/// #1257: the scored trees that share the child `key` (the larger child, the
+/// only child, or the leaf itself), in class order; one worker evaluates `key`
+/// once for all of them.
+#[derive(Clone, Debug, Default)]
+struct Unit {
+    key: u32,
+    members: Vec<u32>,
+}
+
+/// #1257: the data-free part of a pass: the source of every scored tree and the
+/// work units.
+#[derive(Clone, Debug, Default)]
+struct Plan {
+    sources: Vec<Source>,
+    /// Largest first; the order does not change the result.
+    units: Vec<Unit>,
+    /// Per scored position: some mirror derives its outcome from this tree.
+    twins: Vec<bool>,
+}
+
 /// The trees of a class in class order.
 pub struct Class {
     ops: Vec<Op>,
     max_size: usize,
+    canonical: bool,
     entries: Vec<Entry>,
     /// `bounds[s]..bounds[s + 1]` are the entries of size `s`; `bounds[0]` is unused.
     bounds: Vec<usize>,
+    /// The first entry of each (size, operator, left child size) run, at [`Class::run_slot`].
+    starts: Vec<usize>,
     scored: Vec<u32>,
+    plan: Plan,
 }
 
 impl Class {
@@ -176,15 +226,18 @@ impl Class {
         }
         let mut entries: Vec<Entry> = (0..nvars).map(|v| Entry { op: Op::Input, a: v as u32, b: 0 }).collect();
         let mut bounds = vec![0usize, 0, nvars];
+        let mut starts = vec![usize::MAX; (max_size + 1) * ops.len() * (max_size + 1)];
         for s in 2..=max_size {
-            for &op in &ops {
+            for (oi, &op) in ops.iter().enumerate() {
                 if op.arity() == 1 {
+                    starts[(s * ops.len() + oi) * (max_size + 1)] = entries.len();
                     for c in bounds[s - 1]..bounds[s] {
                         entries.push(Entry { op, a: c as u32, b: 0 });
                     }
                     continue;
                 }
                 for ls in 1..s - 1 {
+                    starts[(s * ops.len() + oi) * (max_size + 1) + ls] = entries.len();
                     let rs = s - 1 - ls;
                     for l in bounds[ls]..bounds[ls + 1] {
                         for r in bounds[rs]..bounds[rs + 1] {
@@ -204,7 +257,161 @@ impl Class {
                 !(canonical && op.arity() == 1 && root_skipped(op, &ops))
             })
             .collect();
-        Ok(Class { ops, max_size, entries, bounds, scored })
+        let mut class = Class { ops, max_size, canonical, entries, bounds, starts, scored, plan: Plan::default() };
+        class.plan = class.make_plan();
+        Ok(class)
+    }
+
+    /// The child a work unit shares: the only child, the larger child (a larger
+    /// size has a larger index), or a leaf itself. `sub(a, b)` and `sub(b, a)`
+    /// share it.
+    fn key_of(&self, e: u32) -> u32 {
+        let en = self.entries[e as usize];
+        match en.op.arity() {
+            0 => e,
+            1 => en.a,
+            _ => en.a.max(en.b),
+        }
+    }
+
+    fn run_slot(&self, s: usize, oi: usize, ls: usize) -> usize {
+        (s * self.ops.len() + oi) * (self.max_size + 1) + ls
+    }
+
+    /// The entry of `op(a)` or `op(a, b)` over entries `a` and `b`; `None` when
+    /// the class does not hold it (too large, a left-out child order or self
+    /// pair, or an operator outside `--ops`).
+    fn lookup(&self, op: Op, a: u32, b: u32) -> Option<u32> {
+        let oi = self.ops.iter().position(|&o| o == op)?;
+        let (a, b) = (a as usize, b as usize);
+        let sa = self.size_of(a);
+        let i = a - self.bounds[sa];
+        if op.arity() == 1 {
+            return (sa < self.max_size).then(|| (self.starts[self.run_slot(sa + 1, oi, 0)] + i) as u32);
+        }
+        let sb = self.size_of(b);
+        if sa + sb + 1 > self.max_size {
+            return None;
+        }
+        let (la, lb, j) = (self.pool_len(sa), self.pool_len(sb), b - self.bounds[sb]);
+        let off = if !self.canonical {
+            i * lb + j
+        } else if commutative(op) {
+            match sa.cmp(&sb) {
+                std::cmp::Ordering::Less => i * lb + j,
+                std::cmp::Ordering::Equal if j >= i => i * la - (i * i - i) / 2 + (j - i),
+                _ => return None,
+            }
+        } else if self_pair_skipped(op) && sa == sb {
+            if i == j {
+                return None;
+            }
+            i * (la - 1) + if j < i { j } else { j - 1 }
+        } else {
+            i * lb + j
+        };
+        Some((self.starts[self.run_slot(sa + sb + 1, oi, sa)] + off) as u32)
+    }
+
+    /// The entry of `op(a, b)` over canonical entries after the rules of
+    /// [`REUSE_RULES`] at the root, repeated until none applies, and the rules
+    /// applied so far (`mask`, bit `k` for rule `k`). Every rule moves to an
+    /// earlier entry, so the loop ends. `None` when the result is not in the class.
+    fn reduce(&self, mut op: Op, mut a: u32, mut b: u32, mut mask: u8) -> Option<(u32, u8)> {
+        loop {
+            if op.arity() == 1 {
+                let child = self.entries[a as usize];
+                if op == Op::Abs && matches!(child.op, Op::Abs | Op::Exp | Op::Square | Op::Gauss | Op::Logistic | Op::Tanh) {
+                    return Some((a, mask | 1));
+                }
+                if matches!(op, Op::Abs | Op::Square | Op::Gauss) && child.op == Op::Sub {
+                    if let Some(t) = self.lookup(Op::Sub, child.b, child.a).filter(|&t| t < a) {
+                        a = t;
+                        mask |= 2;
+                        continue;
+                    }
+                }
+                if matches!(op, Op::Square | Op::Gauss) && child.op == Op::Abs {
+                    a = child.a;
+                    mask |= 4;
+                    continue;
+                }
+                return self.lookup(op, a, 0).map(|t| (t, mask));
+            }
+            if commutative(op) && b < a {
+                std::mem::swap(&mut a, &mut b);
+            }
+            if op == Op::Mul && a == b && self.ops.contains(&Op::Square) {
+                op = Op::Square;
+                mask |= 8;
+                continue;
+            }
+            return self.lookup(op, a, b).map(|t| (t, mask));
+        }
+    }
+
+    /// The canonical forms bottom up, the source of every scored tree and the
+    /// units. A raw class prices every tree.
+    fn make_plan(&self) -> Plan {
+        let n = self.entries.len();
+        let (mut canon, mut applied) = (Vec::new(), Vec::new());
+        if self.canonical {
+            canon = vec![0u32; n];
+            applied = vec![0u8; n];
+            for e in 0..n {
+                let en = self.entries[e];
+                let (a, b) = (en.a as usize, en.b as usize);
+                let found = match en.op.arity() {
+                    0 => None,
+                    1 => self.reduce(en.op, canon[a], 0, applied[a]),
+                    _ => self.reduce(en.op, canon[a], canon[b], applied[a] | applied[b]),
+                };
+                let (c, m) = found.unwrap_or((e as u32, 0));
+                canon[e] = c;
+                applied[e] = if c == e as u32 { 0 } else { m };
+            }
+        }
+        let position = |e: u32| self.scored.binary_search(&e).ok().map(|p| p as u32);
+        let sources: Vec<Source> = self
+            .scored
+            .iter()
+            .map(|&e| {
+                if !self.canonical {
+                    return Source::Priced;
+                }
+                let c = canon[e as usize];
+                if c != e {
+                    let mask = applied[e as usize];
+                    return match position(c) {
+                        Some(twin) if mask != 0 => Source::Copy { twin, rule: mask.trailing_zeros() as u8 },
+                        _ => Source::Priced,
+                    };
+                }
+                let en = self.entries[e as usize];
+                match (en.op == Op::Sub).then(|| self.lookup(Op::Sub, en.b, en.a)).flatten().filter(|&t| t < e).and_then(position) {
+                    Some(twin) => Source::Mirror { twin },
+                    None => Source::Priced,
+                }
+            })
+            .collect();
+        let mut keyed: Vec<(u32, u32)> =
+            sources.iter().enumerate().filter(|(_, s)| !matches!(s, Source::Copy { .. })).map(|(p, _)| (self.key_of(self.scored[p]), p as u32)).collect();
+        keyed.sort_unstable();
+        let mut units: Vec<Unit> = Vec::new();
+        for (key, p) in keyed {
+            match units.last_mut() {
+                Some(u) if u.key == key => u.members.push(p),
+                _ => units.push(Unit { key, members: vec![p] }),
+            }
+        }
+        units.sort_by(|x, y| y.members.len().cmp(&x.members.len()).then(x.key.cmp(&y.key)));
+        let mut twins = vec![false; sources.len()];
+        for s in &sources {
+            if let Source::Mirror { twin } = s {
+                twins[*twin as usize] = true;
+            }
+        }
+        Plan { sources, units, twins }
     }
 
     pub fn ops(&self) -> &[Op] {
@@ -279,7 +486,7 @@ impl Cut {
 /// The long-row shares of `q` cuts: `0.5 * 0.7^j` for `j < q / 2`, on each side, by
 /// repeated multiplication (a `powi` folded at compile time can differ in the last bit).
 pub fn shares(q: usize) -> Vec<f64> {
-    let mut s = 0.5f64;
+    let mut s = 0.49f64;
     (0..q / 2)
         .map(|_| {
             let v = s;
@@ -382,6 +589,7 @@ pub fn grid(values: &[f64], q: usize, scratch: &mut Vec<f64>) -> Vec<Cut> {
     cuts
 }
 
+#[cfg(test)]
 fn fill(pred: &mut [f64], vals: &[f64], cut: &Cut, threshold: f64) {
     let c = cut.constant(threshold);
     match cut.side {
@@ -433,6 +641,34 @@ pub enum Outcome {
     Scored { fitness: f64, cut: Cut, cuts: usize },
 }
 
+/// #1257: the work of a pass over the class.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Work {
+    /// Scored trees whose outcome is reused, per rule of [`REUSE_RULES`].
+    pub reused: [u64; 5],
+    /// Root mirrors whose cut grids do not pair with the twin's: priced in full.
+    pub mirror_priced: u64,
+    /// Scored trees whose outcome comes from their own values: the scored trees
+    /// minus the reused ones.
+    pub priced: u64,
+    /// Passes over the class, one per batch of books.
+    pub book_batches: u64,
+}
+
+impl Work {
+    /// The `work` member of `rcsr-enumerate/1`.
+    pub fn json(&self) -> String {
+        let reused: Vec<String> = REUSE_RULES.iter().zip(self.reused).map(|(k, n)| format!("{}:{}", text(k), n)).collect();
+        format!(
+            "{{\"reused\":{{{}}},\"mirror_priced\":{},\"priced\":{},\"book_batches\":{}}}",
+            reused.join(","),
+            self.mirror_priced,
+            self.priced,
+            self.book_batches
+        )
+    }
+}
+
 /// One pass of the class over several books.
 pub struct Pass {
     /// Per book, the lowest fitness of the class (`+inf` when none is finite).
@@ -442,15 +678,272 @@ pub struct Pass {
     pub outcomes: Vec<Outcome>,
     /// With detail: the distinct books of the first book, by [`book_key`].
     pub books: HashSet<u64>,
+    /// #1257: per scored tree, a root mirror whose outcome follows from its
+    /// twin; a later batch of books skips it.
+    pub derived: Vec<bool>,
+    /// #1257: the trees priced and reused (`book_batches` is 1).
+    pub work: Work,
 }
 
+#[derive(Default)]
 struct Part {
     best: Vec<f64>,
     outcomes: Vec<(usize, Outcome)>,
     books: HashSet<u64>,
+    derived: Vec<usize>,
 }
 
-fn worker(scan: &Scan, books: &[&FitnessBook], detail: bool, next: &AtomicUsize) -> Part {
+/// #1257: what the workers of one pass share.
+struct Shared<'a> {
+    scan: &'a Scan<'a>,
+    plan: &'a Plan,
+    family: BookFamily<'a>,
+    detail: bool,
+    /// The derived mirrors of an earlier pass over the class: skipped.
+    known: Option<&'a [bool]>,
+}
+
+/// #1257: the buffers of the fused pricing of one tree.
+#[derive(Default)]
+struct Pricer {
+    scratch: CutScratch,
+    totals: Vec<FitnessTotals>,
+    consts: Vec<(bool, f64)>,
+    /// The fitness of every cut on the first book.
+    fit: Vec<f64>,
+}
+
+impl Pricer {
+    /// Every cut of `vals` on every book of the family in one pass over the
+    /// rows; the outcome takes the earliest cut on a tie.
+    fn price(&mut self, family: &BookFamily, vals: &[f64], cuts: &[Cut], detail: bool, part: &mut Part) -> Outcome {
+        let books = family.books();
+        let threshold = books[0].threshold();
+        self.consts.clear();
+        self.consts.extend(cuts.iter().map(|c| (c.side == Side::Above, c.constant(threshold))));
+        family.cut_totals(vals, &self.consts, &mut self.scratch, &mut self.totals);
+        let (q, nb) = (cuts.len(), books[0].blocks());
+        self.fit.clear();
+        let (mut own, mut own_cut) = (f64::INFINITY, cuts[0]);
+        for (k, cut) in cuts.iter().enumerate() {
+            for (b, book) in books.iter().enumerate() {
+                let at = (b * q + k) * nb;
+                let totals = &self.totals[at..at + nb];
+                let f = book.fitness_of(totals);
+                if b == 0 {
+                    if detail {
+                        part.books.insert(book_key(totals));
+                    }
+                    self.fit.push(f);
+                    if f <= own {
+                        own = f;
+                        own_cut = *cut;
+                    }
+                }
+                if f < part.best[b] {
+                    part.best[b] = f;
+                }
+            }
+        }
+        Outcome::Scored { fitness: own, cut: own_cut, cuts: q }
+    }
+}
+
+/// #1257: the outcome of the root mirror `sub(b, a)` from its twin `sub(a, b)`;
+/// `None` when a cut of the mirror has no twin cut on the other side at the
+/// exact negated value. `b - a` is `-(a - b)` bit for bit (both `+0` when
+/// `a == b`) and the constants of paired cuts are exact negations
+/// ([`Cut::constant`] is `value - t` or `value + t`, and rounding commutes with
+/// negation), so the mirror's `v - c` and the twin's `c' - v'` are the same
+/// `f64` up to the sign of a zero: every row has the same long bit at any
+/// threshold, and every book of a pair is the same.
+fn mirror_outcome(cuts: &[Cut], twin: &[Cut], twin_fit: &[f64]) -> Option<Outcome> {
+    if cuts.len() != twin.len() {
+        return None;
+    }
+    let (mut own, mut own_cut) = (f64::INFINITY, cuts[0]);
+    for c in cuts {
+        let side = match c.side {
+            Side::Above => Side::Below,
+            Side::Below => Side::Above,
+        };
+        let bits = (-c.value).to_bits();
+        let j = twin.iter().position(|t| t.side == side && t.value.to_bits() == bits)?;
+        if twin_fit[j] < own {
+            own = twin_fit[j];
+            own_cut = *c;
+        }
+    }
+    Some(Outcome::Scored { fitness: own, cut: own_cut, cuts: cuts.len() })
+}
+
+/// The values of entry `e` over the columns, through the column evaluator.
+fn eval_entry(class: &Class, e: usize, cols: &[Vec<f64>], rows: usize, out: &mut Vec<f64>, scratch: &mut eval_soa::Scratch) {
+    out.resize(rows, 0.0);
+    let program = eval_soa::compile(&class.node(e)).expect("every class operator compiles");
+    eval_soa::eval_batch_into(&program, cols, rows, out, scratch);
+}
+
+/// The rows of child `x` of a tree of the unit with key `key`: the key's rows,
+/// an input column, or the other child's buffer.
+fn operand<'b>(class: &Class, x: u32, key: u32, key_vals: &'b [f64], cols: &'b [Vec<f64>], other: &'b [f64]) -> &'b [f64] {
+    let en = class.entries[x as usize];
+    if x == key {
+        key_vals
+    } else if en.op == Op::Input {
+        &cols[en.a as usize]
+    } else {
+        other
+    }
+}
+
+fn worker(sh: &Shared, next: &AtomicUsize) -> Part {
+    let class = sh.scan.class;
+    let (cols, n) = (sh.scan.cols, sh.scan.rows);
+    let mut part = Part { best: vec![f64::INFINITY; sh.family.books().len()], ..Part::default() };
+    let (mut key_buf, mut other, mut vals) = (Vec::new(), Vec::new(), Vec::new());
+    let mut sel: Vec<f64> = Vec::with_capacity(n);
+    let mut eval = eval_soa::Scratch::new();
+    let mut pricer = Pricer::default();
+    let mut twins: HashMap<u32, (Vec<Cut>, Vec<f64>)> = HashMap::new();
+    let skipped = |pos: u32| matches!(sh.plan.sources[pos as usize], Source::Mirror { .. }) && sh.known.is_some_and(|k| k[pos as usize]);
+    while let Some(unit) = sh.plan.units.get(next.fetch_add(1, Ordering::Relaxed)) {
+        if unit.members.iter().all(|&p| skipped(p)) {
+            continue;
+        }
+        twins.clear();
+        let key = class.entries[unit.key as usize];
+        if key.op != Op::Input {
+            eval_entry(class, unit.key as usize, cols, n, &mut key_buf, &mut eval);
+        }
+        let key_vals: &[f64] = if key.op == Op::Input { &cols[key.a as usize] } else { &key_buf };
+        for &pos in &unit.members {
+            if skipped(pos) {
+                continue;
+            }
+            let p = pos as usize;
+            let en = class.entries[class.scored[p] as usize];
+            let tree: &[f64] = match en.op.arity() {
+                0 => key_vals,
+                1 => {
+                    vals.resize(n, 0.0);
+                    assert!(eval_soa::apply_rows(en.op, key_vals, &[], &mut vals), "every class operator applies");
+                    &vals
+                }
+                _ => {
+                    for x in [en.a, en.b] {
+                        if x != unit.key && class.entries[x as usize].op != Op::Input {
+                            eval_entry(class, x as usize, cols, n, &mut other, &mut eval);
+                        }
+                    }
+                    vals.resize(n, 0.0);
+                    let l = operand(class, en.a, unit.key, key_vals, cols, &other);
+                    let r = operand(class, en.b, unit.key, key_vals, cols, &other);
+                    assert!(eval_soa::apply_rows(en.op, l, r, &mut vals), "every class operator applies");
+                    &vals
+                }
+            };
+            let mirror = matches!(sh.plan.sources[p], Source::Mirror { .. }) && sh.known.is_none();
+            let mut derived = mirror;
+            let outcome = if tree.iter().any(|v| !v.is_finite()) {
+                Outcome::NonFinite
+            } else {
+                let cuts = grid(tree, sh.scan.cuts, &mut sel);
+                if cuts.is_empty() {
+                    Outcome::Constant
+                } else {
+                    let from_twin = match sh.plan.sources[p] {
+                        Source::Mirror { twin } if mirror => twins.get(&twin).and_then(|(c, f)| mirror_outcome(&cuts, c, f)),
+                        _ => None,
+                    };
+                    match from_twin {
+                        Some(o) => o,
+                        None => {
+                            derived = false;
+                            let o = pricer.price(&sh.family, tree, &cuts, sh.detail, &mut part);
+                            if sh.plan.twins[p] && sh.known.is_none() {
+                                twins.insert(pos, (cuts, pricer.fit.clone()));
+                            }
+                            o
+                        }
+                    }
+                }
+            };
+            if derived {
+                part.derived.push(p);
+            }
+            if sh.detail {
+                part.outcomes.push((p, outcome));
+            }
+        }
+    }
+    part
+}
+
+/// Scores every tree of the class at every cut on each book. The books share
+/// the training rows and the threshold ([`BookFamily`]). The result does not
+/// depend on the thread count: trees are merged by class position and minima
+/// are order free.
+pub fn pass(scan: &Scan, books: &[&FitnessBook], detail: bool) -> Pass {
+    pass_with(scan, &scan.class.plan, books, detail, None)
+}
+
+/// [`pass`] over the units of `plan`; `known` holds the derived mirrors of an
+/// earlier pass over the same class, which this pass skips.
+fn pass_with(scan: &Scan, plan: &Plan, books: &[&FitnessBook], detail: bool, known: Option<&[bool]>) -> Pass {
+    let family = BookFamily::new(books.to_vec()).expect("the books of a pass share their rows");
+    let trees = scan.class.scored().len();
+    let next = AtomicUsize::new(0);
+    let threads = scan.threads.max(1).min(plan.units.len().max(1));
+    let shared = Shared { scan, plan, family, detail, known };
+    let parts: Vec<Part> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..threads).map(|_| s.spawn(|| worker(&shared, &next))).collect();
+        handles.into_iter().map(|h| h.join().expect("an enumerate worker panicked")).collect()
+    });
+    let mut out = Pass {
+        best: vec![f64::INFINITY; books.len()],
+        outcomes: if detail { vec![Outcome::Constant; trees] } else { Vec::new() },
+        books: HashSet::new(),
+        derived: known.map_or_else(|| vec![false; trees], <[bool]>::to_vec),
+        work: Work::default(),
+    };
+    for p in parts {
+        for (b, f) in p.best.iter().enumerate() {
+            if *f < out.best[b] {
+                out.best[b] = *f;
+            }
+        }
+        for (pos, o) in p.outcomes {
+            out.outcomes[pos] = o;
+        }
+        out.books.extend(p.books);
+        for pos in p.derived {
+            out.derived[pos] = true;
+        }
+    }
+    let mut work = Work { book_batches: 1, ..Work::default() };
+    for (pos, source) in plan.sources.iter().enumerate() {
+        match *source {
+            Source::Copy { twin, rule } => {
+                work.reused[rule as usize] += 1;
+                if detail {
+                    out.outcomes[pos] = out.outcomes[twin as usize];
+                }
+            }
+            Source::Mirror { .. } if out.derived[pos] => work.reused[4] += 1,
+            Source::Mirror { .. } => work.mirror_priced += 1,
+            Source::Priced => {}
+        }
+    }
+    work.priced = trees as u64 - work.reused.iter().sum::<u64>();
+    out.work = work;
+    out
+}
+
+/// The #1183 pass: every tree evaluated from its leaves and every cut priced by
+/// [`FitnessBook::block_totals`] on the explicit prediction, book by book.
+#[cfg(test)]
+fn worker_reference(scan: &Scan, books: &[&FitnessBook], detail: bool, next: &AtomicUsize) -> Part {
     let trees = scan.class.scored();
     let n = scan.rows;
     let threshold = books.first().map_or(0.0, |b| b.threshold());
@@ -458,7 +951,7 @@ fn worker(scan: &Scan, books: &[&FitnessBook], detail: bool, next: &AtomicUsize)
     let mut pred = vec![0.0f64; n];
     let mut sel: Vec<f64> = Vec::with_capacity(n);
     let mut scratch = eval_soa::Scratch::new();
-    let mut part = Part { best: vec![f64::INFINITY; books.len()], outcomes: Vec::new(), books: HashSet::new() };
+    let mut part = Part { best: vec![f64::INFINITY; books.len()], ..Part::default() };
     loop {
         let lo = next.fetch_add(1, Ordering::Relaxed) * CHUNK;
         if lo >= trees.len() {
@@ -506,21 +999,22 @@ fn worker(scan: &Scan, books: &[&FitnessBook], detail: bool, next: &AtomicUsize)
     part
 }
 
-/// Scores every tree of the class at every cut on each book. The books share
-/// the training rows and the threshold. The result does not depend on the
-/// thread count: trees are merged by class position and minima are order free.
-pub fn pass(scan: &Scan, books: &[&FitnessBook], detail: bool) -> Pass {
+/// The #1183 pass, the reference the fused pass is held to.
+#[cfg(test)]
+fn pass_reference(scan: &Scan, books: &[&FitnessBook], detail: bool) -> Pass {
     let trees = scan.class.scored().len();
     let next = AtomicUsize::new(0);
     let threads = scan.threads.max(1).min(trees.div_ceil(CHUNK).max(1));
     let parts: Vec<Part> = std::thread::scope(|s| {
-        let handles: Vec<_> = (0..threads).map(|_| s.spawn(|| worker(scan, books, detail, &next))).collect();
+        let handles: Vec<_> = (0..threads).map(|_| s.spawn(|| worker_reference(scan, books, detail, &next))).collect();
         handles.into_iter().map(|h| h.join().expect("an enumerate worker panicked")).collect()
     });
     let mut out = Pass {
         best: vec![f64::INFINITY; books.len()],
         outcomes: if detail { vec![Outcome::Constant; trees] } else { Vec::new() },
         books: HashSet::new(),
+        derived: Vec::new(),
+        work: Work::default(),
     };
     for p in parts {
         for (b, f) in p.best.iter().enumerate() {
@@ -800,7 +1294,12 @@ USAGE:
   predictions (long-row shares 0.5 * 0.7^j for pred > cut and for pred < cut; a
   tree with fewer than Q distinct values uses every midpoint) and every cut is
   priced by the search's fitness book on the expression (tree - c) or (c - tree).
-  A tree with a non-finite training prediction is dropped and counted.
+  A tree with a non-finite training prediction is dropped and counted. One walk
+  over the rows prices every cut of a tree on every book of a batch; a tree whose
+  predictions equal an earlier scored tree's bit for bit (abs of a non-negative
+  tree, abs, square or gauss of a reversed sub, square or gauss of abs, mul(a, a))
+  copies its outcome, a root sub(b, a) takes the outcome of sub(a, b) when their
+  cut grids are exact negations, and the report counts both in work.
 
 OPTIONS:
   --max-size <N>        largest tree, in nodes (default 3; above 4 needs --allow-large; at most 6)
@@ -1202,10 +1701,12 @@ fn run(req: &Request, inp: &Inputs) -> Result<(String, String, Vec<String>), Fai
     drop(extra);
     let class_seconds = started.elapsed().as_secs_f64();
     let mut null_best: Vec<f64> = p1.best[1..].to_vec();
+    let mut work = p1.work;
     for chunk in nums[first..].chunks(BOOK_BATCH) {
         let batch = shifted_books(chunk)?;
         let refs: Vec<&FitnessBook> = batch.iter().collect();
-        null_best.extend(pass(&scan, &refs, false).best);
+        null_best.extend(pass_with(&scan, &class.plan, &refs, false, Some(&p1.derived)).best);
+        work.book_batches += 1;
     }
     let observed = p1.best[0];
     if !observed.is_finite() {
@@ -1329,7 +1830,7 @@ fn run(req: &Request, inp: &Inputs) -> Result<(String, String, Vec<String>), Fai
     );
     let seconds = started.elapsed().as_secs_f64();
     let json = format!(
-        "{{\"schema\":{},\"tool\":\"rcsr\",\"version\":{},\"target\":{},\"book\":{},\"split\":{},\"class\":{},\"best\":[{}],\"top\":[{}],\"null\":{},\"compare\":{},\"timing\":{{\"threads\":{},\"seconds\":{},\"class_seconds\":{},\"null_seconds\":{}}}}}",
+        "{{\"schema\":{},\"tool\":\"rcsr\",\"version\":{},\"target\":{},\"book\":{},\"split\":{},\"class\":{},\"best\":[{}],\"top\":[{}],\"null\":{},\"compare\":{},\"work\":{},\"timing\":{{\"threads\":{},\"seconds\":{},\"class_seconds\":{},\"null_seconds\":{}}}}}",
         text(SCHEMA),
         text(env!("CARGO_PKG_VERSION")),
         text(inp.target),
@@ -1340,6 +1841,7 @@ fn run(req: &Request, inp: &Inputs) -> Result<(String, String, Vec<String>), Fai
         top_json.join(","),
         null_json,
         compared.as_ref().map_or_else(|| "null".to_string(), |c| c.0.clone()),
+        work.json(),
         scan.threads,
         num(seconds),
         num(class_seconds),
@@ -1417,6 +1919,15 @@ fn run(req: &Request, inp: &Inputs) -> Result<(String, String, Vec<String>), Fai
             }
         }
     }
+    let reused: Vec<String> = REUSE_RULES.iter().zip(work.reused).map(|(k, n)| format!("{} {}", k, n)).collect();
+    s.push_str(&format!(
+        "work: priced {}, reused {} ({}), mirrors priced {}, book batches {}\n",
+        work.priced,
+        work.reused.iter().sum::<u64>(),
+        reused.join(", "),
+        work.mirror_priced,
+        work.book_batches
+    ));
     s.push_str(&format!("{:.2} s on {} thread(s)\n", seconds, scan.threads));
     let seeds = top.iter().map(|m| m.expression.clone()).collect();
     Ok((json, s, seeds))
@@ -1804,5 +2315,420 @@ mod tests {
         let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
         let rest: Vec<&str> = stat[stat.rfind(')').unwrap() + 2..].split_whitespace().collect();
         (rest[11].parse::<f64>().unwrap() + rest[12].parse::<f64>().unwrap()) / 100.0
+    }
+
+    /// #1257: the adversarial panel, 3 x 8,192 + 77 rows in five groups.
+    /// `x1 - x2` is bimodal around the gap from -1 to 1 + 2^-52 at the median
+    /// rank, so the median cuts of `sub(x1, x2)` and of its root mirror
+    /// `sub(x2, x1)` are 0 and -2^-52: that mirror fails the guard. x1 holds +0,
+    /// -0, ties and values near 1e154 (`square` overflows); x2 takes three values
+    /// (0 among them, the guard of `div`); x3 holds ties and values at 1e-12.
+    fn adversarial() -> Panel {
+        let sizes = [6_000usize, 5_000, 7_000, 3_653, 3_000];
+        let n: usize = sizes.iter().sum();
+        let lower = (0.5 * n as f64).round() as usize;
+        let mut rng = Rng(1257);
+        let (mut x1, mut x2, mut x3) = (vec![0.0f64; n], vec![0.0f64; n], vec![0.0f64; n]);
+        let (mut time, mut group, mut ret) = (Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n));
+        let (mut lowest_seen, mut gap_seen) = (false, false);
+        let mut i = 0usize;
+        for (g, &len) in sizes.iter().enumerate() {
+            for k in 0..len {
+                let low = (i * 7_919) % n < lower;
+                x2[i] = [-1.0, 0.0, 2.0][i % 3];
+                x1[i] = if low {
+                    match i % 11 {
+                        _ if !lowest_seen => {
+                            lowest_seen = true;
+                            x2[i] - 1.0
+                        }
+                        0 if x2[i] == 2.0 => [0.0, -0.0][(i / 11) % 2],
+                        1 => -1.5e154,
+                        2 => -1.2e154,
+                        _ => x2[i] - 1.0 - ((i * 13) % 400) as f64 / 64.0,
+                    }
+                } else if x2[i] == 0.0 && (!gap_seen || i % 7 == 0) {
+                    gap_seen = true;
+                    1.0 + f64::EPSILON
+                } else {
+                    match i % 11 {
+                        1 => 1.5e154,
+                        2 => 1.2e154,
+                        _ => x2[i] + 1.0 + ((i * 17) % 400 + 1) as f64 / 64.0,
+                    }
+                };
+                x3[i] = match i % 13 {
+                    0 => 1e-12,
+                    1 => -1e-12,
+                    2 => 1.5e-12,
+                    _ => match ((i * 29) % 200) as f64 / 16.0 - 6.0 {
+                        v if v == 0.0 => 1e-12,
+                        v => v,
+                    },
+                };
+                time.push(3600.0 * k as f64);
+                group.push(g as u64);
+                ret.push(0.004 * rng.gauss() + if low { -0.001 } else { 0.001 });
+                i += 1;
+            }
+        }
+        let cols = vec![x1, x2, x3];
+        let vars = (0..3).map(|j| format!("x{}", j + 1)).collect();
+        Panel { raw: cols.clone(), cols, means: vec![0.0; 3], stds: vec![1.0; 3], slice: TradingSlice { rows: TradingRows { time, group, funding: Vec::new() }, ret }, vars }
+    }
+
+    /// The observed book on `slice` and `count - 1` copies with every group's
+    /// returns rotated by a shared shift.
+    fn family(slice: &TradingSlice, count: usize, threshold: f64, blocks: usize, stat: BlockStat, min_trades: usize) -> Vec<FitnessBook> {
+        let spec = TradingSpec { cost_bps: 5.0, min_trades, threshold, ..TradingSpec::default() };
+        let params = BookParams { spec: &spec, horizon_seconds: 0.0, blocks, lambda: 1.0, stat, segments: &[] };
+        let mut stamps: Vec<u64> = slice.rows.time.iter().map(|t| t.to_bits()).collect();
+        stamps.sort_unstable();
+        stamps.dedup();
+        (0..count as u64)
+            .map(|k| match k {
+                0 => book_of(slice, &params).unwrap(),
+                _ => book_of(&shifted_slice(slice, 37 * k + 11, stamps.len() as u64).unwrap(), &params).unwrap(),
+            })
+            .collect()
+    }
+
+    fn bits(v: &[f64]) -> Vec<u64> {
+        v.iter().map(|f| f.to_bits()).collect()
+    }
+
+    /// Outcomes equal bit for bit: fitness, cut value and share by `to_bits`.
+    fn same_outcome(a: &Outcome, b: &Outcome) -> bool {
+        match (a, b) {
+            (Outcome::Scored { fitness: f, cut: c, cuts: k }, Outcome::Scored { fitness: g, cut: d, cuts: m }) => {
+                f.to_bits() == g.to_bits()
+                    && c.side == d.side
+                    && c.value.to_bits() == d.value.to_bits()
+                    && c.share.map(f64::to_bits) == d.share.map(f64::to_bits)
+                    && k == m
+            }
+            _ => a == b,
+        }
+    }
+
+    #[test]
+    fn fused_pass_equals_the_reference_pass() {
+        let planted = panel(1183, 4, 500, 3, |x, rng| if x[0] - x[1] < -0.3 { 0.003 } else { -0.002 } + 0.004 * rng.gauss());
+        let wide = panel(31, 89, 277, 3, noise);
+        let adv = adversarial();
+        assert_eq!((wide.slice.ret.len(), adv.slice.ret.len()), (3 * 8_192 + 77, 3 * 8_192 + 77));
+        // (panel, blocks, statistic, minimum trades); a minimum no cut reaches ties every cut at +inf.
+        let cases: [(&Panel, usize, BlockStat, usize); 4] =
+            [(&planted, 1, BlockStat::MeanSd, 1), (&planted, 4, BlockStat::MeanSd, 1_000_000), (&wide, 4, BlockStat::MeanSemi, 1), (&adv, 4, BlockStat::Cvar(0.25), 1)];
+        let mut compared = 0;
+        for (p, blocks, stat, min_trades) in cases {
+            let rows = p.slice.ret.len();
+            for threshold in [0.0, 1e-30] {
+                let books = family(&p.slice, 20, threshold, blocks, stat, min_trades);
+                let refs: Vec<&FitnessBook> = books.iter().collect();
+                for (names, max) in [(OPS10, 3usize), (OPS10, 4), ("add,sub,mul,abs", 3), ("add,sub,mul,abs", 4)] {
+                    let class = Class::build(3, &ops(names), max, true).unwrap();
+                    let scan = |threads| Scan { class: &class, cols: &p.cols, rows, cuts: 16, threads };
+                    let want = pass_reference(&scan(4), &refs, true);
+                    for nbooks in [1usize, 20] {
+                        for threads in [1usize, 4] {
+                            let got = pass(&scan(threads), &refs[..nbooks], true);
+                            let label =
+                                format!("{rows} rows, {blocks} blocks, {stat:?}, min trades {min_trades}, threshold {threshold}, {names} max {max}, {nbooks} books, {threads} threads");
+                            assert_eq!(bits(&got.best), bits(&want.best[..nbooks]), "{label}: best");
+                            assert_eq!(got.outcomes.len(), want.outcomes.len(), "{label}");
+                            for (pos, (g, w)) in got.outcomes.iter().zip(&want.outcomes).enumerate() {
+                                assert!(same_outcome(g, w), "{label}: tree {pos}: {g:?} vs {w:?}");
+                            }
+                            assert_eq!(got.books, want.books, "{label}: books");
+                            compared += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(compared, 4 * 2 * 4 * 2 * 2);
+    }
+
+    /// The outcome of scored tree `pos` priced alone, as the #1183 worker prices it.
+    fn priced_alone(class: &Class, pos: usize, cols: &[Vec<f64>], rows: usize, book: &FitnessBook) -> Outcome {
+        let program = eval_soa::compile(&class.node(class.scored()[pos] as usize)).unwrap();
+        let mut vals = vec![0.0f64; rows];
+        eval_soa::eval_batch(&program, cols, rows, &mut vals);
+        if vals.iter().any(|v| !v.is_finite()) {
+            return Outcome::NonFinite;
+        }
+        let cuts = grid(&vals, 16, &mut Vec::new());
+        if cuts.is_empty() {
+            return Outcome::Constant;
+        }
+        let mut pred = vec![0.0f64; rows];
+        let (mut own, mut own_cut) = (f64::INFINITY, cuts[0]);
+        for cut in &cuts {
+            fill(&mut pred, &vals, cut, book.threshold());
+            let f = book.fitness_of(&book.block_totals(&pred));
+            if f < own {
+                own = f;
+                own_cut = *cut;
+            }
+        }
+        Outcome::Scored { fitness: own, cut: own_cut, cuts: cuts.len() }
+    }
+
+    #[test]
+    fn reused_outcomes_equal_priced_outcomes() {
+        let p = adversarial();
+        let rows = p.slice.ret.len();
+        let class = Class::build(3, &ops(OPS10), 5, true).unwrap();
+        assert_eq!(class.scored().len(), 4_950);
+        let scan = Scan { class: &class, cols: &p.cols, rows, cuts: 16, threads: 4 };
+        let (mut copies, mut mirrors) = (0usize, 0usize);
+        for threshold in [0.0, 1e-30, 1.0] {
+            let books = family(&p.slice, 3, threshold, 4, BlockStat::MeanSd, 1);
+            let mut alone: HashMap<usize, Outcome> = HashMap::new();
+            for nbooks in [1usize, 3] {
+                let refs: Vec<&FitnessBook> = books.iter().take(nbooks).collect();
+                let got = pass(&scan, &refs, true);
+                assert!(got.work.mirror_priced >= 1, "threshold {threshold}: the constructed mirror fails the guard: {:?}", got.work);
+                for (pos, source) in class.plan.sources.iter().enumerate() {
+                    let reused = match source {
+                        Source::Copy { .. } => true,
+                        Source::Mirror { .. } => got.derived[pos],
+                        Source::Priced => false,
+                    };
+                    if !reused {
+                        continue;
+                    }
+                    if matches!(source, Source::Copy { .. }) {
+                        copies += 1;
+                    } else {
+                        mirrors += 1;
+                    }
+                    let want = *alone.entry(pos).or_insert_with(|| priced_alone(&class, pos, &p.cols, rows, &books[0]));
+                    let tree = expr::to_string(&class.node(class.scored()[pos] as usize), &p.vars);
+                    assert!(same_outcome(&got.outcomes[pos], &want), "threshold {threshold}, {nbooks} books, {source:?} {tree}: {:?} vs {want:?}", got.outcomes[pos]);
+                }
+            }
+        }
+        assert!(copies > 0 && mirrors > 0, "{copies} copies, {mirrors} derived mirrors");
+    }
+
+    /// The sources of `class` from a rewriter over `Node` trees: string forms,
+    /// class positions by form, the rules applied bottom up until none applies
+    /// at a node, and the original tree where a rewritten one is not in the class.
+    fn slow_sources(class: &Class) -> Vec<Source> {
+        fn form(n: &Node) -> String {
+            match n.op {
+                Op::Input => format!("x{}", n.val as usize),
+                op => format!("{}({})", op_name(op), n.kids.iter().map(form).collect::<Vec<_>>().join(",")),
+            }
+        }
+        fn canon(n: &Node, at: &dyn Fn(&Node) -> Option<usize>, square: bool) -> (Node, u8) {
+            if n.op == Op::Input {
+                return (n.clone(), 0);
+            }
+            let mut mask = 0u8;
+            let mut kids = Vec::new();
+            for k in &n.kids {
+                let (c, m) = canon(k, at, square);
+                mask |= m;
+                kids.push(c);
+            }
+            let mut t = expr::node(n.op, kids);
+            loop {
+                if matches!(t.op, Op::Add | Op::Mul) && at(&t.kids[1]) < at(&t.kids[0]) {
+                    t.kids.swap(0, 1);
+                }
+                let kid = t.kids[0].clone();
+                match t.op {
+                    Op::Abs if matches!(kid.op, Op::Abs | Op::Exp | Op::Square | Op::Gauss | Op::Logistic) => return (kid, mask | 1),
+                    Op::Abs | Op::Square | Op::Gauss if kid.op == Op::Sub => {
+                        let rev = expr::node(Op::Sub, vec![kid.kids[1].clone(), kid.kids[0].clone()]);
+                        if let (Some(r), Some(k)) = (at(&rev), at(&kid)) {
+                            if r < k {
+                                t.kids[0] = rev;
+                                mask |= 2;
+                                continue;
+                            }
+                        }
+                    }
+                    Op::Square | Op::Gauss if kid.op == Op::Abs => {
+                        t.kids[0] = kid.kids[0].clone();
+                        mask |= 4;
+                        continue;
+                    }
+                    Op::Mul if square && form(&t.kids[0]) == form(&t.kids[1]) => {
+                        t = expr::node(Op::Square, vec![kid]);
+                        mask |= 8;
+                        continue;
+                    }
+                    _ => {}
+                }
+                break;
+            }
+            match at(&t) {
+                Some(_) => (t, mask),
+                None => (n.clone(), 0),
+            }
+        }
+        let index: HashMap<String, usize> = (0..class.entries.len()).map(|e| (form(&class.node(e)), e)).collect();
+        let at = |n: &Node| index.get(&form(n)).copied();
+        let square = class.ops().contains(&Op::Square);
+        let position = |e: usize| class.scored().binary_search(&(e as u32)).ok().map(|p| p as u32);
+        class
+            .scored()
+            .iter()
+            .map(|&e| {
+                let e = e as usize;
+                let n = class.node(e);
+                let (c, mask) = canon(&n, &at, square);
+                let ce = at(&c).expect("a canonical tree is in the class");
+                if ce != e {
+                    return match position(ce) {
+                        Some(twin) if mask != 0 => Source::Copy { twin, rule: mask.trailing_zeros() as u8 },
+                        _ => Source::Priced,
+                    };
+                }
+                if n.op == Op::Sub {
+                    let rev = expr::node(Op::Sub, vec![n.kids[1].clone(), n.kids[0].clone()]);
+                    if let Some(twin) = at(&rev).filter(|&r| r < e).and_then(position) {
+                        return Source::Mirror { twin };
+                    }
+                }
+                Source::Priced
+            })
+            .collect()
+    }
+
+    /// Copies per rule and root mirrors of a plan.
+    fn reuse_counts(plan: &Plan) -> ([u64; 4], u64) {
+        let (mut copies, mut mirrors) = ([0u64; 4], 0u64);
+        for s in &plan.sources {
+            match s {
+                Source::Copy { rule, .. } => copies[*rule as usize] += 1,
+                Source::Mirror { .. } => mirrors += 1,
+                Source::Priced => {}
+            }
+        }
+        (copies, mirrors)
+    }
+
+    #[test]
+    fn reuse_counts_match_a_brute_force_rewrite() {
+        for (nvars, names, max, canonical) in
+            [(3usize, OPS10, 5usize, true), (3, OPS10, 4, false), (2, "sub,div,neg,mul,square,abs", 5, true), (3, "add,sub,mul,abs,square,gauss", 5, true)]
+        {
+            let class = Class::build(nvars, &ops(names), max, canonical).unwrap();
+            for (e, en) in class.entries.iter().enumerate().skip(nvars) {
+                assert_eq!(class.lookup(en.op, en.a, en.b), Some(e as u32), "{names} max {max} canonical {canonical}: entry {e}");
+            }
+            let plan = &class.plan;
+            // A copy's twin is not a copy (it may be a mirror); a mirror's twin is priced.
+            for (pos, s) in plan.sources.iter().enumerate() {
+                match *s {
+                    Source::Copy { twin, .. } => {
+                        assert!((twin as usize) < pos && !matches!(plan.sources[twin as usize], Source::Copy { .. }), "{names}: tree {pos} copies {twin}")
+                    }
+                    Source::Mirror { twin } => assert!((twin as usize) < pos && plan.sources[twin as usize] == Source::Priced, "{names}: tree {pos} mirrors {twin}"),
+                    Source::Priced => {}
+                }
+            }
+            if canonical {
+                assert_eq!(plan.sources, slow_sources(&class), "{names} max {max}");
+            } else {
+                assert!(plan.sources.iter().all(|s| *s == Source::Priced), "a raw class reuses nothing");
+            }
+            let members: usize = plan.units.iter().map(|u| u.members.len()).sum();
+            assert_eq!(members as u64 + reuse_counts(plan).0.iter().sum::<u64>(), class.scored().len() as u64, "{names}: every tree that is not copied is in one unit");
+        }
+        let (small4, small5) = (Class::build(3, &ops(OPS10), 4, true).unwrap(), Class::build(3, &ops(OPS10), 5, true).unwrap());
+        assert_eq!(small4.plan.sources, slow_sources(&small4));
+        let (four, five) = (reuse_counts(&small4.plan), reuse_counts(&small5.plan));
+        assert!(five.0[0] > four.0[0] && five.0[1] > four.0[1] && five.1 > four.1, "max size 5 reuses more: {four:?} {five:?}");
+        let all = reuse_counts(&Class::build(3, &ops("add,sub,mul,abs,square,gauss"), 5, true).unwrap().plan);
+        assert!(all.0.iter().all(|&k| k > 0), "every rule copies some tree: {all:?}");
+        // 32 variables, the ten campaign operators, max size 4 (decision 3 of #1257).
+        let campaign = Class::build(32, &ops(OPS10), 4, true).unwrap();
+        assert_eq!(reuse_counts(&campaign.plan), ([96, 496, 0, 0], 6_640));
+    }
+
+    /// 306 groups x 7,403 hours, 32 standard normal variables, returns with a weak
+    /// signal on the first: the panel of `enumerate_cost_at_the_campaign_shape`.
+    fn campaign_panel() -> (Vec<Vec<f64>>, TradingSlice) {
+        let (groups, steps, nvars) = (306usize, 7403usize, 32usize);
+        let n = groups * steps;
+        let mut rng = Rng(268);
+        let cols: Vec<Vec<f64>> = (0..nvars).map(|_| (0..n).map(|_| rng.gauss()).collect()).collect();
+        let (mut time, mut group, mut ret) = (Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n));
+        for g in 0..groups {
+            for k in 0..steps {
+                time.push(3600.0 * k as f64);
+                group.push(g as u64);
+                ret.push(0.004 * rng.gauss() + 0.0005 * cols[0][g * steps + k]);
+            }
+        }
+        (cols, TradingSlice { rows: TradingRows { time, group, funding: Vec::new() }, ret })
+    }
+
+    /// Every `step`-th scored tree of `class`, each priced in a unit of its own.
+    fn stride_plan(class: &Class, step: usize) -> Plan {
+        let trees = class.scored().len();
+        let units = (0..trees).step_by(step).map(|p| Unit { key: class.key_of(class.scored()[p]), members: vec![p as u32] }).collect();
+        Plan { sources: vec![Source::Priced; trees], units, twins: vec![false; trees], ..Plan::default() }
+    }
+
+    /// #1257: CPU seconds per scored tree of the #1183 pass (arm `R`) and the
+    /// fused pass (arm `N`) at the campaign training shape on 4 threads. Run by
+    /// hand; `RCSR_ENUMERATE_COST` lists the arms in order. `R<k>` and `N<k>`
+    /// score the 504 trees of the class over the first 3 variables (the ten
+    /// operators, max size 4) on `k` books; `S<k>` scores every 64th tree of the
+    /// 32-variable class on `k` books, one unit per tree, so it reuses nothing.
+    /// Prints CPU seconds and the load average and asserts no time.
+    #[test]
+    #[ignore]
+    fn enumerate_cost_per_tree() {
+        let arms = std::env::var("RCSR_ENUMERATE_COST").unwrap_or_else(|_| "R1,N1,R1,N1,R5,N5,R5,N5,N20,S20".to_string());
+        let arms: Vec<(char, usize)> = arms.split(',').map(|a| (a.chars().next().unwrap(), a[1..].parse::<usize>().unwrap())).collect();
+        let (cols, slice) = campaign_panel();
+        let n = slice.ret.len();
+        let params = BookParams { spec: &spec(), horizon_seconds: 3600.0, blocks: 4, lambda: 1.0, stat: BlockStat::MeanSd, segments: &[] };
+        let b = book_of(&slice, &params).unwrap();
+        let plan = null_plan(&slice.rows, 3600.0, 19, 1).unwrap();
+        let need = arms.iter().map(|a| a.1).max().unwrap_or(1);
+        let shifted: Vec<FitnessBook> =
+            plan.nums.iter().take(need - 1).map(|&s| book_of(&shifted_slice(&slice, s, plan.periods as u64).unwrap(), &params).unwrap()).collect();
+        let mut books: Vec<&FitnessBook> = vec![&b];
+        books.extend(shifted.iter());
+        let small = Class::build(3, &ops(OPS10), 4, true).unwrap();
+        let full = Class::build(32, &ops(OPS10), 4, true).unwrap();
+        let stride = stride_plan(&full, 64);
+        let (small_scan, full_scan) =
+            (Scan { class: &small, cols: &cols, rows: n, cuts: 16, threads: 4 }, Scan { class: &full, cols: &cols, rows: n, cuts: 16, threads: 4 });
+        let load = || std::fs::read_to_string("/proc/loadavg").unwrap().split_whitespace().take(3).collect::<Vec<_>>().join(" ");
+        for (arm, k) in arms {
+            let before = load();
+            let (start, cpu) = (std::time::Instant::now(), cpu_seconds());
+            let trees = match arm {
+                'R' => {
+                    pass_reference(&small_scan, &books[..k], false);
+                    small.scored().len()
+                }
+                'N' => {
+                    pass(&small_scan, &books[..k], false);
+                    small.scored().len()
+                }
+                'S' => {
+                    pass_with(&full_scan, &stride, &books[..k], false, None);
+                    stride.units.len()
+                }
+                other => panic!("unknown arm {other}"),
+            };
+            let (wall, used) = (start.elapsed().as_secs_f64(), cpu_seconds() - cpu);
+            println!(
+                "enumerate cost per tree: arm {arm}{k}: {trees} trees, {n} rows, 4 blocks, 16 cuts, {k} book(s), 4 threads: {wall:.1} s wall, {used:.1} s cpu, {:.4} cpu s per tree; load {before} before, {} after",
+                used / trees as f64,
+                load()
+            );
+        }
     }
 }
