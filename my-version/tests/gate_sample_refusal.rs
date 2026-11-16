@@ -147,6 +147,15 @@ fn switch(f: &Fixture, extra: &[&str]) -> Output {
     run(&args)
 }
 
+/// #1182: a gate search between the branch x1 and cash over the gate variables x1, x2.
+fn gate_search(f: &Fixture, extra: &[&str]) -> Output {
+    let mut args = vec!["--data", &f.store, "--target-spec", &f.spec, "--gate-search", "--branch-on", "x1", "--branch-off", "cash"];
+    args.extend_from_slice(&RUN_FLAGS);
+    args.extend(["--seed", "3", "--generations", "1", "--pop", "8", "--json"]);
+    args.extend_from_slice(extra);
+    run(&args)
+}
+
 fn assert_refused(o: &Output, flags: &[&str], dir: &Path) {
     let err = stderr(o);
     assert_eq!(code(o), 2, "{err}");
@@ -166,6 +175,7 @@ fn sample_rows_refused_with_gate_commands() {
     assert_refused(&masked(&f, &["--sample-rows", "1000"]), &["--sample-rows", "--pnl-mask"], &f.dir);
     assert_refused(&compose(&f, &["--sample-rows", "1000"]), &["--sample-rows", "rcsr compose"], &f.dir);
     assert_refused(&switch(&f, &["--sample-rows", "1000"]), &["--sample-rows", "rcsr switch"], &f.dir);
+    assert_refused(&gate_search(&f, &["--sample-rows", "1000"]), &["--sample-rows", "--gate-search"], &f.dir);
     // n at or above the row count is a full load; the flag is what is refused.
     assert_refused(&masked(&f, &["--sample-rows", "999999"]), &["--sample-rows", "--pnl-mask"], &f.dir);
 }
@@ -173,7 +183,7 @@ fn sample_rows_refused_with_gate_commands() {
 #[test]
 fn gate_commands_without_sample_rows_still_run() {
     let f = fixture();
-    for o in [masked(&f, &[]), compose(&f, &[]), switch(&f, &[])] {
+    for o in [masked(&f, &[]), compose(&f, &[]), switch(&f, &[]), gate_search(&f, &[])] {
         assert_eq!(code(&o), 0, "{}", stderr(&o));
     }
 }

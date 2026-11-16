@@ -313,6 +313,17 @@ rcsr enumerate --data dev.rcsb --target lbl_h1_y --target-spec dev.targets.json 
 
 See [`docs/optimisation.md`](docs/optimisation.md) section 3.6 and [`docs/overfitting.md`](docs/overfitting.md) section 3.12.
 
+### Gate search between frozen branches (`--gate-search`)
+
+`--gate-search` searches the gate of a switch itself. The genome is one formula `g` over `--vars`; the two branches are frozen: the finalist of a run (with its threshold folded in), an expression, or cash. A candidate gate is scored at its best cut of the 16-quantile grid of its training values by the `--fitness pnl` book of the one composite that holds `--branch-on` where the gate state is on and `--branch-off` elsewhere (the state is the `--pnl-mask` kernel over `g - c` with `--gate-band` and `--gate-dwell`). The front goes to the choice and the pricing of `rcsr compose`: every member is a searched gate with one composite, chosen on the validation rows by the robust rule with a non-negative alpha in each gate state, and the run.json carries the switch of every composite, so walk-forward, `ladder --sr-run`, `--reselect-run`, the seal and the sealed read price it unchanged. Every candidate counts in `search.candidates_evaluated` and every composite pays its full description length (the gate tree under the composite code plus the 4-bit cut).
+
+```sh
+rcsr --data dev.rcsb --target lbl_h24a_y --target-spec dev.targets.json --vars btc_r96,btc_r672,mkt_breadth \
+  --time ts --group-by symbol --split-table cpcv61/splits.csv --split-id s07 --objective sharpe --cost-bps 10 \
+  --gate-search --branch-on bull_s07.run.json --branch-off bear_s07.run.json --gate-dwell 24 \
+  --pop 64 --islands 4 --generations 300 --max-complexity 7 --ops add,sub,mul,min,max --json > gate_s07.run.json
+```
+
 ### Combinatorial purged cross-validation (CPCV)
 
 `rcsr protocol cpcv --start 2017-12-15 --end 2023-11-01 --groups 6 --test-groups 2 --purge-seconds 7200 --embargo-seconds auto --vars "$VIEW" --bar-seconds 3600 --validation-share 0.2 --out cpcv62` writes the C(N, k) splits of N equal calendar groups as a `--split-table` (training and validation intervals already purged before and embargoed after every test group, locked ranges as holes), one walk-forward windows file per split and `cpcv.json`. After one search and one `walkforward --pool-reset-flat --period-grid target` per split (the target grid gives every split the same periods on a group, whatever NaN coverage or gate its formula has; a period where the book prices no row books net 0), `rcsr trials --cpcv-assemble wf_s*.json --splits cpcv62/splits.csv --out-dir paths` joins the test series into C(N-1, k-1) complete backtest paths (López de Prado 2018, ch. 12): path j of group g takes the j-th split that tests g, and every group starts flat and pays its final exit. The paths are walk-forward-schema reports, so `rcsr trials --wf` gives `N_eff`, DSR, SPA and PBO across configurations; the summary gives the path Sharpe distribution. Split reports written with `--emit-series` give every path their per-period series and `entry_times` (#1236), so `rcsr trials --table` gates path rows on net at twice the cost, exposure, entry times and the alpha over buy-and-hold. See [`docs/walkforward.md`](docs/walkforward.md#cpcv).
@@ -516,7 +527,7 @@ atomically instead of streaming it. See
   estimate is 7.83 GB against a 7.26 GB measured peak, instead of the old
   61.71 GiB that produced a 577k-row sample. A store that does not fit is
   refused; sampling is explicit via `--sample-rows N` (mutually exclusive with
-  `--force`, still budget-guarded, and refused with `--pnl-mask`, `rcsr compose` and `rcsr switch`, whose gate states need every row) and is recorded as `full_rows=false` in
+  `--force`, still budget-guarded, and refused with `--pnl-mask`, `rcsr compose`, `rcsr switch` and `--gate-search`, whose gate states need every row) and is recorded as `full_rows=false` in
   the preparation block, manifest and dev log. When a store is read with
   `--vars` and `--time`, the default **projects the read** to those variables,
   targets, `--weight`, `--time` and `--group-by`: only those blocks are read,
@@ -704,7 +715,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--objective mse|pnl|sharpe|log_growth] [--position long_only|top_tercile] [--threshold f]
      [--cost-bps f | --cost-override f] [--slippage-bps f] [--cash-return f] [--funding col]
      [--max-position f] [--min-trades n] [--min-holding n] [--band B] [--band-units score|sd] [--allow-short]
-     [--fitness metric|pnl] [--pnl-blocks K] [--pnl-block-lambda L] [--pnl-stat mean-sd|mean-semi|cvar] [--pnl-cvar-q q] [--pnl-mask expr] [--pnl-mask-band h] [--pnl-mask-dwell D] [--pnl-excess none|xs-mean] [--book-target col]
+     [--fitness metric|pnl] [--pnl-blocks K] [--pnl-block-lambda L] [--pnl-stat mean-sd|mean-semi|cvar] [--pnl-cvar-q q] [--pnl-mask expr] [--pnl-mask-band h] [--pnl-mask-dwell D] [--gate-search --branch-on run.json|expr|cash --branch-off run.json|expr|cash] [--gate-band h] [--gate-dwell D] [--pnl-excess none|xs-mean] [--book-target col]
 |pnl]
      [--equivalence-z z] [--noise-lag n|auto]
      [--allow-lockbox] [--lockbox START,END|none] [--lockbox-embargo SECONDS] [--retired retired.json] [--ledger file] [--arm name] [--target-spec file] [--allow-target-structure] [--require-clean-inputs]
@@ -865,6 +876,7 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
   `2 / sqrt(K)`: lambda `t / sqrt(K)` keeps the t-statistic test level `t` across block counts.
   The device computes every statistic bit for bit like the CPU.
   `--pnl-mask <expr>` (with `--pnl-mask-band h` and `--pnl-mask-dwell D`) scores only the rows inside a causal regime gate, so bull and bear specialists can be searched: rows outside are flat, every run of on rows starts flat and pays its exit, and the validation and test books apply the same mask with the gate state of `rcsr-gate-state/1` (the whole readable prefix of the data file; CPU only; `docs/optimisation.md`).
+  `--gate-search` (with `--branch-on`, `--branch-off`, `--gate-band h` and `--gate-dwell D`) searches a regime gate over `--vars` between two frozen branches: each candidate is scored at its best 16-quantile cut by the composite book, and the front is chosen and priced by `rcsr compose` (CPU only; `docs/compose.md`).
   `--pnl-excess xs-mean` (default `none`) scores the excess over the equal-weight mean return of the training rows at each timestamp instead of over cash, so the fitness pays for timing and selection relative to the cross-section, not for market beta; the validation and test books, robust selection and walk-forward stay absolute and `objective.validation` and `objective.test` gain `xs_excess_net` (needs `--fitness pnl` and `--cash-return 0`; `docs/optimisation.md`).
   `--book-target COL` prices the book on another label of the same target spec (fit on `--target`); a row with a NaN fit label and a finite book return stays in the book and leaves the constant fit.
   `--reject-fixed-position` (off by default) rejects trees whose position cannot depend on the
@@ -1567,7 +1579,7 @@ docs/data-preparation.md      missing values, outliers, smoothing, scaling and f
 docs/memory-model.md          bytes per cell, dictionary encoding and row selectors
 docs/data-format.md           versioned .rcsb column store, import and the memory guard
 docs/walkforward.md           walk-forward evaluation, costs, metrics and the long/flat rule
-docs/compose.md               regime-switching composition of specialist pools (rcsr compose)
+docs/compose.md               regime-switching composition of specialist pools (rcsr compose) and the gate search (--gate-search)
 docs/variable-types.md        boolean and categorical inputs, one-hot encoding
 docs/weights.md               per-row weights, weighted metrics and weighted least squares
 docs/implicit.md              implicit relations f(x, y) = 0 and the level-set metric
