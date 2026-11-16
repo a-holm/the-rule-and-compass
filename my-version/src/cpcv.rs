@@ -829,6 +829,8 @@ struct SplitReport {
     extra: Vec<Option<Vec<f64>>>,
     /// #1236: `pooled.entry_times`; the window counts sum to it.
     entry_times: Option<f64>,
+    /// #1237: `selection.composite.type` of a report of a composed run.
+    composite: Option<String>,
 }
 
 fn whole(x: Option<f64>) -> Option<i64> {
@@ -893,7 +895,14 @@ fn load_report(path: &str) -> Result<SplitReport, Fail> {
         extra.push(Some(v));
     }
     let entry_times = entry_count(&json, &windows, path)?;
-    Ok(SplitReport { path: path.to_string(), sha256: crate::manifest::sha256_hex(text.as_bytes()), json, windows, time, net, rows, extra, entry_times })
+    let composite = match at(&json, &["selection", "composite"]) {
+        None => None,
+        Some(m) => match m.get("type").and_then(Json::as_str) {
+            Some(t) => Some(t.to_string()),
+            None => return usage(format!("field 'selection.composite.type' is missing in {}: a composite marker names its type", path)),
+        },
+    };
+    Ok(SplitReport { path: path.to_string(), sha256: crate::manifest::sha256_hex(text.as_bytes()), json, windows, time, net, rows, extra, entry_times, composite })
 }
 
 /// #1236: `pooled.entry_times` of a report. A report with it gives every window its count
@@ -1007,6 +1016,13 @@ fn path_series_json(p: &BuiltPath) -> String {
     s
 }
 
+/// #1237: the composite marker of a path of composed split reports, the type of every group
+/// in path order, with a trailing comma; empty for plain reports.
+fn composite_json(reports: &[SplitReport], p: &BuiltPath) -> String {
+    let types: Option<Vec<String>> = p.splits.iter().map(|&s| reports[s].composite.as_deref().map(jstr)).collect();
+    types.map_or(String::new(), |t| format!("\"composite\":{{\"source\":\"rcsr compose\",\"types\":[{}]}},", t.join(",")))
+}
+
 fn sum(x: &[f64]) -> f64 {
     x.iter().sum()
 }
@@ -1118,6 +1134,14 @@ pub fn assemble_cli(args: &[String]) -> Result<(), Fail> {
         require_same(&reports[0], r)?;
     }
     require_all_or_none(&reports)?;
+    let composed: Vec<bool> = reports.iter().map(|r| r.composite.is_some()).collect();
+    if let Some((a, b)) = mixed(&composed) {
+        return usage(format!(
+            "field 'selection.composite' is in {} but missing in {}: the split reports of one assembly come from rcsr compose runs \
+in every split or in none",
+            reports[a].path, reports[b].path
+        ));
+    }
     let ppy = at(&reports[0].json, &["annualization", "periods_per_year"]).and_then(Json::as_f64).unwrap_or(f64::NAN);
     // Group series of every split, as index lists into its pooled series.
     let mut parts: Vec<Vec<Vec<usize>>> = Vec::with_capacity(count);
@@ -1223,7 +1247,7 @@ pub fn assemble_cli(args: &[String]) -> Result<(), Fail> {
                     .filter_map(|w| w.expression.as_deref().map(jstr))
                     .collect();
                 format!(
-                    "{{\"group\":{},\"start\":{},\"end\":{},\"split\":{},\"report\":{},\"report_sha256\":{},\"expression\":[{}],\"periods\":{},\"net\":{}{}}}",
+                    "{{\"group\":{},\"start\":{},\"end\":{},\"split\":{},\"report\":{},\"report_sha256\":{},\"expression\":[{}],\"periods\":{},\"net\":{}{}{}}}",
                     jstr(&label(g)),
                     scheme.groups[g].start(),
                     scheme.groups[g].end(),
@@ -1233,7 +1257,8 @@ pub fn assemble_cli(args: &[String]) -> Result<(), Fail> {
                     exprs.join(","),
                     p.group_periods[g],
                     jnum(p.group_net[g]),
-                    p.group_entry_times[g].map_or(String::new(), |v| format!(",\"entry_times\":{}", jnum(v)))
+                    p.group_entry_times[g].map_or(String::new(), |v| format!(",\"entry_times\":{}", jnum(v))),
+                    r.composite.as_deref().map_or(String::new(), |t| format!(",\"composite_type\":{}", jstr(t)))
                 )
             })
             .collect();
@@ -1251,7 +1276,7 @@ pub fn assemble_cli(args: &[String]) -> Result<(), Fail> {
         let text = format!(
             "{{\"tool\":\"rcsr\",\"version\":{},\"mode\":\"cpcv_path\",\"schema\":{},\"window_definition\":{},\
 \"purge\":{},\"cost_model\":{},\"cost\":{},\"annualization\":{},\"threshold\":{},\"policy\":{},\"book\":{{\"missing_score\":{}}},\
-\"pooled_seam\":{{\"reset_flat\":true,\"seam_cost\":0,\"seam_trades\":0}},\
+\"pooled_seam\":{{\"reset_flat\":true,\"seam_cost\":0,\"seam_trades\":0}},{}\
 \"cpcv\":{{\"scheme_sha256\":{},\"splits_sha256\":{},\"groups\":{},\"test_groups\":{},\"splits\":{},\"paths\":{},\"path\":{},\
 \"seam_rule\":{},\"segments\":[{}]}},\
 \"pooled\":{{\"sharpe\":{},\"max_drawdown\":{},\"net\":{},\"mean_return\":{},\"periods\":{},\"periods_per_year\":{},\
@@ -1266,6 +1291,7 @@ pub fn assemble_cli(args: &[String]) -> Result<(), Fail> {
             copy("threshold"),
             copy("policy"),
             at(first, crate::trials::MISSING_SCORE).map_or("null".to_string(), to_json),
+            composite_json(&reports, p),
             jstr(&scheme_sha),
             jstr(&splits_sha),
             n,

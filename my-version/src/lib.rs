@@ -116,6 +116,7 @@ pub mod walkforward;
 pub mod wf_protocol; // #264: economics, block inference and nulls for the walk-forward report
 pub mod trials; // #926: campaign trial accounting and paired run comparison
 pub mod trials_table; // #1177: multi-metric candidate table of rcsr trials --table
+pub mod trials_freeze; // #1237: frozen sealed-read thresholds of the candidate table picks
 pub mod wf_batch; // #309: batch walk-forward P&L over (candidate, window)
 pub mod protocol; // #264: windows table, candidate ledger, sealed list, one-read lockbox
 pub mod retire; // #924: retire a locked range after its one sealed read

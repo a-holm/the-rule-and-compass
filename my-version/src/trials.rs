@@ -93,8 +93,24 @@ at N_eff, 10 N_eff and the nominal N (every row of the table, plus --prior-trial
 (Bonferroni, Holm, BHY over the rows) and its StepM and BH-FDR verdicts; SPA, StepM, BH-FDR and PBO run over the\n\
 distinct varying rows against the --baseline best rung, else cash at 0. Output rcsr-trials-table/1.\n\
   --rule <file>          rcsr-trials-rule/1 JSON with cost_multiples, gates, relaxed_gates (apply when no row passes\n\
-                         gates), pareto, rank, pick, diversity_rho and min_front; its sha256 is in the output; it\n\
-                         excludes --gates, --pareto, --rank, --pick, --diversity-rho, --min-front, --cost-multiples\n\
+                         gates), pareto, rank, pick, diversity_rho, min_front, max_composites and freeze; its sha256 is\n\
+                         in the output; it excludes --gates, --pareto, --rank, --pick, --diversity-rho, --min-front,\n\
+                         --cost-multiples. max_composites K (#1237, D8): the walk skips a composite row (a report with\n\
+                         the composite marker of an rcsr compose run: selection.composite, or composite of a CPCV path)\n\
+                         once the picks hold K composites (skipped.reason max_composites). freeze (#1237):\n\
+                         {\"cpcv\":[N,k],\"cost_bps\":B,\"s4\":{\"window_days\":W,\"percentile\":P},\"p1\":{...},\n\
+                         \"drawdown_cap\":{\"window_days\":W,\"percentile\":P,\"floor\":F}} freezes per pick the sealed-read\n\
+                         thresholds over every CPCV(N,k) path of the pick's configuration (needs --freeze-map)\n\
+  --freeze-map <file>    rcsr-trials-freeze-map/1 JSON {\"rows\":[{\"row\",\"configuration\",\"paths\",\"run\"}]}: per\n\
+                         row (its report as given to --wf) the configuration name, its CPCV path reports and the\n\
+                         run.json to seal (optional). Every pick gets freeze: s4_floor and p1_floor (nearest-rank\n\
+                         percentile, k = (P n + 99) / 100, of the annualised mean nets at B bp of the windows\n\
+                         [t, t + W days) that start at each period and end inside one path, pooled over the paths),\n\
+                         drawdown_cap (max(F, the percentile of the windows' compounding max drawdown magnitudes)),\n\
+                         window counts and ranks, the path files with sha256 and run_sha256. A pick without a map\n\
+                         entry, a missing or doubled cpcv.path, paths of two splits tables, a split with two\n\
+                         report_sha256, cpcv.groups or cpcv.test_groups other than freeze.cpcv, a locked period, a\n\
+                         path priced at another cost without pooled.period_cost, or no window that fits exit 2\n\
   --gates <file>         JSON object {metric: [op, value]}, op >, >=, <, <=, or [\"between\", lo, hi]; all must hold;\n\
                          a NaN value fails; every failed gate is listed per row\n\
   --pareto <m[:dir],...> Pareto metrics over the gate passers, dir max (default) or min; NaN is the worst value\n\
