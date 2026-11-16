@@ -11691,7 +11691,9 @@ OPTIONS:
                              band exit 2; a label, target, return or construction
                              gate column exits 5. Such a run writes
                              selection.composite: source, type, form and gate of its
-                             compose.chosen (#1237); other reports carry no marker
+                             compose.chosen (#1237); other reports carry no marker.
+                             The selection block carries run and run_sha256 (the
+                             SHA-256 of the file, inside the report hash; #1238)
   --threshold-quantile <q>   exact type-7 training/validation score quantile
                              (default {DEFAULT_QUANTILE}); selected by order-preserving
                              radix count, so theta is bit-identical to numpy
@@ -13218,13 +13220,16 @@ fn run_walkforward(args: &[String]) -> ! {
             }
         }
     }
-    let report = match walkforward::run_path_with(&data_path, &spec, &popts) {
+    let mut report = match walkforward::run_path_with(&data_path, &spec, &popts) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("error: {}", e);
             std::process::exit(if e.contains("overlapping returns") || e.contains("purge gap") || e.contains("are not in time order") || e.starts_with("--periods-per-year") || e.starts_with("missing stride_seconds") || e.starts_with("stride_seconds") { EXIT_USAGE } else { EXIT_INPUT });
         }
     };
+    if let (Some(path), Some(run)) = (&from_run_path, &front_run) {
+        report.from_run = Some(walkforward::RunRef { run: path.clone(), run_sha256: run.sha256.clone() });
+    }
     if spec.threshold_fixed.is_none() {
         for c in &report.candidates {
             let constant = expr::parse(c, &report.variables)
