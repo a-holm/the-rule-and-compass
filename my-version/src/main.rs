@@ -286,8 +286,9 @@ INPUT:
                              block, manifest and dev log. Mutually exclusive
                              with --force; n >= the row count is a full load
                              and must still fit the budget
-                             Exit 2 with --pnl-mask, rcsr compose and
-                             rcsr switch (gate states need every row)
+                             Exit 2 with --pnl-mask, rcsr compose, rcsr
+                             switch and --gate-search (gate states need
+                             every row)
   --target <col>[,<col>..]   target column; a comma-separated list enables
                              multi-output regression (one shared shape, one
                              fitted constant vector per output). See
@@ -4736,6 +4737,8 @@ fn main() {
             Some("rcsr switch")
         } else if rcsr::compose::request().is_some() {
             Some("rcsr compose")
+        } else if rcsr::gate_search::request().is_some() {
+            Some("--gate-search")
         } else {
             None
         };

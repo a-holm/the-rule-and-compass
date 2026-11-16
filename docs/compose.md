@@ -179,7 +179,7 @@ Every composite pays its full length under the composite code (report-only): the
 | no `--vars`; an aggregate, meta or building-block operator in `--ops` | 2 |
 | branch runs that differ in target, target spec, cost or split, from each other or from this invocation; a composed, banded, minimum-hold or top-tercile run | 2 |
 | identical branches or the same training positions | 2 |
-| `--gpu`, the pricing flags compose refuses, `--allow-short`, `--pnl-excess`, `--save`, `--save-every`, `--resume`, `--interim-chunk`, `--reselect`, `--reselect-run`, `--eval-expr`, `--function`, `--implicit`, `--format`, `--ndjson`, `--json-out`, `--report` | 2 |
+| `--gpu`, `--sample-rows`, the pricing flags compose refuses, `--allow-short`, `--pnl-excess`, `--save`, `--save-every`, `--resume`, `--interim-chunk`, `--reselect`, `--reselect-run`, `--eval-expr`, `--function`, `--implicit`, `--format`, `--ndjson`, `--json-out`, `--report` | 2 |
 | `--lags`, `--lag-set`, `--fill` other than `drop`, `--outlier-iqr`, `--smooth` | 2 |
 | a label-family column, the target, its return column or a construction column in `--vars` or a branch | 5 |
 | an unreadable branch run | 3 |
