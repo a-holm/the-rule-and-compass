@@ -536,6 +536,10 @@ pub(crate) const SPAN_FIT: i32 = 1;
 /// #481: why a tiled context cannot score the long/flat fitness.
 pub const LONG_PNL_TILED: &str = "long_pnl fitness needs resident training rows (tiled residency: #293)";
 
+/// #1244: why a regime-masked book with an sd-unit band stays on the CPU.
+pub const LONG_PNL_MASKED_SD: &str =
+    "--pnl-mask with --band-units sd is priced on the CPU: the device sd reads every row, not the rows inside the mask";
+
 /// #604: prefix of an injected device refusal (test hook, see [`injected_fault`]).
 pub const INJECTED_REFUSAL: &str = "injected fault: the device refused ";
 
@@ -1942,8 +1946,8 @@ impl GpuEvaluator {
         if injected_fault("pnl_book") {
             return Err(format!("{}the long_pnl fitness book", INJECTED_REFUSAL));
         }
-        if book.is_masked() {
-            return Err("the long_pnl fitness book has a regime mask (--pnl-mask) and the device book carries none".to_string());
+        if book.is_masked() && book.band_units() == crate::trading::BandUnits::Sd {
+            return Err(LONG_PNL_MASKED_SD.to_string());
         }
         if book.len() as u64 != self.n_rows {
             return Err(format!(
@@ -5101,6 +5105,7 @@ mod tests {
         assert_eq!(define("RC_PNL_MAX_BLOCKS"), crate::trading::FITNESS_MAX_BLOCKS as i64);
         assert_eq!(define("RC_PNL_WIDE_BLOCKS"), crate::trading::FITNESS_BOOK_MAX_BLOCKS as i64);
         assert_eq!(define("RC_PNL_BLOCK_SHIFT"), crate::trading::FITNESS_BLOCK_SHIFT as i64);
+        assert_eq!(define("RC_PNL_MASK_OFF"), crate::trading::FITNESS_MASK_OFF as i64);
         use crate::trading::BlockStat;
         assert_eq!(define("RC_PNL_STAT_MEAN_SD"), BlockStat::MeanSd.code() as i64);
         assert_eq!(define("RC_PNL_STAT_MEAN_SEMI"), BlockStat::MeanSemi.code() as i64);

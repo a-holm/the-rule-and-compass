@@ -390,7 +390,8 @@ INPUT:
                              over every row of the data file from each group's
                              first row (never a label or a row filter); the
                              validation rows never read a test interval.
-                             CPU only: --gpu exits 2. Needs --fitness pnl;
+                             --gpu scores it on the device, except with
+                             --band-units sd (exit 2). Needs --fitness pnl;
                              the book hash covers it, so a resume needs the
                              same mask
   --pnl-mask-band h         hysteresis of --pnl-mask (default 0, finite, >= 0):
@@ -4410,8 +4411,8 @@ fn main() {
     }
     cfg.dispatch = dispatch_mode;
 
-    if pnl_mask_arg.is_some() && gpu_explicit == Some(true) {
-        trading_usage("--pnl-mask with --gpu: the device long_pnl book carries no regime mask; omit --gpu to run on the CPU");
+    if pnl_mask_arg.is_some() && gpu_explicit == Some(true) && trade_band_units.as_deref().map(str::trim) == Some("sd") {
+        trading_usage("--pnl-mask with --band-units sd and --gpu: the device sd reads every row, not the rows inside the mask; use --band-units score or omit --gpu to run on the CPU");
     }
     let gpu_probe = if gpu_explicit == Some(false) {
         backend::Probe::not_probed("--cpu/--no-gpu (device not probed)")
