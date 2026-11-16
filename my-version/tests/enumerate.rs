@@ -368,6 +368,91 @@ fn enumerate_refuses_sample_rows() {
     assert_eq!(code(&o), 0, "the store runs without --sample-rows: {}", stderr(&o));
 }
 
+/// The report without its `,"<key>":{...}` member.
+fn drop_member(text: &str, key: &str) -> String {
+    let needle = format!(",\"{key}\":{{");
+    let Some(at) = text.find(&needle) else {
+        return text.to_string();
+    };
+    let open = at + needle.len() - 1;
+    let mut depth = 0usize;
+    for (i, ch) in text[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return format!("{}{}", &text[..at], &text[open + i + 1..]);
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unbalanced {key} member: {text}");
+}
+
+/// #1257: the `--json` report equals the report of the #1183 code byte for byte
+/// after deleting `timing` and `work`: with and without the family null, one
+/// batch of books and two, 1 and 4 blocks, the three block statistics,
+/// thresholds 0 and 1e-30, `--compare-run`, and 1, 2 and 4 threads. On a
+/// difference the observed report is written under `CARGO_TARGET_TMPDIR`.
+#[test]
+fn enumerate_report_is_unchanged() {
+    let (_s, dir) = scratch();
+    let (planted, discrete, spec) = (write_csv(&dir, Panel::Planted), write_csv(&dir, Panel::Discrete), write_spec(&dir));
+    // A run.json on the planted book with fixed bytes, so its sha256 in the report is fixed.
+    let probe = json(&enumerate(&planted, &spec, &["--ops", "abs", "--max-size", "1", "--json"]));
+    let run = dir.join("run.json");
+    std::fs::write(
+        &run,
+        format!(
+            "{{\"search_fitness\":{{\"kind\":\"long_pnl_regret\",\"book_hash\":\"{}\"}},\"pareto\":[\
+             {{\"complexity\":1,\"k_constants\":0,\"expression_exact\":\"x1\",\"fitness\":{{\"train_regret\":0.99}}}},\
+             {{\"complexity\":3,\"k_constants\":0,\"expression_exact\":\"(x2 - x1)\",\"fitness\":{{\"train_regret\":0.5}}}},\
+             {{\"complexity\":5,\"k_constants\":1,\"expression_exact\":\"(-0.3 - (x1 - x2))\",\"fitness\":{{\"train_regret\":0.25}}}},\
+             {{\"complexity\":12,\"k_constants\":2,\"expression_exact\":\"((x1 * 2) - 1)\",\"fitness\":{{\"train_regret\":0.8}}}}]}}\n",
+            str_at(&probe, &["book", "book_hash"])
+        ),
+    )
+    .unwrap();
+    let run = run.to_string_lossy().into_owned();
+    let planted3 = ["--ops", OPS10, "--max-size", "3", "--null-shifts", "19", "--seed", "11", "--compare-run", &run, "--top", "50", "--json"];
+    let cases: Vec<(&str, &str, Vec<&str>)> = vec![
+        ("planted_size3", planted.as_str(), [&planted3[..], &["--threads", "1"][..]].concat()),
+        ("planted_size3", planted.as_str(), [&planted3[..], &["--threads", "4"][..]].concat()),
+        (
+            "planted_size4_blocks4",
+            planted.as_str(),
+            vec![
+                "--ops", OPS10, "--max-size", "4", "--null-shifts", "25", "--seed", "5", "--pnl-blocks", "4", "--pnl-stat", "mean-semi", "--threshold",
+                "1e-30", "--threads", "4", "--json",
+            ],
+        ),
+        (
+            "discrete_size3_cvar",
+            discrete.as_str(),
+            vec!["--ops", "add,sub,mul,abs", "--max-size", "3", "--pnl-blocks", "4", "--pnl-stat", "cvar", "--threads", "2", "--json"],
+        ),
+    ];
+    let root = dir.to_string_lossy().into_owned();
+    let mut differ = Vec::new();
+    for (k, (name, data, extra)) in cases.into_iter().enumerate() {
+        let o = enumerate(data, &spec, &extra);
+        assert_eq!(code(&o), 0, "{name}: {}", stderr(&o));
+        let got = drop_member(&drop_member(stdout(&o).trim(), "work"), "timing").replace(&root, "<dir>");
+        let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/enumerate").join(format!("{name}.json"));
+        let want = std::fs::read_to_string(&golden).unwrap_or_default();
+        if got != want.trim_end() {
+            let out = Path::new(env!("CARGO_TARGET_TMPDIR")).join("enumerate-golden");
+            std::fs::create_dir_all(&out).unwrap();
+            let path = out.join(format!("{k}-{name}.json"));
+            std::fs::write(&path, format!("{got}\n")).unwrap();
+            differ.push(format!("case {k} {name} ({extra:?}) differs from {}; observed report in {}", golden.display(), path.display()));
+        }
+    }
+    assert!(differ.is_empty(), "{}", differ.join("\n"));
+}
+
 /// A gate search written before the subcommand is refused: `--gate-search` takes its
 /// flags first, and the plain class report would drop the gate search without a word.
 #[test]
