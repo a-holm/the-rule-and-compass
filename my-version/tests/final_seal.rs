@@ -1525,8 +1525,9 @@ fn plain_run(dir: &Path, name: &str) -> String {
     s(&path)
 }
 
-/// Path `k` of a CPCV(3, 2) assembly over six daily periods from 2020-01-01 at 10 bp and 365
-/// periods a year (fixture F of tests/trials_table.rs): the population of a frozen pick.
+/// Path `k` of a CPCV(3, 2) assembly over six daily periods from 2020-01-01 at 10 bp and 8760
+/// periods a year (the grid of the hourly read; fixture F of tests/trials_table.rs): the
+/// population of a frozen pick.
 fn cpcv_path(dir: &Path, k: usize) -> String {
     const F0: i64 = 1_577_836_800;
     const DAY: i64 = 86_400;
@@ -1555,12 +1556,12 @@ fn cpcv_path(dir: &Path, k: usize) -> String {
         "{{\"tool\":\"rcsr\",\"mode\":\"cpcv_path\",\"schema\":\"rcsr-cpcv-path/1\",\"window_definition\":\"{scheme}\",\
          \"purge\":{{\"horizon_seconds\":86400,\"embargo_seconds\":0}},\"cost_model\":{{\"per_side_bps\":10,\"round_trip_bps\":20}},\
          \"cost\":{{\"per_side_bps\":10,\"source\":\"flag\"}},\
-         \"annualization\":{{\"periods_per_year\":365,\"method\":\"explicit\",\"source\":\"explicit\",\"period_seconds\":86400}},\
+         \"annualization\":{{\"periods_per_year\":8760,\"method\":\"explicit\",\"source\":\"explicit\",\"period_seconds\":86400}},\
          \"threshold\":{{\"quantile\":0.5,\"fixed\":0}},\"policy\":{{\"name\":\"threshold\",\"band_width\":0,\"min_hold\":1}},\
          \"book\":{{\"missing_score\":\"flat\"}},\"pooled_seam\":{{\"reset_flat\":true,\"seam_cost\":0,\"seam_trades\":0}},\
          \"cpcv\":{{\"scheme_sha256\":\"{scheme}\",\"splits_sha256\":\"{splits}\",\"groups\":3,\"test_groups\":2,\"splits\":3,\"paths\":2,\
          \"path\":{k},\"seam_rule\":\"flat\",\"segments\":[{}]}},\
-         \"pooled\":{{\"periods\":6,\"periods_per_year\":365,\"period_net\":[{}],\"period_time\":[{}]}}}}\n",
+         \"pooled\":{{\"periods\":6,\"periods_per_year\":8760,\"period_net\":[{}],\"period_time\":[{}]}}}}\n",
         segs.join(","),
         list(&net),
         list(&time)
@@ -1596,7 +1597,7 @@ fn sealed_read_verdict_end_to_end() {
     let l = p("ledger.jsonl");
     let wf = |extra: &[&str]| {
         let mut a = vec![
-            "walkforward", "--data", data.as_str(), "--target", "y", "--time", "ts", "--group-by", "s", "--from-run", run.as_str(), "--periods-per-year", "365",
+            "walkforward", "--data", data.as_str(), "--target", "y", "--time", "ts", "--group-by", "s", "--from-run", run.as_str(),
             "--emit-series", "--json", "--ledger", l.as_str(),
         ];
         a.extend_from_slice(extra);

@@ -630,7 +630,8 @@ fn verdict_uses_frozen_thresholds_as_is() {
     assert_eq!(code, 0, "{out}{err}");
     let table = Json::parse(std::fs::read_to_string(&s.thresholds).unwrap().trim()).unwrap();
     let frozen = at(&items(at(&table, &["picks"]))[0], &["freeze"]);
-    let c = candidate(&result(&s), 0);
+    let j = result(&s);
+    let c = candidate(&j, 0);
     for (gate, key, field) in [("S4", "floor", "s4_floor"), ("P1", "floor", "p1_floor"), ("S3", "cap", "drawdown_cap")] {
         assert_eq!(num(c, &["gates", gate, key]).to_bits(), num(frozen, &[field, "value"]).to_bits(), "{gate}");
     }
@@ -668,12 +669,13 @@ fn hashed_report_text_reproduces_the_report_hash() {
     }
     let data = p("d.csv");
     std::fs::write(&data, csv).unwrap();
+    rcsr::lockbox::write_sidecar(&data, &rcsr::lockbox::Lockbox { start: t0 + 300 * 3600, end: t0 + 400 * 3600 }, "test").unwrap();
     let run = p("run.json");
     std::fs::write(&run, run_json(t0)).unwrap();
     let respelled = p("run2.json");
     std::fs::write(&respelled, format!("{} \n", run_json(t0).trim_end())).unwrap();
     let w = format!("dev,{},{},{},{}", t0, t0 + 150 * 3600, t0 + 160 * 3600, t0 + 250 * 3600);
-    let base = ["walkforward", "--data", data.as_str(), "--target", "y", "--time", "ts", "--window", w.as_str(), "--periods-per-year", "365", "--emit-series", "--bootstrap", "50"];
+    let base = ["walkforward", "--data", data.as_str(), "--target", "y", "--time", "ts", "--window", w.as_str(), "--emit-series", "--bootstrap", "100"];
     let report = |name: &str, extra: &[&str]| -> (String, Json) {
         let out = p(name);
         let mut a = base.to_vec();
