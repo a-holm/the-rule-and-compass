@@ -435,7 +435,8 @@ fn enumerate_report_is_unchanged() {
         ),
     ];
     let root = dir.to_string_lossy().into_owned();
-    for (name, data, extra) in cases {
+    let mut differ = Vec::new();
+    for (k, (name, data, extra)) in cases.into_iter().enumerate() {
         let o = enumerate(data, &spec, &extra);
         assert_eq!(code(&o), 0, "{name}: {}", stderr(&o));
         let got = drop_member(&drop_member(stdout(&o).trim(), "work"), "timing").replace(&root, "<dir>");
@@ -444,11 +445,12 @@ fn enumerate_report_is_unchanged() {
         if got != want.trim_end() {
             let out = Path::new(env!("CARGO_TARGET_TMPDIR")).join("enumerate-golden");
             std::fs::create_dir_all(&out).unwrap();
-            let path = out.join(format!("{name}.json"));
+            let path = out.join(format!("{k}-{name}.json"));
             std::fs::write(&path, format!("{got}\n")).unwrap();
-            panic!("{name} ({extra:?}) differs from {}; observed report in {}", golden.display(), path.display());
+            differ.push(format!("case {k} {name} ({extra:?}) differs from {}; observed report in {}", golden.display(), path.display()));
         }
     }
+    assert!(differ.is_empty(), "{}", differ.join("\n"));
 }
 
 /// A gate search written before the subcommand is refused: `--gate-search` takes its
