@@ -2630,3 +2630,126 @@ fn xs_mean_runs_with_a_split_table_and_a_mask() {
         assert!(num(b, &["mask", "on_share"]) < 1.0, "{slot}");
     }
 }
+
+// ---- #1246: one masked sd definition ----
+
+const MASKED_SD_ARGS: [&str; 10] = ["--fitness", "pnl", "--pnl-mask", "g", "--band", "0.5", "--band-units", "sd", "--min-holding", "2"];
+
+/// The gate-on training rows of the `g` column of `write_gate_csv`, as `(x1, x2)` and the scores of `exact` on them.
+fn masked_train_scores(j: &Json, data: &str, exact: &str) -> Vec<f64> {
+    let tree = rcsr::parse::parse(exact, &["x1".to_string(), "x2".to_string()]).unwrap();
+    let (lo, hi) = time_range(j, "train_time");
+    let text = std::fs::read_to_string(data).unwrap();
+    text.lines()
+        .skip(1)
+        .map(|l| l.split(',').map(|c| c.parse::<f64>().unwrap()).collect::<Vec<f64>>())
+        .filter(|v| v[0] >= lo && v[0] <= hi && v[5] > 0.0)
+        .map(|v| rcsr::expr::eval(&tree, &[v[1], v[2]]))
+        .collect()
+}
+
+#[test]
+fn masked_sd_run_reports_the_training_band() {
+    let (_scratch, dir) = scratch();
+    let data = write_gate_csv(&dir);
+    let spec = write_spec(&dir);
+    let j = json(&run(&data, &spec, &MASKED_SD_ARGS));
+    let mut seen = 0;
+    for m in pareto(&j) {
+        let v = at(m, &["validation_book"]);
+        let Some(sd) = v.get("band_sd").and_then(Json::as_f64) else { continue };
+        let on = masked_train_scores(&j, &data, at(m, &["expression_exact"]).as_str().unwrap());
+        let want = trading::score_sd(&on).sd.unwrap();
+        assert_eq!(sd.to_bits(), want.to_bits(), "{}", at(m, &["expression_exact"]).as_str().unwrap());
+        assert_eq!(num(v, &["band_resolved"]).to_bits(), (0.5 * want).to_bits());
+        seen += 1;
+    }
+    assert!(seen >= 2, "{seen} members with an sd");
+    let exact = at(&j, &["objective", "finalist", "expression_exact"]).as_str().unwrap();
+    let on = masked_train_scores(&j, &data, exact);
+    let sd = trading::score_sd(&on);
+    let band = (0.5 * sd.sd.unwrap()).to_bits();
+    assert_eq!(num(&j, &["objective", "spec", "band_sd_rows"]), sd.rows as f64);
+    assert_eq!(num(&j, &["objective", "spec", "band_resolved"]).to_bits(), band);
+    for slot in ["validation", "test"] {
+        assert_eq!(num(&j, &["objective", slot, "band_resolved"]).to_bits(), band, "{slot}");
+    }
+}
+
+#[test]
+fn walkforward_from_masked_sd_run_uses_the_training_band() {
+    let (_scratch, dir) = scratch();
+    let data = write_gate_csv(&dir);
+    let spec = write_spec(&dir);
+    let out = run(&data, &spec, &MASKED_SD_ARGS);
+    let j = json(&out);
+    let run_path = dir.join("run.json").to_string_lossy().into_owned();
+    std::fs::write(&run_path, &out.stdout).unwrap();
+    let (tlo, thi) = time_range(&j, "train_time");
+    let (vlo, vhi) = time_range(&j, "validation_time");
+    let window = format!("v,{tlo},{thi},{vlo},{vhi}");
+    let wf_path = dir.join("wf.json").to_string_lossy().into_owned();
+    let wf = rcsr_cmd::rcsr()
+        .args(["walkforward", "--data", &data, "--time", "t", "--from-run", &run_path, "--window", &window, "--allow-in-sample-windows", "--out", &wf_path])
+        .output()
+        .unwrap();
+    assert_eq!(code(&wf), 0, "{}", stderr(&wf));
+    let report = Json::parse(std::fs::read_to_string(&wf_path).unwrap().trim()).unwrap();
+    let exact = at(&j, &["objective", "finalist", "expression_exact"]).as_str().unwrap();
+    let want = 0.5 * trading::score_sd(&masked_train_scores(&j, &data, exact)).sd.unwrap();
+    let Json::Arr(windows) = at(&report, &["windows"]) else { panic!("windows") };
+    assert_eq!(num(&windows[0], &["band", "band_width"]).to_bits(), want.to_bits());
+}
+
+/// The book hash of a masked sd-unit book on `slice(&[400, 400])` before #1246.
+const MASKED_SD_HASH_BEFORE: u64 = 0xc99ea16df2e72a3a;
+const MASKED_SCORE_HASH: u64 = 0xc4f6750e164e983d;
+const UNMASKED_SD_HASH: u64 = 0xc12c5650f2d4ac73;
+const MASKED_SD_CHECKPOINT_HASH_BEFORE: u64 = 0xe2ff12ae5c721c6d;
+
+#[test]
+fn book_hash_unmasked_sd_unchanged() {
+    let s = slice(&[400, 400]);
+    let book = FitnessBook::new(&s, &band_spec(0.5, trading::BandUnits::Sd, 1), 900.0).unwrap();
+    assert_eq!(book.hash(), UNMASKED_SD_HASH, "{:#x}", book.hash());
+}
+
+#[test]
+fn book_hash_masked_score_unchanged() {
+    let s = slice(&[400, 400]);
+    let on = alternate_mask(&s, 50);
+    let book = masked(&s, &band_spec(0.5, trading::BandUnits::Score, 1), 2, &on).unwrap();
+    assert_eq!(book.hash(), MASKED_SCORE_HASH, "{:#x}", book.hash());
+}
+
+#[test]
+fn masked_sd_book_hash_names_the_masked_definition() {
+    let s = slice(&[400, 400]);
+    let on = alternate_mask(&s, 50);
+    let book = masked(&s, &band_spec(0.5, trading::BandUnits::Sd, 1), 2, &on).unwrap();
+    assert_ne!(book.hash(), MASKED_SD_HASH_BEFORE, "{:#x}", book.hash());
+}
+
+#[test]
+fn masked_sd_checkpoint_from_before_the_fix_refuses_resume() {
+    let (_scratch, dir) = scratch();
+    let data = write_gate_csv(&dir);
+    let spec = write_spec(&dir);
+    let cp = dir.join("masked-sd.rcsr").to_string_lossy().into_owned();
+    let first = run(&data, &spec, &[&MASKED_SD_ARGS[..], &["--generations", "10", "--save", &cp]].concat());
+    assert_eq!(code(&first), 0, "{}", stderr(&first));
+    let hash = saved_book_hash(&cp);
+    assert_ne!(hash, MASKED_SD_CHECKPOINT_HASH_BEFORE, "{hash:#x}");
+    let before = unfnv_u64(hash, 1);
+    assert_eq!(before, MASKED_SD_CHECKPOINT_HASH_BEFORE, "{hash:#x} {before:#x}");
+    let resume = |path: &str| run(&data, &spec, &[&MASKED_SD_ARGS[..], &["--generations", "20", "--resume", path]].concat());
+    let same = resume(&cp);
+    assert_eq!(code(&same), 0, "{}", stderr(&same));
+    let text = std::fs::read_to_string(&cp).unwrap().replace(&format!("long_pnl:{hash:016x}"), &format!("long_pnl:{before:016x}"));
+    let block: String = text.lines().filter(|l| l.starts_with("config ")).map(|l| format!("{l}\n")).collect();
+    let config_hash = format!("config_hash {:016x}", rcsr::checkpoint::hash_config_text(&block));
+    let old: String = text.lines().map(|l| if l.starts_with("config_hash ") { format!("{config_hash}\n") } else { format!("{l}\n") }).collect();
+    let old_cp = dir.join("before.rcsr");
+    std::fs::write(&old_cp, old).unwrap();
+    usage_error(&resume(&old_cp.to_string_lossy()), "fitness");
+}
