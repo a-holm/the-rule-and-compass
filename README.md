@@ -514,7 +514,7 @@ atomically instead of streaming it. See
   estimate is 7.83 GB against a 7.26 GB measured peak, instead of the old
   61.71 GiB that produced a 577k-row sample. A store that does not fit is
   refused; sampling is explicit via `--sample-rows N` (mutually exclusive with
-  `--force`, and still budget-guarded) and is recorded as `full_rows=false` in
+  `--force`, still budget-guarded, and refused with `--pnl-mask`, `rcsr compose` and `rcsr switch`, whose gate states need every row) and is recorded as `full_rows=false` in
   the preparation block, manifest and dev log. When a store is read with
   `--vars` and `--time`, the default **projects the read** to those variables,
   targets, `--weight`, `--time` and `--group-by`: only those blocks are read,
