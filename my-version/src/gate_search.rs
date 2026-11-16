@@ -25,7 +25,7 @@ use crate::devlog::{num, text, Json};
 use crate::expr::{self, Node, Op};
 use crate::occam::{self, CodeSpec};
 use crate::regime_gate::{self, GateSpec};
-use crate::trading::{FitnessBook, PositionLayer, TradingSpec};
+use crate::trading::{BlockStat, FitnessBook, PnlExcess, PositionLayer, TradingSpec};
 use std::sync::{Arc, OnceLock};
 
 /// Quantiles of the cut grid (the 4-bit cut of the composite code).
@@ -300,6 +300,7 @@ fn load_branch(flag: &str, pool: Pool, value: &str) -> Result<Branch, (i32, Stri
     let doc = Json::parse(body.trim()).ok_or_else(|| bad("not a run.json document".to_string()))?;
     let archive_rank = doc.get("objective").and_then(|o| o.get("finalist")).and_then(|f| f.get("archive_rank")).and_then(Json::as_usize).unwrap_or(1);
     let text = if book.threshold == 0.0 { e.clone() } else { format!("({}) - ({:?})", e, book.threshold) };
+    let (pnl_excess, stat) = compose::run_fitness(&doc).map_err(bad)?;
     let pool_run = PoolRun {
         pool,
         path: value.to_string(),
@@ -312,6 +313,8 @@ fn load_branch(flag: &str, pool: Pool, value: &str) -> Result<Branch, (i32, Stri
         split: doc.get("split").cloned().unwrap_or(Json::Null),
         candidates_evaluated: run.candidates_evaluated,
         front_size: run.front.len(),
+        pnl_excess,
+        stat,
     };
     Ok(Branch { source: Source::Run(Box::new(pool_run)), expression_exact: e, text, columns, archive_rank })
 }
@@ -650,6 +653,8 @@ pub fn finish(req: &Request, f: &Finish, trading: Option<&TradingSplit>, tspec: 
                 split: split_doc.clone(),
                 candidates_evaluated: None,
                 front_size: 1,
+                pnl_excess: PnlExcess::None,
+                stat: BlockStat::MeanSd,
             },
         };
         member_bits.push(compose::tree_bits(&code, tree).unwrap_or_else(|e| fail(&format!("branch '{}': {}", b.expression_exact, e))));

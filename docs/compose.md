@@ -25,6 +25,8 @@ Every input run must share with this invocation:
 | target spec | `target_spec` (by its hash) |
 | cost | `objective.spec.per_side_bps` |
 | split | `split.mode`, `train_rows`, `validation_rows`, `test_rows`, `train_time`, `validation_time`, `required_purge_seconds`, `purge_seconds`, `split_id`, `intervals`, `interval_purge_seconds`, `embargo_seconds` |
+| fitness excess (#1232) | `objective.spec.pnl_excess` (absent: `none`), against `--pnl-excess` |
+| block statistic (#1232) | `search_fitness.stat` and `search_fitness.cvar_q` (absent: `mean-sd`), against `--pnl-stat` and `--pnl-cvar-q` |
 
 A difference exits 2 and names the field. A run.json records no data hash, so the row counts, the time ranges and the intervals stand in for it. A run that priced a band, a minimum hold, the top-tercile book, a position size or a funding column exits 2, as does a front member without `expression_exact`.
 
@@ -74,7 +76,7 @@ A branch is its member with its run's threshold subtracted, `(f) - (t)` (just `f
 
 ### Pruning
 
-With `switch_budget k` in the menu, the k-switch bound of #1185 is computed for every C1 and C2 pair on the training rows. A pair whose bound gain over its better branch is not positive is pruned for every gate: it is counted and listed (`pruned`, `bound_gain`) but not scored. The bound is a necessary condition only.
+With `switch_budget k` in the menu, the k-switch bound of #1185 is computed for every C1 and C2 pair on the training rows. A pair whose bound gain over its better branch is not positive is pruned for every gate: it is counted and listed (`pruned`, `bound_gain`) but not scored. The bound is a necessary condition only. Under `--pnl-excess xs-mean` the bound and the branch nets it is compared with are on the training excess `(r - m_t) - funding`, the quantity the pools were fitted on, so the gain compares two numbers on one scale.
 
 ## The choice
 
@@ -83,6 +85,15 @@ Every composite that is not pruned is priced on the validation rows by the long/
 The state view of a book splits it by gate state. The book of state s holds the composite's score on the rows of state s and a flat score elsewhere; a row with no finite score stays one in every state book, so all of them follow the same missing-score rule as the composite (#1206). Each is priced by the book code. Its alpha is its net minus its exposure (long rows over priced rows of the state) times the net of the buy-and-hold book of the same rows. The composite net is the sum of the two state nets and the seam, `2 side J` of the seam identity (#1185). A period is in the state that most of its priced rows hold.
 
 Only the training and validation rows are read before the finalist is fixed. The test rows are priced afterwards, for the finalist, its branches and the best all-weather member.
+
+### Pools searched under another fitness (#1232)
+
+Pools searched with `--pnl-excess xs-mean` (#1179) or with another `--pnl-stat` (#1178) compose when this invocation passes the same flags. The fitness changes how the pools found their members, not how a composite is priced or chosen:
+
+* The choice ranks absolute net and absolute alpha under every fitness. The composite is one absolute book: its positions and costs are absolute, a composite ranked on the excess could beat the cross-section while losing money, the per-state alpha already removes market beta through the exposure-matched buy-and-hold, and walk-forward, the ladder and the seal price the absolute book. The excess is reported, never ranked; the statistic is not read at all.
+* The pruning bound reads the training book: under xs-mean it is on the training excess, `m_t` the equal-weight mean of every training row at the row's timestamp. A pool searched with `--pnl-mask` had `m_t` over its gate-on rows; compose and its validation and test books use the unmasked rows.
+* Every pool must carry the flags of this invocation (the table above), and the pools must agree with each other; a difference exits 2 and names `objective.spec.pnl_excess` or `search_fitness.stat`. There is no inheritance: a run of `none` pools never becomes an xs-mean run, nor the reverse.
+* Under xs-mean every priced book (the composites in `compose.composites`, the chosen validation and test books, each branch, the best all-weather member, `objective.validation` and `objective.test`) gains `xs_excess_net`, the net minus the sum over rows of position times the slice's timestamp mean; `compose.chosen.excess` is `xs_mean`, `objective.spec.pnl_excess` stays as the spec writes it, and the text summary names the excess. `compose.runs[]` carries `pnl_excess`, `stat` and `cvar_q` of each pool when they are not `none` and `mean-sd`. Without the flags none of these fields is written.
 
 ## Output
 
@@ -120,8 +131,8 @@ A run written before the switch block (`compose.gate.carried: true` and no `obje
 | case | exit |
 |---|---|
 | no `--gates`, no `--bull` and no `--bear`, `--top 0`, a bad menu | 2 |
-| input runs that differ in target, target spec, cost or split, from each other or from this invocation | 2 |
-| `--threshold`, `--position`, `--book-target`, `--band`, `--band-units`, `--min-holding`, `--max-position`, `--cash-return`, `--funding`, `--pnl-mask`, `--sample-rows`, `--pnl-excess`, `--pnl-stat`, `--pnl-cvar-q`, `--gpu`, a `--select-rule` other than robust, a `--fitness` other than pnl | 2 |
+| input runs that differ in target, target spec, cost, split or fitness (`objective.spec.pnl_excess`, `search_fitness.stat`), from each other or from this invocation | 2 |
+| `--threshold`, `--position`, `--book-target`, `--band`, `--band-units`, `--min-holding`, `--max-position`, `--cash-return`, `--funding`, `--pnl-mask`, `--sample-rows`, `--gpu`, a `--select-rule` other than robust, a `--fitness` other than pnl | 2 |
 | `--lags`, `--lag-set`, `--fill` other than `drop`, `--outlier-iqr`, `--smooth` | 2 |
 | no validation rows, or no composite with a usable validation book | 2 |
 | a gate or branch column of the label family, the target, its return column or a construction column | 5 |
@@ -184,4 +195,4 @@ Every composite pays its full length under the composite code (report-only): the
 | a label-family column, the target, its return column or a construction column in `--vars` or a branch | 5 |
 | an unreadable branch run | 3 |
 
-The device arm is refused: the device book carries no gate layer.
+The device arm is refused: the device book carries no gate layer. `--pnl-excess` stays refused: the gate's own fitness and the `gate_search` training figures would be on the excess. A branch run is not checked for `objective.spec.pnl_excess` or `search_fitness.stat`: the branch is a frozen formula and the gate search ranks by its own `--pnl-stat`; `compose.runs[]` reports the branch run's fitness when it is not `none` and `mean-sd`.
