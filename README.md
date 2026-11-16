@@ -300,6 +300,19 @@ rcsr compose --data dev.rcsb --target lbl_h24a_y --target-spec dev.targets.json 
 
 See [`docs/compose.md`](docs/compose.md).
 
+### Every small formula, scored exactly (`rcsr enumerate`)
+
+`rcsr enumerate` takes the flags of a `--fitness pnl` run, builds that run's training book and stops before any search. It scores every tree of at most `--max-size` nodes over the normalised `--vars` and the unary and binary `--ops` (no constant leaf, canonical forms only) at `--cuts Q` quantiles of each tree's own training predictions, with the same book code the search ranks by. The report gives the class counts, the best member of every size (the certified class optimum), the `--top` members with their validation book, and the expression of each member in original units. `--compare-run run.json` gives the gap of a finished search to the class optimum at each complexity, `--null-shifts R` the family-wise p-value of the class under R shared circular shifts of the returns (White 2000; Romano and Wolf 2005), and `--emit-seeds` writes the top members for `--seed-file` and `walkforward --expr`. Above 4 nodes the command needs `--allow-large`.
+
+```sh
+rcsr enumerate --data dev.rcsb --target lbl_h1_y --target-spec dev.targets.json --vars "$VIEW" \
+  --ops add,sub,mul,div,abs,exp,square,tanh,logistic,gauss --time ts --group-by symbol \
+  --split temporal --validation-frac 0.3 --objective sharpe --cost-bps 10 --pnl-blocks 4 \
+  --max-size 4 --null-shifts 19 --compare-run run.json --emit-seeds seeds.txt --json --out enumerate.json
+```
+
+See [`docs/optimisation.md`](docs/optimisation.md) section 3.6 and [`docs/overfitting.md`](docs/overfitting.md) section 3.12.
+
 ### Gate search between frozen branches (`--gate-search`)
 
 `--gate-search` searches the gate of a switch itself. The genome is one formula `g` over `--vars`; the two branches are frozen: the finalist of a run (with its threshold folded in), an expression, or cash. A candidate gate is scored at its best cut of the 16-quantile grid of its training values by the `--fitness pnl` book of the one composite that holds `--branch-on` where the gate state is on and `--branch-off` elsewhere (the state is the `--pnl-mask` kernel over `g - c` with `--gate-band` and `--gate-dwell`). The front goes to the choice and the pricing of `rcsr compose`: every member is a searched gate with one composite, chosen on the validation rows by the robust rule with a non-negative alpha in each gate state, and the run.json carries the switch of every composite, so walk-forward, `ladder --sr-run`, `--reselect-run`, the seal and the sealed read price it unchanged. Every candidate counts in `search.candidates_evaluated` and every composite pays its full description length (the gate tree under the composite code plus the 4-bit cut).

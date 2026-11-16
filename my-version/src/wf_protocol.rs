@@ -426,7 +426,7 @@ fn permuted_sources(periods: usize, block: usize, rng: &mut Mt) -> Vec<u32> {
 }
 
 /// Smallest offset of the shared shift and the number of offsets of a window of `periods`.
-fn shift_range(periods: usize, block: usize) -> (u64, u64) {
+pub(crate) fn shift_range(periods: usize, block: usize) -> (u64, u64) {
     let lo = block.min(periods / 4).max(1) as u64;
     let p = periods as u64;
     (lo, (p + 1).saturating_sub(2 * lo))
