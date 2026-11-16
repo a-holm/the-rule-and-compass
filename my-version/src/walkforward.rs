@@ -288,6 +288,13 @@ pub struct FrontSource {
     pub ranks: Vec<usize>,
 }
 
+/// #1238: the run file a `--from-run` report priced and the SHA-256 of its bytes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RunRef {
+    pub run: String,
+    pub run_sha256: String,
+}
+
 impl Default for ProtocolOptions {
     fn default() -> Self {
         ProtocolOptions {
@@ -815,6 +822,8 @@ pub struct Report {
     pub selected_on: String,
     /// #482: the run whose Pareto front supplied the candidates.
     pub front: Option<FrontSource>,
+    /// #1238: the run of a `--from-run` report, written as `selection.run` and `run_sha256`.
+    pub from_run: Option<RunRef>,
     /// #807: `exact` or `rounded` for candidates read from a run.json.
     pub expression_source: Option<crate::run_json::ExpressionSource>,
     /// #1237: the compose provenance of the run, written as `selection.composite`.
@@ -2828,6 +2837,7 @@ impl Accum {
             candidates: expressions,
             selected_on,
             front: opts.front.clone(),
+            from_run: None,
             expression_source: opts.expression_source,
             composite: opts.composite.clone(),
             band_select: spec.band_select,
@@ -4903,19 +4913,22 @@ impl Member {
 }
 
 impl Report {
-    /// #482: `source`, `run`, `run_sha256` and the candidate labels, then the #1237
+    /// #482: `source`, `run`, `run_sha256` and the candidate labels of a `--front`
+    /// report, `run` and `run_sha256` of a `--from-run` report (#1238), then the #1237
     /// `composite` marker of a composed run, with a leading comma. Empty when the
     /// candidates came from `--expr`.
     fn front_json(&self, paths: bool) -> String {
-        let mut s = match &self.front {
-            Some(f) => format!(
+        let path = |run: &str| if paths { format!(",\"run\":{}", jstr(run)) } else { String::new() };
+        let mut s = match (&self.front, &self.from_run) {
+            (Some(f), _) => format!(
                 ",\"source\":\"{}\"{},\"run_sha256\":{},\"candidate_labels\":[{}]",
                 if self.members.is_some() { "front_all_members" } else { "front" },
-                if paths { format!(",\"run\":{}", jstr(&f.run)) } else { String::new() },
+                path(&f.run),
                 jstr(&f.run_sha256),
                 f.labels.iter().map(|l| jstr(l)).collect::<Vec<_>>().join(",")
             ),
-            None => String::new(),
+            (None, Some(r)) => format!("{},\"run_sha256\":{}", path(&r.run), jstr(&r.run_sha256)),
+            (None, None) => String::new(),
         };
         if let Some(c) = &self.composite {
             s.push_str(&format!(",\"composite\":{}", c.json()));
