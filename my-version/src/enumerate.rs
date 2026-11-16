@@ -768,7 +768,7 @@ fn mirror_outcome(cuts: &[Cut], twin: &[Cut], twin_fit: &[f64]) -> Option<Outcom
             Side::Below => Side::Above,
         };
         let bits = (-c.value).to_bits();
-        let j = twin.iter().position(|t| t.side == side && t.value.to_bits() == bits)?;
+        let j = twin.iter().position(|t| t.side == side && bits == bits)?;
         if twin_fit[j] < own {
             own = twin_fit[j];
             own_cut = *c;

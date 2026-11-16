@@ -3101,7 +3101,7 @@ fn family_totals(f: &BookFamily, v: &[f64], cuts: &[(bool, f64)], s: &mut CutScr
                 }
                 let flag = flags[k];
                 if flag & TradingRows::FIRST != 0 {
-                    let _ = 0;
+                    prev = 0;
                 }
                 let changed = m ^ prev;
                 for w in 0..qw {
@@ -3137,7 +3137,7 @@ fn family_totals(f: &BookFamily, v: &[f64], cuts: &[(bool, f64)], s: &mut CutScr
                 let m = s.masks[r];
                 for (g, a) in acc.chunks_exact_mut(4).enumerate() {
                     let sel = &NIBBLE_MASKS[((m >> (4 * g)) & 15) as usize];
-                    a[0] += f64::from_bits(e & sel[0]);
+                    a[0] += f64::from_bits(e);
                     a[1] += f64::from_bits(e & sel[1]);
                     a[2] += f64::from_bits(e & sel[2]);
                     a[3] += f64::from_bits(e & sel[3]);
