@@ -261,8 +261,6 @@ fn switch_refusals_name_their_reason() {
     refused(&["--a", "x1", "--b", "x1", "--gate", "g"], 2, "same book");
     refused(&["--a", "x1", "--b", "flat", "--gate", "g", "--band", "0.1"], 2, "not plain");
     refused(&["--a", "x1", "--b", "flat", "--gate", "g", "--pnl-mask", "g"], 2, "--pnl-mask");
-    refused(&["--a", "x1", "--b", "flat", "--gate", "g", "--pnl-stat", "cvar"], 2, "--pnl-stat: the sweep reports the mean-sd block fitness");
-    refused(&["--a", "x1", "--b", "flat", "--gate", "g", "--pnl-cvar-q", "0.5"], 2, "--pnl-cvar-q: the sweep reports the mean-sd block fitness");
     refused(&["--a", "x1", "--b", "flat", "--gate", "g", "--gpu"], 2, "--gpu");
     refused(&["--a", "x1", "--b", "flat", "--gate", "g", "--fitness", "metric"], 2, "--fitness must be pnl");
     refused(&["--a", "x1", "--b", "flat"], 2, "--gate <expr> is required");
@@ -290,3 +288,117 @@ fn switch_help_lists_its_options() {
     let top = rcsr(&["--help"]);
     assert!(String::from_utf8_lossy(&top.stdout).contains("rcsr switch"));
 }
+
+/// `x1` and the return of row `(k, j)` of [`write_csv`].
+fn row(k: usize, j: usize) -> (f64, f64) {
+    let i = (k + 40) as f64 * 3.0 + j as f64;
+    let x1 = frac(i * 0.618_033_988_749_894_9) - 0.5;
+    let noise = frac(i * 0.324_717_957_244_746) - 0.5;
+    (x1, (if regime(k) > 0.0 { 0.01 } else { -0.01 }) * x1 + 0.0005 * noise)
+}
+
+/// #1232: under `--pnl-excess xs-mean` the profile is on the excess per row
+/// `(r - m_t) - funding`. The report says so; the counts that depend on the
+/// positions only are those of the absolute run at every grid cut, and the
+/// gross of a cut is the absolute gross less the sum over its long rows of the
+/// mean return of the three symbols at the row's stamp, by hand.
+#[test]
+fn switch_json_reports_excess_label() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, "d.csv", 0, |_| None);
+    let spec = write_spec(&dir);
+    let args = ["--a", "x1", "--b", "0 - x1", "--gate", "g", "--cuts", "8"];
+    let none = json(&switch(&data, &spec, &[&args[..], &["--json"]].concat()));
+    let xs = json(&switch(&data, &spec, &[&args[..], &["--json", "--pnl-excess", "xs-mean"]].concat()));
+    assert!(none.get("excess").is_none());
+    assert_eq!(at(&xs, &["excess"]).as_str(), Some("xs_mean"));
+    let stamps = num(&xs, &["timestamps"]) as usize;
+    assert_eq!(num(&xs, &["train_rows"]), 3.0 * stamps as f64);
+    let mean = |k: usize| (0..SYMBOLS.len()).map(|j| row(k, j).1).sum::<f64>() / SYMBOLS.len() as f64;
+    let profile = |j: &Json| arr(&arr(j, &["gates"])[0], &["grid", "profile"]).clone();
+    let (pn, px) = (profile(&none), profile(&xs));
+    assert_eq!(pn.len(), 7);
+    for (a, b) in pn.iter().zip(&px) {
+        for key in ["index", "value", "rows_a", "flips", "exits", "long_rows", "entry_times", "gate_flips", "switches", "seam_pairs"] {
+            assert_eq!(at(a, &[key]), at(b, &[key]), "{key}");
+        }
+        let c = num(a, &["value"]);
+        let mut held = 0.0f64;
+        for k in 0..stamps {
+            for j in 0..SYMBOLS.len() {
+                let (x1, _) = row(k, j);
+                let v = if regime(k) > c { x1 } else { 0.0 - x1 };
+                if v > 0.0 {
+                    held += mean(k);
+                }
+            }
+        }
+        let want = num(a, &["gross"]) - held;
+        assert!((num(b, &["gross"]) - want).abs() <= 1e-12, "cut {c}: xs gross {} vs gross - sum m {want}", num(b, &["gross"]));
+        let cost = num(a, &["gross"]) - num(a, &["net"]);
+        assert!((num(b, &["gross"]) - num(b, &["net"]) - cost).abs() <= 1e-12, "cut {c}: the cost is on positions only");
+        assert!((num(b, &["net"]) - num(a, &["net"])).abs() > 1e-6, "cut {c}: the net is on the excess");
+    }
+    for side in ["a", "b"] {
+        for key in ["flips", "exits", "long_rows"] {
+            assert_eq!(at(&none, &[side, key]), at(&xs, &[side, key]), "{side}.{key}");
+        }
+    }
+    let text = switch(&data, &spec, &[&args[..], &["--pnl-excess", "xs-mean"]].concat());
+    assert_eq!(code(&text), 0, "{}", stderr(&text));
+    assert!(String::from_utf8_lossy(&text.stdout).contains("excess: xs_mean"), "{}", String::from_utf8_lossy(&text.stdout));
+    let plain = switch(&data, &spec, &args);
+    assert!(!String::from_utf8_lossy(&plain.stdout).contains("excess:"));
+}
+
+/// #1232 (with #1178): `--pnl-stat` and `--pnl-cvar-q` change the block fitness
+/// of the cuts and nothing else, and the report names the statistic.
+#[test]
+fn switch_reports_the_block_statistic() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, "d.csv", 0, |_| None);
+    let spec = write_spec(&dir);
+    let args = ["--a", "x1", "--b", "0 - x1", "--gate", "g", "--cuts", "8", "--pnl-blocks", "8"];
+    let run = |extra: &[&str]| json(&switch(&data, &spec, &[&args[..], extra, &["--json"]].concat()));
+    let sd = run(&[]);
+    assert!(at(&sd, &["book"]).get("stat").is_none());
+    for (extra, stat, q) in [(&["--pnl-stat", "cvar", "--pnl-cvar-q", "0.25"][..], "cvar", Some(0.25)), (&["--pnl-stat", "mean-semi"][..], "mean-semi", None)] {
+        let j = run(extra);
+        assert_eq!(at(&j, &["book", "stat"]).as_str(), Some(stat));
+        assert_eq!(at(&j, &["book"]).get("cvar_q").and_then(Json::as_f64), q);
+        let (gs, gj) = (&arr(&sd, &["gates"])[0], &arr(&j, &["gates"])[0]);
+        let mut changed = 0;
+        for (a, b) in arr(gs, &["grid", "profile"]).iter().zip(arr(gj, &["grid", "profile"])) {
+            for key in ["index", "value", "net", "gross", "flips", "exits", "long_rows", "switches"] {
+                assert_eq!(at(a, &[key]), at(b, &[key]), "{stat}: {key}");
+            }
+            if num(a, &["fitness"]) != num(b, &["fitness"]) {
+                changed += 1;
+            }
+        }
+        assert!(changed > 0, "{stat}: the statistic changes the fitness");
+        assert_eq!(at(gs, &["best", "index"]), at(gj, &["best", "index"]), "{stat}: the best cut is by net");
+        assert_eq!(at(&sd, &["bound"]), at(&j, &["bound"]), "{stat}");
+        let text = switch(&data, &spec, &[&args[..], extra].concat());
+        assert!(String::from_utf8_lossy(&text.stdout).contains(&format!("fitness statistic: {stat}")), "{}", String::from_utf8_lossy(&text.stdout));
+    }
+}
+
+/// #1232: the default report (`--pnl-excess none`, mean-sd), JSON and text, is
+/// the report of the build before the fitness flags were accepted.
+#[test]
+fn switch_none_output_is_unchanged() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, "d.csv", 0, |_| None);
+    let spec = write_spec(&dir);
+    let args = ["--a", "x1", "--b", "0 - x1", "--gate", "g", "--gate", "h", "--cuts", "8", "--switches", "0,2,8", "--pnl-blocks", "4"];
+    let text = switch(&data, &spec, &args);
+    assert_eq!(code(&text), 0, "{}", stderr(&text));
+    let j = switch(&data, &spec, &[&args[..], &["--json"]].concat());
+    assert_eq!(code(&j), 0, "{}", stderr(&j));
+    let got = (rcsr::manifest::sha256_hex(&j.stdout), rcsr::manifest::sha256_hex(&text.stdout));
+    assert_eq!(got, (PINNED_SWITCH_JSON.to_string(), PINNED_SWITCH_TEXT.to_string()), "the default switch report (JSON, text) changed");
+}
+
+const PINNED_SWITCH_JSON: &str = "unset";
+const PINNED_SWITCH_TEXT: &str = "unset";

@@ -174,13 +174,20 @@ struct Planted {
 }
 
 fn planted(bull: &[&str], bear: &[&str]) -> Planted {
+    planted_with(bull, bear, &[])
+}
+
+/// The planted pools searched with `extra` added to both pool searches.
+fn planted_with(bull: &[&str], bear: &[&str], extra: &[&str]) -> Planted {
     let (scratch, dir) = scratch();
     let data = write_csv(&dir, "d.csv", |_| None);
     let spec = write_spec(&dir);
-    let bull = pool_run(&dir, "bull.json", &data, &spec, &["--pnl-mask", "g"], bull);
-    let bear = pool_run(&dir, "bear.json", &data, &spec, &["--pnl-mask", "0 - g"], bear);
+    let bull = pool_run(&dir, "bull.json", &data, &spec, &[&["--pnl-mask", "g"][..], extra].concat(), bull);
+    let bear = pool_run(&dir, "bear.json", &data, &spec, &[&["--pnl-mask", "0 - g"][..], extra].concat(), bear);
     Planted { _scratch: scratch, dir, data, spec, bull, bear }
 }
+
+const XS: [&str; 2] = ["--pnl-excess", "xs-mean"];
 
 const BULL: [&str; 3] = ["x1", "x2", "x1 + x2"];
 const BEAR: [&str; 3] = ["0 - x1", "x2", "x2 - x1"];
@@ -234,9 +241,32 @@ fn compose_finds_the_planted_switch() {
 #[test]
 fn composite_prices_the_same_in_walkforward() {
     let p = planted(&BULL, &BEAR);
+    replays_in_walkforward(&p, &[]);
+}
+
+/// #1232: pools searched under `--pnl-excess xs-mean` compose with the flag, and
+/// the run prices the absolute book: walk-forward reproduces its nets.
+#[test]
+fn compose_xs_mean_prices_the_same_in_walkforward() {
+    let p = planted_with(&BULL, &BEAR, &XS);
+    let j = replays_in_walkforward(&p, &XS);
+    assert_eq!(s(&j, &["objective", "spec", "pnl_excess"]), "xs_mean");
+    assert_eq!(s(&j, &["objective", "finalist", "expression_exact"]), "if(greater(g, 0), x1, 0 - x1)");
+    for slot in ["validation", "test"] {
+        let b = at(&j, &["objective", slot]);
+        assert_ne!(num(b, &["xs_excess_net"]), num(b, &["net_pnl"]), "{slot}");
+    }
+}
+
+/// Composes `p` (gate `g`, `extra` added) and checks that `walkforward
+/// --from-run` on the test rows and `walkforward --expr` on the validation rows
+/// give the run's absolute nets to 1e-12. Returns the run.
+fn replays_in_walkforward(p: &Planted, extra: &[&str]) -> Json {
     let menu = write_menu(&p.dir, "menu.json", &[("g", "000", "g", 0.0, 1)], None);
     let out = p.dir.join("composed.json").to_string_lossy().into_owned();
-    let j = json(&compose(&p.data, &p.spec, &["--gates", &menu, "--bull", &p.bull, "--bear", &p.bear, "--top", "3", "--json", "--out", &out]));
+    let mut args = vec!["--gates", menu.as_str(), "--bull", p.bull.as_str(), "--bear", p.bear.as_str(), "--top", "3", "--json", "--out", out.as_str()];
+    args.extend_from_slice(extra);
+    let j = json(&compose(&p.data, &p.spec, &args));
     let expr = s(&j, &["objective", "finalist", "expression_exact"]).to_string();
     let test_rows = num(&j, &["test_rows"]) as i64;
     let k_test = STAMPS as i64 - test_rows / SYMBOLS.len() as i64;
@@ -268,7 +298,220 @@ fn composite_prices_the_same_in_walkforward() {
     let report = Json::parse(std::fs::read_to_string(&wv_out).unwrap().trim()).unwrap();
     let val_net = num(&j, &["objective", "validation", "net_pnl"]);
     assert!((net_of(&report) - val_net).abs() <= 1e-12, "walkforward {} vs objective.validation {val_net}", net_of(&report));
+    j
 }
+
+/// The return of row `(k, j)` of [`write_csv`].
+fn ret(k: i64, j: usize) -> f64 {
+    let i = (k + 40) as f64 * 3.0 + j as f64;
+    let noise = frac(i * 0.324_717_957_244_746) - 0.5;
+    (if regime(k) > 0.0 { 0.01 } else { -0.01 }) * x1(k, j) + 0.0005 * noise
+}
+
+/// #1232: under xs-mean every priced book reports `xs_excess_net`; the
+/// finalist's is its absolute net less the sum over rows of its position times
+/// the mean return of the three symbols at the row's stamp, by hand. A
+/// re-selection of the run needs the same flag.
+#[test]
+fn compose_xs_mean_reports_excess_net() {
+    let p = planted_with(&["x1"], &["0 - x1"], &XS);
+    let menu = write_menu(&p.dir, "menu.json", &[("g", "000", "g", 0.0, 1)], None);
+    let out = p.dir.join("composed.json").to_string_lossy().into_owned();
+    let args = ["--gates", menu.as_str(), "--bull", p.bull.as_str(), "--bear", p.bear.as_str(), "--pnl-excess", "xs-mean"];
+    let j = json(&compose(&p.data, &p.spec, &[&args[..], &["--json", "--out", out.as_str()]].concat()));
+    assert_eq!(s(&j, &["objective", "finalist", "expression_exact"]), "if(greater(g, 0), x1, 0 - x1)");
+    assert_eq!(s(&j, &["objective", "spec", "pnl_excess"]), "xs_mean");
+    assert_eq!(s(&j, &["compose", "chosen", "excess"]), "xs_mean");
+    for r in arr(&j, &["compose", "runs"]) {
+        assert_eq!(s(r, &["pnl_excess"]), "xs_mean");
+        assert!(r.get("stat").is_none());
+    }
+    let pos = |k: i64, jj: usize| -> f64 {
+        let v = if regime(k) > 0.0 { x1(k, jj) } else { 0.0 - x1(k, jj) };
+        if v > 0.0 {
+            1.0
+        } else {
+            0.0
+        }
+    };
+    let mean = |k: i64| (0..SYMBOLS.len()).map(|jj| ret(k, jj)).sum::<f64>() / SYMBOLS.len() as f64;
+    let held = |k0: i64, k1: i64| -> f64 { (k0..=k1).map(|k| (0..SYMBOLS.len()).map(|jj| pos(k, jj)).sum::<f64>() * mean(k)).sum() };
+    let k0 = (num(&arr(&j, &["split", "validation_time"])[0], &[]) as i64 - T0) / STEP;
+    let k1 = (num(&arr(&j, &["split", "validation_time"])[1], &[]) as i64 - T0) / STEP;
+    let kt = STAMPS as i64 - num(&j, &["test_rows"]) as i64 / SYMBOLS.len() as i64;
+    for (slot, a, b) in [("validation", k0, k1), ("test", kt, STAMPS as i64 - 1)] {
+        let book = at(&j, &["objective", slot]);
+        let net = num(book, &["net_pnl"]);
+        let got = num(book, &["xs_excess_net"]);
+        let want = net - held(a, b);
+        assert!((got - want).abs() <= 1e-12, "{slot}: xs_excess_net {got} vs net - sum p m {want}");
+        assert!((got - net).abs() > 1e-6, "{slot}: the excess differs from the net");
+        assert_eq!(num(&j, &["compose", "chosen", slot, "xs_excess_net"]), got, "{slot}");
+        assert_eq!(num(&j, &["compose", "chosen", slot, "net"]), net, "{slot}");
+    }
+    for b in arr(&j, &["compose", "chosen", "branches"]) {
+        for slot in ["validation", "test"] {
+            assert!(num(b, &[slot, "xs_excess_net"]).is_finite(), "branch {}: {slot}", num(b, &["member"]));
+        }
+    }
+    for c in arr(&j, &["compose", "composites"]) {
+        assert!(num(c, &["validation", "xs_excess_net"]).is_finite(), "{}", s(c, &["expression"]));
+    }
+    let text = compose(&p.data, &p.spec, &args);
+    assert_eq!(code(&text), 0, "{}", stderr(&text));
+    let text = String::from_utf8_lossy(&text.stdout);
+    assert!(text.contains("excess: xs_mean") && text.contains("xs_excess_net"), "{text}");
+    let reselect = |extra: &[&str]| {
+        let mut args = vec!["--data", p.data.as_str(), "--target-spec", p.spec.as_str()];
+        args.extend_from_slice(&RUN_FLAGS);
+        args.extend_from_slice(extra);
+        args.extend(["--reselect-run", out.as_str(), "--select-rule", "robust", "--json"]);
+        rcsr(&args)
+    };
+    let again = json(&reselect(&XS));
+    for key in ["expression_exact", "switch"] {
+        assert_eq!(at(&again, &["objective", "finalist", key]), at(&j, &["objective", "finalist", key]), "{key}");
+    }
+    let (a, b) = (num(&again, &["objective", "validation", "xs_excess_net"]), num(&j, &["objective", "validation", "xs_excess_net"]));
+    assert!((a - b).abs() <= 1e-12, "{a} vs {b}");
+    let refused = reselect(&[]);
+    assert_eq!(code(&refused), 2, "{}", stderr(&refused));
+    assert!(stderr(&refused).contains("objective.spec.pnl_excess"), "{}", stderr(&refused));
+}
+
+/// #1232: selection is on absolute net and alpha. The same pool expressions
+/// searched and composed under xs-mean give the finalist, the ranking and the
+/// validation books of the run without it; the training pruning reads the
+/// training excess.
+#[test]
+fn compose_selection_is_absolute_under_xs_mean() {
+    let plain = planted(&BULL, &BEAR);
+    let xs = planted_with(&BULL, &BEAR, &XS);
+    let aw = ["x2", "0 - x1", "x1 + x2"];
+    let plain_aw = pool_run(&plain.dir, "aw.json", &plain.data, &plain.spec, &[], &aw);
+    let xs_aw = pool_run(&xs.dir, "aw.json", &xs.data, &xs.spec, &XS, &aw);
+    let gates = [("g", "000", "g", 0.0, 1), ("h", "001", "h", 0.0, 1)];
+    let run = |p: &Planted, aw: &str, budget: Option<usize>, extra: &[&str]| -> Json {
+        let menu = write_menu(&p.dir, "menu.json", &gates, budget);
+        let mut args = vec!["--gates", menu.as_str(), "--bull", p.bull.as_str(), "--bear", p.bear.as_str(), "--all-weather", aw, "--top", "3", "--json"];
+        args.extend_from_slice(extra);
+        json(&compose(&p.data, &p.spec, &args))
+    };
+    let (a, b) = (run(&plain, &plain_aw, None, &[]), run(&xs, &xs_aw, None, &XS));
+    assert_eq!(at(&a, &["objective", "finalist"]), at(&b, &["objective", "finalist"]));
+    assert_eq!(at(&a, &["compose", "selection"]), at(&b, &["compose", "selection"]));
+    for slot in ["validation", "test"] {
+        assert_eq!(num(&a, &["objective", slot, "net_pnl"]), num(&b, &["objective", slot, "net_pnl"]), "{slot}");
+        assert!(at(&a, &["objective", slot]).get("xs_excess_net").is_none());
+        assert!(num(&b, &["objective", slot, "xs_excess_net"]).is_finite());
+        let (x, y) = (at(&a, &["compose", "chosen", "best_all_weather", slot]), at(&b, &["compose", "chosen", "best_all_weather", slot]));
+        assert_eq!(num(x, &["net"]), num(y, &["net"]), "best all-weather {slot}");
+        assert!(x.get("xs_excess_net").is_none() && num(y, &["xs_excess_net"]).is_finite());
+    }
+    let (ca, cb) = (arr(&a, &["compose", "composites"]), arr(&b, &["compose", "composites"]));
+    assert_eq!(ca.len(), cb.len());
+    for (x, y) in ca.iter().zip(cb) {
+        for key in ["id", "rank", "type", "expression", "pruned", "bits"] {
+            assert_eq!(at(x, &[key]), at(y, &[key]), "{key} of {}", s(x, &["expression"]));
+        }
+        for key in ["net", "objective", "pooled_alpha", "alpha_on", "alpha_off", "eligible", "robust_eligible"] {
+            assert_eq!(at(x, &["validation", key]), at(y, &["validation", key]), "validation {key} of {}", s(x, &["expression"]));
+        }
+        assert!(at(x, &["validation"]).get("xs_excess_net").is_none());
+    }
+    assert_eq!(arr(&a, &["pareto"]).iter().map(|m| s(m, &["expression"]).to_string()).collect::<Vec<_>>(), arr(&b, &["pareto"]).iter().map(|m| s(m, &["expression"]).to_string()).collect::<Vec<_>>());
+    let (a8, b8) = (run(&plain, &plain_aw, Some(8), &[]), run(&xs, &xs_aw, Some(8), &XS));
+    let gains = |j: &Json| -> Vec<Option<f64>> { arr(j, &["compose", "composites"]).iter().map(|c| at(c, &["bound_gain"]).as_f64()).collect() };
+    let (ga, gb) = (gains(&a8), gains(&b8));
+    assert!(ga.iter().flatten().count() > 0 && ga.iter().flatten().count() == gb.iter().flatten().count());
+    assert_ne!(ga, gb, "the pruning bound is on the training excess under xs-mean");
+}
+
+/// #1232: a pool run whose `objective.spec.pnl_excess` differs from the flag, in
+/// either direction, exits 2 and names the field; so do mixed pools.
+#[test]
+fn compose_refuses_pool_excess_mismatch() {
+    let p = planted(&BULL, &BEAR);
+    let xs_bull = pool_run(&p.dir, "xs_bull.json", &p.data, &p.spec, &["--pnl-mask", "g", "--pnl-excess", "xs-mean"], &BULL);
+    let xs_bear = pool_run(&p.dir, "xs_bear.json", &p.data, &p.spec, &["--pnl-mask", "0 - g", "--pnl-excess", "xs-mean"], &BEAR);
+    let menu = write_menu(&p.dir, "menu.json", &[("g", "000", "g", 0.0, 1)], None);
+    let refused = |bull: &str, bear: &str, extra: &[&str], needle: &str| {
+        let o = compose(&p.data, &p.spec, &[&["--gates", menu.as_str(), "--bull", bull, "--bear", bear][..], extra].concat());
+        assert_eq!(code(&o), 2, "{bull} {bear} {extra:?}: {}", stderr(&o));
+        assert!(stderr(&o).contains(needle), "{bull} {bear} {extra:?}: want '{needle}' in {}", stderr(&o));
+    };
+    refused(&p.bull, &p.bear, &XS, "differs from this invocation in objective.spec.pnl_excess");
+    refused(&xs_bull, &xs_bear, &[], "differs from this invocation in objective.spec.pnl_excess");
+    refused(&p.bull, &xs_bear, &XS, "differ in objective.spec.pnl_excess");
+    refused(&xs_bull, &p.bear, &[], "differ in objective.spec.pnl_excess");
+    let ok = compose(&p.data, &p.spec, &["--gates", menu.as_str(), "--bull", xs_bull.as_str(), "--bear", xs_bear.as_str(), "--pnl-excess", "xs-mean"]);
+    assert_eq!(code(&ok), 0, "{}", stderr(&ok));
+}
+
+/// #1232 (with #1178): pools searched under another block statistic compose with
+/// the same `--pnl-stat` (and `--pnl-cvar-q`). The choice reads no statistic, so
+/// the run is the run of mean-sd pools of the same expressions, apart from
+/// `compose.runs[].stat`; a statistic that differs from the flag exits 2.
+#[test]
+fn compose_accepts_block_statistic_pools() {
+    let p = planted(&BULL, &BEAR);
+    let pool = |name: &str, mask: &str, extra: &[&str], exprs: &[&str]| pool_run(&p.dir, name, &p.data, &p.spec, &[&["--pnl-mask", mask][..], extra].concat(), exprs);
+    let semi = ["--pnl-stat", "mean-semi"];
+    let cvar = ["--pnl-stat", "cvar", "--pnl-cvar-q", "0.5"];
+    let (semi_bull, semi_bear) = (pool("semi_bull.json", "g", &semi, &BULL), pool("semi_bear.json", "0 - g", &semi, &BEAR));
+    let (cvar_bull, cvar_bear) = (pool("cvar_bull.json", "g", &cvar, &BULL), pool("cvar_bear.json", "0 - g", &cvar, &BEAR));
+    let menu = write_menu(&p.dir, "menu.json", &[("g", "000", "g", 0.0, 1), ("h", "001", "h", 0.0, 1)], Some(8));
+    let args = |bull: &str, bear: &str, extra: &[&str]| -> Output {
+        compose(&p.data, &p.spec, &[&["--gates", menu.as_str(), "--bull", bull, "--bear", bear, "--top", "3", "--json"][..], extra].concat())
+    };
+    let base = json(&args(&p.bull, &p.bear, &[]));
+    for r in arr(&base, &["compose", "runs"]) {
+        assert!(r.get("stat").is_none() && r.get("cvar_q").is_none() && r.get("pnl_excess").is_none());
+    }
+    let same = |j: &Json, stat: &str, q: Option<f64>| {
+        assert_eq!(without(&base, &["command", "compose.runs"]), without(j, &["command", "compose.runs"]), "{stat}: the statistic changes nothing but compose.runs");
+        for r in arr(j, &["compose", "runs"]) {
+            assert_eq!(s(r, &["stat"]), stat);
+            assert_eq!(r.get("cvar_q").and_then(Json::as_f64), q);
+        }
+    };
+    same(&json(&args(&semi_bull, &semi_bear, &semi)), "mean-semi", None);
+    same(&json(&args(&cvar_bull, &cvar_bear, &cvar)), "cvar", Some(0.5));
+    let refused = |o: Output, needle: &str| {
+        assert_eq!(code(&o), 2, "{}", stderr(&o));
+        assert!(stderr(&o).contains(needle), "want '{needle}' in {}", stderr(&o));
+    };
+    refused(args(&semi_bull, &semi_bear, &[]), "differs from this invocation in search_fitness.stat");
+    refused(args(&p.bull, &p.bear, &semi), "differs from this invocation in search_fitness.stat");
+    refused(args(&cvar_bull, &cvar_bear, &["--pnl-stat", "cvar", "--pnl-cvar-q", "0.25"]), "differs from this invocation in search_fitness.stat");
+    refused(args(&semi_bull, &cvar_bear, &semi), "differ in search_fitness.stat");
+}
+
+/// #1232: the default output of compose (pools and invocation without
+/// `--pnl-excess` and `--pnl-stat`), JSON and text, is the output of the build
+/// before those flags were accepted. The scratch directory, the pool file hashes
+/// and the version are replaced before hashing.
+#[test]
+fn compose_none_output_is_unchanged() {
+    let p = planted(&BULL, &BEAR);
+    let aw = pool_run(&p.dir, "aw.json", &p.data, &p.spec, &[], &["x2", "0 - x1", "x1 + x2"]);
+    let menu = write_menu(&p.dir, "menu.json", &[("g", "000", "g", 0.0, 1), ("h", "001", "h", 0.0, 1)], Some(8));
+    let args = ["--gates", menu.as_str(), "--bull", p.bull.as_str(), "--bear", p.bear.as_str(), "--all-weather", aw.as_str(), "--top", "3"];
+    let text = compose(&p.data, &p.spec, &args);
+    assert_eq!(code(&text), 0, "{}", stderr(&text));
+    let j = compose(&p.data, &p.spec, &[&args[..], &["--json"]].concat());
+    assert_eq!(code(&j), 0, "{}", stderr(&j));
+    let mut body = String::from_utf8_lossy(&j.stdout).into_owned();
+    for f in [&p.bull, &p.bear, &aw] {
+        body = body.replace(&rcsr::manifest::sha256_hex(&std::fs::read(f).unwrap()), "<sha256>");
+    }
+    let body = body.replace(&*p.dir.to_string_lossy(), "<dir>").replace(&format!("\"version\":\"{}\"", env!("CARGO_PKG_VERSION")), "\"version\":\"<version>\"");
+    let got = (rcsr::manifest::sha256_hex(body.as_bytes()), rcsr::manifest::sha256_hex(&text.stdout));
+    assert_eq!(got, (PINNED_COMPOSE_JSON.to_string(), PINNED_COMPOSE_TEXT.to_string()), "the default compose output (run.json, summary) changed");
+}
+
+const PINNED_COMPOSE_JSON: &str = "unset";
+const PINNED_COMPOSE_TEXT: &str = "unset";
 
 #[test]
 fn hysteresis_gate_is_carried() {
@@ -477,7 +720,7 @@ fn compose_refuses_mismatched_runs() {
     refused(&p.data, &["--gates", "/nonexistent/menu.json", "--bull", &p.bull], 3, "--gates");
     refused(&p.data, &["--bull", &p.bull], 2, "--gates <menu.json> is required");
     refused(&p.data, &["--gates", &menu], 2, "--bull <run.json> or --bear <run.json> is required");
-    for flag in [&["--threshold", "0.1"][..], &["--band", "0.1"], &["--pnl-mask", "g"], &["--pnl-stat", "cvar"], &["--pnl-cvar-q", "0.5"], &["--gpu"], &["--select-rule", "occam"], &["--fitness", "metric"], &["--top", "0"]] {
+    for flag in [&["--threshold", "0.1"][..], &["--band", "0.1"], &["--pnl-mask", "g"], &["--gpu"], &["--select-rule", "occam"], &["--fitness", "metric"], &["--top", "0"]] {
         let mut extra = vec!["--gates", menu.as_str(), "--bull", p.bull.as_str()];
         extra.extend_from_slice(flag);
         refused(&p.data, &extra, 2, flag[0]);

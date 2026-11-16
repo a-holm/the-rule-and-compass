@@ -1165,7 +1165,7 @@ pub fn run(req: &Request, book: &FitnessBook, slice: &TradingSlice, values: &[Ve
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::trading::{BookMask, TradingSpec};
+    use crate::trading::{BlockStat, BookMask, PnlExcess, TradingSpec};
     use std::collections::BTreeMap;
 
     struct Mix(u64);
@@ -1584,6 +1584,187 @@ mod tests {
         let s = seam(&bk, &a, &b, &sw.state(best));
         assert!(close(s.composite, sw.net(best), 1e-12));
         assert_eq!(s.pairs, 0, "B is flat: no pair is long on both sides");
+    }
+
+
+    /// #1232: the training book under `--pnl-excess xs-mean`.
+    fn xs_book_of(p: &Panel, blocks: usize, segments: &[f64], cost: f64) -> Result<FitnessBook, String> {
+        let spec = TradingSpec { pnl_excess: PnlExcess::XsMean, ..spec(cost) };
+        FitnessBook::with_segments(&p.slice, &spec, 0.0, blocks, 1.0, segments, None)
+    }
+
+    fn xs_book(p: &Panel, blocks: usize, segments: &[f64], cost: f64) -> FitnessBook {
+        xs_book_of(p, blocks, segments, cost).unwrap()
+    }
+
+    /// The mean return of the rows at each row's timestamp, summed in row order
+    /// (every panel row has a finite return).
+    fn stamp_means(p: &Panel) -> Vec<f64> {
+        let mut sums: BTreeMap<u64, (f64, f64)> = BTreeMap::new();
+        for (t, r) in p.slice.rows.time.iter().zip(&p.slice.ret) {
+            let s = sums.entry(t.to_bits()).or_insert((0.0, 0.0));
+            s.0 += r;
+            s.1 += 1.0;
+        }
+        p.slice.rows.time.iter().map(|t| sums[&t.to_bits()].0 / sums[&t.to_bits()].1).collect()
+    }
+
+    /// Gross and net of a position vector from the raw returns: the sum of
+    /// `r - m_t` over the long rows, less one side per entry and per exit; every
+    /// run of the book's flags starts flat.
+    fn raw_xs(book: &FitnessBook, p: &Panel, m: &[f64], pos: &[bool]) -> (f64, f64) {
+        let flags = book.flags();
+        let (mut gross, mut turns) = (0.0f64, 0u64);
+        for i in 0..pos.len() {
+            let prev = flags[i] & TradingRows::FIRST == 0 && pos[i - 1];
+            if pos[i] {
+                gross += p.slice.ret[i] - m[i];
+            }
+            turns += (pos[i] != prev) as u64 + (pos[i] && flags[i] & TradingRows::LAST != 0) as u64;
+        }
+        (gross, gross - book.side() * turns as f64)
+    }
+
+    #[test]
+    fn gate_sweep_equals_the_composite_book_xs_mean() {
+        let mut rng = Mix(1232);
+        let mut cuts = 0;
+        for trial in 0..6 {
+            let p = panel(&mut rng, 7, 300, if trial % 2 == 0 { 0.03 } else { 0.0 });
+            let segments: Vec<f64> = if trial % 3 == 2 { vec![0.0, 140.0 * 3600.0] } else { Vec::new() };
+            let blocks = [1usize, 2, 4][trial % 3];
+            let bk = xs_book(&p, blocks, &segments, 5.0 + 5.0 * (trial % 2) as f64);
+            assert_eq!(bk.excess_mode(), PnlExcess::XsMean);
+            let m = stamp_means(&p);
+            let n = bk.len();
+            let a = persistent(&mut rng, n, 0.9);
+            let b = persistent(&mut rng, n, 0.85);
+            let time = &p.slice.rows.time;
+            for kind in 0..3 {
+                let g = gate_of(&mut rng, &p, kind);
+                cuts += check_sweep(&bk, &a, &b, &g, time, kind != 2);
+                // The same cuts from the raw returns and the timestamp means, without the book.
+                let sw = gate_sweep(&bk, &a, &b, &g, time).unwrap();
+                let plain = gate_sweep(&book(&p, blocks, &segments, 5.0 + 5.0 * (trial % 2) as f64), &a, &b, &g, time).unwrap();
+                for t in (0..=sw.ordered_rows()).filter(|&t| sw.is_valid(t)) {
+                    let (gross, net) = raw_xs(&bk, &p, &m, &compose(&a, &b, &sw.state(t)));
+                    assert!(close(sw.gross(t), gross, 1e-12), "trial {trial}, cut {t}: gross {} vs sum of r - m {gross}", sw.gross(t));
+                    assert!(close(sw.net(t), net, 1e-12), "trial {trial}, cut {t}: net {} vs raw {net}", sw.net(t));
+                    // m_t is a property of the rows: every count is the absolute run's.
+                    assert_eq!((sw.flips(t), sw.exits(t), sw.long_rows(t), sw.gate_flips(t), sw.seam_pairs(t)), (plain.flips(t), plain.exits(t), plain.long_rows(t), plain.gate_flips(t), plain.seam_pairs(t)));
+                    assert_eq!((sw.entry_times(t), sw.switches(t)), (plain.entry_times(t), plain.switches(t)));
+                }
+            }
+        }
+        assert!(cuts > 10_000, "{cuts} cuts checked");
+    }
+
+    #[test]
+    fn the_seam_identity_holds_xs_mean() {
+        let mut rng = Mix(1179);
+        let mut used = 0;
+        for trial in 0..120usize {
+            let steps = 40 + (trial * 7) % 50;
+            let p = panel(&mut rng, 2 + trial % 4, steps, if trial % 3 == 0 { 0.05 } else { 0.0 });
+            let segments: Vec<f64> = if trial % 2 == 1 { vec![0.0, (steps / 2) as f64 * 3600.0] } else { Vec::new() };
+            let Ok(bk) = xs_book_of(&p, 1 + trial % 2, &segments, 5.0 + 5.0 * (trial % 3) as f64) else { continue };
+            used += 1;
+            let m = stamp_means(&p);
+            let n = bk.len();
+            let a = persistent(&mut rng, n, 0.9);
+            let b = persistent(&mut rng, n, 0.9);
+            let path = persistent(&mut rng, steps, 0.9);
+            let on: Vec<bool> = p.step.iter().map(|&k| path[k]).collect();
+            let flat = vec![false; n];
+            let s = seam(&bk, &a, &b, &on);
+            let (_, composite) = raw_xs(&bk, &p, &m, &compose(&a, &b, &on));
+            let (_, masked_a) = raw_xs(&bk, &p, &m, &compose(&a, &flat, &on));
+            let (_, masked_b) = raw_xs(&bk, &p, &m, &compose(&flat, &b, &on));
+            let (stamps, stamp) = stamps_of(&p.slice.rows.time);
+            let (_, _, j) = direct_counts(&bk, &compose(&a, &b, &on), &on, &stamp, stamps);
+            assert_eq!(s.pairs, j as u64, "trial {trial}");
+            assert!(close(s.composite, composite, 1e-12) && close(s.masked_a, masked_a, 1e-12) && close(s.masked_b, masked_b, 1e-12), "trial {trial}: {s:?} vs raw {composite} {masked_a} {masked_b}");
+            assert!((masked_a + masked_b + 2.0 * bk.side() * j as f64 - composite).abs() <= 1e-9, "trial {trial}: the identity on the excess");
+        }
+        assert!(used >= 110, "{used} of 120 panels built an xs-mean book");
+    }
+
+    #[test]
+    fn the_switch_bound_is_the_path_optimum_xs_mean() {
+        let mut rng = Mix(1232);
+        for trial in 0..20usize {
+            let steps = 6 + trial % 7;
+            let p = panel(&mut rng, 3, steps, 0.0);
+            let segments: Vec<f64> = if trial % 3 == 1 { vec![0.0, (steps / 2) as f64 * 3600.0] } else { Vec::new() };
+            let bk = xs_book(&p, 1 + trial % 2, &segments, 5.0);
+            let m = stamp_means(&p);
+            let n = bk.len();
+            let a = persistent(&mut rng, n, 0.7);
+            let b = persistent(&mut rng, n, 0.7);
+            let bound = switch_bound(&bk, &a, &b, &p.slice.rows.time, steps + 3).unwrap();
+            assert_eq!((bound.timestamps, bound.gap_pairs), (steps, 0));
+            let best = brute_force(&bk, &p, &a, &b);
+            // Every path again from the raw returns, without the book.
+            let mut raw = vec![f64::NEG_INFINITY; steps];
+            for mask in 0u32..(1 << steps) {
+                let on: Vec<bool> = p.step.iter().map(|&k| mask >> k & 1 == 1).collect();
+                let switches = (1..steps).filter(|&k| (mask >> k & 1) != (mask >> (k - 1) & 1)).count();
+                let (_, v) = raw_xs(&bk, &p, &m, &compose(&a, &b, &on));
+                for slot in raw.iter_mut().skip(switches) {
+                    *slot = slot.max(v);
+                }
+            }
+            for k in 0..steps {
+                assert!(close(bound.value(k), best[k], 1e-12), "trial {trial}, k {k}: bound {} paths {}", bound.value(k), best[k]);
+                assert!(close(bound.value(k), raw[k], 1e-12), "trial {trial}, k {k}: bound {} raw paths {}", bound.value(k), raw[k]);
+            }
+            assert!(close(bound.free, raw[steps - 1], 1e-12));
+        }
+        // The bound dominates every cut of a time-level gate on the same excess.
+        let mut checked = 0;
+        for trial in 0..4usize {
+            let p = panel(&mut rng, 7, 300, if trial % 2 == 0 { 0.04 } else { 0.0 });
+            let bk = xs_book(&p, [1usize, 2][trial % 2], &[], 10.0);
+            let n = bk.len();
+            let a = persistent(&mut rng, n, 0.95);
+            let b = persistent(&mut rng, n, 0.95);
+            let time = &p.slice.rows.time;
+            let g = gate_of(&mut rng, &p, 0);
+            let sw = gate_sweep(&bk, &a, &b, &g, time).unwrap();
+            let kmax = (0..=sw.ordered_rows()).filter(|&t| sw.is_valid(t)).map(|t| sw.switches(t).unwrap() as usize).max().unwrap();
+            let bound = switch_bound(&bk, &a, &b, time, kmax).unwrap();
+            for t in (0..=sw.ordered_rows()).filter(|&t| sw.is_valid(t)) {
+                let k = sw.switches(t).unwrap() as usize;
+                assert!(sw.net(t) <= bound.value(k) + 1e-12, "trial {trial}, cut {t}: net {} above V_{k} {}", sw.net(t), bound.value(k));
+                checked += 1;
+            }
+        }
+        assert!(checked > 1_000, "{checked} cuts");
+    }
+
+    /// #1232 (with #1178): the sweep's fitness is the book's statistic of the
+    /// cut's block totals under every statistic.
+    #[test]
+    fn gate_sweep_fitness_follows_the_block_statistic() {
+        let mut rng = Mix(1178);
+        let mut changed = 0;
+        for (trial, stat) in [BlockStat::MeanSemi, BlockStat::Cvar(0.25), BlockStat::Cvar(1.0), BlockStat::MeanSemi].into_iter().enumerate() {
+            let p = panel(&mut rng, 7, 300, if trial % 2 == 0 { 0.03 } else { 0.0 });
+            let blocks = [8usize, 4, 8, 12][trial];
+            let sd = book(&p, blocks, &[], 5.0);
+            let bk = sd.clone().with_stat(stat).unwrap();
+            let n = bk.len();
+            let a = persistent(&mut rng, n, 0.9);
+            let b = persistent(&mut rng, n, 0.85);
+            let g = gate_of(&mut rng, &p, 0);
+            check_sweep(&bk, &a, &b, &g, &p.slice.rows.time, true);
+            let (x, y) = (gate_sweep(&bk, &a, &b, &g, &p.slice.rows.time).unwrap(), gate_sweep(&sd, &a, &b, &g, &p.slice.rows.time).unwrap());
+            for t in (0..=x.ordered_rows()).filter(|&t| x.is_valid(t)) {
+                assert_eq!(x.net(t).to_bits(), y.net(t).to_bits(), "{stat:?} cut {t}: the net does not read the statistic");
+                changed += (x.fitness(t) != y.fitness(t)) as usize;
+            }
+        }
+        assert!(changed > 100, "{changed} cuts whose fitness the statistic changes");
     }
 
     /// Seconds of the sweep and of the bound at k = 32 at the campaign training
