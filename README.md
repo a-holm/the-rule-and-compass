@@ -860,7 +860,7 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
   `--max-position` other than 1, multiple targets or overlapping rows. `--band B` and
   `--min-holding K` price the no-trade band of `walkforward --policy band` in the fitness and in
   the validation and test books (#925); `--band-units sd` reads `B` as a multiple of each
-  candidate's training-score sd, resolved on the training rows only (`objective.spec.band_sd`,
+  candidate's training-score sd, resolved on the training rows only (with `--pnl-mask`, the gate-on training rows; `objective.spec.band_sd`,
   `band_resolved`). The device holds at most 32 rows (`--gpu` exits 2 above that).
   On the GPU the device scores the regret natively, fused with the program interpreter
   (`search_fitness.scorer_backend` `cuda`); it equals the CPU book on the device's own `f32`
