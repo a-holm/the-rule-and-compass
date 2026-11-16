@@ -845,6 +845,9 @@ pub fn claim(args: &[String]) -> Vec<String> {
         println!("{}", usage_text());
         std::process::exit(0);
     }
+    if crate::gate_search::request().is_some() {
+        fail("--gate-search before rcsr enumerate: the class report would drop the gate search; run them as separate commands");
+    }
     let mut req = Request {
         max_size: DEFAULT_MAX_SIZE,
         cuts: DEFAULT_CUTS,
