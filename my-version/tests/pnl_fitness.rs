@@ -3233,11 +3233,11 @@ fn dense_masked_books_are_pinned() {
     assert_eq!(all, PINNED_DENSE_BOOKS, "{}", got.join("\n"));
 }
 
-const PINNED_DENSE_BOOKS: &str = "unpinned";
+const PINNED_DENSE_BOOKS: &str = "4ab830e2ea9b23584cca27e12f9a366c37e3582c7d4c51a46bd6024e50a9459b";
 
-/// #1278: the sealed read prices the masked book of a strided label like the search. The run
-/// searched `STRIDED_DAYS` days; the walk-forward data runs 40 days longer with a synthetic lock
-/// over the run's test block, a development window after it, a final seal and one locked read.
+/// #1278: the sealed read prices the masked book of a strided label like the search: a synthetic
+/// lock over the run's test block, a development window on the validation rows, a final seal and
+/// one locked read of the test block.
 #[test]
 fn sealed_read_prices_the_strided_masked_book() {
     let (_scratch, dir) = scratch();
@@ -3247,20 +3247,20 @@ fn sealed_read_prices_the_strided_masked_book() {
     let j = json(&out);
     let run_path = dir.join("sealed.run.json").to_string_lossy().into_owned();
     std::fs::write(&run_path, &out.stdout).unwrap();
-    let [_, (_, test_window)] = strided_block_windows(&j, STRIDED_DAYS, 24, num(&j, &["test_rows"]));
-    let start: i64 = test_window.split(',').nth(3).unwrap().parse().unwrap();
+    let [(_, validation_window), (_, test_window)] = strided_block_windows(&j, STRIDED_DAYS, 24, num(&j, &["test_rows"]));
+    let field = |w: &str, k: usize| -> i64 { w.split(',').nth(k).unwrap().parse().unwrap() };
+    let (vlo, start) = (field(&validation_window, 3), field(&test_window, 3));
     let lock_end = T0 + DAY * STRIDED_DAYS as i64;
-    let longer = write_strided_every(&dir, "longer.csv", STRIDED_DAYS + 40, 24);
-    lockbox::write_sidecar(&longer, &Lockbox { start, end: lock_end }, "test").unwrap();
+    let locked = write_strided_every(&dir, "locked.csv", STRIDED_DAYS, 24);
+    lockbox::write_sidecar(&locked, &Lockbox { start, end: lock_end }, "test").unwrap();
     let ledger = dir.join("ledger.jsonl").to_string_lossy().into_owned();
     let sealed = dir.join("sealed.json").to_string_lossy().into_owned();
-    let train = format!("{T0},{}", start - 2 * DAY);
-    walk_window(&longer, &run_path, &format!("dev,{train},{},{}", lock_end + 5 * DAY, lock_end + 40 * DAY), &["--ledger", &ledger]);
+    let dev = format!("dev,{T0},{},{vlo},{}", vlo - 2 * DAY, vlo + 10 * DAY);
+    walk_window(&locked, &run_path, &dev, &["--ledger", &ledger, "--allow-in-sample-windows"]);
     let seal = rcsr_cmd::rcsr().args(["protocol", "seal", "--final", "--ledger", &ledger, "--out", &sealed]).output().unwrap();
     assert_eq!(code(&seal), 0, "{}", stderr(&seal));
-    let window = format!("locked,{train},{start},{lock_end}");
-    let read = walk_window(&longer, &run_path, &window, &["--ledger", &ledger, "--locked-test", "--sealed", &sealed]);
-    let open = walk_window(&data, &run_path, &window, &[]);
+    let read = walk_window(&locked, &run_path, &test_window, &["--ledger", &ledger, "--allow-in-sample-windows", "--locked-test", "--sealed", &sealed]);
+    let open = walk_window(&data, &run_path, &test_window, &["--allow-in-sample-windows"]);
     let m = at(&read, &["metrics"]);
     assert_eq!(json_text(m), json_text(at(&open, &["metrics"])), "the sealed read prices the open book");
     let want = at(&j, &["objective", "test"]);
