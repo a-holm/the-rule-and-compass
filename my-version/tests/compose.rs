@@ -298,7 +298,7 @@ fn replays_in_walkforward(p: &Planted, extra: &[&str]) -> Json {
     assert_eq!(num(&at(&arr(&report, &["windows"])[0], &["metrics"]), &["rows"]), test_rows as f64);
     // The printed expression priced directly on the validation rows is the composite's validation book.
     let wv_out = p.dir.join("wv.json").to_string_lossy().into_owned();
-    let w = format!("v,{},{},{},{}", T0, first_val - STEP, first_val, last_val + 1);
+    let w = format!("v,{},{},{},{}", T0, first_val - STEP * p.stride, first_val, last_val + 1);
     let wv = rcsr(&[
         "walkforward", "--data", &p.data, "--target", "y", "--target-spec", &p.spec, "--expr", &expr, "--vars", "g,x1,x2", "--time", "t", "--group-by", "s",
         "--window", &w, "--threshold-fixed", "0", "--cost-bps", "5", "--out", &wv_out,

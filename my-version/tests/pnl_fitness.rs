@@ -3077,7 +3077,9 @@ fn strided_block_windows(j: &Json, days: usize, stride: i64, test_rows: f64) -> 
     let stamps = (days as i64 * 24 + stride - 1) / stride;
     let start = T0 + HOUR * stride * (stamps - test_rows as i64 / 2);
     let end = T0 + DAY * days as i64;
-    [("validation", format!("v,{T0},{},{vlo},{}", vlo - 2 * DAY, vhi + 1)), ("test", format!("t,{T0},{},{start},{end}", start - 2 * DAY))]
+    // A training range that ends two label strides (at least two days) before the test block.
+    let gap = (2 * HOUR * stride).max(2 * DAY);
+    [("validation", format!("v,{T0},{},{vlo},{}", vlo - gap, vhi + 1)), ("test", format!("t,{T0},{},{start},{end}", start - gap))]
 }
 
 /// Window 0 of `walkforward --from-run run` on `data` with `window`, `extra` added.
@@ -3148,9 +3150,10 @@ fn assert_blocks_reproduced(tag: &str, j: &Json, data: &str, run: &str, days: us
 #[test]
 fn strided_masked_walkforward_reproduces_objective_test() {
     let (_scratch, dir) = scratch();
-    let spec = write_daily_spec(&dir);
     let band: Vec<&str> = [&STRIDED_ARGS[..], &BAND_SD[..]].concat();
     for (stride, days) in [(24i64, STRIDED_DAYS), (72, 2 * STRIDED_DAYS)] {
+        // A label horizon equal to the stride: one period per labelled row.
+        let spec = write_horizon_spec(&dir, HOUR * stride);
         let data = write_strided_every(&dir, &format!("strided{stride}.csv"), days, stride);
         for (book, args) in [("unmasked", &STRIDED_ARGS[..6]), ("threshold", &STRIDED_ARGS[..]), ("band", &band[..])] {
             let tag = format!("stride {stride} {book}");
