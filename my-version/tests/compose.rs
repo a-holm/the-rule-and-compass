@@ -828,3 +828,91 @@ fn compose_refuses_masked_sd_band_run() {
     assert_eq!(code(&o), 2, "{}", stderr(&o));
     assert!(stderr(&o).contains("priced a band or a minimum hold"), "{}", stderr(&o));
 }
+
+// ---- #1268: compose and the pools read one training state ----
+
+/// A gate positive for 72 stamps and negative for the next 24, the same for every symbol.
+fn uneven_regime(k: i64) -> f64 {
+    regime(k).abs() * if k % 96 < 72 { 1.0 } else { -1.0 }
+}
+
+/// The planted panel on `STAMPS * stride` stamps with the gate `uneven_regime` and the label `y` on every
+/// `stride`-th stamp only, so `--fill drop` keeps one stamp in `stride` while every stamp stays a gate row.
+fn write_strided_csv(dir: &Path, name: &str, stride: i64) -> String {
+    let mut text = String::from("t,s,x1,x2,g,h,r,y,lbl_h24a_y\n");
+    for k in 0..STAMPS as i64 * stride {
+        for (j, sym) in SYMBOLS.iter().enumerate() {
+            let i = (k + 40) as f64 * 3.0 + j as f64;
+            let x2 = frac(i * 0.754_877_666_246_692_7) - 0.5;
+            let h = frac(i * 0.414_213_562_373_095) - 0.5;
+            let noise = frac(i * 0.324_717_957_244_746) - 0.5;
+            let g = uneven_regime(k);
+            let r = if g > 0.0 { 0.01 } else { -0.01 } * x1(k, j) + 0.0005 * noise;
+            let y = if k % stride == 0 { r.to_string() } else { String::new() };
+            text.push_str(&format!("{},{},{},{},{},{},{},{},{}\n", T0 + STEP * k, sym, x1(k, j), x2, g, h, r, y, r));
+        }
+    }
+    let path = dir.join(name);
+    std::fs::write(&path, text).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+/// A short real pool search on `data` with its own front.
+fn searched_pool(dir: &Path, name: &str, data: &str, spec: &str, extra: &[&str]) -> (String, Json) {
+    let mut args = vec!["--data", data, "--target-spec", spec];
+    args.extend_from_slice(&RUN_FLAGS);
+    args.extend(["--fitness", "pnl", "--cpu", "--seed", "3", "--generations", "2", "--pop", "16", "--json"]);
+    args.extend_from_slice(extra);
+    let o = rcsr(&args);
+    let j = json(&o);
+    let path = dir.join(name);
+    std::fs::write(&path, &o.stdout).unwrap();
+    (path.to_string_lossy().into_owned(), j)
+}
+
+/// The training net of a pool's top member (the lowest archive rank), on its masked book.
+fn top_train_net(run: &Json) -> f64 {
+    let front = arr(run, &["pareto"]);
+    let top = front.iter().min_by_key(|m| num(m, &["archive_rank"]) as usize).expect("a front member");
+    num(top, &["fitness", "train_net"])
+}
+
+#[test]
+fn compose_training_states_equal_the_pool_masks() {
+    // A label on every 4th stamp and dwell 24: the state of every stamp follows each 24-stamp
+    // negative run of the gate, while 24 labelled rows would hold a state for 96 stamps.
+    const STRIDE: i64 = 4;
+    const DWELL: usize = 24;
+    let (_scratch, dir) = scratch();
+    let data = write_strided_csv(&dir, "strided.csv", STRIDE);
+    let spec = write_spec(&dir);
+    let dwell = DWELL.to_string();
+    let (bull, bull_run) = searched_pool(&dir, "bull.json", &data, &spec, &["--fill", "drop", "--pnl-mask", "g", "--pnl-mask-dwell", &dwell]);
+    let (bear, bear_run) = searched_pool(&dir, "bear.json", &data, &spec, &["--fill", "drop", "--pnl-mask", "0 - g", "--pnl-mask-dwell", &dwell]);
+    // Each pool's training mask is the evaluation state of its gate: the kernel over every stamp.
+    let stamps = STAMPS * STRIDE as usize;
+    let gate: Vec<f64> = (0..stamps as i64).map(uneven_regime).collect();
+    let state = rcsr::regime_gate::hysteresis_states(&gate, &vec![0; stamps], 0.0, DWELL);
+    let range = arr(&bull_run, &["split", "train_time"]);
+    let (lo, hi) = (num(&range[0], &[]), num(&range[1], &[]));
+    let train: Vec<usize> = (0..stamps).filter(|&k| k as i64 % STRIDE == 0 && (lo..=hi).contains(&((T0 + STEP * k as i64) as f64))).collect();
+    let rows = (SYMBOLS.len() * train.len()) as f64;
+    let off = (SYMBOLS.len() * train.iter().filter(|&&k| !state[k]).count()) as f64;
+    assert!(off > 0.0 && off < rows, "{off} of {rows}");
+    assert_eq!(num(&bull_run, &["search_fitness", "mask", "off_rows"]), off, "bull training mask");
+    assert_eq!(num(&bear_run, &["search_fitness", "mask", "off_rows"]), rows - off, "bear training mask");
+    // The training seam of the composite reads the same states as the pools' masked books.
+    let menu = write_menu(&dir, "menu.json", &[("g", "000", "g", 0.0, DWELL)], None);
+    let j = json(&compose(&data, &spec, &["--fill", "drop", "--gates", &menu, "--bull", &bull, "--bear", &bear, "--top", "1", "--json"]));
+    let chosen = composite(&j, num(&j, &["compose", "chosen", "id"]) as usize);
+    let seam = at(&j, &["compose", "chosen", "train_seam"]);
+    let mut compared = 0;
+    for (side, masked, run) in [("on", "masked_on", &bull_run), ("off", "masked_off", &bear_run)] {
+        if at(chosen, &[side]).as_f64().is_some() {
+            let (a, b) = (num(seam, &[masked]), top_train_net(run));
+            assert!((a - b).abs() <= 1e-12, "{masked} {a} vs the pool's training net {b}");
+            compared += 1;
+        }
+    }
+    assert!(compared > 0, "the chosen composite holds a branch: {:?}", chosen);
+}
