@@ -227,13 +227,17 @@ fn calendar(bytes: &[u8], what: &str) -> Res<Calendar> {
 /// SPA and PBO of a development table (D2 and D3).
 struct Dev {
     spa_p: Option<f64>,
+    /// #1269: `family` when the table carries `trials.family` (D2 reads `spa.p_family`), else `consistent`.
+    p_source: &'static str,
     benchmark: Option<String>,
     pbo: Option<f64>,
 }
 
 fn dev_of(j: &Json) -> Dev {
+    let family = matches!(at(j, &["trials", "family"]), Some(Json::Obj(_)));
     Dev {
-        spa_p: num_at(j, &["spa", "p_consistent"]),
+        spa_p: num_at(j, &["spa", if family { "p_family" } else { "p_consistent" }]),
+        p_source: if family { "family" } else { "consistent" },
         benchmark: str_at(j, &["spa", "benchmark"]).map(str::to_string),
         pbo: num_at(j, &["pbo", "value"]),
     }
@@ -680,7 +684,12 @@ fn evaluate_gates(r: &Read, pick: &Pick, dev: &Dev, s: &Strata) -> Outcome {
         value_gate("D1", vec![("dsr", opt(pick.dsr)), ("min", jnum(D1_MIN))], pick.dsr, d1),
         value_gate(
             "D2",
-            vec![("p", opt(dev.spa_p)), ("alpha", jnum(D2_ALPHA)), ("benchmark", dev.benchmark.as_deref().map_or("null".to_string(), jstr))],
+            vec![
+                ("p", opt(dev.spa_p)),
+                ("p_source", jstr(dev.p_source)),
+                ("alpha", jnum(D2_ALPHA)),
+                ("benchmark", dev.benchmark.as_deref().map_or("null".to_string(), jstr)),
+            ],
             dev.spa_p,
             d2,
         ),
@@ -1080,7 +1089,9 @@ pub fn usage() -> &'static str {
       ann(x - e b) >= 0; P1 on the --pristine-label periods ann(x) >= the frozen P1
       floor (a stratum without periods fails); D1 the pick's DSR at N_eff >= 0.95;
       D2 SPA p <= 0.05 and D3 PBO <= 0.2 of the development table (else the
-      thresholds table). Verdict: good (every gate), promising (S1 at 10 bp, S2,
+      thresholds table); D2 reads spa.p_family when that table carries
+      trials.family (rcsr trials --family-table, #1269), else spa.p_consistent,
+      and p_source names it. Verdict: good (every gate), promising (S1 at 10 bp, S2,
       S4, S5 p <= 0.10, D2, DSR >= 0.80), not_confirmed (ann(x) >= 0), falsified.
       Pick 1 is the primary; secondaries get Holm-adjusted S5 p only when the
       primary is good. Report-only: the full lock and each subwindows part, the

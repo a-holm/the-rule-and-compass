@@ -154,6 +154,9 @@ struct Fx {
     freeze_subwindows: bool,
     /// Population files the table names; the verdict never opens them.
     population: Vec<String>,
+    /// #1269: `spa.p_family` of a thresholds or development table written with `--family-table`.
+    table_family: Option<f64>,
+    development_family: Option<f64>,
 }
 
 impl Fx {
@@ -161,11 +164,34 @@ impl Fx {
     /// a development table with SPA p 0.03 and PBO 0.10 (the thresholds table holds 0.5 and
     /// 0.9, so a verdict that read it for D2 or D3 would fail them).
     fn r() -> Fx {
-        Fx { reads: vec![ReadFx::r("a", 1)], picks: vec![PickFx::r(1)], table: (0.5, 0.9), development: Some((0.03, 0.10)), freeze_subwindows: true, population: Vec::new() }
+        Fx {
+            reads: vec![ReadFx::r("a", 1)],
+            picks: vec![PickFx::r(1)],
+            table: (0.5, 0.9),
+            development: Some((0.03, 0.10)),
+            freeze_subwindows: true,
+            population: Vec::new(),
+            table_family: None,
+            development_family: None,
+        }
     }
 }
 
-fn table_json(picks: &[PickFx], (spa, pbo): (f64, f64), population: &[String]) -> String {
+/// #1269: the `trials` member with a family block and the `spa.p_family` member of a table
+/// written with `--family-table`, or two empty strings; NaN gives the family block without
+/// `spa.p_family`.
+fn family_members(p_family: Option<f64>) -> (String, String) {
+    p_family.map_or((String::new(), String::new()), |p| {
+        (
+            ",\"trials\":{\"nominal\":4,\"n_eff\":3,\"family\":{\"tables\":[{\"sha256\":\"f1\",\"n_eff\":5,\"nominal\":6,\"spa_p\":0.4}],\
+\"sha256\":\"f\",\"n_eff_total\":8,\"nominal_total\":10}}"
+                .to_string(),
+            if p.is_nan() { String::new() } else { format!(",\"p_family\":{p}") },
+        )
+    })
+}
+
+fn table_json(picks: &[PickFx], (spa, pbo): (f64, f64), population: &[String], family: Option<f64>) -> String {
     let files: Vec<String> =
         population.iter().enumerate().map(|(i, f)| format!("{{\"file\":\"{f}\",\"sha256\":\"{}\",\"path\":{},\"periods\":6}}", sha(f.as_bytes()), i + 1)).collect();
     let picks_json: Vec<String> = picks
@@ -192,10 +218,11 @@ fn table_json(picks: &[PickFx], (spa, pbo): (f64, f64), population: &[String]) -
     let rows: Vec<String> = (0..picks.len())
         .map(|k| format!("{{\"row\":{k},\"label\":\"row{k}\",\"occam\":{{\"run\":\"o.json\",\"source\":\"occam\",\"bits\":{},\"p_occam\":0.25,\"bit_budget\":40}}}}", 12 + k))
         .collect();
+    let (trials, p_family) = family_members(family);
     format!(
         "{{\"schema\":\"rcsr-trials-table/1\",\"rule\":{{\"schema\":\"rcsr-trials-rule/1\",\"pick\":{},\"sha256\":\"{rule}\"}},\
-\"freeze\":{{\"schema\":\"rcsr-trials-freeze/1\",\"rule_sha256\":\"{rule}\",\"map\":\"map.json\",\"map_sha256\":\"{map}\",\"method\":{{}}}},\
-\"picks\":[{}],\"spa\":{{\"benchmark\":\"cash\",\"p_consistent\":{spa}}},\"pbo\":{{\"value\":{pbo}}},\"rows\":[{}]}}\n",
+\"freeze\":{{\"schema\":\"rcsr-trials-freeze/1\",\"rule_sha256\":\"{rule}\",\"map\":\"map.json\",\"map_sha256\":\"{map}\",\"method\":{{}}}}{trials},\
+\"picks\":[{}],\"spa\":{{\"benchmark\":\"cash\",\"p_consistent\":{spa}{p_family}}},\"pbo\":{{\"value\":{pbo}}},\"rows\":[{}]}}\n",
         picks.len(),
         picks_json.join(","),
         rows.join(","),
@@ -204,8 +231,11 @@ fn table_json(picks: &[PickFx], (spa, pbo): (f64, f64), population: &[String]) -
     )
 }
 
-fn development_json((spa, pbo): (f64, f64)) -> String {
-    format!("{{\"schema\":\"rcsr-trials-table/1\",\"picks\":[],\"spa\":{{\"benchmark\":\"ladder\",\"p_consistent\":{spa}}},\"pbo\":{{\"value\":{pbo}}},\"rows\":[]}}\n")
+fn development_json((spa, pbo): (f64, f64), family: Option<f64>) -> String {
+    let (trials, p_family) = family_members(family);
+    format!(
+        "{{\"schema\":\"rcsr-trials-table/1\"{trials},\"picks\":[],\"spa\":{{\"benchmark\":\"ladder\",\"p_consistent\":{spa}{p_family}}},\"pbo\":{{\"value\":{pbo}}},\"rows\":[]}}\n"
+    )
 }
 
 struct Setup {
@@ -240,10 +270,10 @@ fn setup(tag: &str, fx: &Fx) -> Setup {
         std::fs::write(f, "{\"mode\":\"cpcv_path\"}\n").unwrap();
     }
     let thresholds = p("table.json");
-    std::fs::write(&thresholds, table_json(&fx.picks, fx.table, &population)).unwrap();
+    std::fs::write(&thresholds, table_json(&fx.picks, fx.table, &population, fx.table_family)).unwrap();
     let development = fx.development.map(|d| {
         let path = p("development.json");
-        std::fs::write(&path, development_json(d)).unwrap();
+        std::fs::write(&path, development_json(d, fx.development_family)).unwrap();
         path
     });
     let (subwindows, years, regimes) = (p("subwindows.csv"), p("years.csv"), p("regimes_lock.csv"));
@@ -464,6 +494,46 @@ fn verdict_classes_follow_design_table() {
     fx.reads[0].net = vec![0.01, -0.01, 0.0, 0.0, 0.0, 0.0];
     let (class, c) = class_of("verdict-zero", &fx);
     assert_eq!(num(&c, &["gates", "S1", "net10"]), 0.0);
+    assert_eq!(class, "not_confirmed");
+}
+
+/// #1269: a table written with `--family-table` carries `trials.family`; D2 then reads its
+/// Bonferroni `spa.p_family` and names the source.
+#[test]
+fn verdict_d2_reads_the_family_p() {
+    let fx = Fx { development: Some((0.02, 0.10)), development_family: Some(0.08), ..Fx::r() };
+    let s = setup("verdict-d2-family", &fx);
+    let (code, out, err) = verdict(&s);
+    assert_eq!(code, 0, "{out}{err}");
+    let c = candidate(&result(&s), 0).clone();
+    let d2 = at(&c, &["gates", "D2"]);
+    close(num(d2, &["p"]), 0.08, "D2 reads spa.p_family");
+    assert_eq!(text(d2, &["p_source"]), "family");
+    assert_eq!(at(d2, &["pass"]), &Json::Bool(false));
+    assert_eq!(text(&c, &["verdict"]), "not_confirmed", "D2 fails, so neither good nor promising");
+    let md = std::fs::read_to_string(s.path("verdict.md")).unwrap();
+    assert!(md.contains("| D2 | p 0.08, p_source family,"), "{md}");
+
+    let (class, c) = class_of("verdict-d2-consistent", &Fx { development_family: None, ..fx.clone() });
+    let d2 = at(&c, &["gates", "D2"]);
+    close(num(d2, &["p"]), 0.02, "D2 reads spa.p_consistent");
+    assert_eq!(text(d2, &["p_source"]), "consistent");
+    assert_eq!(at(d2, &["pass"]), &Json::Bool(true));
+    assert_eq!(class, "good");
+
+    // Without a frozen development table D2 reads the family p of the thresholds table.
+    let (class, c) = class_of("verdict-d2-thresholds", &Fx { development: None, table: (0.02, 0.10), table_family: Some(0.08), ..Fx::r() });
+    let d2 = at(&c, &["gates", "D2"]);
+    close(num(d2, &["p"]), 0.08, "D2 reads the thresholds table's spa.p_family");
+    assert_eq!(text(d2, &["p_source"]), "family");
+    assert_eq!(class, "not_confirmed");
+
+    // A family block without spa.p_family fails D2 with a reason.
+    let (class, c) = class_of("verdict-d2-no-p", &Fx { development_family: Some(f64::NAN), ..fx.clone() });
+    let d2 = at(&c, &["gates", "D2"]);
+    assert!(matches!(at(d2, &["p"]), Json::Null), "{d2:?}");
+    assert_eq!(text(d2, &["p_source"]), "family");
+    assert_eq!(text(d2, &["reason"]), "missing in the frozen table");
     assert_eq!(class, "not_confirmed");
 }
 
