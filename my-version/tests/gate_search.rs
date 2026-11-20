@@ -549,3 +549,65 @@ fn gate_search_training_states_equal_evaluation_states_on_strided_labels() {
     assert!((num(&gates[0], &["on_share"]) - share).abs() <= 1e-12, "training on share {} vs the evaluation rule {share}", num(&gates[0], &["on_share"]));
     assert_eq!(s(&j, &["gate_search", "train_state_rule"]), "rcsr-gate-state/1");
 }
+
+#[test]
+fn searched_gate_training_states_equal_evaluation_states_row_for_row() {
+    use rcsr::data::{FillMethod, PrepSpec, SplitMode, SplitSpec, TradingColumns};
+    use rcsr::gate_search::{Cut, GateLayer};
+    use rcsr::regime_gate::GateSpec;
+    use rcsr::trading::{FitnessBook, TradingSpec};
+    let scratch = Scratch::new("gate-search-states");
+    let data = strided_csv(scratch.path());
+    let table = rcsr::data::parse_table(&std::fs::read_to_string(&data).unwrap()).unwrap();
+    let cols = TradingColumns { return_column: Some("r".to_string()), log_returns: true, train: true, gate_rows: vec!["g".to_string()], ..Default::default() };
+    let spec = SplitSpec {
+        mode: SplitMode::Temporal,
+        time_col: Some(0),
+        group_col: Some(1),
+        test_frac: 0.2,
+        validation_frac: 0.3,
+        trading: Some(cols),
+        canonical_train_order: true,
+        ..SplitSpec::default()
+    };
+    let prep = PrepSpec { fill: FillMethod::Drop, ..PrepSpec::default() };
+    let p = rcsr::data::prepare_full_with(&table, &["g".to_string()], "y", &spec, &mut rcsr::rng::Mt::new(1), &prep).unwrap();
+    let split = p.trading.as_ref().expect("trading split");
+    let rows = split.gate_rows.as_ref().expect("gate rows");
+    let train = split.train.as_ref().expect("training rows");
+    let n = train.ret.len();
+    let tspec = TradingSpec { cost_bps: 5.0, ..Default::default() };
+    let book = FitnessBook::new(train, &tspec, 86_400.0).expect("a profitable training book");
+    let on: Vec<bool> = (0..n).map(|i| i % 3 != 0).collect();
+    let off: Vec<bool> = (0..n).map(|i| i % 2 == 0).collect();
+    // The gate `g` with band 0 and dwell 24 on every gate row.
+    let (band, dwell) = (0.0, 24);
+    let plain = GateSpec::parse("g", band, dwell).unwrap();
+    let g_all = rows.values(&plain).unwrap();
+    let layer = GateLayer::new(book, on, off, rows.plan().unwrap(), None, band, dwell, "t").unwrap();
+    let choice = layer.choose(&g_all).expect("finite gate values");
+    let Cut::Grid { value, .. } = choice.cut else { panic!("a constant gate: {:?}", choice.cut) };
+    let gate = GateSpec::parse(&format!("(g) - ({:?})", value), band, dwell).unwrap();
+    let evaluation = rows.states(&gate).unwrap().train.expect("training states");
+    assert_eq!(choice.states.len(), n);
+    assert_eq!(choice.states, evaluation, "the search's training states, row for row");
+    assert!(evaluation.iter().any(|&s| s) && evaluation.iter().any(|&s| !s));
+    // The fixture separates the row sets: the kernel over the training rows alone differs.
+    let train_g: Vec<f64> = rows.plan().unwrap().train_rows().iter().map(|&r| g_all[r] - value).collect();
+    let group: Vec<u64> = train.rows.group.clone();
+    assert_ne!(rcsr::regime_gate::hysteresis_states(&train_g, &group, band, dwell), evaluation);
+}
+
+#[test]
+fn gate_search_output_is_identical_at_one_and_four_threads() {
+    let scratch = Scratch::new("gate-search-threads");
+    let data = strided_csv(scratch.path());
+    let spec = daily_spec(scratch.path());
+    let one = strided_gate_search(&data, &spec, &["--threads", "1"]);
+    let four = strided_gate_search(&data, &spec, &["--threads", "4"]);
+    assert_eq!(code(&one), 0, "{}", stderr(&one));
+    assert_eq!(code(&four), 0, "{}", stderr(&four));
+    // Only the echoed thread count differs.
+    let strip = |o: &Output| String::from_utf8_lossy(&o.stdout).replace("--threads 1", "--threads N").replace("--threads 4", "--threads N").replace("\"threads\":1", "\"threads\":N").replace("\"threads\":4", "\"threads\":N");
+    assert_eq!(strip(&one), strip(&four));
+}
