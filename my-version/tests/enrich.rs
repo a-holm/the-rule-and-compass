@@ -6018,6 +6018,7 @@ fn min_cross_members_flag_validation() {
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
     for flag in ["--min-cross-members", "--min-cross-members-rank"] {
         for bad in ["0", "4", "201", "x"] {
+            let _ = std::fs::remove_file(&out);
             let r = cli_enrich(&input, &out, "mkt_r16", &[flag, bad]);
             assert_eq!(r.status.code(), Some(2), "{flag} {bad}: {}", stderr_of(&r));
             assert!(stderr_of(&r).contains("5..=200"), "{flag} {bad}: {}", stderr_of(&r));

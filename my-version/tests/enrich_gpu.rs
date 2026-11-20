@@ -413,7 +413,7 @@ fn gpu_cross_section_rank_edge_cases() {
 
     let mut gpu = open(&whole_start, &whole_len);
     assert!(gpu.prepare_cross_section(&sym, Some(&member)));
-    let got = gpu.rank(&src).expect("device rank");
+    let got = gpu.rank(&src, 20).expect("device rank");
     let want = reference(&src);
     for (r, (g, w)) in got.iter().zip(want.iter()).enumerate() {
         assert_eq!(
@@ -449,7 +449,7 @@ fn gpu_cross_section_rank_edge_cases() {
             _ => v,
         })
         .collect();
-    let swapped_ranks = gpu.rank(&swapped).expect("device rank");
+    let swapped_ranks = gpu.rank(&swapped, 20).expect("device rank");
     assert_eq!(bits(&swapped_ranks), bits(&got), "the sign of zero changed a rank");
     for i in (0..steps).filter(|i| i % 5 == 3) {
         for k in 0..3 {
@@ -473,7 +473,7 @@ fn gpu_cross_section_rank_edge_cases() {
     let mut split = open(&half_start, &half_len);
     assert!(split.prepare_cross_section(&sym, Some(&member)));
     assert_eq!(
-        bits(&split.rank(&src).expect("device rank")),
+        bits(&split.rank(&src, 20).expect("device rank")),
         bits(&got),
         "segment partition changed a rank"
     );
@@ -973,10 +973,10 @@ fn refused_cub_sort_fails_cross_section_prepare_then_recovers() {
     let refused = gpu.prepare_cross_section(&sym, None);
     unsafe { rc_enrich_test_force_cub_fail(0) };
     assert!(!refused, "a refused CUB sort must fail the prepare");
-    assert!(gpu.rank(&src).is_none(), "no permutation may survive a failed prepare");
+    assert!(gpu.rank(&src, 20).is_none(), "no permutation may survive a failed prepare");
 
     assert!(gpu.prepare_cross_section(&sym, None), "no error may stay pending");
-    assert!(gpu.rank(&src).is_some());
+    assert!(gpu.rank(&src, 20).is_some());
 }
 
 /// #410: refusing the later real CUB calls of the cross-section prepare (the
@@ -1015,19 +1015,100 @@ fn refused_later_cub_calls_fail_cross_section_prepare_then_recover() {
 
     let mut reference = make();
     assert!(reference.prepare_cross_section(&sym, None), "baseline prepare");
-    let base = reference.rank(&src).expect("baseline rank");
+    let base = reference.rank(&src, 20).expect("baseline rank");
     for k in [2, 3] {
         let mut gpu = make();
         unsafe { rc_enrich_test_force_cub_fail(k) };
         let refused = gpu.prepare_cross_section(&sym, None);
         unsafe { rc_enrich_test_force_cub_fail(0) };
         assert!(!refused, "refusing real call {k} must fail the prepare");
-        assert!(gpu.rank(&src).is_none(), "no permutation may survive call {k}");
+        assert!(gpu.rank(&src, 20).is_none(), "no permutation may survive call {k}");
         assert!(gpu.prepare_cross_section(&sym, None), "no error may stay pending after {k}");
-        let again = gpu.rank(&src).expect("rank after recovery");
+        let again = gpu.rank(&src, 20).expect("rank after recovery");
         assert!(
             again.iter().zip(base.iter()).all(|(a, b)| a.to_bits() == b.to_bits()),
             "ranks after refusing call {k}"
         );
     }
+}
+
+/// #1274: a store whose member count ramps from 1 to `symbols` over bars `ramp..ramp + symbols`, so every
+/// floor between 5 and 24 splits the timestamps into NaN and finite ones.
+fn write_ramp_store(path: &str, symbols: usize, bars: usize, ramp: usize) {
+    let mut text = String::from("ts,symbol,open,high,low,close,volume,quote_volume,member_asof\n");
+    let t0 = 1_700_000_000i64;
+    for k in 0..symbols {
+        let name = if k == 0 { "BTCUSDT".to_string() } else { format!("SYM{k:02}") };
+        let asof = t0 + (ramp + k) as i64 * 900;
+        for i in 0..bars {
+            let p = 100.0 * ((0.0002 * (k as f64 - 6.0)) * i as f64 + 0.03 * (i as f64 * 0.23 + k as f64 * 0.41).sin()).exp();
+            let volume = 500.0 + 7.0 * k as f64 + (i % 11) as f64;
+            text.push_str(&format!(
+                "{},{name},{},{},{},{p},{volume},{},{asof}\n",
+                t0 + i as i64 * 900,
+                p * 0.999,
+                p * 1.002,
+                p * 0.998,
+                p * volume
+            ));
+        }
+    }
+    let table = data::parse_table_with_time(&text, false, Some("ts")).unwrap();
+    store::write_store_with_time(path, &table, 4096, Some(0)).unwrap();
+}
+
+/// #1274: the device kernels read the member floor as an argument. CPU and device give identical column
+/// bytes at floor 5, floor 20 and a separate rank floor, and a lower floor finishes more timestamps.
+#[test]
+fn min_cross_members_device_parity() {
+    if !rcsr::gpu::probe().available() {
+        rcsr::backend::skip_without_device("skipping: no CUDA device");
+        return;
+    }
+    let _floor = Floor::zero();
+    let (_scratch, dir) = tmp_dir("floor-parity");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    write_ramp_store(&src, 24, 400, 90);
+    let names = [
+        "mkt_r16", "mkt_ew_ret16", "breadth", "mkt_breadth", "dispersion", "mkt_dispersion", "rel_mkt16", "mkt_r96",
+        "rel_mkt96", "mkt_vol96", "mkt_ew_ret1", "avg_corr", "btc_volume_share", "xs_rank_r1", "xs_rank_r16",
+        "xs_rank_r20", "xs_rank_vol20", "xs_rank_amihud96", "cs_rank_r60",
+    ];
+    let features = names.join(",");
+    let run = |tag: &str, mode: GpuMode, members: usize, rank: usize| {
+        let out = dir.join(format!("{tag}.rcsb")).to_string_lossy().into_owned();
+        let report = enrich::build(&Options {
+            data: src.clone(),
+            out: Some(out.clone()),
+            features: vec![features.clone()],
+            gpu: mode,
+            cross_floor: rcsr::cross_floor::CrossFloor { members, rank_members: rank },
+            ..Default::default()
+        })
+        .unwrap();
+        (out, report)
+    };
+    let finite = |out: &str, name: &str| column(out, name).iter().filter(|v| v.is_finite()).count();
+    let mut counts = Vec::new();
+    for (members, rank) in [(5usize, 5usize), (20, 20), (5, 12)] {
+        let (cpu_out, cpu) = run(&format!("cpu-{members}-{rank}"), GpuMode::Off, members, rank);
+        let (gpu_out, gpu) = run(&format!("gpu-{members}-{rank}"), GpuMode::On, members, rank);
+        assert_eq!(gpu.gpu_fallback, 0, "floor {members}/{rank}: {:?}", gpu.gpu_fallback_columns);
+        // cs_rank_r60 is the legacy alias path and always ranks on the CPU.
+        assert_eq!(gpu.gpu_columns, names.len() - 1, "floor {members}/{rank}: every column but cs_rank_r60 runs on the device");
+        assert!(cpu.json().contains(&format!("\"cross_floor\":{{\"members\":{members},\"rank_members\":{rank}}}")));
+        for name in names {
+            let a = column(&cpu_out, name);
+            let b = column(&gpu_out, name);
+            for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+                assert_eq!(x.to_bits(), y.to_bits(), "{name} row {i} at floor {members}/{rank}: CPU {x:?} device {y:?}");
+            }
+        }
+        counts.push((finite(&cpu_out, "mkt_r16"), finite(&cpu_out, "avg_corr"), finite(&cpu_out, "xs_rank_r1")));
+    }
+    assert!(counts[0].0 > counts[1].0, "floor 5 must finish more mkt_r16 rows than floor 20: {counts:?}");
+    assert!(counts[0].1 > counts[1].1, "floor 5 must finish more avg_corr rows than floor 20: {counts:?}");
+    assert!(counts[0].2 > counts[1].2, "floor 5 must finish more xs_rank_r1 rows than floor 20: {counts:?}");
+    assert_eq!(counts[2].0, counts[0].0, "the mean floor is independent of the rank floor");
+    assert!(counts[2].2 < counts[0].2 && counts[2].2 > counts[1].2, "rank floor 12 lies between: {counts:?}");
 }

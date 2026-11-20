@@ -234,9 +234,9 @@ pub const WANT_REL: u32 = 8;
 /// calls it first and falls back to the CPU reference when a call returns
 /// `None`.
 pub trait MarketDevice {
-    fn group_stats(&mut self, src: &[f64], want: u32) -> Option<GroupStats>;
-    fn volume_share(&mut self, volume: &[f64], bench: &BenchSeries) -> Option<Vec<f64>>;
-    fn avg_corr(&mut self, r1: &[f64]) -> Option<Vec<f64>>;
+    fn group_stats(&mut self, src: &[f64], want: u32, floor: usize) -> Option<GroupStats>;
+    fn volume_share(&mut self, volume: &[f64], bench: &BenchSeries, floor: usize) -> Option<Vec<f64>>;
+    fn avg_corr(&mut self, r1: &[f64], floor: usize) -> Option<Vec<f64>>;
 }
 
 #[cfg(feature = "cuda")]
@@ -300,6 +300,7 @@ mod device {
             ctx: *mut c_void,
             src: *const f64,
             want: u32,
+            floor: c_int,
             mean: *mut f64,
             breadth: *mut f64,
             disp: *mut f64,
@@ -311,9 +312,10 @@ mod device {
             bt: *const i64,
             bvol: *const f64,
             nb: c_int,
+            floor: c_int,
             out: *mut f64,
         ) -> c_int;
-        fn rc_bench_market_avg_corr(ctx: *mut c_void, r1: *const f64, out: *mut f64) -> c_int;
+        fn rc_bench_market_avg_corr(ctx: *mut c_void, r1: *const f64, floor: c_int, out: *mut f64) -> c_int;
     }
 
     fn raw_series(s: Option<&BenchSeries>) -> RawSeries {
@@ -492,7 +494,7 @@ mod device {
     }
 
     impl MarketDevice for crate::enrich_gpu::EnrichGpu {
-        fn group_stats(&mut self, src: &[f64], want: u32) -> Option<GroupStats> {
+        fn group_stats(&mut self, src: &[f64], want: u32, floor: usize) -> Option<GroupStats> {
             let n = src.len();
             let mut st = GroupStats::default();
             let alloc = |bit: u32| if want & bit != 0 { vec![0.0; n] } else { Vec::new() };
@@ -507,6 +509,7 @@ mod device {
                         ctx,
                         src.as_ptr(),
                         want,
+                        floor as c_int,
                         ptr(&mut st.mean),
                         ptr(&mut st.breadth),
                         ptr(&mut st.dispersion),
@@ -522,7 +525,7 @@ mod device {
             Some(st)
         }
 
-        fn volume_share(&mut self, volume: &[f64], bench: &BenchSeries) -> Option<Vec<f64>> {
+        fn volume_share(&mut self, volume: &[f64], bench: &BenchSeries, floor: usize) -> Option<Vec<f64>> {
             if bench.is_empty() || !bench.consistent() {
                 return None;
             }
@@ -535,6 +538,7 @@ mod device {
                         bench.times.as_ptr(),
                         bench.planes[PLANE_VOLUME].as_ptr(),
                         bench.len() as c_int,
+                        floor as c_int,
                         out.as_mut_ptr(),
                     )
                 };
@@ -547,10 +551,10 @@ mod device {
             Some(out)
         }
 
-        fn avg_corr(&mut self, r1: &[f64]) -> Option<Vec<f64>> {
+        fn avg_corr(&mut self, r1: &[f64], floor: usize) -> Option<Vec<f64>> {
             let mut out = vec![0.0; r1.len()];
             self.market_call(|ctx| {
-                let rc = unsafe { rc_bench_market_avg_corr(ctx, r1.as_ptr(), out.as_mut_ptr()) };
+                let rc = unsafe { rc_bench_market_avg_corr(ctx, r1.as_ptr(), floor as c_int, out.as_mut_ptr()) };
                 if rc == 0 {
                     Some(())
                 } else {

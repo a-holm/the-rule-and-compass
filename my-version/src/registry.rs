@@ -228,6 +228,8 @@ pub struct ColumnSchema {
     pub dtype: DType,
     pub availability_start: Option<i64>,
     pub availability_end: Option<i64>,
+    /// Member floor the column was built with (#1274); `None` outside the cross-section columns.
+    pub min_members: Option<usize>,
     pub sha256: String,
 }
 
@@ -390,6 +392,7 @@ pub fn build_schema_excluding(store: &FileStore, exclude: Option<crate::lockbox:
             dtype: dtypes[c],
             availability_start: first[c],
             availability_end: last[c],
+            min_members: None,
             sha256: hasher.finalize(),
         });
     }
@@ -458,13 +461,13 @@ pub fn schema_json(
         s.push_str(&format!(
             "{{\"name\":{},\"family\":{},\"timeframe\":{},\"sources\":[{}],\"transform\":{},\
              \"causal_offset\":{},\"warmup_bars\":{},\"lookback_seconds\":{},\"dtype\":{},\"unit\":{},\
-             \"availability_start\":{},\"availability_end\":{},\"pit_rule\":{},\
+             \"availability_start\":{},\"availability_end\":{},\"pit_rule\":{},{}\
              \"semantic_cost\":{},\"status\":{},\"sha256\":{}}}{}\n",
             esc(&c.name),
             esc(&r.family),
             esc(&r.timeframe),
             sources.join(","),
-            esc(&r.transform),
+            esc(&crate::cross_floor::pit_text(&r.transform, c.min_members)),
             r.causal_offset,
             r.warmup,
             opt_i64(crate::enrich::lookback_seconds(&c.name, base_bar)),
@@ -472,7 +475,8 @@ pub fn schema_json(
             esc(&r.unit),
             opt_i64(c.availability_start),
             opt_i64(c.availability_end),
-            esc(&r.pit_rule),
+            esc(&crate::cross_floor::pit_text(&r.pit_rule, c.min_members)),
+            c.min_members.map(|k| format!("\"min_members\":{},", k)).unwrap_or_default(),
             r.semantic_cost,
             esc(if r.available { "available" } else { "unavailable" }),
             esc(&c.sha256),
@@ -550,8 +554,28 @@ pub fn write_schema_locked(
     retired: Option<&crate::retire::Retirement>,
     record: Option<&crate::lockrec::LockRecord>,
 ) -> Result<String, String> {
+    let floors = crate::cross_floor::recorded_columns(store_path);
+    write_schema_floors(store_path, panel_version, locked_test, also, embargo_floor, retired, record, &floors)
+}
+
+/// As [`write_schema_locked`], recording `floors` (column name to member floor, #1274) on the cross-section columns.
+pub fn write_schema_floors(
+    store_path: &str,
+    panel_version: &str,
+    locked_test: Option<&crate::lockbox::Lockbox>,
+    also: Option<&crate::lockbox::Lockbox>,
+    embargo_floor: Option<i64>,
+    retired: Option<&crate::retire::Retirement>,
+    record: Option<&crate::lockrec::LockRecord>,
+    floors: &BTreeMap<String, usize>,
+) -> Result<String, String> {
     let store = FileStore::open(store_path)?;
-    let (columns, bar, kept) = build_schema_excluding(&store, record.map(|r| r.range))?;
+    let (mut columns, bar, kept) = build_schema_excluding(&store, record.map(|r| r.range))?;
+    for c in &mut columns {
+        if crate::cross_floor::is_floored(&c.name) {
+            c.min_members = floors.get(&c.name).copied();
+        }
+    }
     let rows = if record.is_some() { kept } else { store.n_rows() };
     let mut text = schema_json(&columns, &bar, rows, panel_version, locked_test, also, embargo_floor, retired);
     if let Some(r) = record {
