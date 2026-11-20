@@ -6209,3 +6209,48 @@ fn min_cross_members_floor_survives_a_chained_enrich() {
     let r = cli_enrich(&s2, &p("s3.rcsb"), "mkt_vol96", &[]);
     assert_eq!(r.status.code(), Some(2), "{}", stderr_of(&r));
 }
+
+#[test]
+fn min_cross_members_panel_append_floor_is_seen_by_a_later_enrich() {
+    let (_scratch, dir) = tmp_dir("floor-append-enrich");
+    let rows = member_rows(8, 120, 900);
+    let base = dir.join("base.rcsb").to_string_lossy().into_owned();
+    write_panel_store(&base, &rows, 64);
+    let p = |name: &str| dir.join(name).to_string_lossy().into_owned();
+    let (s1, o, oe) = (p("s1.rcsb"), p("o.rcsb"), p("oe.rcsb"));
+    cli_enrich_ok(&base, &s1, "mkt_r16,mkt_r96", &["--min-cross-members", "5"]);
+    let append = |target: &str, family: &str, columns: &str, out: &str| {
+        rcsr_cmd::rcsr()
+            .args(["panel", "append", "--data", target, "--family", family, "--columns", columns, "--out", out])
+            .output()
+            .unwrap()
+    };
+    // A floor-5 column appended into a symbol-major store: the floor lives only in o.rcsb.schema.json.
+    let r = append(&base, &s1, "mkt_r16", &o);
+    assert_eq!(r.status.code(), Some(0), "{}", stderr_of(&r));
+    assert!(!std::path::Path::new(&format!("{o}.enrich.json")).exists());
+
+    let r = cli_enrich(&o, &oe, "mkt_vol96", &[]);
+    assert_eq!(r.status.code(), Some(2), "{}", stderr_of(&r));
+    let text = stderr_of(&r);
+    assert!(text.contains("'mkt_r16'") && text.contains("--min-cross-members 5") && text.contains("--min-cross-members 20"), "{text}");
+    assert!(!std::path::Path::new(&oe).exists());
+
+    cli_enrich_ok(&o, &oe, "mkt_vol96", &["--min-cross-members", "5"]);
+    let text = std::fs::read_to_string(format!("{oe}.enrich.json")).unwrap();
+    assert!(text.contains("\"cross_floor\":{\"members\":5,\"rank_members\":5}"), "{text}");
+    let floors = column_floors(&text);
+    assert_eq!(floors.get("mkt_r16"), Some(&5), "the carried column keeps its floor: {floors:?}");
+    assert_eq!(floors.get("mkt_vol96"), Some(&5));
+
+    // The floor of the carried column reaches a later append.
+    let panel = dir.join("panel.rcsb").to_string_lossy().into_owned();
+    let mut time_major = rows.clone();
+    time_major.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    write_panel_store(&panel, &time_major, 64);
+    let out = p("final.rcsb");
+    let r = append(&panel, &oe, "mkt_r16,mkt_vol96", &out);
+    assert_eq!(r.status.code(), Some(0), "{}", stderr_of(&r));
+    let floors = column_floors(&std::fs::read_to_string(format!("{out}.schema.json")).unwrap());
+    assert_eq!((floors.get("mkt_r16"), floors.get("mkt_vol96")), (Some(&5), Some(&5)), "{floors:?}");
+}
