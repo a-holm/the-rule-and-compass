@@ -18,7 +18,7 @@
 //! gate states of the evaluation rule `rcsr-gate-state/1` (warm-up over the full
 //! readable prefix of the data file; the training and validation rows never
 //! read the test intervals), the states the `--pnl-mask` pools trained under
-//! (#1268). A searched gate keeps the per-segment training kernel of its search.
+//! (#1268). A searched gate's search reads the same states on its training rows (#1279).
 //! The run carries the switch of every C1 and C2 composite, so every reader
 //! prices the same book.
 
