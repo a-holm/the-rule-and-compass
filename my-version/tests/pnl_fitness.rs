@@ -2808,3 +2808,237 @@ fn masked_sd_edge_cases_give_no_band() {
 fn close(a: f64, b: f64) -> bool {
     (a - b).abs() <= 1e-12 * a.abs().max(b.abs())
 }
+
+// ---- #1268: the training mask follows rcsr-gate-state/1 ----
+
+use rcsr::regime_gate::{self, Barrier, BarrierKind, GateSpec};
+
+const HOUR: i64 = 3600;
+const DAY: i64 = 86_400;
+const STRIDED_DAYS: usize = 160;
+const STRIDED_ARGS: [&str; 10] = ["--group-by", "s", "--fill", "drop", "--fitness", "pnl", "--pnl-mask", "g", "--pnl-mask-dwell", "168"];
+
+/// A gate that changes sign every 10 days, a day later for symbol b.
+fn ten_day_gate(h: i64, j: usize) -> f64 {
+    if ((h + 24 * j as i64) / 240) % 2 == 0 { 1.0 } else { -1.0 }
+}
+
+/// A gate that changes sign every 3 days, a day later for symbol b.
+fn three_day_gate(h: i64, j: usize) -> f64 {
+    if ((h + 24 * j as i64) / 72) % 2 == 0 { 1.0 } else { -1.0 }
+}
+
+/// Hourly rows of symbols a and b over `days` days with the gate `g = gate(hour, symbol)`. The label
+/// `y` and the return `r` are finite at hour 0 of each day only (a stride-24 label), so `--fill drop`
+/// keeps one row per symbol and day.
+fn strided_text(days: usize, gate: fn(i64, usize) -> f64) -> String {
+    let mut text = String::from("t,s,x1,x2,g,r,y\n");
+    for h in 0..(days * 24) as i64 {
+        for (j, sym) in ["a", "b"].iter().enumerate() {
+            let f = (2 * h + j as i64) as f64;
+            let x1 = frac(f * 0.618_033_988_749_894_9) - 0.5;
+            let x2 = frac(f * 0.754_877_666_246_692_7) - 0.5;
+            let noise = frac(f * 0.324_717_957_244_746) - 0.5;
+            let r = 0.01 * x1 + 0.0005 * noise;
+            let (r, y) = if h % 24 == 0 { (r.to_string(), (r + 0.05 * x2).to_string()) } else { (String::new(), String::new()) };
+            text.push_str(&format!("{},{},{},{},{},{},{}\n", T0 + HOUR * h, sym, x1, x2, gate(h, j), r, y));
+        }
+    }
+    text
+}
+
+fn write_strided_csv(dir: &std::path::Path, gate: fn(i64, usize) -> f64) -> String {
+    let path = dir.join("strided.csv");
+    std::fs::write(&path, strided_text(STRIDED_DAYS, gate)).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+/// A one-day forward-return label on `y` with return column `r`.
+fn write_daily_spec(dir: &std::path::Path) -> String {
+    let text = "{\"schema\":\"rcsr-target-spec/1\",\"targets\":[{\"column\":\"y\",\"name\":\"raw_target\",\
+         \"kind\":\"forward_return\",\"deprecated\":false,\"return_column\":\"r\",\"return_units\":\"log\",\
+         \"horizon_seconds\":86400,\"entry_offset_seconds\":0,\"delay_seconds\":0,\
+         \"entry_price\":\"open\",\"exit_price\":\"close\",\"offset\":0.0,\
+         \"scale\":{\"kind\":\"constant\",\"value\":1.0},\"clip\":null,\"units\":\"log_return\",\
+         \"cost_bps\":null,\"cost_in_label\":false,\"construction_columns\":[],\"note\":null}]}";
+    let path = dir.join("daily.json");
+    std::fs::write(&path, text).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+/// The strided fixture prepared like a `--fitness pnl` run with `--fill drop` and a temporal split.
+fn strided_prepared(text: &str, gate: &GateSpec) -> (rcsr::data::Table, rcsr::data::Prepared) {
+    use rcsr::data::{FillMethod, PrepSpec, SplitMode, SplitSpec, TradingColumns};
+    let table = rcsr::data::parse_table(text).unwrap();
+    let cols = TradingColumns { return_column: Some("r".to_string()), log_returns: true, train: true, mask: Some(gate.clone()), ..Default::default() };
+    let spec = SplitSpec {
+        mode: SplitMode::Temporal,
+        time_col: Some(0),
+        group_col: Some(1),
+        test_frac: 0.25,
+        validation_frac: 0.25,
+        trading: Some(cols),
+        canonical_train_order: true,
+        ..SplitSpec::default()
+    };
+    let prep = PrepSpec { fill: FillMethod::Drop, ..PrepSpec::default() };
+    let vars = ["x1".to_string(), "x2".to_string()];
+    let p = rcsr::data::prepare_full_with(&table, &vars, "y", &spec, &mut rcsr::rng::Mt::new(1), &prep).unwrap();
+    (table, p)
+}
+
+/// The file row of every slice row, matched on group and time.
+fn file_rows(table: &rcsr::data::Table, rows: &TradingRows) -> Vec<usize> {
+    let time = rcsr::data::time_keys(table, 0).to_f64();
+    let group = rcsr::data::group_ids(table, 1).0;
+    let row_at: std::collections::HashMap<(u64, u64), usize> = (0..time.len()).map(|r| ((group[r] as u64, time[r].to_bits()), r)).collect();
+    (0..rows.time.len()).map(|i| row_at[&(rows.group[i], rows.time[i].to_bits())]).collect()
+}
+
+/// The `rcsr-gate-state/1` states of `gate` on `rows`: the kernel over every row of the file, not
+/// reading rows from `barrier_from` on (the selection barrier of a temporal split).
+fn evaluation_states(table: &rcsr::data::Table, gate: &GateSpec, barrier_from: Option<f64>, rows: &TradingRows) -> Vec<bool> {
+    let time = rcsr::data::time_keys(table, 0).to_f64();
+    let group: Vec<u64> = rcsr::data::group_ids(table, 1).0.into_iter().map(|g| g as u64).collect();
+    let g = table.col(table.index_of("g").unwrap()).to_vec();
+    let barriers: Vec<Barrier> = barrier_from.map(|start| Barrier { start, end: f64::INFINITY, kind: BarrierKind::Test }).into_iter().collect();
+    regime_gate::prefix_states(gate, &group, &time, &[g], &barriers, &file_rows(table, rows)).unwrap()
+}
+
+/// The kernel over the slice rows alone, per group: the training rule before #1268.
+fn slice_kernel_states(table: &rcsr::data::Table, gate: &GateSpec, rows: &TradingRows) -> Vec<bool> {
+    let g = table.col(table.index_of("g").unwrap());
+    let values: Vec<f64> = file_rows(table, rows).into_iter().map(|r| g[r]).collect();
+    regime_gate::gate_states(gate, &rows.group, &rows.time, &[values]).unwrap()
+}
+
+/// `search_fitness.mask.off_rows`; the block is absent when every training row is on.
+fn off_rows(run: &Json) -> f64 {
+    at(run, &["search_fitness"]).get("mask").map_or(0.0, |m| num(m, &["off_rows"]))
+}
+
+/// `(group, time)` of the first row of every maximal on-run of a group.
+fn on_run_starts(rows: &TradingRows, on: &[bool]) -> Vec<(u64, f64)> {
+    (0..on.len()).filter(|&i| on[i] && (i == 0 || rows.group[i] != rows.group[i - 1] || !on[i - 1])).map(|i| (rows.group[i], rows.time[i])).collect()
+}
+
+#[test]
+fn training_mask_equals_the_evaluation_states_on_a_strided_label() {
+    let gate = GateSpec::parse("g", 0.0, 168).unwrap();
+    let (table, p) = strided_prepared(&strided_text(STRIDED_DAYS, ten_day_gate), &gate);
+    let split = p.trading.as_ref().expect("trading split");
+    let masks = split.masks.as_ref().expect("masks");
+    let rows = &split.train.as_ref().expect("training rows").rows;
+    assert!(rows.time.windows(2).zip(rows.group.windows(2)).all(|(t, g)| g[0] != g[1] || t[1] - t[0] == DAY as f64), "one training row per symbol and day");
+    let test_start = split.test.rows.time.iter().copied().fold(f64::INFINITY, f64::min);
+    let want = evaluation_states(&table, &gate, Some(test_start), rows);
+    assert!(want.iter().any(|&o| o) && want.iter().any(|&o| !o));
+    assert_ne!(slice_kernel_states(&table, &gate, rows), want, "the fixture separates the row sets: 168 training rows are 168 days");
+    assert_eq!(masks.train.as_deref(), Some(&want[..]), "training rows");
+    let validation = &split.validation.as_ref().expect("validation rows").rows;
+    assert_eq!(masks.validation.as_deref(), Some(&evaluation_states(&table, &gate, Some(test_start), validation)[..]), "validation rows");
+    assert_eq!(masks.test, evaluation_states(&table, &gate, None, &split.test.rows), "test rows");
+}
+
+#[test]
+fn training_on_runs_match_the_evaluation_rule() {
+    let gate = GateSpec::parse("g", 0.0, 168).unwrap();
+    let (table, p) = strided_prepared(&strided_text(STRIDED_DAYS, three_day_gate), &gate);
+    let split = p.trading.as_ref().expect("trading split");
+    let rows = &split.train.as_ref().expect("training rows").rows;
+    let test_start = split.test.rows.time.iter().copied().fold(f64::INFINITY, f64::min);
+    let want = on_run_starts(rows, &evaluation_states(&table, &gate, Some(test_start), rows));
+    for g in 0..2u64 {
+        assert!(want.iter().filter(|s| s.0 == g).count() >= 2, "group {g}: {want:?}");
+    }
+    assert_ne!(on_run_starts(rows, &slice_kernel_states(&table, &gate, rows)), want, "the fixture separates the row sets");
+    let train = split.masks.as_ref().and_then(|m| m.train.as_deref()).expect("training mask");
+    assert_eq!(on_run_starts(rows, train), want);
+}
+
+/// Every row of the strided CSV as `(time, symbol, labelled, state)`: the state from the kernel over
+/// every row of the file per symbol (no barrier lies before the test block).
+fn strided_row_states(path: &str, dwell: usize) -> Vec<(f64, u64, bool, bool)> {
+    let text = std::fs::read_to_string(path).unwrap();
+    let rows: Vec<Vec<&str>> = text.lines().skip(1).map(|l| l.split(',').collect()).collect();
+    let group: Vec<u64> = rows.iter().map(|r| u64::from(r[1] == "b")).collect();
+    let gate: Vec<f64> = rows.iter().map(|r| r[4].parse().unwrap()).collect();
+    let states = regime_gate::hysteresis_states(&gate, &group, 0.0, dwell);
+    rows.iter().zip(&group).zip(&states).map(|((r, &g), &s)| (r[0].parse().unwrap(), g, !r[6].is_empty(), s)).collect()
+}
+
+#[test]
+fn strided_training_states_agree_with_validation_and_walkforward() {
+    let (_scratch, dir) = scratch();
+    let data = write_strided_csv(&dir, three_day_gate);
+    let spec = write_daily_spec(&dir);
+    let out = run(&data, &spec, &STRIDED_ARGS);
+    let j = json(&out);
+    let run_path = dir.join("strided.run.json").to_string_lossy().into_owned();
+    std::fs::write(&run_path, &out.stdout).unwrap();
+    let rows = strided_row_states(&data, 168);
+    let labelled = |lo: f64, hi: f64| -> Vec<(f64, u64, bool, bool)> { rows.iter().copied().filter(|r| r.2 && r.0 >= lo && r.0 <= hi).collect() };
+    let (tlo, thi) = time_range(&j, "train_time");
+    let train = labelled(tlo, thi);
+    assert_eq!(train.len() as f64, num(&j, &["train_rows"]));
+    let off = train.iter().filter(|r| !r.3).count();
+    assert!(off > 0 && off < train.len(), "{off} of {}", train.len());
+    assert_eq!(off_rows(&j), off as f64, "training off rows");
+    let (vlo, vhi) = time_range(&j, "validation_time");
+    let validation = labelled(vlo, vhi);
+    let on = validation.iter().filter(|r| r.3).count();
+    let vm = at(&j, &["objective", "validation", "mask"]);
+    assert!((num(vm, &["on_share"]) - on as f64 / validation.len() as f64).abs() <= 1e-12, "validation on share");
+    let runs: usize = (0..2u64)
+        .map(|g| {
+            let on: Vec<bool> = validation.iter().filter(|r| r.1 == g).map(|r| r.3).collect();
+            (0..on.len()).filter(|&i| on[i] && (i == 0 || !on[i - 1])).count()
+        })
+        .sum();
+    assert_eq!(num(vm, &["runs"]), runs as f64, "validation on-runs");
+    // An in-sample walk-forward window over the second half of the training days prices the rows the
+    // training mask holds on.
+    let mid = tlo + (DAY * ((thi - tlo) as i64 / DAY / 2)) as f64;
+    let window = format!("w,{},{},{},{}", tlo, mid - (2 * DAY) as f64, mid, thi + 1.0);
+    let wf = rcsr_cmd::rcsr()
+        .args(["walkforward", "--data", &data, "--time", "t", "--group-by", "s", "--from-run", &run_path, "--window", &window, "--allow-in-sample-windows", "--json"])
+        .output()
+        .unwrap();
+    let report = json(&wf);
+    let Json::Arr(windows) = at(&report, &["windows"]) else { panic!("windows") };
+    let priced = labelled(mid, thi).iter().filter(|r| r.3).count();
+    assert!(priced > 0);
+    assert_eq!(num(&windows[0], &["metrics", "rows"]), priced as f64, "walk-forward rows on");
+}
+
+/// The book hash of `STRIDED_ARGS` with `--generations 10` on the three-day strided fixture under the
+/// training rule before #1268: the kernel over the training rows alone.
+const STRIDED_MASK_HASH_BEFORE: u64 = 0xe370_75dd_e50d_5673;
+
+/// A copy of checkpoint `cp` at `out` whose book hash is `to`, with its config hash recomputed.
+fn with_book_hash(cp: &str, to: u64, out: &std::path::Path) {
+    let from = saved_book_hash(cp);
+    let text = std::fs::read_to_string(cp).unwrap().replace(&format!("long_pnl:{from:016x}"), &format!("long_pnl:{to:016x}"));
+    let block: String = text.lines().filter(|l| l.starts_with("config ")).map(|l| format!("{l}\n")).collect();
+    let config_hash = format!("config_hash {:016x}", rcsr::checkpoint::hash_config_text(&block));
+    let edited: String = text.lines().map(|l| if l.starts_with("config_hash ") { format!("{config_hash}\n") } else { format!("{l}\n") }).collect();
+    std::fs::write(out, edited).unwrap();
+}
+
+#[test]
+fn a_masked_checkpoint_of_the_training_row_rule_refuses_resume() {
+    let (_scratch, dir) = scratch();
+    let data = write_strided_csv(&dir, three_day_gate);
+    let spec = write_daily_spec(&dir);
+    let cp = dir.join("strided.rcsr").to_string_lossy().into_owned();
+    let first = run(&data, &spec, &[&STRIDED_ARGS[..], &["--generations", "10", "--save", &cp]].concat());
+    assert_eq!(code(&first), 0, "{}", stderr(&first));
+    let hash = saved_book_hash(&cp);
+    assert_ne!(hash, STRIDED_MASK_HASH_BEFORE, "{hash:#x}: the training mask still reads the training rows alone");
+    let resume = |path: &str| run(&data, &spec, &[&STRIDED_ARGS[..], &["--generations", "20", "--resume", path]].concat());
+    let same = resume(&cp);
+    assert_eq!(code(&same), 0, "{}", stderr(&same));
+    let old = dir.join("before.rcsr");
+    with_book_hash(&cp, STRIDED_MASK_HASH_BEFORE, &old);
+    usage_error(&resume(&old.to_string_lossy()), "--pnl-mask");
+}
