@@ -1543,3 +1543,187 @@ fn table_without_family_is_unchanged() {
 
 const PINNED_TABLE_T1: &str = "48f3193890355a469c4b4ac30987aa0ef5a96496fbac2a882a27492ad491e8ae";
 const PINNED_TABLE_T2: &str = "7e24c7106fdbe3ce17387bacf90f674721ca8e813ab5c43332bc69840b764f68";
+
+// ---------------------------------------------------------------------------
+// Baselines from walk-forward reports (#1271)
+// ---------------------------------------------------------------------------
+
+const BN: usize = 400;
+
+/// Three candidate reports and two baseline reports on one grid and one cost; the first baseline is the best rung.
+struct BaselineFx {
+    candidates: Vec<String>,
+    nets: Vec<Vec<f64>>,
+    baselines: Vec<String>,
+    base_nets: Vec<Vec<f64>>,
+    bh: Vec<f64>,
+}
+
+fn baseline_fx(dir: &Path, edit: &dyn Fn(&mut Fx)) -> BaselineFx {
+    let nets: Vec<Vec<f64>> = [0.0010, 0.0007, 0.0004]
+        .iter()
+        .enumerate()
+        .map(|(k, m)| centred_noise(BN, 40 + k as u32, 0.01).iter().map(|x| x + m).collect())
+        .collect();
+    let candidates = nets.iter().enumerate().map(|(k, v)| write_fx(dir, &format!("c{k}"), &Fx::new(v.clone()))).collect();
+    let bh: Vec<f64> = centred_noise(BN, 50, 0.01).iter().map(|x| x + 0.0002).collect();
+    let base_nets: Vec<Vec<f64>> = [0.0006, -0.0003]
+        .iter()
+        .enumerate()
+        .map(|(k, m)| centred_noise(BN, 60 + k as u32, 0.01).iter().map(|x| x + m).collect())
+        .collect();
+    let mut baselines = Vec::new();
+    for (k, v) in base_nets.iter().enumerate() {
+        let sub = dir.join(format!("base{k}"));
+        std::fs::create_dir_all(&sub).unwrap();
+        let mut fx = Fx::new(v.clone());
+        fx.bh_net = Some(bh.clone());
+        edit(&mut fx);
+        baselines.push(write_fx(&sub, "path_1", &fx));
+    }
+    BaselineFx { candidates, nets, baselines, base_nets, bh }
+}
+
+fn baseline_run(fx: &BaselineFx, baselines: &[String], extra: &[&str]) -> Output {
+    let mut args = vec!["trials", "--wf"];
+    args.extend(fx.candidates.iter().map(String::as_str));
+    args.extend(["--table", "--draws", "200", "--block-len", "4", "--pbo-blocks", "4", "--cluster-rho", "0.7", "--gates", "net10>-100", "--baseline-wf"]);
+    args.extend(baselines.iter().map(String::as_str));
+    args.extend(extra);
+    run(&args)
+}
+
+#[test]
+fn baseline_wf_takes_the_best_rung() {
+    let (_s, dir) = scratch("baseline-wf-best");
+    let fx = baseline_fx(&dir, &|_| {});
+    let j = stdout_json(&baseline_run(&fx, &fx.baselines, &["--rank", "baseline_excess"]));
+    let rungs = [vec![0.0; BN], fx.bh.clone(), fx.base_nets[0].clone(), fx.base_nets[1].clone()];
+    let best = (0..rungs.len()).max_by(|&a, &b| mean(&rungs[a]).total_cmp(&mean(&rungs[b]))).unwrap();
+    assert_eq!(best, 2, "fixture: the first baseline report is the best rung");
+    assert_eq!(at(&j, &["spa", "benchmark"]).as_str(), Some("base0/path_1"));
+    assert_eq!(at(&j, &["stepm", "benchmark"]).as_str(), Some("base0/path_1"));
+    assert_eq!(at(&j, &["inputs", "baseline", "source"]).as_str(), Some("wf"));
+    assert_eq!(at(&j, &["inputs", "baseline", "best"]).as_str(), Some("base0/path_1"));
+    let names: Vec<&str> = items(at(&j, &["inputs", "baseline", "rungs"])).iter().map(|r| at(r, &["name"]).as_str().unwrap()).collect();
+    assert_eq!(names, ["cash", "buy_and_hold", "base0/path_1", "base1/path_1"]);
+    let sha = at(&j, &["inputs", "baseline", "rungs"]);
+    for (r, p) in items(sha)[2..].iter().zip(&fx.baselines) {
+        assert_eq!(at(r, &["sha256"]).as_str().unwrap(), rcsr::manifest::sha256_hex(&std::fs::read(p).unwrap()));
+    }
+    for (i, net) in fx.nets.iter().enumerate() {
+        let want = (mean(net) - mean(&rungs[best])) * 8760.0;
+        let got = num(at(row(&j, i), &["metrics"]), &["baseline_excess"]);
+        assert!((got - want).abs() <= 1e-12, "row {i}: table {got} hand {want}");
+    }
+    let diffs: Vec<Vec<f64>> = fx.nets.iter().map(|c| c.iter().zip(&rungs[best]).map(|(a, b)| a - b).collect()).collect();
+    let spa = rcsr::inference::spa_test(&diffs, 4, 200, 20_260_101).unwrap();
+    assert_eq!(num(&j, &["spa", "p_consistent"]), spa.p_consistent);
+}
+
+#[test]
+fn baseline_wf_buy_and_hold_and_cash_can_win() {
+    let (_s, dir) = scratch("baseline-wf-builtin");
+    let fx = baseline_fx(&dir, &|f| {
+        f.net = f.net.iter().map(|x| x - 0.01).collect();
+        f.bh_net = f.bh_net.as_ref().map(|b| b.iter().map(|x| x + 0.005).collect());
+    });
+    let j = stdout_json(&baseline_run(&fx, &fx.baselines, &[]));
+    assert_eq!(at(&j, &["spa", "benchmark"]).as_str(), Some("buy_and_hold"));
+}
+
+#[test]
+fn baseline_wf_refuses_another_grid() {
+    let (_s, dir) = scratch("baseline-wf-grid");
+    let fx = baseline_fx(&dir, &|_| {});
+    let sub = dir.join("shifted");
+    std::fs::create_dir_all(&sub).unwrap();
+    let mut other = Fx::new(fx.base_nets[0].clone());
+    other.bh_net = Some(fx.bh.clone());
+    other.time = other.time.iter().map(|t| t + 60.0).collect();
+    let bad = write_fx(&sub, "path_1", &other);
+    let o = baseline_run(&fx, &[bad.clone()], &[]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    let e = stderr(&o);
+    assert!(e.contains("pooled.period_time") && e.contains(&bad), "{e}");
+}
+
+#[test]
+fn baseline_wf_refuses_another_cost() {
+    let (_s, dir) = scratch("baseline-wf-cost");
+    let fx = baseline_fx(&dir, &|_| {});
+    let text = std::fs::read_to_string(&fx.baselines[0]).unwrap().replace("\"cost_model\":{\"per_side_bps\":10,", "\"cost_model\":{\"per_side_bps\":15,");
+    let bad = write_text(&dir, "dear.json", &text);
+    let o = baseline_run(&fx, &[bad.clone()], &[]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    let e = stderr(&o);
+    assert!(e.contains("cost_model.per_side_bps") && e.contains(&bad), "{e}");
+}
+
+#[test]
+fn baseline_wf_accepts_another_minimum_hold() {
+    let (_s, dir) = scratch("baseline-wf-hold");
+    let fx = baseline_fx(&dir, &|_| {});
+    let text = std::fs::read_to_string(&fx.baselines[0]).unwrap().replace("\"min_hold\":1", "\"min_hold\":6");
+    assert_ne!(text, std::fs::read_to_string(&fx.baselines[0]).unwrap());
+    let held = write_text(&dir, "held.json", &text);
+    let j = stdout_json(&baseline_run(&fx, &[held], &[]));
+    assert_eq!(at(&j, &["spa", "benchmark"]).as_str(), Some("held"));
+}
+
+#[test]
+fn baseline_wf_refuses_ladder_baseline_locked_and_name_clashes() {
+    let (_s, dir) = scratch("baseline-wf-refusals");
+    let fx = baseline_fx(&dir, &|_| {});
+    let o = baseline_run(&fx, &fx.baselines, &["--baseline", "ladder.json"]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).contains("--baseline-wf excludes --baseline"), "{}", stderr(&o));
+    let text = std::fs::read_to_string(&fx.baselines[0]).unwrap().replace("\"mode\":\"walkforward\",", "\"mode\":\"walkforward\",\"protocol\":{\"test_read\":true},");
+    let locked = write_text(&dir, "locked.json", &text);
+    let o = baseline_run(&fx, &[locked.clone()], &[]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).contains(&locked) && stderr(&o).contains("locked"), "{}", stderr(&o));
+    let a = write_text(&dir, "cash.json", &std::fs::read_to_string(&fx.baselines[0]).unwrap());
+    let o = baseline_run(&fx, &[a], &[]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).contains("'cash' is taken"), "{}", stderr(&o));
+}
+
+#[test]
+fn baseline_wf_needs_the_table() {
+    let (_s, dir) = scratch("baseline-wf-notable");
+    let fx = baseline_fx(&dir, &|_| {});
+    let o = run(&["trials", "--wf", &fx.candidates[0], &fx.candidates[1], "--baseline-wf", &fx.baselines[0]]);
+    assert_eq!(code(&o), 2);
+    assert!(stderr(&o).contains("--baseline-wf needs --table"), "{}", stderr(&o));
+}
+
+/// The table output without `--baseline-wf`, pinned to the SHA-256 of the integration base before #1271.
+#[test]
+fn table_output_without_baseline_wf_is_unchanged() {
+    let (_s, dir) = scratch("table-baseline-golden");
+    let fx = baseline_fx(&dir, &|_| {});
+    let ladder = write_text(
+        &dir,
+        "ladder.json",
+        &format!(
+            "{{\"schema\":\"rcsr-ladder/1\",\"series\":{{\"period_time\":[{}],\"period_net\":{{\"cash\":[{}],\"buy_and_hold\":[{}]}}}}}}",
+            arr(&grid(BN)),
+            arr(&vec![0.0; BN]),
+            arr(&fx.bh)
+        ),
+    );
+    let mut bytes = Vec::new();
+    for baseline in [None, Some(ladder.as_str())] {
+        let mut args = vec!["trials", "--wf"];
+        args.extend(fx.candidates.iter().map(String::as_str));
+        args.extend(["--table", "--draws", "200", "--block-len", "4", "--pbo-blocks", "4", "--cluster-rho", "0.7", "--rank", "net10,sharpe"]);
+        if let Some(l) = baseline {
+            args.extend(["--baseline", l]);
+        }
+        let o = run(&args);
+        assert_eq!(code(&o), 0, "{}", stderr(&o));
+        bytes.extend_from_slice(&o.stdout);
+    }
+    assert_eq!(rcsr::manifest::sha256_hex(&bytes), "PIN");
+}
