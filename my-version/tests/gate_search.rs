@@ -312,7 +312,7 @@ fn gate_search_refuses_mismatched_branches() {
     refused("g,y", &["--branch-on", "x1", "--branch-off", "cash"], 5, "D13");
     refused("g", &["--branch-on", "lbl_h24a_y", "--branch-off", "cash"], 5, "--branch-on");
     // Refused flags: the device, interest, masks and pricing changes, checkpoints.
-    for flag in [&["--gpu"][..], &["--cash-return", "0.0001"], &["--pnl-mask", "g"], &["--threshold", "0.1"], &["--band", "0.1"], &["--save", "x.ckpt"], &["--fitness", "metric"], &["--select-rule", "occam"], &["--gate-band", "-1"], &["--gate-dwell", "0"]] {
+    for flag in [&["--gpu"][..], &["--cash-return", "0.0001"], &["--cash-return", "train-mean"], &["--pnl-mask", "g"], &["--threshold", "0.1"], &["--band", "0.1"], &["--save", "x.ckpt"], &["--fitness", "metric"], &["--select-rule", "occam"], &["--gate-band", "-1"], &["--gate-dwell", "0"]] {
         let mut extra = vec!["--branch-on", "x1", "--branch-off", "cash"];
         extra.extend_from_slice(flag);
         refused("g", &extra, 2, flag[0]);

@@ -3324,3 +3324,179 @@ fn masked_slice_skips_rows_without_a_return() {
     }
     assert!(inside > 0, "the cases put an off row without a return inside an on-run");
 }
+
+// ---- #1273: --cash-return train-mean ----
+
+const TRAIN_MEAN: [&str; 4] = ["--fitness", "pnl", "--cash-return", "train-mean"];
+
+/// Simple return of every `write_panel_csv` row with a time in `[lo, hi]`.
+fn panel_returns(data: &str, lo: f64, hi: f64) -> Vec<f64> {
+    std::fs::read_to_string(data)
+        .unwrap()
+        .lines()
+        .skip(1)
+        .map(|l| l.split(',').collect::<Vec<_>>())
+        .filter(|c| (lo..=hi).contains(&c[0].parse::<f64>().unwrap()))
+        .map(|c| c[4].parse::<f64>().unwrap().exp_m1())
+        .collect()
+}
+
+fn cash_of(j: &Json) -> f64 {
+    assert_eq!(at(j, &["search_fitness", "cash_return_source"]).as_str(), Some("train_mean"));
+    num(j, &["search_fitness", "cash_return"])
+}
+
+/// Reports stay at cash 0: the spec, the cash books and the walk-forward book.
+fn assert_reports_at_cash_zero(j: &Json) {
+    assert_eq!(num(j, &["objective", "spec", "cash_return"]), 0.0);
+    for slot in ["validation", "test"] {
+        let cash = at(at(j, &["objective", slot]), &["cash"]);
+        assert_eq!(num(cash, &["net_pnl"]), 0.0, "{slot} cash book");
+    }
+}
+
+#[test]
+fn cash_return_train_mean_is_the_training_mean() {
+    let (_scratch, dir) = scratch();
+    let data = write_panel_csv(&dir);
+    let spec = write_panel_spec(&dir);
+    let j = json(&run_panel(&data, &spec, &TRAIN_MEAN));
+    let (lo, hi) = time_range(&j, "train_time");
+    let rows = panel_returns(&data, lo, hi);
+    assert_eq!(num(&j, &["search_fitness", "rows"]), rows.len() as f64);
+    let want = rows.iter().sum::<f64>() / rows.len() as f64;
+    let got = cash_of(&j);
+    assert!(want != 0.0 && (got - want).abs() <= 1e-15, "m {got} hand mean {want}");
+    assert_reports_at_cash_zero(&j);
+    let plain = json(&run_panel(&data, &spec, &["--fitness", "pnl"]));
+    assert!(at(&plain, &["search_fitness"]).get("cash_return").is_none());
+    assert!(at(&plain, &["search_fitness"]).get("cash_return_source").is_none());
+}
+
+#[test]
+fn cash_return_train_mean_prices_like_the_constant_in_the_fitness() {
+    let (_scratch, dir) = scratch();
+    let data = write_panel_csv(&dir);
+    let spec = write_panel_spec(&dir);
+    let mean = json(&run_panel(&data, &spec, &TRAIN_MEAN));
+    let m = cash_of(&mean);
+    let constant = json(&run_panel(&data, &spec, &["--fitness", "pnl", "--cash-return", &format!("{m:e}")]));
+    for key in ["rows", "groups", "bound", "cost_per_side", "threshold", "min_trades"] {
+        assert_eq!(at(&mean, &["search_fitness", key]), at(&constant, &["search_fitness", key]), "{key}");
+    }
+    assert_eq!(members(&mean), members(&constant));
+    assert_ne!(at(&mean, &["search_fitness", "book_hash"]), at(&constant, &["search_fitness", "book_hash"]));
+    assert_eq!(num(&constant, &["objective", "spec", "cash_return"]), m);
+    assert_reports_at_cash_zero(&mean);
+}
+
+#[test]
+fn cash_return_train_mean_reads_training_rows_only() {
+    let (_scratch, dir) = scratch();
+    let data = write_panel_csv(&dir);
+    let spec = write_panel_spec(&dir);
+    let step = |k: i64| T0 + 900 * k;
+    let table = dir.join("splits.csv");
+    std::fs::write(
+        &table,
+        format!(
+            "split_id,role,start,end\na,train,{},{}\na,validation,{},{}\na,train,{},{}\na,test,{},{}\n",
+            step(0),
+            step(150),
+            step(150),
+            step(200),
+            step(200),
+            step(300),
+            step(300),
+            step(400)
+        ),
+    )
+    .unwrap();
+    let table = table.to_string_lossy().into_owned();
+    // Same file with every validation and test return replaced.
+    let edited = dir.join("edited.csv");
+    let text: String = std::fs::read_to_string(&data)
+        .unwrap()
+        .lines()
+        .enumerate()
+        .map(|(i, l)| {
+            let c: Vec<&str> = l.split(',').collect();
+            let t = if i == 0 { 0 } else { (c[0].parse::<i64>().unwrap() - T0) / 900 };
+            if i > 0 && ((150..200).contains(&t) || t >= 300) {
+                format!("{},{},{},{},{},{}\n", c[0], c[1], c[2], c[3], 0.02 + 0.001 * (t % 7) as f64, 0.02)
+            } else {
+                format!("{l}\n")
+            }
+        })
+        .collect();
+    std::fs::write(&edited, text).unwrap();
+    let edited = edited.to_string_lossy().into_owned();
+    let go = |d: &str| {
+        let out = run_panel(d, &spec, &[&["--split-table", &table, "--split-id", "a"][..], &TRAIN_MEAN].concat());
+        json(&out)
+    };
+    let (a, b) = (go(&data), go(&edited));
+    assert_ne!(cash_of(&a), 0.0);
+    assert_eq!(cash_of(&a).to_bits(), cash_of(&b).to_bits());
+    assert_eq!(at(&a, &["search_fitness", "book_hash"]), at(&b, &["search_fitness", "book_hash"]));
+    assert_ne!(num(at(&a, &["objective", "test"]), &["net_pnl"]), num(at(&b, &["objective", "test"]), &["net_pnl"]));
+}
+
+#[test]
+fn cash_return_train_mean_keeps_reports_at_cash_zero() {
+    let (_scratch, dir) = scratch();
+    let data = write_panel_csv(&dir);
+    let spec = write_panel_spec(&dir);
+    let out = run_panel(&data, &spec, &TRAIN_MEAN);
+    let j = json(&out);
+    assert_reports_at_cash_zero(&j);
+    let run_path = dir.join("run.json");
+    std::fs::write(&run_path, &out.stdout).unwrap();
+    let run = run_path.to_string_lossy().into_owned();
+    let step = |k: usize| (T0 + 900 * k as i64).to_string();
+    let w = format!("v,{},{},{},{}", step(0), step(299), step(300), step(PANEL_STEPS));
+    let wf_path = dir.join("wf.json").to_string_lossy().into_owned();
+    let wf = rcsr_cmd::rcsr()
+        .args(["walkforward", "--data", &data, "--time", "t", "--group-by", "sym", "--from-run", &run, "--window", &w, "--out", &wf_path])
+        .output()
+        .unwrap();
+    assert_eq!(code(&wf), 0, "{}", stderr(&wf));
+    let wf_json = Json::parse(std::fs::read_to_string(&wf_path).unwrap().trim()).unwrap();
+    let m = match at(&wf_json, &["windows"]) {
+        Json::Arr(a) => at(&a[0], &["metrics"]).clone(),
+        _ => panic!("windows is not an array"),
+    };
+    let test = at(&j, &["objective", "test"]);
+    let wf_net = num(&m, &["mean_return"]) * num(&m, &["periods"]) * PANEL_SYMBOLS as f64;
+    assert!((wf_net - num(test, &["net_pnl"])).abs() <= 1e-12, "walkforward net {wf_net} objective {}", num(test, &["net_pnl"]));
+}
+
+#[test]
+fn cash_return_train_mean_flags_name_their_reason() {
+    let (_scratch, dir) = scratch();
+    let data = write_panel_csv(&dir);
+    let spec = write_panel_spec(&dir);
+    usage_error(&run_panel(&data, &spec, &["--cash-return", "train-mean"]), "--cash-return train-mean needs --fitness pnl");
+    usage_error(
+        &run_panel(&data, &spec, &["--fitness", "pnl", "--pnl-excess", "xs-mean", "--cash-return", "train-mean"]),
+        "--pnl-excess xs-mean needs --cash-return 0",
+    );
+    usage_error(&run_panel(&data, &spec, &["--fitness", "pnl", "--cash-return", "mean"]), "--cash-return");
+}
+
+#[test]
+fn resume_needs_the_same_cash_mode() {
+    let (_scratch, dir) = scratch();
+    let data = write_panel_csv(&dir);
+    let spec = write_panel_spec(&dir);
+    let cp = dir.join("cash.rcsr").to_string_lossy().into_owned();
+    let first = run_panel(&data, &spec, &[&TRAIN_MEAN[..], &["--generations", "10", "--save", &cp]].concat());
+    assert_eq!(code(&first), 0, "{}", stderr(&first));
+    let m = cash_of(&json(&first));
+    let straight = json(&run_panel(&data, &spec, &[&TRAIN_MEAN[..], &["--generations", "20"]].concat()));
+    let resumed = json(&run_panel(&data, &spec, &[&TRAIN_MEAN[..], &["--generations", "20", "--resume", &cp]].concat()));
+    assert_eq!(members(&straight), members(&resumed));
+    let resume = |extra: &[&str]| run_panel(&data, &spec, &[&["--fitness", "pnl", "--generations", "20", "--resume", &cp][..], extra].concat());
+    usage_error(&resume(&[]), "fitness");
+    usage_error(&resume(&["--cash-return", &format!("{m:e}")]), "fitness");
+}

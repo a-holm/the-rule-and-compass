@@ -729,7 +729,7 @@ fn compose_refuses_mismatched_runs() {
     refused(&p.data, &["--gates", "/nonexistent/menu.json", "--bull", &p.bull], 3, "--gates");
     refused(&p.data, &["--bull", &p.bull], 2, "--gates <menu.json> is required");
     refused(&p.data, &["--gates", &menu], 2, "--bull <run.json> or --bear <run.json> is required");
-    for flag in [&["--threshold", "0.1"][..], &["--band", "0.1"], &["--pnl-mask", "g"], &["--gpu"], &["--select-rule", "occam"], &["--fitness", "metric"], &["--top", "0"]] {
+    for flag in [&["--threshold", "0.1"][..], &["--band", "0.1"], &["--pnl-mask", "g"], &["--gpu"], &["--cash-return", "train-mean"], &["--select-rule", "occam"], &["--fitness", "metric"], &["--top", "0"]] {
         let mut extra = vec!["--gates", menu.as_str(), "--bull", p.bull.as_str()];
         extra.extend_from_slice(flag);
         refused(&p.data, &extra, 2, flag[0]);
