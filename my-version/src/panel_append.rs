@@ -180,8 +180,8 @@ fn merged_floors(
     columns: &[String],
 ) -> Result<std::collections::BTreeMap<String, usize>, String> {
     use crate::cross_floor as cf;
-    let panel_rec = cf::recorded_columns(target_path);
-    let family_rec = cf::recorded_columns(family_path);
+    let panel_rec = cf::resolved_columns(target_path, &target.header().names());
+    let family_rec = cf::resolved_columns(family_path, columns);
     let mut floors = std::collections::BTreeMap::new();
     for n in target.header().names().iter().filter(|n| cf::is_floored(n)) {
         floors.insert(n.clone(), panel_rec.get(n).copied().unwrap_or(cf::DEFAULT));

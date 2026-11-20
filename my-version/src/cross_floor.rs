@@ -148,6 +148,20 @@ pub fn recorded_floor(store_path: &str) -> Option<CrossFloor> {
     Some(CrossFloor { members: int_after(obj, "members")?, rank_members: int_after(obj, "rank_members")? })
 }
 
+/// Floors of the cross columns among `names`: the per-column record when the store has one, else the top-level
+/// `cross_floor` of its `.enrich.json` (a later enrich run lists only its own columns, and `enrich` refuses a run whose
+/// floors differ from the top-level record, so it holds for every cross column the store carries), else 20.
+pub fn resolved_columns(store_path: &str, names: &[String]) -> BTreeMap<String, usize> {
+    let mut out = recorded_columns(store_path);
+    let top = recorded_floor(store_path);
+    for n in names.iter().filter(|n| is_floored(n)) {
+        if let (false, Some(t)) = (out.contains_key(n), top) {
+            out.insert(n.clone(), t.of(n).unwrap_or(DEFAULT));
+        }
+    }
+    out
+}
+
 /// Per-column floors recorded next to a store, from its schema and enrich sidecars.
 pub fn recorded_columns(store_path: &str) -> BTreeMap<String, usize> {
     let mut out = BTreeMap::new();

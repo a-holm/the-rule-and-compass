@@ -554,7 +554,8 @@ pub fn write_schema_locked(
     retired: Option<&crate::retire::Retirement>,
     record: Option<&crate::lockrec::LockRecord>,
 ) -> Result<String, String> {
-    let floors = crate::cross_floor::recorded_columns(store_path);
+    let names = FileStore::open(store_path)?.header().names();
+    let floors = crate::cross_floor::resolved_columns(store_path, &names);
     write_schema_floors(store_path, panel_version, locked_test, also, embargo_floor, retired, record, &floors)
 }
 
