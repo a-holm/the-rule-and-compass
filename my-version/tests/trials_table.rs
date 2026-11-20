@@ -1395,12 +1395,16 @@ fn family_spa_p_is_bonferroni_over_the_tables() {
     assert_eq!(num(&jn, &["spa", "p_family"]), 1.0);
 }
 
-/// A minimal sibling table: the fields the family reads and nothing else.
+/// A minimal sibling table: the fields the family reads and nothing else, with one report
+/// named after the table that resolves nowhere.
 fn sibling(dir: &Path, name: &str, n_eff: u32, nominal: u32, spa_p: f64) -> String {
     write_text(
         dir,
         name,
-        &format!("{{\"schema\":\"rcsr-trials-table/1\",\"trials\":{{\"nominal\":{nominal},\"n_eff\":{n_eff}}},\"spa\":{{\"benchmark\":\"cash\",\"p_consistent\":{spa_p}}}}}\n"),
+        &format!(
+            "{{\"schema\":\"rcsr-trials-table/1\",\"inputs\":{{\"reports\":[\"missing-{name}\"]}},\"trials\":{{\"nominal\":{nominal},\"n_eff\":{n_eff}}},\
+\"spa\":{{\"benchmark\":\"cash\",\"p_consistent\":{spa_p}}}}}\n"
+        ),
     )
 }
 
@@ -1450,7 +1454,7 @@ fn family_table_refuses_missing_fields() {
     let a = family_reports(&dir, "a", 3, 200, 520, 0.0002, false);
     let full = std::fs::read_to_string(sibling(&dir, "full.json", 5, 5, 0.2)).unwrap();
     let out = dir.join("out.json").to_string_lossy().into_owned();
-    for (k, path) in [&["trials", "n_eff"][..], &["trials", "nominal"], &["spa", "p_consistent"]].iter().enumerate() {
+    for (k, path) in [&["trials", "n_eff"][..], &["trials", "nominal"], &["spa", "p_consistent"], &["inputs", "reports"]].iter().enumerate() {
         let text = rcsr::verdict::remove_member(&full, path).unwrap();
         assert_ne!(text, full, "{path:?}");
         let bad = write_text(&dir, &format!("bad{k}.json"), &text);
@@ -1474,6 +1478,30 @@ fn family_table_refuses_locked_data() {
     read.protocol = Some("{\"lockbox\":{\"rows\":0,\"evaluated\":false},\"test_read\":true}".to_string());
     let read = write_fx(&dir, "sealed_read", &read);
     refused_family(&a, &out, &["--family-table", &read], &[&read, "locked"]);
+}
+
+#[test]
+fn family_table_refuses_shared_reports() {
+    let (_s, dir) = scratch("family-shared");
+    let p = |name: &str| dir.join(name).to_string_lossy().into_owned();
+    let a = family_reports(&dir, "a", 3, 200, 540, 0.0002, false);
+    let b = family_reports(&dir, "b", 4, 200, 550, 0.0001, false);
+    let out = p("out.json");
+    // An earlier table of the same rows under another file name, its reports spelled through `.`.
+    let respelled: Vec<String> = a.iter().map(|r| dir.join(".").join(Path::new(r).file_name().unwrap()).to_string_lossy().into_owned()).collect();
+    let earlier = p("earlier.json");
+    let o = family_run(&respelled, &earlier, &[]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    refused_family(&a, &out, &["--family-table", &earlier], &[&earlier, "this table", &respelled[0]]);
+    // Two siblings that share the report b1.
+    let (tb1, tb2, tb3) = (p("tb1.json"), p("tb2.json"), p("tb3.json"));
+    for (reports, table) in [(&b[..2], &tb1), (&b[1..3], &tb2), (&b[2..], &tb3)] {
+        let o = family_run(reports, table, &[]);
+        assert_eq!(code(&o), 0, "{}", stderr(&o));
+    }
+    refused_family(&a, &out, &["--family-table", &tb1, &tb2], &[&tb2, &tb1, &b[1]]);
+    let o = family_run(&a, &out, &["--family-table", &tb1, &tb3]);
+    assert_eq!(code(&o), 0, "disjoint reports: {}", stderr(&o));
 }
 
 /// The JSON and Markdown of `rcsr trials --table` without `--family-table` on two fixtures,
