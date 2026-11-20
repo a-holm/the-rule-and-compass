@@ -47,6 +47,7 @@ pub const FLAGS: &[&str] = &[
     "--occam",
     "--freeze-map",
     "--family-table",
+    "--baseline-wf",
 ];
 
 /// Metrics every row has (null where the series is too short or flat).
@@ -390,6 +391,7 @@ struct TableArgs {
     occam: Vec<String>,
     freeze_map: Option<String>,
     family: Vec<String>,
+    baseline_wf: Vec<String>,
 }
 
 fn value(args: &[String], i: &mut usize, flag: &str) -> Res<String> {
@@ -437,6 +439,7 @@ fn split_args(args: &[String]) -> Res<(TableArgs, Vec<String>)> {
             "--occam" => t.occam = files(args, &mut i, a)?,
             "--freeze-map" => t.freeze_map = Some(value(args, &mut i, a)?),
             "--family-table" => t.family.extend(files(args, &mut i, a)?),
+            "--baseline-wf" => t.baseline_wf.extend(files(args, &mut i, a)?),
             "--locked-test" => {
                 let v = value(args, &mut i, a)?;
                 let parsed = v.split_once(',').and_then(|(s, e)| Some((crate::data::parse_time(s)?, crate::data::parse_time(e)?)));
@@ -451,6 +454,9 @@ fn split_args(args: &[String]) -> Res<(TableArgs, Vec<String>)> {
     }
     if t.alpha.is_some_and(|x| !(x > 0.0 && x < 1.0)) {
         return usage("--alpha must be in (0, 1)");
+    }
+    if !t.baseline_wf.is_empty() && rest.iter().any(|a| a == "--baseline") {
+        return usage("--baseline-wf excludes --baseline");
     }
     Ok((t, rest))
 }
@@ -690,6 +696,97 @@ fn load_entries(o: &Options, locked: &[(f64, f64)]) -> Res<Vec<Entry>> {
         }
     }
     Ok(out)
+}
+
+/// #1271: the `--baseline-wf` benchmark: the best rung by mean, and the `inputs.baseline` object.
+struct WfBaseline {
+    best: (String, Vec<f64>),
+    json: String,
+}
+
+/// Rungs: `cash` (zeros), `buy_and_hold` (`pooled.period_bh_net` of the first report) and one per report, named by
+/// its `label` or file stem (`<directory>/<stem>` when two stems agree). Reports share the table's period grid and
+/// per-side cost; policy, band and hold may differ.
+fn load_baseline_wf(paths: &[String], time: &[f64], bps: Option<f64>, locked: &[(f64, f64)]) -> Res<WfBaseline> {
+    struct Rung {
+        path: String,
+        name: String,
+        sha256: String,
+        net: Vec<f64>,
+    }
+    let mut rungs: Vec<Rung> = Vec::new();
+    let mut bh: Option<Vec<f64>> = None;
+    for p in paths {
+        let bytes = std::fs::read(p).map_err(|e| (3, format!("{}: {}", p, e)))?;
+        let j = read_checked(p, locked)?;
+        let grid = trials::series(&j, &["pooled", "period_time"], p)?;
+        if grid != time {
+            return usage(format!(
+                "--baseline-wf {} differs in field 'pooled.period_time' ({} periods) from the table grid ({} periods)",
+                p,
+                grid.len(),
+                time.len()
+            ));
+        }
+        let got = num_at(&j, &["cost_model", "per_side_bps"]);
+        if got != bps {
+            let show = |v: Option<f64>| v.map_or("missing".to_string(), jnum);
+            return usage(format!(
+                "--baseline-wf {} differs in field 'cost_model.per_side_bps': {} vs {} in the table reports",
+                p,
+                show(got),
+                show(bps)
+            ));
+        }
+        let net = trials::series(&j, &["pooled", "period_net"], p)?;
+        if net.len() != time.len() {
+            return usage(format!("field 'pooled.period_net' has {} values but 'pooled.period_time' has {} in {}", net.len(), time.len(), p));
+        }
+        if bh.is_none() {
+            let v = trials::series(&j, &["pooled", "period_bh_net"], p)?;
+            if v.len() != time.len() {
+                return usage(format!("field 'pooled.period_bh_net' has {} values but 'pooled.period_time' has {} in {}", v.len(), time.len(), p));
+            }
+            bh = Some(v);
+        }
+        let name = j.get("label").and_then(Json::as_str).map_or_else(|| trials::label_of(p), str::to_string);
+        rungs.push(Rung { path: p.clone(), name, sha256: crate::manifest::sha256_hex(&bytes), net });
+    }
+    let stems: Vec<String> = rungs.iter().map(|r| r.name.clone()).collect();
+    for r in rungs.iter_mut().filter(|r| stems.iter().filter(|s| **s == r.name).count() > 1) {
+        let dir = std::path::Path::new(&r.path).parent().and_then(|d| d.file_name()).map(|d| d.to_string_lossy().into_owned());
+        if let Some(d) = dir {
+            r.name = format!("{}/{}", d, r.name);
+        }
+    }
+    let mut all: Vec<(String, Option<String>, Vec<f64>)> = vec![
+        ("cash".to_string(), None, vec![0.0; time.len()]),
+        ("buy_and_hold".to_string(), rungs.first().map(|r| r.sha256.clone()), bh.unwrap_or_default()),
+    ];
+    for r in &rungs {
+        if let Some(prev) = all.iter().position(|(n, _, _)| *n == r.name) {
+            return usage(format!(
+                "--baseline-wf {}: the rung name '{}' is taken{}; give the report a distinct label or file name",
+                r.path,
+                r.name,
+                if prev < 2 { " by a built-in rung" } else { " by another report" }
+            ));
+        }
+        all.push((r.name.clone(), Some(r.sha256.clone()), r.net.clone()));
+    }
+    let mut best = 0;
+    for k in 1..all.len() {
+        if inference::mean(&all[k].2) > inference::mean(&all[best].2) {
+            best = k;
+        }
+    }
+    let rung_json: Vec<String> = all
+        .iter()
+        .map(|(n, s, _)| format!("{{\"name\":{},\"sha256\":{}}}", jstr(n), s.as_ref().map_or("null".to_string(), |s| jstr(s))))
+        .collect();
+    let json = format!("{{\"source\":\"wf\",\"rungs\":[{}],\"best\":{}}}", rung_json.join(","), jstr(&all[best].0));
+    let (name, _, net) = all.swap_remove(best);
+    Ok(WfBaseline { best: (name, net), json })
 }
 
 /// `--occam`: one re-selected or composed run.json.
@@ -1033,7 +1130,7 @@ fn check_metric(name: &str, nm: &Names) -> Res<()> {
         "bear_excess" => return label("bear"),
         "worst_stratum" => return if nm.labels.is_some() { Ok(()) } else { usage("metric 'worst_stratum' needs --regimes") },
         "null_q" => return if nm.null { Ok(()) } else { usage("metric 'null_q' needs --null-wf") },
-        "baseline_excess" => return if nm.baseline { Ok(()) } else { usage("metric 'baseline_excess' needs --baseline") },
+        "baseline_excess" => return if nm.baseline { Ok(()) } else { usage("metric 'baseline_excess' needs --baseline or --baseline-wf") },
         _ => {}
     }
     for prefix in ["net:", "excess:", "alpha_bh:"] {
@@ -1043,7 +1140,7 @@ fn check_metric(name: &str, nm: &Names) -> Res<()> {
     }
     usage(format!(
         "unknown metric '{}'; known: {}, {}; with --regimes bull_net, bear_excess, worst_stratum, net:<label>, excess:<label>, \
-alpha_bh:<label>; null_q with --null-wf; baseline_excess with --baseline (the net metrics are cost_multiples x cost_model.per_side_bps)",
+alpha_bh:<label>; null_q with --null-wf; baseline_excess with --baseline or --baseline-wf (the net metrics are cost_multiples x cost_model.per_side_bps)",
         name,
         nm.cost.join(", "),
         BASE_METRICS.join(", ")
@@ -1300,7 +1397,7 @@ fn table(o: &Options, t: &TableArgs, rule: &Rule, rule_sha: &str, rule_source: &
         labels: calendar.as_ref().map(|c| c.labels()),
         regimes: o.regimes.as_deref(),
         null: !t.null_wf.is_empty(),
-        baseline: o.baseline.is_some(),
+        baseline: o.baseline.is_some() || !t.baseline_wf.is_empty(),
     };
     let used = rule.metrics();
     for m in &used {
@@ -1315,9 +1412,11 @@ fn table(o: &Options, t: &TableArgs, rule: &Rule, rule_sha: &str, rule_source: &
         trials::require_same(&first.wf, &w, o.threshold_arms)?;
         null_sharpes.push(crate::walkforward::sharpe(&w.net, w.ppy));
     }
-    let baseline = match &o.baseline {
-        None => None,
-        Some(path) => Some(trials::load_baseline(path, o.baseline_rung.as_deref(), &first.wf.time)?),
+    let wf_baseline = if t.baseline_wf.is_empty() { None } else { Some(load_baseline_wf(&t.baseline_wf, &first.wf.time, first.per_side_bps, &t.locked)?) };
+    let baseline = match (&o.baseline, &wf_baseline) {
+        (_, Some(w)) => Some(w.best.clone()),
+        (None, None) => None,
+        (Some(path), None) => Some(trials::load_baseline(path, o.baseline_rung.as_deref(), &first.wf.time)?),
     };
     let occam = load_occam(&t.occam)?;
 
@@ -1814,7 +1913,7 @@ fn table(o: &Options, t: &TableArgs, rule: &Rule, rule_sha: &str, rule_source: &
         t.null_wf.len(),
         null_sharpes.iter().map(|s| jnum(*s)).collect::<Vec<_>>().join(","),
         calendar_json,
-        baseline.as_ref().map_or("null".to_string(), |(name, _)| jstr(name)),
+        wf_baseline.as_ref().map(|w| w.json.clone()).or_else(|| baseline.as_ref().map(|(name, _)| jstr(name))).unwrap_or_else(|| "null".to_string()),
         t.occam.len(),
         t.locked.iter().map(|(s, e)| format!("[{},{}]", jnum(*s), jnum(*e))).collect::<Vec<_>>().join(","),
         rows_n,
