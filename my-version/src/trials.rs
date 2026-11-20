@@ -91,7 +91,8 @@ the Pareto front ranks the passers, the average rank orders them inside a front,
 average rank, complexity, trades, input order picks rows below the diversity cap. Every picked row gets PSR, DSR\n\
 at N_eff, 10 N_eff and the nominal N (every row of the table, plus --prior-trials), MinBTL, the Harvey-Liu haircut\n\
 (Bonferroni, Holm, BHY over the rows) and its StepM and BH-FDR verdicts; SPA, StepM, BH-FDR and PBO run over the\n\
-distinct varying rows against the --baseline best rung, else cash at 0. Output rcsr-trials-table/1.\n\
+distinct varying rows against the --baseline best rung, else cash at 0. With --family-table the deflation also\n\
+counts the sibling horizon tables. Output rcsr-trials-table/1.\n\
   --rule <file>          rcsr-trials-rule/1 JSON with cost_multiples, gates, relaxed_gates (apply when no row passes\n\
                          gates), pareto, rank, pick, diversity_rho, min_front, max_composites and freeze; its sha256 is\n\
                          in the output; it excludes --gates, --pareto, --rank, --pick, --diversity-rho, --min-front,\n\
@@ -122,6 +123,17 @@ distinct varying rows against the --baseline best rung, else cash at 0. Output r
   --cost-multiples <m,..> net<bps> metrics at m x cost_model.per_side_bps (default 1,2: net10 and net20 at 10 bp)\n\
   --null-wf <files...>   null walk-forward reports; null_q = share of their annual Sharpes below the row's\n\
   --prior-trials <N0>    add N0 earlier trials to the nominal N of the picked rows' DSR\n\
+  --family-table <files...> rcsr trials --table outputs of the sibling horizons over the same development span\n\
+                         (#1269, repeatable). DSR, DSR 10 N_eff and MinBTL use N_eff plus each sibling's own\n\
+                         trials.n_eff, DSR nominal the nominal N plus --prior-trials plus each sibling's trials.nominal,\n\
+                         always with this table's cross-trial Sharpe variance; spa.p_family = min(1, (1 + k)\n\
+                         spa.p_consistent) for k siblings; trials.family lists each sibling's path, sha256, n_eff,\n\
+                         nominal and spa_p, the family sha256 and the totals. A sibling's own trials.family is not\n\
+                         read. Two siblings with one sha256, a sibling that is the --out file, a sibling that is not\n\
+                         an rcsr-trials-table/1 output or lacks trials.n_eff, trials.nominal, spa.p_consistent or\n\
+                         inputs.reports, a sibling with a locked read, and a sibling whose inputs.reports share a report\n\
+                         with --wf or with an earlier sibling (by canonical path when the path resolves from the current\n\
+                         directory, else as given) exit 2 naming the file (and the shared report and the other table)\n\
   --alpha <a>            family error rate of StepM and q of BH-FDR (default 0.05)\n\
   --locked-test <S,E>    refuse a report with a period or test window in [S, E) (repeatable)\n\
   --occam <files...>     run.json of a --select-rule occam re-selection or of rcsr compose: bits, p_occam and\n\

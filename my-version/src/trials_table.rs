@@ -8,7 +8,9 @@
 //! below the cap with every earlier pick. A picked row gets its deflation at
 //! the trial count of the whole table. With `max_composites` (#1237, D8) the
 //! walk skips a composite row once the picks hold that many; with `freeze`
-//! every pick gets the sealed-read thresholds of [`crate::trials_freeze`].
+//! every pick gets the sealed-read thresholds of [`crate::trials_freeze`]. With
+//! `--family-table` (#1269) the sibling horizon tables add their trials to the
+//! deflation and the SPA p gets a Bonferroni factor over the tables.
 //!
 //! The table reads development reports only. A report with a locked read, or
 //! with a period or test window inside a locked range, exits 2.
@@ -44,6 +46,7 @@ pub const FLAGS: &[&str] = &[
     "--locked-test",
     "--occam",
     "--freeze-map",
+    "--family-table",
 ];
 
 /// Metrics every row has (null where the series is too short or flat).
@@ -386,6 +389,7 @@ struct TableArgs {
     locked: Vec<(f64, f64)>,
     occam: Vec<String>,
     freeze_map: Option<String>,
+    family: Vec<String>,
 }
 
 fn value(args: &[String], i: &mut usize, flag: &str) -> Res<String> {
@@ -432,6 +436,7 @@ fn split_args(args: &[String]) -> Res<(TableArgs, Vec<String>)> {
             "--markdown" => t.markdown = Some(value(args, &mut i, a)?),
             "--occam" => t.occam = files(args, &mut i, a)?,
             "--freeze-map" => t.freeze_map = Some(value(args, &mut i, a)?),
+            "--family-table" => t.family.extend(files(args, &mut i, a)?),
             "--locked-test" => {
                 let v = value(args, &mut i, a)?;
                 let parsed = v.split_once(',').and_then(|(s, e)| Some((crate::data::parse_time(s)?, crate::data::parse_time(e)?)));
@@ -740,6 +745,86 @@ fn occam_cell(e: &Entry, runs: &[OccamRun]) -> String {
         );
     }
     "null".to_string()
+}
+
+/// #1269: one `--family-table`, the table of a sibling horizon over the same development span.
+struct Sibling {
+    path: String,
+    sha256: String,
+    n_eff: f64,
+    nominal: f64,
+    spa_p: f64,
+    /// [`report_key`] of every `inputs.reports` entry.
+    reports: Vec<String>,
+}
+
+fn same_file(a: &str, b: &str) -> bool {
+    a == b || matches!((std::fs::canonicalize(a), std::fs::canonicalize(b)), (Ok(x), Ok(y)) if x == y)
+}
+
+/// A report path as compared across tables: its canonical path when it resolves from the
+/// current directory, else the path as given. Tables record no report sha256.
+fn report_key(p: &str) -> String {
+    std::fs::canonicalize(p).map_or_else(|_| p.to_string(), |c| c.to_string_lossy().into_owned())
+}
+
+/// The sibling tables with their own `trials.n_eff`, `trials.nominal` and `spa.p_consistent`;
+/// a sibling's own `trials.family` is never read, so tables that list each other count once.
+/// A report of this table (`own`) or of an earlier sibling in a sibling's `inputs.reports`
+/// would count its rows twice.
+fn load_family(paths: &[String], own: &[String], out: Option<&str>, locked: &[(f64, f64)]) -> Res<Vec<Sibling>> {
+    let own_keys: Vec<String> = if paths.is_empty() { Vec::new() } else { own.iter().map(|r| report_key(r)).collect() };
+    let mut family: Vec<Sibling> = Vec::new();
+    for p in paths {
+        if let Some(o) = out.filter(|o| same_file(p, o)) {
+            return usage(format!("--family-table {}: the file is the --out of this run ({}); a table cannot count itself", p, o));
+        }
+        let bytes = std::fs::read(p).map_err(|e| (3, format!("{}: {}", p, e)))?;
+        let sha256 = crate::manifest::sha256_hex(&bytes);
+        let j = Json::parse(String::from_utf8_lossy(&bytes).trim()).ok_or_else(|| (3, format!("{}: not a JSON table", p)))?;
+        refuse_locked(&j, p, locked)?;
+        if j.get("schema").and_then(Json::as_str) != Some(SCHEMA) {
+            return usage(format!("--family-table {}: schema is not {} (the output of rcsr trials --table)", p, SCHEMA));
+        }
+        if let Some(twin) = family.iter().find(|s| s.sha256 == sha256) {
+            return usage(format!("--family-table {}: sha256 {} is the sha256 of the family table {}; each sibling table counts once", p, sha256, twin.path));
+        }
+        let field = |path: &[&str], ok: fn(f64) -> bool| {
+            num_at(&j, path).filter(|v| v.is_finite() && ok(*v)).ok_or_else(|| {
+                (2, format!("--family-table {}: field '{}' is missing or invalid (a table with a computed SPA is needed)", p, path.join(".")))
+            })
+        };
+        let n_eff = field(&["trials", "n_eff"], |v| v >= 1.0)?;
+        let nominal = field(&["trials", "nominal"], |v| v >= 1.0)?;
+        let spa_p = field(&["spa", "p_consistent"], |v| (0.0..=1.0).contains(&v))?;
+        let listed: Vec<&str> = match at(&j, &["inputs", "reports"]) {
+            Some(Json::Arr(a)) if !a.is_empty() && a.iter().all(|x| x.as_str().is_some()) => a.iter().filter_map(Json::as_str).collect(),
+            _ => return usage(format!("--family-table {}: field 'inputs.reports' is missing or invalid (a list of report paths)", p)),
+        };
+        let reports: Vec<String> = listed.iter().map(|r| report_key(r)).collect();
+        for (r, key) in listed.iter().zip(&reports) {
+            let other = if own_keys.contains(key) {
+                Some("this table (--wf)".to_string())
+            } else {
+                family.iter().find(|s| s.reports.contains(key)).map(|s| format!("the family table {}", s.path))
+            };
+            if let Some(other) = other {
+                return usage(format!(
+                    "--family-table {}: its report {} is also a report of {} (compared by canonical path); a report counts in one table only",
+                    p, r, other
+                ));
+            }
+        }
+        family.push(Sibling { path: p.clone(), sha256, n_eff, nominal, spa_p, reports });
+    }
+    Ok(family)
+}
+
+/// The SHA-256 of the sorted sibling sha256 values, each followed by a newline.
+fn family_sha(family: &[Sibling]) -> String {
+    let mut shas: Vec<&str> = family.iter().map(|s| s.sha256.as_str()).collect();
+    shas.sort_unstable();
+    crate::manifest::sha256_hex(shas.iter().map(|s| format!("{}\n", s)).collect::<String>().as_bytes())
 }
 
 // ---------------------------------------------------------------------------
@@ -1181,6 +1266,7 @@ fn metric_cell(name: &str, v: &Val) -> String {
 
 fn table(o: &Options, t: &TableArgs, rule: &Rule, rule_sha: &str, rule_source: &str) -> Res<Out> {
     let map: Option<FreezeMap> = t.freeze_map.as_deref().map(trials_freeze::load_map).transpose()?;
+    let family = load_family(&t.family, &o.wf, o.out.as_deref(), &t.locked)?;
     let entries = load_entries(o, &t.locked)?;
     let first = &entries[0];
     let n = first.wf.net.len();
@@ -1264,6 +1350,8 @@ fn table(o: &Options, t: &TableArgs, rule: &Rule, rule_sha: &str, rule_source: &
     let n_eff = (clusters_varying + constant_books).max(1) as f64;
     let nominal = rows_n as f64;
     let nominal_prior = nominal + t.prior_trials as f64;
+    let n_eff_total = family.iter().fold(n_eff, |a, s| a + s.n_eff);
+    let nominal_total = family.iter().fold(nominal_prior, |a, s| a + s.nominal);
 
     // Block statistics of every varying book.
     let stats: Vec<BookStat> = par_map(cols.len(), |v| book_stat(&cols[v], block, o.draws, o.seed, ppy));
@@ -1450,13 +1538,14 @@ fn table(o: &Options, t: &TableArgs, rule: &Rule, rule_sha: &str, rule_source: &
         None => ("cash".to_string(), vec![0.0; n]),
     };
     let diffs: Vec<Vec<f64>> = cols.iter().map(|c| c.iter().zip(&bench).map(|(a, b)| a - b).collect()).collect();
+    let p_family = |p: f64| ((1 + family.len()) as f64 * p).min(1.0);
     let spa_json = if cols.is_empty() {
         skipped("no varying series")
     } else {
         match inference::spa_test(&diffs, block, o.draws, o.seed) {
             Ok(s) => format!(
                 "{{\"benchmark\":{},\"variant\":\"hansen_2005_circular_block\",\"models\":{},\"n\":{},\"block_len\":{},\"draws\":{},\"seed\":{},\
-\"statistic\":{},\"best_model\":{},\"p_consistent\":{},\"p_lower\":{},\"p_upper\":{}}}",
+\"statistic\":{},\"best_model\":{},\"p_consistent\":{},\"p_lower\":{},\"p_upper\":{}{}}}",
                 jstr(&bench_name),
                 s.models,
                 s.n,
@@ -1467,7 +1556,8 @@ fn table(o: &Options, t: &TableArgs, rule: &Rule, rule_sha: &str, rule_source: &
                 s.best_model.map_or("null".to_string(), |m| jstr(&entries[varying[m]].wf.label)),
                 jnum(s.p_consistent),
                 jnum(s.p_lower),
-                jnum(s.p_upper)
+                jnum(s.p_upper),
+                if family.is_empty() { String::new() } else { format!(",\"p_family\":{}", jnum(p_family(s.p_consistent))) }
             ),
             Err(e) => skipped(&e),
         }
@@ -1558,10 +1648,10 @@ fn table(o: &Options, t: &TableArgs, rule: &Rule, rule_sha: &str, rule_source: &
                 head,
                 jnum(sharpe),
                 jnum(d(1.0).dsr),
-                trials::dsr_json(&d(n_eff), n_eff),
-                trials::dsr_json(&d(10.0 * n_eff), 10.0 * n_eff),
-                trials::dsr_json(&d(nominal_prior), nominal_prior),
-                jnum(inference::min_btl_years(sharpe, n_eff)),
+                trials::dsr_json(&d(n_eff_total), n_eff_total),
+                trials::dsr_json(&d(10.0 * n_eff_total), 10.0 * n_eff_total),
+                trials::dsr_json(&d(nominal_total), nominal_total),
+                jnum(inference::min_btl_years(sharpe, n_eff_total)),
                 jnum(span_years),
                 jnum(t),
                 jnum(p_hl[r]),
@@ -1691,11 +1781,28 @@ fn table(o: &Options, t: &TableArgs, rule: &Rule, rule_sha: &str, rule_source: &
         (Some(m), Some(_)) => format!(",\"freeze\":{}", trials_freeze::top_json(rule_sha, m)),
         _ => String::new(),
     };
+    let family_obj = if family.is_empty() {
+        String::new()
+    } else {
+        let tables: Vec<String> = family
+            .iter()
+            .map(|s| {
+                format!("{{\"path\":{},\"sha256\":{},\"n_eff\":{},\"nominal\":{},\"spa_p\":{}}}", jstr(&s.path), jstr(&s.sha256), jnum(s.n_eff), jnum(s.nominal), jnum(s.spa_p))
+            })
+            .collect();
+        format!(
+            ",\"family\":{{\"tables\":[{}],\"sha256\":{},\"n_eff_total\":{},\"nominal_total\":{}}}",
+            tables.join(","),
+            jstr(&family_sha(&family)),
+            jnum(n_eff_total),
+            jnum(nominal_total)
+        )
+    };
     let json = format!(
         "{{\"schema\":{},\"rule\":{}{},\"inputs\":{{\"reports\":[{}],\"members\":{},\"null_reports\":{},\"null_sharpes\":[{}],\"calendar\":{},\
 \"baseline\":{},\"occam_runs\":{},\"locked_test\":[{}]}},\
 \"trials\":{{\"nominal\":{},\"prior_trials\":{},\"nominal_with_prior\":{},\"distinct_books\":{},\"constant_books\":{},\"n_eff\":{},\
-\"cluster_rho\":{},\"participation_ratio\":{}}},\
+\"cluster_rho\":{},\"participation_ratio\":{}{}}},\
 \"periods\":{},\"periods_per_year\":{},\"span_years\":{},\"block_len\":{},\"draws\":{},\"seed\":{},\"alpha\":{},\"benchmark\":{},\
 \"gate_set\":{},\"gate_passers\":{},\"pareto\":{},\"rank\":{},\"picks\":[{}],\"spa\":{},\"stepm\":{},\"bh_fdr\":{},\"pbo\":{},\
 \"notes\":[{}],\"rows\":[{}]}}\n",
@@ -1718,6 +1825,7 @@ fn table(o: &Options, t: &TableArgs, rule: &Rule, rule_sha: &str, rule_source: &
         jnum(n_eff),
         jnum(o.rho),
         jnum(pr),
+        family_obj,
         n,
         jnum(ppy),
         jnum(span_years),
@@ -1756,6 +1864,28 @@ Gate set: {}, {} of {} rows pass. Benchmark: {}.\n\n",
         rows_n,
         bench_name
     ));
+    if !family.is_empty() {
+        let spa_p = Json::parse(&spa_json).and_then(|j| num_at(&j, &["p_consistent"]));
+        md.push_str(&format!(
+            "Family: {} sibling horizon table(s) (family sha256 `{}`). DSR, DSR 10 N_eff and MinBTL use N_eff {} (this table {} plus {}), \
+DSR nominal uses N {} (this table {} plus {}); the expected maximum keeps this table's cross-trial Sharpe variance, the family adds \
+trials, not variance. {}.\n\n",
+            family.len(),
+            family_sha(&family),
+            jnum(n_eff_total),
+            jnum(n_eff),
+            family.iter().map(|s| jnum(s.n_eff)).collect::<Vec<_>>().join(" + "),
+            jnum(nominal_total),
+            jnum(nominal_prior),
+            family.iter().map(|s| jnum(s.nominal)).collect::<Vec<_>>().join(" + "),
+            spa_p.map_or("SPA skipped: no family p".to_string(), |p| format!(
+                "SPA family p {} = min(1, {} x p {})",
+                cell(p_family(p)),
+                family.len() + 1,
+                cell(p)
+            ))
+        ));
+    }
     let dir_list = |d: &[(String, Dir)]| d.iter().map(|(m, x)| format!("{} ({})", m, x.name())).collect::<Vec<_>>().join(", ");
     if !rule.pareto.is_empty() {
         md.push_str(&format!("Pareto over {}: {}.\n\n", dir_list(rule.pareto.as_slice()), match front.iter().flatten().max() {
@@ -1847,10 +1977,10 @@ Gate set: {}, {} of {} rows pass. Benchmark: {}.\n\n",
                 entries[r].wf.label,
                 cell(sharpe),
                 cell(d(1.0)),
-                cell(d(n_eff)),
-                cell(d(10.0 * n_eff)),
-                cell(d(nominal_prior)),
-                cell(inference::min_btl_years(sharpe, n_eff)),
+                cell(d(n_eff_total)),
+                cell(d(10.0 * n_eff_total)),
+                cell(d(nominal_total)),
+                cell(inference::min_btl_years(sharpe, n_eff_total)),
                 cell(hl),
                 cell(t),
                 yes(stepm.as_ref().ok().map(|s| s.rejected[v])),

@@ -14,10 +14,11 @@
 //!
 //! The choice reads the training and validation rows only; the test rows are
 //! read once the finalist is fixed. A C1 or C2 composite is a switch
-//! ([`regime_gate::Switch`]): its validation and test rows take the gate states
-//! of the evaluation rule `rcsr-gate-state/1` (warm-up over the full readable
-//! prefix of the data file; the validation rows never read the test intervals),
-//! its training rows the per-segment kernel of the `--pnl-mask` fitness (#1190).
+//! ([`regime_gate::Switch`]): its training, validation and test rows take the
+//! gate states of the evaluation rule `rcsr-gate-state/1` (warm-up over the full
+//! readable prefix of the data file; the training and validation rows never
+//! read the test intervals), the states the `--pnl-mask` pools trained under
+//! (#1268). A searched gate keeps the per-segment training kernel of its search.
 //! The run carries the switch of every C1 and C2 composite, so every reader
 //! prices the same book.
 
@@ -643,12 +644,13 @@ USAGE:
 
   Every C1 and C2 composite is a switch: run.json carries objective.finalist.switch
   and pareto[].switch (gate, on branch, off branch), and pareto lists every
-  composite with pruned. The validation and test rows take the gate states of
-  rcsr-gate-state/1: the kernel over every row of the data file with a finite
-  time, per group from its first readable row, never reading a locked range the
-  command does not open (with its lookback embargo); the validation rows also
-  never read a test interval (with the split's embargo). The training rows keep
-  the per-segment start of the --pnl-mask fitness. compose.chosen.validation.regime
+  composite with pruned. The training, validation and test rows take the gate
+  states of rcsr-gate-state/1: the kernel over every row of the data file with a
+  finite time, per group from its first readable row, never reading a locked
+  range the command does not open (with its lookback embargo); the training and
+  validation rows also never read a test interval (with the split's embargo).
+  The dwell counts rows of the data file in every slice, as in the --pnl-mask
+  fitness of the pools. compose.chosen.validation.regime
   and .test.regime carry the warm-up (start). walkforward --from-run and --front,
   ladder --sr-run, the seal and the locked read price the switch.
 
@@ -916,8 +918,9 @@ pub(crate) fn state_groups(rows: &TradingRows, starts: &[f64]) -> Vec<u64> {
 }
 
 /// Branch values and gate states on one slice. `states` holds the gate states of
-/// the evaluation rule per menu gate; without it (the training rows) the kernel
-/// runs over the slice rows, per group and training segment.
+/// the evaluation rule per menu gate; without it (the training rows of a gate
+/// search, #1182) the kernel runs over the slice rows, per group and training
+/// segment.
 fn slice_vals(req: &Request, columns: &[String], values: &[Vec<f64>], rows: &TradingRows, starts: &[f64], states: Option<&[Vec<bool>]>) -> Result<SliceVals, String> {
     let n = rows.time.len();
     if values.len() != columns.len() || values.iter().any(|v| v.len() != n) {
@@ -1079,7 +1082,8 @@ pub fn compose(req: &Request, book: &FitnessBook, slices: &Slices, ctx: &Context
     };
 
     // Training rows: the pruning bound of each pair (a re-selection keeps the run's pruning).
-    let train = slice_vals(req, &columns, slices.train_values, &slices.train.rows, ctx.train_segments, None).map_err(|e| (2, format!("training rows: {}", e)))?;
+    let train_states: Option<Vec<Vec<bool>>> = slices.gates.iter().map(|g| g.train.clone()).collect();
+    let train = slice_vals(req, &columns, slices.train_values, &slices.train.rows, ctx.train_segments, train_states.as_deref()).map_err(|e| (2, format!("training rows: {}", e)))?;
     let n_train = book.len();
     if slices.train.rows.time.len() != n_train {
         return usage(format!("the training book holds {} rows for {} training trading rows", n_train, slices.train.rows.time.len()));

@@ -1248,3 +1248,298 @@ fn freeze_rule_refuses_bad_keys() {
         assert!(stderr(&o).contains(key), "{key}: {}", stderr(&o));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Sibling horizon tables (#1269)
+// ---------------------------------------------------------------------------
+
+/// `rows` walk-forward reports `<tag><k>.json` over `n` hourly periods with exact means
+/// `lift + 0.0002 k`; with `twin` the second series is 0.98 x the first's noise plus 0.2 x
+/// its own, so the two share one cluster at `--cluster-rho 0.9`.
+fn family_reports(dir: &Path, tag: &str, rows: usize, n: usize, seed: u32, lift: f64, twin: bool) -> Vec<String> {
+    let first = centred_noise(n, seed, 0.01);
+    (0..rows)
+        .map(|k| {
+            let noise: Vec<f64> = match k {
+                0 => first.clone(),
+                1 if twin => first.iter().zip(centred_noise(n, seed + 50, 0.01)).map(|(a, b)| 0.98 * a + 0.2 * b).collect(),
+                _ => centred_noise(n, seed + k as u32, 0.01),
+            };
+            let net: Vec<f64> = noise.iter().map(|x| x + lift + 0.0002 * k as f64).collect();
+            write_fx(dir, &format!("{tag}{k}"), &Fx::new(net))
+        })
+        .collect()
+}
+
+/// `rcsr trials --table` over `reports` that picks every row, written to `out`.
+fn family_run(reports: &[String], out: &str, extra: &[&str]) -> Output {
+    let picks = reports.len().to_string();
+    let mut args = vec!["trials", "--wf"];
+    args.extend(reports.iter().map(String::as_str));
+    args.extend(["--table", "--pick", &picks, "--diversity-rho", "1", "--draws", "200", "--out", out]);
+    args.extend_from_slice(extra);
+    run(&args)
+}
+
+/// Fixture A, B, C: three tables of 6, 5 and 4 rows (B and C written to `b.json` and
+/// `c.json`); A's second row is the twin of its first, so N_eff is 5, 5 and 4.
+fn abc(dir: &Path) -> (Vec<String>, String, String) {
+    let a = family_reports(dir, "a", 6, 400, 100, 0.0002, true);
+    let b = family_reports(dir, "b", 5, 400, 200, 0.0001, false);
+    let c = family_reports(dir, "c", 4, 300, 300, 0.0001, false);
+    let (tb, tc) = (dir.join("b.json").to_string_lossy().into_owned(), dir.join("c.json").to_string_lossy().into_owned());
+    for (reports, out) in [(&b, &tb), (&c, &tc)] {
+        let o = family_run(reports, out, &[]);
+        assert_eq!(code(&o), 0, "{}", stderr(&o));
+    }
+    (a, tb, tc)
+}
+
+/// `E[max_N]` of Bailey and López de Prado (2014) with cross-trial Sharpe variance `var`.
+fn hand_expected_max(n: f64, var: f64) -> f64 {
+    let q = rcsr::inference::normal_quantile;
+    let g = 0.577_215_664_901_532_9;
+    var.sqrt() * ((1.0 - g) * q(1.0 - 1.0 / n) + g * q(1.0 - 1.0 / (n * std::f64::consts::E))).max(0.0)
+}
+
+/// The DSR of a pick's `dsr` object at `n` trials, from its Sharpe, T, skew, kurtosis and `var_sr`.
+fn hand_dsr(d: &Json, n: f64) -> f64 {
+    let (sr, t, skew, kurt, var) = (num(d, &["sharpe_per_period"]), num(d, &["t"]), num(d, &["skew"]), num(d, &["kurtosis"]), num(d, &["var_sr"]));
+    let denom = 1.0 - skew * sr + (kurt - 1.0) / 4.0 * sr * sr;
+    rcsr::inference::normal_cdf((sr - hand_expected_max(n, var)) * (t - 1.0).sqrt() / denom.sqrt())
+}
+
+fn file_sha(path: &str) -> String {
+    rcsr::manifest::sha256_hex(&std::fs::read(path).unwrap())
+}
+
+#[test]
+fn family_tables_add_their_n_eff_to_the_dsr() {
+    let (_s, dir) = scratch("family-neff");
+    let (a, tb, tc) = abc(&dir);
+    let p = |name: &str| dir.join(name).to_string_lossy().into_owned();
+    let (ta, tf) = (p("a.json"), p("a_family.json"));
+    for (out, extra) in [(&ta, vec![]), (&tf, vec!["--family-table", tb.as_str(), tc.as_str()])] {
+        let o = family_run(&a, out, &extra);
+        assert_eq!(code(&o), 0, "{}", stderr(&o));
+    }
+    let (ja, jb, jc, jf) = (read_json(&ta), read_json(&tb), read_json(&tc), read_json(&tf));
+    let n_eff = |j: &Json| num(j, &["trials", "n_eff"]);
+    assert_eq!((n_eff(&ja), n_eff(&jb), n_eff(&jc)), (5.0, 5.0, 4.0), "planted clusters");
+    assert_eq!(n_eff(&jf), n_eff(&ja), "trials.n_eff stays the table's own");
+    let total = n_eff(&ja) + n_eff(&jb) + n_eff(&jc);
+    let family = at(&jf, &["trials", "family"]);
+    assert_eq!(num(family, &["n_eff_total"]), total);
+    assert_eq!(num(family, &["nominal_total"]), 6.0 + 5.0 + 4.0);
+    let tables = items(at(family, &["tables"]));
+    assert_eq!(tables.len(), 2);
+    for (t, (path, j)) in tables.iter().zip([(&tb, &jb), (&tc, &jc)]) {
+        assert_eq!(at(t, &["path"]).as_str(), Some(path.as_str()));
+        assert_eq!(at(t, &["sha256"]).as_str(), Some(file_sha(path).as_str()));
+        assert_eq!(num(t, &["n_eff"]), n_eff(j));
+        assert_eq!(num(t, &["nominal"]), num(j, &["trials", "nominal"]));
+        assert_eq!(num(t, &["spa_p"]), num(j, &["spa", "p_consistent"]));
+    }
+    let mut shas = vec![file_sha(&tb), file_sha(&tc)];
+    shas.sort();
+    let joined: String = shas.iter().map(|s| format!("{s}\n")).collect();
+    assert_eq!(at(family, &["sha256"]).as_str(), Some(rcsr::manifest::sha256_hex(joined.as_bytes()).as_str()));
+    let (picks_a, picks_f) = (items(at(&ja, &["picks"])), items(at(&jf, &["picks"])));
+    assert_eq!((picks_a.len(), picks_f.len()), (6, 6), "every row is picked");
+    for (k, (pa, pf)) in picks_a.iter().zip(picks_f).enumerate() {
+        let (da, df) = (at(pa, &["dsr"]), at(pf, &["dsr"]));
+        assert_eq!(num(da, &["n_eff"]), 5.0, "pick {k}");
+        close(num(da, &["value"]), hand_dsr(da, 5.0), &format!("pick {k} own DSR"));
+        assert_eq!(num(df, &["n_eff"]), total, "pick {k}");
+        for key in ["sharpe_per_period", "t", "skew", "kurtosis", "var_sr"] {
+            assert_eq!(num(df, &[key]).to_bits(), num(da, &[key]).to_bits(), "pick {k} {key}: the family adds trials, not variance");
+        }
+        close(num(df, &["value"]), hand_dsr(df, total), &format!("pick {k} family DSR"));
+        assert!(num(df, &["value"]) < num(da, &["value"]), "pick {k}: {} vs {}", num(df, &["value"]), num(da, &["value"]));
+        assert_eq!(num(pf, &["dsr_10x", "n_eff"]), 10.0 * total);
+        close(num(pf, &["dsr_10x", "value"]), hand_dsr(at(pf, &["dsr_10x"]), 10.0 * total), &format!("pick {k} DSR 10 N_eff"));
+        assert_eq!(num(pf, &["dsr_nominal", "n_eff"]), 15.0);
+        close(num(pf, &["dsr_nominal", "value"]), hand_dsr(at(pf, &["dsr_nominal"]), 15.0), &format!("pick {k} nominal DSR"));
+        let sharpe = num(pf, &["sharpe_annual"]);
+        close(num(pf, &["min_btl_years"]), (hand_expected_max(total, 1.0) / sharpe).powi(2), &format!("pick {k} MinBTL"));
+        assert_eq!(num(pf, &["psr"]), num(pa, &["psr"]), "pick {k}");
+    }
+}
+
+#[test]
+fn family_spa_p_is_bonferroni_over_the_tables() {
+    let (_s, dir) = scratch("family-spa");
+    let (a, tb, tc) = abc(&dir);
+    let p = |name: &str| dir.join(name).to_string_lossy().into_owned();
+    let (ta, tf, md) = (p("a.json"), p("a_family.json"), p("a_family.md"));
+    let o = family_run(&a, &ta, &[]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let o = family_run(&a, &tf, &["--family-table", &tb, &tc, "--markdown", &md]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let (ja, jf) = (read_json(&ta), read_json(&tf));
+    assert!(at(&ja, &["spa"]).get("p_family").is_none() && at(&ja, &["trials"]).get("family").is_none(), "no family block without the flag");
+    let p_own = num(&jf, &["spa", "p_consistent"]);
+    assert_eq!(p_own, num(&ja, &["spa", "p_consistent"]), "the family leaves the SPA of the table");
+    assert!(p_own > 0.0 && 3.0 * p_own < 1.0, "fixture A tests the uncapped branch: p {p_own}");
+    assert_eq!(num(&jf, &["spa", "p_family"]).to_bits(), (3.0 * p_own).min(1.0).to_bits());
+    let text = std::fs::read_to_string(&md).unwrap();
+    assert!(text.contains("SPA family p") && text.contains("cross-trial Sharpe variance"), "{text}");
+    // A table of losing rows: 3 p is above 1 and the family p is 1.
+    let losers = family_reports(&dir, "n", 4, 400, 400, -0.001, false);
+    let tn = p("n_family.json");
+    let o = family_run(&losers, &tn, &["--family-table", &tb, &tc]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let jn = read_json(&tn);
+    let p_losers = num(&jn, &["spa", "p_consistent"]);
+    assert!(3.0 * p_losers > 1.0, "losing rows: p {p_losers}");
+    assert_eq!(num(&jn, &["spa", "p_family"]), 1.0);
+}
+
+/// A minimal sibling table: the fields the family reads and nothing else, with one report
+/// named after the table that resolves nowhere.
+fn sibling(dir: &Path, name: &str, n_eff: u32, nominal: u32, spa_p: f64) -> String {
+    write_text(
+        dir,
+        name,
+        &format!(
+            "{{\"schema\":\"rcsr-trials-table/1\",\"inputs\":{{\"reports\":[\"missing-{name}\"]}},\"trials\":{{\"nominal\":{nominal},\"n_eff\":{n_eff}}},\
+\"spa\":{{\"benchmark\":\"cash\",\"p_consistent\":{spa_p}}}}}\n"
+        ),
+    )
+}
+
+fn refused_family(reports: &[String], out: &str, extra: &[&str], needles: &[&str]) {
+    let o = family_run(reports, out, extra);
+    assert_eq!(code(&o), 2, "{extra:?}: {}", stderr(&o));
+    for n in needles {
+        assert!(stderr(&o).contains(n), "{extra:?}: '{n}' not in {}", stderr(&o));
+    }
+    assert!(!Path::new(out).exists() || extra.contains(&out), "{extra:?}: a refused table writes nothing");
+}
+
+#[test]
+fn family_table_refuses_two_tables_with_one_sha256() {
+    let (_s, dir) = scratch("family-twice");
+    let a = family_reports(&dir, "a", 3, 200, 500, 0.0002, false);
+    let b = sibling(&dir, "b.json", 5, 5, 0.2);
+    let copy = write_text(&dir, "b_copy.json", &std::fs::read_to_string(&b).unwrap());
+    let out = dir.join("out.json").to_string_lossy().into_owned();
+    refused_family(&a, &out, &["--family-table", &b, &copy], &[&copy, &b, "sha256"]);
+    refused_family(&a, &out, &["--family-table", &b, "--family-table", &b], &[&b, "sha256"]);
+    let c = sibling(&dir, "c.json", 4, 4, 0.3);
+    let o = family_run(&a, &out, &["--family-table", &b, "--family-table", &c]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(items(at(&read_json(&out), &["trials", "family", "tables"])).len(), 2, "the flag repeats");
+}
+
+#[test]
+fn family_table_refuses_the_out_file() {
+    let (_s, dir) = scratch("family-out");
+    let a = family_reports(&dir, "a", 3, 200, 510, 0.0002, false);
+    let b = sibling(&dir, "b.json", 5, 5, 0.2);
+    let before = std::fs::read(&b).unwrap();
+    let o = family_run(&a, &b, &["--family-table", &b]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).contains(&b) && stderr(&o).contains("--out"), "{}", stderr(&o));
+    let respelled = dir.join(".").join("b.json").to_string_lossy().into_owned();
+    let o = family_run(&a, &respelled, &["--family-table", &b]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).contains(&b) && stderr(&o).contains("--out"), "{}", stderr(&o));
+    assert_eq!(std::fs::read(&b).unwrap(), before, "the family table is not overwritten");
+}
+
+#[test]
+fn family_table_refuses_missing_fields() {
+    let (_s, dir) = scratch("family-fields");
+    let a = family_reports(&dir, "a", 3, 200, 520, 0.0002, false);
+    let full = std::fs::read_to_string(sibling(&dir, "full.json", 5, 5, 0.2)).unwrap();
+    let out = dir.join("out.json").to_string_lossy().into_owned();
+    for (k, path) in [&["trials", "n_eff"][..], &["trials", "nominal"], &["spa", "p_consistent"], &["inputs", "reports"]].iter().enumerate() {
+        let text = rcsr::verdict::remove_member(&full, path).unwrap();
+        assert_ne!(text, full, "{path:?}");
+        let bad = write_text(&dir, &format!("bad{k}.json"), &text);
+        refused_family(&a, &out, &["--family-table", &bad], &[&bad, &path.join(".")]);
+    }
+    let skipped = write_text(&dir, "skipped.json", &full.replace("{\"benchmark\":\"cash\",\"p_consistent\":0.2}", "{\"skipped\":\"no varying series\"}"));
+    refused_family(&a, &out, &["--family-table", &skipped], &[&skipped, "spa.p_consistent"]);
+    let report = a[0].clone();
+    refused_family(&a, &out, &["--family-table", &report], &[&report, "rcsr-trials-table/1"]);
+}
+
+#[test]
+fn family_table_refuses_locked_data() {
+    let (_s, dir) = scratch("family-locked");
+    let a = family_reports(&dir, "a", 3, 200, 530, 0.0002, false);
+    let full = std::fs::read_to_string(sibling(&dir, "full.json", 5, 5, 0.2)).unwrap();
+    let out = dir.join("out.json").to_string_lossy().into_owned();
+    let marked = write_text(&dir, "marked.json", &full.replacen("{\"schema\"", "{\"protocol\":{\"test_read\":true},\"schema\"", 1));
+    refused_family(&a, &out, &["--family-table", &marked], &[&marked, "locked"]);
+    let mut read = Fx::new(centred_noise(200, 531, 0.01));
+    read.protocol = Some("{\"lockbox\":{\"rows\":0,\"evaluated\":false},\"test_read\":true}".to_string());
+    let read = write_fx(&dir, "sealed_read", &read);
+    refused_family(&a, &out, &["--family-table", &read], &[&read, "locked"]);
+}
+
+#[test]
+fn family_table_refuses_shared_reports() {
+    let (_s, dir) = scratch("family-shared");
+    let p = |name: &str| dir.join(name).to_string_lossy().into_owned();
+    let a = family_reports(&dir, "a", 3, 200, 540, 0.0002, false);
+    let b = family_reports(&dir, "b", 4, 200, 550, 0.0001, false);
+    let out = p("out.json");
+    // An earlier table of the same rows under another file name, its reports spelled through `.`.
+    let respelled: Vec<String> = a.iter().map(|r| dir.join(".").join(Path::new(r).file_name().unwrap()).to_string_lossy().into_owned()).collect();
+    let earlier = p("earlier.json");
+    let o = family_run(&respelled, &earlier, &[]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    refused_family(&a, &out, &["--family-table", &earlier], &[&earlier, "this table", &respelled[0]]);
+    // Two siblings that share the report b1.
+    let (tb1, tb2, tb3) = (p("tb1.json"), p("tb2.json"), p("tb3.json"));
+    for (reports, table) in [(&b[..2], &tb1), (&b[1..3], &tb2), (&b[2..], &tb3)] {
+        let o = family_run(reports, table, &[]);
+        assert_eq!(code(&o), 0, "{}", stderr(&o));
+    }
+    refused_family(&a, &out, &["--family-table", &tb1, &tb2], &[&tb2, &tb1, &b[1]]);
+    let o = family_run(&a, &out, &["--family-table", &tb1, &tb3]);
+    assert_eq!(code(&o), 0, "disjoint reports: {}", stderr(&o));
+}
+
+/// The JSON and Markdown of `rcsr trials --table` without `--family-table` on two fixtures,
+/// with relative paths, pinned to the SHA-256 of the integration base before #1269.
+#[test]
+fn table_without_family_is_unchanged() {
+    let (_s, dir) = scratch("family-golden");
+    let in_dir = |args: &[&str]| rcsr_cmd::rcsr().current_dir(&dir).args(args).output().expect("run rcsr");
+    let (d, _) = five_series(&dir);
+    let (s, _) = six_series(&dir);
+    let names = |paths: &[String]| paths.iter().map(|p| Path::new(p).file_name().unwrap().to_string_lossy().into_owned()).collect::<Vec<_>>();
+    let (d, s) = (names(&d), names(&s));
+    write_text(&dir, "cal.csv", &format!("label,start,end\nbull,{},{}\nbear,{},{}\n", T0, T0 + 3600 * 6, T0 + 3600 * 6, T0 + 3600 * 12));
+    write_text(
+        &dir,
+        "rule.json",
+        "{\"schema\":\"rcsr-trials-rule/1\",\"gates\":{\"net10\":[\">\",-100]},\"rank\":[\"net20\",\"sharpe\",\"bear_excess\"],\"pick\":2,\"diversity_rho\":0.95}",
+    );
+    let fixtures: [(&[String], Vec<&str>, &str); 2] = [
+        (&d, vec!["--pareto", "net10:max,sharpe:max", "--rank", "net10,sortino", "--pick", "3", "--diversity-rho", "0.7", "--draws", "100"], "t1"),
+        (&s, vec!["--rule", "rule.json", "--regimes", "cal.csv", "--prior-trials", "3", "--pbo-blocks", "4", "--block-len", "2", "--draws", "50"], "t2"),
+    ];
+    let mut got = Vec::new();
+    for (paths, extra, tag) in fixtures {
+        let (out, md) = (format!("{tag}.json"), format!("{tag}.md"));
+        let mut args = vec!["trials", "--wf"];
+        args.extend(paths.iter().map(String::as_str));
+        args.push("--table");
+        args.extend(extra);
+        args.extend(["--out", &out, "--markdown", &md]);
+        let o = in_dir(&args);
+        assert_eq!(code(&o), 0, "{tag}: {}", stderr(&o));
+        let mut bytes = std::fs::read(dir.join(&out)).unwrap();
+        bytes.extend(std::fs::read(dir.join(&md)).unwrap());
+        got.push(rcsr::manifest::sha256_hex(&bytes));
+    }
+    assert_eq!(got, [PINNED_TABLE_T1, PINNED_TABLE_T2]);
+}
+
+const PINNED_TABLE_T1: &str = "48f3193890355a469c4b4ac30987aa0ef5a96496fbac2a882a27492ad491e8ae";
+const PINNED_TABLE_T2: &str = "7e24c7106fdbe3ce17387bacf90f674721ca8e813ab5c43332bc69840b764f68";

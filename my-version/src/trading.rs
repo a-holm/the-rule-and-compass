@@ -3594,11 +3594,11 @@ impl FinalistReport {
         ));
         if let Some(m) = &self.mask {
             s.push_str(&format!(
-                ",\"pnl_mask\":{{\"expr\":{},\"band\":{},\"dwell\":{},\"state_rule\":\"{}\"}}",
+                ",\"pnl_mask\":{{\"expr\":{},\"band\":{},\"dwell\":{},\"state_rule\":\"{rule}\",\"train_state_rule\":\"{rule}\"}}",
                 crate::devlog::text(&m.expr),
                 num(m.band),
                 m.dwell,
-                crate::regime_gate::STATE_RULE
+                rule = crate::regime_gate::STATE_RULE
             ));
         }
         s.push('}');

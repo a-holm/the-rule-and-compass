@@ -9,6 +9,7 @@ mod scratch;
 use rcsr::data::{self, SplitMode, SplitSpec, TradingSlice};
 use rcsr::devlog::Json;
 use rcsr::intervals::{Declared, EmbargoSource, IntervalSplit, Role};
+use rcsr::regime_gate::{self, Barrier, BarrierKind, GateSpec};
 use rcsr::trading::{FitnessBook, TradingRows, TradingSpec};
 use scratch::Scratch;
 use std::path::Path;
@@ -563,31 +564,77 @@ fn a_mask_splits_each_interval_segment_at_its_on_runs() {
     assert!((joint.regret(&pj) - joint.regret(&flat)).abs() <= 1e-15);
 }
 
-#[test]
-fn the_gate_restarts_at_each_training_interval_segment() {
-    // The gate is off for the last two rows of the first interval and on at the first row of the
-    // second; with dwell 5 a gate carried over the gap would still be off there.
+/// #1268: the training mask of `--pnl-mask g` with dwell 5 on hourly rows at `hours` of one series,
+/// `g` -1 at the hours `off` and +1 elsewhere, and the `rcsr-gate-state/1` states of the same rows: the
+/// kernel over every row of the file, not reading the test intervals of `d` (embargo 0).
+fn interval_training_states(hours: impl Iterator<Item = i64>, off: &[i64], d: Declared) -> (Vec<bool>, Vec<bool>) {
     let mut text = String::from("ts,g,r,y\n");
-    for h in (0..120).chain(300..420).chain(420..480) {
-        let g = if h == 118 || h == 119 { -1.0 } else { 1.0 };
+    for h in hours {
+        let g = if off.contains(&h) { -1.0 } else { 1.0 };
         text.push_str(&format!("{},{},{},{}\n", hour(h), g, 0.001 * frac(h as f64 * 0.37), 0.001 * frac(h as f64 * 0.53)));
     }
     let table = data::parse_table(&text).unwrap();
+    let barriers: Vec<Barrier> = d.test.iter().map(|&(s, e)| Barrier { start: s as f64, end: e as f64, kind: BarrierKind::Test }).collect();
+    let iv = IntervalSplit::new(d, 0, 0, EmbargoSource::Purge, None);
+    let gate = GateSpec::parse("g", 0.0, 5).unwrap();
+    let cols = data::TradingColumns { return_column: Some("r".to_string()), log_returns: true, train: true, mask: Some(gate.clone()), ..Default::default() };
+    let spec = SplitSpec { mode: SplitMode::TemporalIntervals, time_col: Some(0), intervals: Some(iv), trading: Some(cols), ..SplitSpec::default() };
+    let p = data::prepare_full(&table, &["g".to_string()], "y", &spec, &mut rcsr::rng::Mt::new(1)).unwrap();
+    let split = p.trading.expect("trading split");
+    let train = split.masks.expect("masks").train.expect("train mask");
+    let time = data::time_keys(&table, 0).to_f64();
+    let rows = &split.train.expect("training rows").rows;
+    let want: Vec<usize> = rows.time.iter().map(|t| time.iter().position(|u| u == t).expect("a file row")).collect();
+    let g = table.col(table.index_of("g").unwrap()).to_vec();
+    let states = regime_gate::prefix_states(&gate, &vec![0; time.len()], &time, &[g], &barriers, &want).unwrap();
+    (train, states)
+}
+
+#[test]
+fn training_states_follow_the_evaluation_rule_across_a_data_gap() {
+    // The gate is off for the last two rows of the first interval and on from the first row of the
+    // second. No barrier lies in the gap, so with dwell 5 the state holds off for 118, 119, 300,
+    // 301 and 302 and turns on at 303.
     let d = Declared {
         split_id: "r".to_string(),
         train: vec![(hour(0), hour(120)), (hour(300), hour(420))],
         validation: Vec::new(),
         test: vec![(hour(420), hour(480))],
     };
-    let iv = IntervalSplit::new(d, 0, 0, EmbargoSource::Purge, None);
-    let mut cols = data::TradingColumns { return_column: Some("r".to_string()), log_returns: true, train: true, ..Default::default() };
-    cols.mask = Some(rcsr::regime_gate::GateSpec::parse("g", 0.0, 5).unwrap());
-    let spec = SplitSpec { mode: SplitMode::TemporalIntervals, time_col: Some(0), intervals: Some(iv), trading: Some(cols), ..SplitSpec::default() };
-    let p = data::prepare_full(&table, &["g".to_string()], "y", &spec, &mut rcsr::rng::Mt::new(1)).unwrap();
-    let train = p.trading.expect("trading split").masks.expect("masks").train.expect("train mask");
+    let (train, want) = interval_training_states((0..120).chain(300..480), &[118, 119], d);
     assert_eq!(train.len(), 240);
+    assert_eq!(train, want, "training rows follow rcsr-gate-state/1");
     assert!(!train[119], "off after the flip at row 118 holds");
-    assert!(train[120], "the first row of the second segment takes the raw state");
+    assert!(!train[120] && !train[122], "the state carries over the data gap");
+    assert!(train[123], "the dwell ends at the fifth off row");
+    // A validation interval in the gap: its rows feed the state of the next training row too.
+    let d = Declared {
+        split_id: "v".to_string(),
+        train: vec![(hour(0), hour(120)), (hour(300), hour(420))],
+        validation: vec![(hour(120), hour(300))],
+        test: vec![(hour(420), hour(480))],
+    };
+    let (train, want) = interval_training_states(0..480, &[296, 297, 298, 299], d);
+    assert_eq!(train, want, "training rows follow rcsr-gate-state/1");
+    assert!(!train[120], "the off state entered on validation row 296 holds at hour 300");
+    assert!(train[121], "the dwell ends at hour 301");
+}
+
+#[test]
+fn the_gate_restarts_after_a_test_interval() {
+    // The test interval [120, 300) is a barrier of the training rows: the first training row
+    // after it restarts and takes the raw state, where a state carried over it would still be off.
+    let d = Declared {
+        split_id: "t".to_string(),
+        train: vec![(hour(0), hour(120)), (hour(300), hour(420))],
+        validation: Vec::new(),
+        test: vec![(hour(120), hour(300)), (hour(420), hour(480))],
+    };
+    let (train, want) = interval_training_states(0..480, &[118, 119], d);
+    assert_eq!(train.len(), 240);
+    assert_eq!(train, want, "training rows follow rcsr-gate-state/1");
+    assert!(!train[119], "off after the flip at row 118 holds");
+    assert!(train[120], "the first training row after the test interval takes the raw state");
 }
 
 #[test]
