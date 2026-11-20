@@ -3120,3 +3120,51 @@ mod members {
         }
     }
 }
+
+/// #1278: under a regime mask a row without a finite target (an unlabelled row of a strided label)
+/// neither starts nor ends an on-run, whatever its gate state. The walk-forward book is the masked
+/// book of the labelled rows alone (`regime_gate::masked_slice`), the book the search prices.
+#[test]
+fn masked_book_skips_unlabelled_rows() {
+    let frac = |v: f64| v - v.floor();
+    // Two symbols; the target is finite on every third stamp. The gate is the same for both: on in
+    // alternate 30-stamp blocks, off for one unlabelled stamp inside each on block.
+    let on_at = |i: usize| (i / 30) % 2 == 0 && i % 30 != 13;
+    let mut s = String::from("ts,sym,x,g,target\n");
+    let mut rows = Vec::new();
+    for i in 0..240usize {
+        for (k, sym) in ["A", "B"].iter().enumerate() {
+            let f = i as f64 + 0.37 * k as f64;
+            let x = frac(f * 0.618_033_988_749_894_9) - 0.3;
+            let y = 0.01 * (frac(f * 0.754_877_666_246_692_7) - 0.5);
+            let g = if on_at(i) { 1 } else { -1 };
+            let target = if i % 3 == 0 { y.to_string() } else { String::new() };
+            s.push_str(&format!("{i},{sym},{x},{g},{target}\n"));
+            if i >= 60 && i % 3 == 0 {
+                rows.push((i as f64, k as u64, x, y, on_at(i)));
+            }
+        }
+    }
+    let t = data::parse_table(&s).unwrap();
+    let mut sp = spec("x", vec![window("w", 0.0, 60.0, 60.0, 240.0)]);
+    sp.group = Some("sym".to_string());
+    sp.threshold_fixed = Some(0.0);
+    sp.periods_per_year = Some(8760.0);
+    let opts = walkforward::ProtocolOptions { mask: Some(rcsr::regime_gate::GateSpec::parse("g", 0.0, 1).unwrap()), ..walkforward::ProtocolOptions::default() };
+    let m = walkforward::run_table_with(&t, &sp, "test", &opts).unwrap().windows[0].metrics.clone();
+    let slice = rcsr::data::TradingSlice {
+        rows: rcsr::trading::TradingRows { time: rows.iter().map(|r| r.0).collect(), group: rows.iter().map(|r| r.1).collect(), funding: Vec::new() },
+        ret: rows.iter().map(|r| r.3).collect(),
+    };
+    let on: Vec<bool> = rows.iter().map(|r| r.4).collect();
+    let book = rcsr::regime_gate::masked_slice(&slice, &on);
+    let ts = rcsr::trading::TradingSpec { cost_bps: 10.0, threshold: 0.0, min_trades: 0, ..rcsr::trading::TradingSpec::default() };
+    let pred: Vec<f64> = rows.iter().map(|r| r.2).collect();
+    let want = rcsr::trading::evaluate(&pred, &book.ret, &book.rows, &ts).unwrap();
+    assert!(want.entries >= 4, "the labelled on rows form several runs: {}", want.entries);
+    assert_eq!((m.rows, m.trades, m.entries), (want.rows, want.trades, want.entries));
+    assert!((m.total_cost - want.total_cost).abs() <= 1e-15, "{} vs {}", m.total_cost, want.total_cost);
+    // One gate for both symbols: each priced stamp holds both rows.
+    let net = m.mean_return * m.periods as f64 * 2.0;
+    assert!((net - want.net_pnl).abs() <= 1e-12, "walkforward {net} vs masked book {}", want.net_pnl);
+}
