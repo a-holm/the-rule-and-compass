@@ -908,6 +908,11 @@ pub fn test_ids(e: &RegistryEntry) -> Vec<&'static str> {
             "tests/enrich.rs::flow_windows_are_gap_masked",
             "tests/enrich.rs::flow_windows_never_bridge_a_listing_boundary",
         ],
+        "cross" if crate::enrich::CROSS_GATE_NAMES.contains(&e.name.as_str()) => vec![
+            "tests/enrich.rs::market_gate_columns_match_hand_built_series",
+            "tests/enrich.rs::market_gate_columns_are_causal_under_future_edits",
+            "tests/enrich.rs::market_gate_columns_respect_the_member_floor",
+        ],
         "cross" => vec![
             "tests/enrich.rs::cross_family_is_exactly_the_registry_and_market_state_is_ex_self_pit",
             "tests/enrich.rs::a_partial_cross_section_is_nan_and_a_prefix_is_causal",

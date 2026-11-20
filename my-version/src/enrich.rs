@@ -362,6 +362,27 @@ pub const MARKET_STATE_NAMES: &[&str] = &[
     "cs_rank_r60",
 ];
 
+/// Market-level gate columns of the regime-gate menu (#1270). The three `btc_`
+/// names join one BTC series by exact timestamp; the three `mkt_` names use the
+/// member rule and the 20-member floor of `mkt_r96`. The daily ones read closed
+/// UTC days only.
+pub const CROSS_GATE_NAMES: &[&str] = &[
+    "btc_r168",
+    "mkt_r672",
+    "btc_trend_ma100_ratio",
+    "mkt_trend_ma100_ratio",
+    "btc_vol_ratio_168_2160",
+    "mkt_trend_hi90_dist",
+];
+
+fn is_gate_market(name: &str) -> bool {
+    matches!(name, "mkt_r672" | "mkt_trend_ma100_ratio" | "mkt_trend_hi90_dist")
+}
+
+fn is_gate_daily(name: &str) -> bool {
+    matches!(name, "btc_trend_ma100_ratio" | "mkt_trend_ma100_ratio" | "mkt_trend_hi90_dist")
+}
+
 /// The complete #273 cross-asset inventory in stable emission order.
 pub fn cross_names() -> Vec<String> {
     CROSS_BTC_NAMES
@@ -370,6 +391,7 @@ pub fn cross_names() -> Vec<String> {
         .chain(CROSS_MARKET_NAMES)
         .chain(CROSS_RANK_NAMES)
         .chain(MARKET_STATE_NAMES)
+        .chain(CROSS_GATE_NAMES)
         .map(|s| s.to_string())
         .collect()
 }
@@ -387,6 +409,7 @@ pub fn cross_source(name: &str) -> Option<&'static str> {
         "xs_rank_vol20" => "vol20",
         "xs_rank_amihud96" => "amihud96",
         "mkt_r96" | "rel_mkt96" => "r96",
+        "mkt_r672" => "r672",
         "mkt_vol96" => "vol96",
         "cs_rank_r60" => "r60",
         "btc_volume_share" => "volume",
@@ -416,6 +439,20 @@ fn cross_formula(name: &str) -> &'static str {
         "beta_eth_60" | "beta_eth_384" => "clip(cov(r_i,r_ETH,w)/var(r_ETH,w),-5,5)",
         "mkt_r16" | "mkt_ew_ret16" => "equal-weight mean of PIT member r16 at t",
         "mkt_r96" => "equal-weight mean of PIT member r96 at t",
+        "mkt_r672" => "equal-weight mean of PIT member r672 at t",
+        "btc_r168" => "ln(C_BTC,t/C_BTC,t-168) at the same timestamp",
+        "btc_trend_ma100_ratio" => {
+            "BTC trend_ma100_ratio (D/SMA100 - 1 on closed UTC daily bars) at the same timestamp"
+        }
+        "mkt_trend_ma100_ratio" => {
+            "I/SMA100(I) - 1 on the closed daily equal-weight index I; I_d = I_(d-1) exp(m_d), m_d the equal-weight mean of PIT member daily log returns, N>=20"
+        }
+        "btc_vol_ratio_168_2160" => {
+            "population sd of BTC one-bar log returns over 168 bars / the same over 2160 bars"
+        }
+        "mkt_trend_hi90_dist" => {
+            "I/max(I over the last 90 closed days) - 1 on the closed daily equal-weight index I"
+        }
         "mkt_vol96" => "equal-weight mean of PIT member vol96 at t",
         "breadth" | "mkt_breadth" => "share of PIT members with r16 > 0",
         "dispersion" | "mkt_dispersion" => "population sd of PIT member r16 at t",
@@ -447,6 +484,12 @@ fn cross_warmup(name: &str) -> usize {
         | "eth_vol96" | "mkt_r96" | "mkt_vol96" | "rel_mkt96" | "avg_corr"
         | "xs_rank_amihud96" => 96,
         "btc_r672" | "eth_r672" => 672,
+        "btc_r168" => 168,
+        "mkt_r672" => 672,
+        "btc_vol_ratio_168_2160" => 2160,
+        "btc_trend_ma100_ratio" => 99,
+        "mkt_trend_ma100_ratio" => 100,
+        "mkt_trend_hi90_dist" => 90,
         "beta_btc_60" | "beta_eth_60" => 59,
         "beta_btc_384" | "beta_eth_384" => 383,
         "xs_rank_r1" => 1,
@@ -738,7 +781,7 @@ pub fn default_registry() -> Vec<RegistryEntry> {
         push_unique(&mut out, RegistryEntry {
             name: name.clone(),
             family: "cross",
-            timeframe: "15m",
+            timeframe: if is_gate_daily(&name) { "1d" } else { "15m" },
             warmup,
             available: true,
             derived: false,
@@ -746,13 +789,22 @@ pub fn default_registry() -> Vec<RegistryEntry> {
             formula,
             source: match cross_source(&name) {
                 Some("volume") => "raw volume + all PIT members",
-                Some("r1") | Some("r16") | Some("r20") | Some("r96") | Some("vol20")
+                Some("r1") | Some("r16") | Some("r20") | Some("r96") | Some("r672") | Some("vol20")
                 | Some("vol96") | Some("r60") | Some("amihud96") => {
                     "all PIT members at the same timestamp"
                 }
+                _ if matches!(name.as_str(), "mkt_trend_ma100_ratio" | "mkt_trend_hi90_dist") => {
+                    "daily closes of all PIT members"
+                }
                 _ => "benchmark series by exact timestamp",
             },
-            pit: if CROSS_BTC_NAMES.contains(&name.as_str()) {
+            pit: if name == "btc_trend_ma100_ratio" {
+                crate::trend::PIT_RULE
+            } else if matches!(name.as_str(), "mkt_trend_ma100_ratio" | "mkt_trend_hi90_dist") {
+                "closed UTC daily bars only (the running day is never used); the index uses member_asof <= t at the last bar of each day, N>=20 members per day, a day below the floor or a missing day is NaN, a window holding it is NaN; no forward fill"
+            } else if matches!(name.as_str(), "btc_r168" | "btc_vol_ratio_168_2160") {
+                "same timestamp only; a missing benchmark row is NaN, never forward-filled"
+            } else if CROSS_BTC_NAMES.contains(&name.as_str()) {
                 "same timestamp only; a missing benchmark row is NaN, never forward-filled"
             } else if CROSS_ETH_NAMES.contains(&name.as_str()) {
                 "same timestamp only; a missing ETH row is NaN, never forward-filled"
@@ -1606,6 +1658,9 @@ pub fn lookback_seconds(name: &str, bar_seconds: i64) -> Option<i64> {
         return Some((mtf_lookback_bars(leaf) + 2) * mtf_seconds(tf));
     }
     if let Some(l) = crate::trend::lookback_seconds(name) {
+        return Some(l);
+    }
+    if let Some(l) = crate::trend::gate_lookback_seconds(name) {
         return Some(l);
     }
     if let Some((_, kind)) = crate::labels::parse_column(name) {
@@ -4621,19 +4676,24 @@ struct Cross {
     r20: BTreeMap<i64, f64>,
     r96: BTreeMap<i64, f64>,
     r672: BTreeMap<i64, f64>,
+    r168: BTreeMap<i64, f64>,
     vol20: BTreeMap<i64, f64>,
     vol96: BTreeMap<i64, f64>,
     volume: BTreeMap<i64, f64>,
+    /// `btc_vol_ratio_168_2160` and `btc_trend_ma100_ratio`, filled only when requested.
+    vol_ratio: BTreeMap<i64, f64>,
+    trend_ma100: BTreeMap<i64, f64>,
 }
 
 impl Cross {
-    fn from_series(s: &Series) -> Self {
+    fn from_series(s: &Series, gates: bool) -> Result<Self, String> {
         let b = Base::new(s);
         let r1 = ret_k(s, 1);
         let r16 = ret_k(s, 16);
         let r20 = ret_k(s, 20);
         let r96 = ret_k(s, 96);
         let r672 = ret_k(s, 672);
+        let r168 = ret_k(s, 168);
         let vol20 = vol_w(s, &b, 20);
         let vol96 = vol_w(s, &b, 96);
         let map = |v: &[f64]| {
@@ -4643,17 +4703,37 @@ impl Cross {
             }
             m
         };
-        Cross {
+        let (vol_ratio, trend_ma100) = if gates {
+            let (v168, v2160) = (vol_w(s, &b, 168), vol_w(s, &b, 2160));
+            let ratio: Vec<f64> = (0..s.len())
+                .map(|i| {
+                    if v168[i].is_finite() && v2160[i].is_finite() && v2160[i] > 0.0 {
+                        v168[i] / v2160[i]
+                    } else {
+                        f64::NAN
+                    }
+                })
+                .collect();
+            let name = "trend_ma100_ratio".to_string();
+            let mut trend = crate::trend::compute(&s.bars(), s.step, std::slice::from_ref(&name))?;
+            (map(&ratio), map(&trend.remove(&name).unwrap_or_default()))
+        } else {
+            (BTreeMap::new(), BTreeMap::new())
+        };
+        Ok(Cross {
             symbol: s.symbol.clone(),
             r1: map(&r1),
             r16: map(&r16),
             r20: map(&r20),
             r96: map(&r96),
             r672: map(&r672),
+            r168: map(&r168),
             vol20: map(&vol20),
             vol96: map(&vol96),
             volume: map(&s.volume),
-        }
+            vol_ratio,
+            trend_ma100,
+        })
     }
     fn at(map: &BTreeMap<i64, f64>, t: i64) -> f64 {
         map.get(&t).copied().unwrap_or(f64::NAN)
@@ -4730,9 +4810,10 @@ fn load_benchmark(
     step: i64,
     symbol: &str,
     external: Option<&str>,
+    gates: bool,
 ) -> Result<Cross, String> {
     if let Some(seg) = segs.iter().find(|s| s.symbol == symbol) {
-        return Ok(Cross::from_series(&load_series(store, seg, cols, step)?));
+        return Cross::from_series(&load_series(store, seg, cols, step)?, gates);
     }
     let Some(path) = external else {
         return Ok(Cross::default());
@@ -4771,7 +4852,7 @@ fn load_benchmark(
         .find(|s| s.symbol == symbol)
         .or_else(|| csegs.first())
         .ok_or_else(|| format!("{}: benchmark store has no rows", path))?;
-    Ok(Cross::from_series(&load_series(&cs, cseg, &ccols, step)?))
+    Cross::from_series(&load_series(&cs, cseg, &ccols, step)?, gates)
 }
 
 // ---------------------------------------------------------------------------
@@ -6570,6 +6651,7 @@ fn benchmark_return(s: &Series, b: &Base, cross: &Cross, k: usize, relative: boo
         20 => &cross.r20,
         96 => &cross.r96,
         672 => &cross.r672,
+        168 => &cross.r168,
         _ => return vec![f64::NAN; s.len()],
     };
     (0..s.len())
@@ -6676,6 +6758,13 @@ fn compute_own(
                 benchmark_return(s, b, ctx.cross, 96, name == "rel_btc_r96")
             }
             "btc_r672" => benchmark_return(s, b, ctx.cross, 672, false),
+            "btc_r168" => benchmark_return(s, b, ctx.cross, 168, false),
+            "btc_vol_ratio_168_2160" => {
+                (0..n).map(|i| Cross::at(&ctx.cross.vol_ratio, s.times[i])).collect()
+            }
+            "btc_trend_ma100_ratio" => {
+                (0..n).map(|i| Cross::at(&ctx.cross.trend_ma100, s.times[i])).collect()
+            }
             "btc_vol20" => benchmark_vol(s, ctx.cross, 20),
             "btc_vol96" => benchmark_vol(s, ctx.cross, 96),
             "beta_btc_60" | "cross_beta20" => {
@@ -6971,7 +7060,9 @@ fn source_values(
 /// True when the market-state pass owns any requested column.
 fn wants_market_state(requested: &[String]) -> bool {
     requested.iter().any(|n| {
-        CROSS_MARKET_NAMES.contains(&n.as_str()) || MARKET_STATE_NAMES.contains(&n.as_str())
+        CROSS_MARKET_NAMES.contains(&n.as_str())
+            || MARKET_STATE_NAMES.contains(&n.as_str())
+            || is_gate_market(n)
     })
 }
 
@@ -7379,7 +7470,113 @@ fn market_state_pass(
         write_cross_output(temp, requested, &["btc_volume_share"], &share)?;
     }
 
+    // Gate columns (#1270): CPU only, never a device kernel.
+    if wants("mkt_r672") {
+        let src = source_values(temp, "r672", rows)?;
+        write_cross_output(temp, requested, &["mkt_r672"], &equal_weight_mean(panel, &src))?;
+    }
+    if wants("mkt_trend_ma100_ratio") || wants("mkt_trend_hi90_dist") {
+        let (ratio, high) = market_daily_gate(panel, segs, store, cols)?;
+        write_cross_output(temp, requested, &["mkt_trend_ma100_ratio"], &ratio)?;
+        write_cross_output(temp, requested, &["mkt_trend_hi90_dist"], &high)?;
+    }
+
     Ok(done)
+}
+
+/// Equal-weight mean of the finite PIT member values per timestamp, `NaN` below
+/// [`MIN_CROSS_MEMBERS`] members and on non-member rows.
+fn equal_weight_mean(panel: &CrossPanel, src: &[f64]) -> Vec<f64> {
+    let mut mkt = vec![f64::NAN; panel.times.len()];
+    for group in panel.groups() {
+        let mut n = 0usize;
+        let mut sum = 0.0;
+        for &r in group {
+            let r = r as usize;
+            if panel.member[r] && src[r].is_finite() {
+                n += 1;
+                sum += src[r];
+            }
+        }
+        if n < MIN_CROSS_MEMBERS {
+            continue;
+        }
+        let mean = sum / n as f64;
+        for &r in group {
+            if panel.member[r as usize] {
+                mkt[r as usize] = mean;
+            }
+        }
+    }
+    mkt
+}
+
+/// `mkt_trend_ma100_ratio` and `mkt_trend_hi90_dist` per row.
+///
+/// A symbol's daily bar is its last base bar of the UTC day. Its daily log
+/// return needs the bar of the day before; the symbol counts on a day when it
+/// is a PIT member at that last bar. A day with fewer than
+/// [`MIN_CROSS_MEMBERS`] returns has no level, and the index restarts at 1
+/// after it. A base row at time `t` reads the day before the day of `t`.
+fn market_daily_gate(
+    panel: &CrossPanel,
+    segs: &[Segment],
+    store: &FileStore,
+    cols: &Cols,
+) -> Result<(Vec<f64>, Vec<f64>), String> {
+    const DAY: i64 = crate::trend::DAY;
+    let rows = panel.times.len();
+    let mut out = (vec![f64::NAN; rows], vec![f64::NAN; rows]);
+    let Some(first) = panel.times.iter().min().map(|t| t.div_euclid(DAY)) else {
+        return Ok(out);
+    };
+    let last = panel.times.iter().max().map(|t| t.div_euclid(DAY)).unwrap_or(first);
+    let days = (last - first + 1) as usize;
+    let mut sum = vec![0.0f64; days];
+    let mut count = vec![0usize; days];
+    let mut order: Vec<&Segment> = segs.iter().collect();
+    order.sort_by_key(|s| s.key);
+    for seg in order {
+        let close = segment_column(store, seg, cols.close)?;
+        let mut prev: Option<(i64, f64)> = None;
+        let mut i = 0usize;
+        while i < seg.len {
+            let day = panel.times[seg.start + i].div_euclid(DAY);
+            let mut j = i;
+            while j + 1 < seg.len && panel.times[seg.start + j + 1].div_euclid(DAY) == day {
+                j += 1;
+            }
+            let c = close[j];
+            if let Some((pd, pc)) = prev {
+                if pd + 1 == day && panel.member[seg.start + j] && c > 0.0 && pc > 0.0 && c.is_finite() && pc.is_finite() {
+                    let d = (day - first) as usize;
+                    sum[d] += (c / pc).ln();
+                    count[d] += 1;
+                }
+            }
+            prev = Some((day, c));
+            i = j + 1;
+        }
+    }
+    let mut index = vec![f64::NAN; days];
+    for d in 0..days {
+        if count[d] >= MIN_CROSS_MEMBERS {
+            let before = if d > 0 && index[d - 1].is_finite() { index[d - 1] } else { 1.0 };
+            index[d] = before * (sum[d] / count[d] as f64).exp();
+        }
+    }
+    let (ratio, high) = crate::trend::index_gate_leaves(&index);
+    for r in 0..rows {
+        if !panel.member[r] {
+            continue;
+        }
+        let d = panel.times[r].div_euclid(DAY) - 1 - first;
+        if d >= 0 && (d as usize) < days {
+            out.0[r] = ratio[d as usize];
+            out.1[r] = high[d as usize];
+        }
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -7742,7 +7939,7 @@ fn enrich_inner(
     if requested.is_empty() && opts.labels.is_empty() {
         return Err("enrich needs --features and/or --label".to_string());
     }
-    if requested.iter().any(|n| crate::trend::is_trend(n)) {
+    if requested.iter().any(|n| crate::trend::is_trend(n) || is_gate_daily(n)) {
         crate::trend::check_bar(step)?;
     }
     // The target spec names `vol<W>` as the scale column, so the store carries it.
@@ -7793,7 +7990,8 @@ fn enrich_inner(
             // Computed in the cross-sectional rank pass, which needs every
             // symbol and point-in-time membership.
         } else if (CROSS_MARKET_NAMES.contains(&n.as_str())
-            || MARKET_STATE_NAMES.contains(&n.as_str()))
+            || MARKET_STATE_NAMES.contains(&n.as_str())
+            || is_gate_market(n))
             && !py15m_names().contains(n)
         {
             // Computed in the whole-panel market-state pass. The five py15m
@@ -7904,6 +8102,9 @@ fn enrich_inner(
         step,
         &opts.cross_symbol,
         opts.cross_data.as_deref(),
+        requested
+            .iter()
+            .any(|n| matches!(n.as_str(), "btc_vol_ratio_168_2160" | "btc_trend_ma100_ratio")),
     )?;
     let needs_eth = requested
         .iter()
@@ -7916,6 +8117,7 @@ fn enrich_inner(
             step,
             &opts.eth_symbol,
             opts.eth_data.as_deref(),
+            false,
         )?
     } else {
         Cross::default()
@@ -8791,7 +8993,7 @@ fn enrich_inner(
     // Point-in-time cross-section pass: market state, then ranks. The two
     // passes share one `(time, symbol, row)` order and one membership mask.
     let t_xs = Instant::now();
-    if !cross_sources.is_empty() {
+    if !cross_sources.is_empty() || wants_market_state(&requested) {
         let panel = CrossPanel::new(
             &store,
             &segs,
@@ -9736,6 +9938,10 @@ FEATURE GROUPS (the default financial feature set; see `rcsr schema`):
              rel_mkt16 rel_mkt96; xs_rank_r1/r16/r20/vol20/amihud96 and the
              legacy mkt_ew_* / cs_rank_r60 aliases. Ranks are [-1,1] and need
              >=20 point-in-time members; a smaller cross-section is NaN.
+             Gate-menu columns (#1270, CPU only): btc_r168 btc_vol_ratio_168_2160
+             btc_trend_ma100_ratio mkt_r672 mkt_trend_ma100_ratio
+             mkt_trend_hi90_dist; the daily ones read closed UTC days, need a base
+             bar that divides one day, and carry registered lookbacks.
   py15m      the 35 columns added by the Python enrich_panel_15m.py step
   mtf        the 36 multi-timeframe columns: mtf_<1h|4h|1d>_<leaf> for the
              twelve leaves ret1 ret4 ret24 ma_ratio vol atr_pct rsi close_pos

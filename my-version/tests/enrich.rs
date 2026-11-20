@@ -1052,7 +1052,8 @@ fn default_financial_registry_is_complete_and_explicit() {
             .unwrap_or_else(|| panic!("{name} missing from registry"));
         assert!(e.available, "{name} must be available");
         assert_eq!(e.family, "cross", "{name} family");
-        assert_eq!(e.timeframe, "15m");
+        let daily = matches!(name.as_str(), "btc_trend_ma100_ratio" | "mkt_trend_ma100_ratio" | "mkt_trend_hi90_dist");
+        assert_eq!(e.timeframe, if daily { "1d" } else { "15m" });
         assert!(!e.formula.is_empty());
         assert!(enrich::expand(&name).is_ok(), "{name} must expand");
     }
@@ -1947,6 +1948,13 @@ fn cross_family_is_exactly_the_registry_and_market_state_is_ex_self_pit() {
     assert_eq!(&names[start..], &expected[..], "cross emission order");
     assert!(rcsr::schema::json().contains("\"family\":\"cross\""));
     for name in &expected {
+        // The fixture spans 800 bars of 15 minutes: too short for these four gate columns.
+        if matches!(
+            name.as_str(),
+            "btc_trend_ma100_ratio" | "mkt_trend_ma100_ratio" | "mkt_trend_hi90_dist" | "btc_vol_ratio_168_2160"
+        ) {
+            continue;
+        }
         let vals = column(&out, name);
         assert!(
             vals.iter().any(|v| v.is_finite()),
@@ -5456,4 +5464,332 @@ fn threads_zero_is_refused_with_exit_3() {
         .unwrap();
     assert_eq!(r.status.code(), Some(3), "{}", String::from_utf8_lossy(&r.stderr));
     assert!(String::from_utf8_lossy(&r.stderr).contains("--threads needs a positive integer"));
+}
+
+// ---------------------------------------------------------------------------
+// Gate-menu columns (#1270)
+// ---------------------------------------------------------------------------
+
+const GATE_NAMES: [&str; 6] = [
+    "btc_r168",
+    "mkt_r672",
+    "btc_trend_ma100_ratio",
+    "mkt_trend_ma100_ratio",
+    "btc_vol_ratio_168_2160",
+    "mkt_trend_hi90_dist",
+];
+const GATE_HOURS: usize = 3200;
+const GATE_SYMBOLS: usize = 24;
+
+fn gate_symbol(k: usize) -> String {
+    if k == 0 {
+        "BTCUSDT".to_string()
+    } else {
+        format!("ALT{:02}USDT", k)
+    }
+}
+
+/// Symbols in the lexical order the cross-section sums them in.
+fn gate_lexical() -> Vec<usize> {
+    let mut ks: Vec<usize> = (0..GATE_SYMBOLS).collect();
+    ks.sort_by_key(|k| gate_symbol(*k));
+    ks
+}
+
+/// Market-wide slow wave plus per-symbol drift and wave, so the equal-weight
+/// index rises and falls and its 90-day high distance is not identically zero.
+fn gate_close(k: usize, i: usize) -> f64 {
+    let t = i as f64;
+    100.0 * (0.00008 * (k as f64 - 11.5) * t + 0.15 * (t * 0.004).sin() + 0.03 * (t * 0.23 + k as f64 * 0.41).sin()).exp()
+}
+
+struct GateFixture {
+    path: String,
+    /// `index[k][i]`: store row of symbol `k` at hour `i`, `None` when the bar is absent.
+    index: Vec<Vec<Option<usize>>>,
+    times: Vec<i64>,
+}
+
+/// Hourly 24-symbol panel from 1970-01-01. `skip(k, i)` removes a bar; `edit(k, i)` scales a bar.
+fn gate_fixture(
+    dir: &std::path::Path,
+    tag: &str,
+    skip: impl Fn(usize, usize) -> bool,
+    edit: impl Fn(usize, usize) -> f64,
+) -> GateFixture {
+    let mut rows = Vec::new();
+    let mut index = vec![vec![None; GATE_HOURS]; GATE_SYMBOLS];
+    let mut times = Vec::new();
+    for k in 0..GATE_SYMBOLS {
+        for i in 0..GATE_HOURS {
+            if skip(k, i) {
+                continue;
+            }
+            let p = gate_close(k, i) * edit(k, i);
+            index[k][i] = Some(rows.len());
+            times.push(i as i64 * 3600);
+            rows.push((i as i64 * 3600, gate_symbol(k), p * 0.999, p * 1.002, p * 0.998, p, 1000.0 + k as f64, 0.0));
+        }
+    }
+    let path = dir.join(format!("{tag}.rcsb")).to_string_lossy().into_owned();
+    write_panel_store(&path, &rows, 4096);
+    GateFixture { path, index, times }
+}
+
+fn gate_build(f: &GateFixture, dir: &std::path::Path, tag: &str) -> String {
+    let out = dir.join(format!("{tag}-out.rcsb")).to_string_lossy().into_owned();
+    let mut o = opts(&f.path, &out, &GATE_NAMES.join(","));
+    o.gpu = GpuMode::Off;
+    enrich::build(&o).unwrap();
+    out
+}
+
+/// The equal-weight daily index of the members by hand. `closes[j][d]` is the
+/// close of the last bar of day `d` of the `j`-th symbol in lexical order.
+/// Returns `(mkt_trend_ma100_ratio, mkt_trend_hi90_dist)` per closed day.
+fn gate_hand_daily(closes: &[Vec<Option<f64>>]) -> (Vec<f64>, Vec<f64>) {
+    let days = closes[0].len();
+    let mut idx = vec![f64::NAN; days];
+    for d in 1..days {
+        let mut sum = 0.0;
+        let mut n = 0usize;
+        for c in closes {
+            if let (Some(now), Some(prev)) = (c[d], c[d - 1]) {
+                sum += (now / prev).ln();
+                n += 1;
+            }
+        }
+        if n >= 20 {
+            let prev = if idx[d - 1].is_finite() { idx[d - 1] } else { 1.0 };
+            idx[d] = prev * (sum / n as f64).exp();
+        }
+    }
+    let mut ratio = vec![f64::NAN; days];
+    let mut hi = vec![f64::NAN; days];
+    for d in 0..days {
+        if d >= 99 && idx[d - 99..=d].iter().all(|v| v.is_finite()) {
+            let mean = idx[d - 99..=d].iter().sum::<f64>() / 100.0;
+            ratio[d] = idx[d] / mean - 1.0;
+        }
+        if d >= 89 && idx[d - 89..=d].iter().all(|v| v.is_finite()) {
+            let max = idx[d - 89..=d].iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            hi[d] = idx[d] / max - 1.0;
+        }
+    }
+    (ratio, hi)
+}
+
+fn gate_day_closes(f: &GateFixture) -> Vec<Vec<Option<f64>>> {
+    let days = GATE_HOURS.div_ceil(24);
+    gate_lexical()
+        .iter()
+        .map(|&k| {
+            (0..days)
+                .map(|d| {
+                    let last = ((d + 1) * 24).min(GATE_HOURS);
+                    (d * 24..last)
+                        .rev()
+                        .find(|i| f.index[k][*i].is_some())
+                        .map(|i| gate_close(k, i))
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn gate_same(want: f64, got: f64, tol: f64, what: &str) {
+    if want.is_nan() || got.is_nan() {
+        assert!(want.is_nan() && got.is_nan(), "{what}: expected {want}, got {got}");
+    } else if tol == 0.0 {
+        assert_eq!(want.to_bits(), got.to_bits(), "{what}: expected {want}, got {got}");
+    } else {
+        closeish(want, got, tol, what);
+    }
+}
+
+#[test]
+fn market_gate_columns_match_hand_built_series() {
+    let (_scratch, dir) = tmp_dir("gate-hand");
+    let f = gate_fixture(&dir, "in", |_, _| false, |_, _| 1.0);
+    let out = gate_build(&f, &dir, "hand");
+    let lex = gate_lexical();
+    let close = gate_close;
+    let btc = |i: usize| close(0, i);
+    let ret1 = |i: usize| (btc(i) / btc(i - 1)).ln();
+    let sd = |i: usize, w: usize| {
+        let v: Vec<f64> = (i + 1 - w..=i).map(ret1).collect();
+        let m = v.iter().sum::<f64>() / w as f64;
+        (v.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / w as f64).sqrt()
+    };
+    let (ratio, hi) = gate_hand_daily(&gate_day_closes(&f));
+    // The first closed day with a trend value is day 99 of BTC.
+    let btc_days: Vec<f64> = (0..GATE_HOURS.div_ceil(24))
+        .map(|d| btc(((d + 1) * 24).min(GATE_HOURS) - 1))
+        .collect();
+    let btc_trend = |d: usize| {
+        if d < 99 {
+            f64::NAN
+        } else {
+            btc_days[d] / (btc_days[d - 99..=d].iter().sum::<f64>() / 100.0) - 1.0
+        }
+    };
+    let cols: Vec<Vec<f64>> = GATE_NAMES.iter().map(|n| column(&out, n)).collect();
+    let mut finite = [0usize; 6];
+    for k in 0..GATE_SYMBOLS {
+        for i in 0..GATE_HOURS {
+            let r = f.index[k][i].unwrap();
+            let day = i / 24;
+            let closed = |v: &[f64]| if day == 0 { f64::NAN } else { v[day - 1] };
+            let want = [
+                if i >= 168 { (btc(i) / btc(i - 168)).ln() } else { f64::NAN },
+                if i >= 672 {
+                    let mut s = 0.0;
+                    for &j in &lex {
+                        s += (close(j, i) / close(j, i - 672)).ln();
+                    }
+                    s / GATE_SYMBOLS as f64
+                } else {
+                    f64::NAN
+                },
+                if day == 0 { f64::NAN } else { btc_trend(day - 1) },
+                closed(&ratio),
+                if i >= 2160 { sd(i, 168) / sd(i, 2160) } else { f64::NAN },
+                closed(&hi),
+            ];
+            for (c, name) in GATE_NAMES.iter().enumerate() {
+                let tol = match c {
+                    0 | 1 => 0.0,
+                    _ => 1e-12,
+                };
+                gate_same(want[c], cols[c][r], tol, &format!("{name} k={k} i={i}"));
+                finite[c] += cols[c][r].is_finite() as usize;
+            }
+        }
+    }
+    for (c, name) in GATE_NAMES.iter().enumerate() {
+        assert!(finite[c] > GATE_SYMBOLS * 100, "{name} is nearly all NaN: {}", finite[c]);
+    }
+    let hi = column(&out, "mkt_trend_hi90_dist");
+    assert!(hi.iter().filter(|v| **v < -0.01).count() > GATE_SYMBOLS * 100, "hi90 must leave the running high");
+}
+
+#[test]
+fn market_gate_columns_are_causal_under_future_edits() {
+    let (_scratch, dir) = tmp_dir("gate-causal");
+    let a_fix = gate_fixture(&dir, "a", |_, _| false, |_, _| 1.0);
+    let t = 110 * 86_400 + 12 * 3600;
+    let b_fix = gate_fixture(
+        &dir,
+        "b",
+        |_, _| false,
+        |k, i| if i as i64 * 3600 > t { 1.0 + 0.04 * (1 + k % 5) as f64 } else { 1.0 },
+    );
+    assert_eq!(a_fix.times, b_fix.times);
+    let a_out = gate_build(&a_fix, &dir, "a");
+    let b_out = gate_build(&b_fix, &dir, "b");
+    for name in GATE_NAMES {
+        let a = column(&a_out, name);
+        let b = column(&b_out, name);
+        assert!(changed_before(&a_fix.times, &a, &b, t + 1).is_empty(), "{name} reads a bar after t");
+        assert!(
+            (0..a.len()).any(|r| a_fix.times[r] > t && a[r].is_finite() && a[r].to_bits() != b[r].to_bits()),
+            "{name}: the edit after t moved nothing, the check is vacuous"
+        );
+    }
+    // A daily column moved one day earlier reads the running day: the edit is caught.
+    for name in ["btc_trend_ma100_ratio", "mkt_trend_ma100_ratio", "mkt_trend_hi90_dist"] {
+        let a = shifted_one_day(&column(&a_out, name));
+        let b = shifted_one_day(&column(&b_out, name));
+        assert!(
+            !changed_before(&a_fix.times, &a, &b, t + 1).is_empty(),
+            "{name}: a one-day future shift must move a value at or before t"
+        );
+    }
+}
+
+#[test]
+fn market_gate_columns_respect_the_member_floor() {
+    let (_scratch, dir) = tmp_dir("gate-floor");
+    // Symbols 1..=5 have no bar on day 30: that day has 19 members, and so has
+    // day 31 because the five lack the day-30 close.
+    let hole = |k: usize, i: usize| (1..=5).contains(&k) && i / 24 == 30;
+    let gap = gate_fixture(&dir, "gap", hole, |_, _| 1.0);
+    let ctl = gate_fixture(&dir, "ctl", |_, _| false, |_, _| 1.0);
+    let gap_out = gate_build(&gap, &dir, "gap");
+    let ctl_out = gate_build(&ctl, &dir, "ctl");
+    let row = |f: &GateFixture, i: usize| f.index[0][i].unwrap();
+    let col = |out: &str, name: &str, f: &GateFixture, i: usize| column(out, name)[row(f, i)];
+
+    // mkt_r672: the 19 full symbols are the only members at day 30, and the
+    // five lose r672 until their window clears the hole.
+    let m_gap = column(&gap_out, "mkt_r672");
+    let m_ctl = column(&ctl_out, "mkt_r672");
+    for i in 0..GATE_HOURS {
+        let r = row(&gap, i);
+        let inside = (720..1416).contains(&i);
+        if inside {
+            assert!(m_gap[r].is_nan(), "mkt_r672 must be NaN at hour {i}");
+            assert!(m_ctl[r].is_finite(), "control mkt_r672 at hour {i}");
+        } else {
+            assert_eq!(m_gap[r].to_bits(), m_ctl[r].to_bits(), "mkt_r672 outside the hole at hour {i}");
+        }
+    }
+
+    // The daily columns: every window that holds day 30 or 31 is NaN, later windows are finite.
+    let (ratio, hi) = gate_hand_daily(&gate_day_closes(&gap));
+    for (name, hand) in [("mkt_trend_ma100_ratio", &ratio), ("mkt_trend_hi90_dist", &hi)] {
+        let a = column(&gap_out, name);
+        for i in 24..GATE_HOURS {
+            let want = hand[i / 24 - 1];
+            gate_same(want, a[row(&gap, i)], 1e-12, &format!("{name} hour {i}"));
+        }
+    }
+    // d = D - 1: day 105 reads d = 104 (window 5..104 holds day 30), day 131 reads d = 130.
+    for i in [105 * 24, 131 * 24 + 5] {
+        assert!(col(&ctl_out, "mkt_trend_ma100_ratio", &ctl, i).is_finite(), "control ratio at hour {i}");
+        assert!(col(&gap_out, "mkt_trend_ma100_ratio", &gap, i).is_nan(), "ratio must be NaN at hour {i}");
+    }
+    assert!(col(&gap_out, "mkt_trend_ma100_ratio", &gap, 132 * 24 + 5).is_finite(), "window 32..131 is clear");
+    for i in [95 * 24, 120 * 24 + 5] {
+        assert!(col(&ctl_out, "mkt_trend_hi90_dist", &ctl, i).is_finite(), "control hi90 at hour {i}");
+        assert!(col(&gap_out, "mkt_trend_hi90_dist", &gap, i).is_nan(), "hi90 must be NaN at hour {i}");
+    }
+    assert!(col(&gap_out, "mkt_trend_hi90_dist", &gap, 122 * 24 + 5).is_finite(), "window 32..121 is clear");
+    // The BTC columns do not use the cross-section.
+    for name in ["btc_r168", "btc_trend_ma100_ratio", "btc_vol_ratio_168_2160"] {
+        assert_eq!(col(&gap_out, name, &gap, 3000).to_bits(), col(&ctl_out, name, &ctl, 3000).to_bits(), "{name}");
+    }
+}
+
+#[test]
+fn cross_inventory_and_schema_list_the_six_gate_columns() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let text = std::fs::read_to_string(root.join("../docs/cross-asset-inventory.json")).unwrap();
+    assert!(text.contains("\"count\": 51,"), "inventory count");
+    assert_eq!(text.matches("\"name\":").count(), 51);
+    assert_eq!(enrich::cross_names().len(), 51);
+    let schema = rcsr::schema::json();
+    for name in GATE_NAMES {
+        assert!(text.contains(&format!("\"name\": \"{name}\"")), "inventory misses {name}");
+        assert!(schema.contains(&format!("\"name\":\"{name}\"")), "schema misses {name}");
+        let e = enrich::default_registry().into_iter().find(|e| e.name == name).unwrap_or_else(|| panic!("{name} is not registered"));
+        assert_eq!(e.family, "cross");
+        assert_eq!(rcsr::registry::lookup(name).unwrap().warmup, e.warmup);
+        assert!(e.available && e.warmup > 0 && e.formula != "see docs/ohlcv.md", "{name}");
+        for id in rcsr::registry::test_ids(&e) {
+            let (file, func) = id.split_once("::").unwrap();
+            let src = std::fs::read_to_string(root.join(file)).unwrap();
+            assert!(src.contains(&format!("fn {func}(")), "{name} cites missing test {id}");
+        }
+    }
+    assert_eq!(
+        enrich::lookback_seconds("btc_r168", 3600),
+        Some(168 * 3600)
+    );
+    assert_eq!(enrich::lookback_seconds("mkt_r672", 3600), Some(672 * 3600));
+    assert_eq!(enrich::lookback_seconds("btc_vol_ratio_168_2160", 3600), Some(2160 * 3600));
+    let ma = rcsr::trend::lookback_seconds("trend_ma100_ratio");
+    assert_eq!(enrich::lookback_seconds("btc_trend_ma100_ratio", 3600), ma);
+    assert_eq!(enrich::lookback_seconds("mkt_trend_ma100_ratio", 3600), Some(102 * 86_400));
+    assert_eq!(enrich::lookback_seconds("mkt_trend_hi90_dist", 3600), Some(92 * 86_400));
 }

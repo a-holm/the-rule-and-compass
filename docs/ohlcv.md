@@ -532,6 +532,28 @@ Whole-panel market state, breadth and dispersion:
 | `mkt_ew_ret1`, `mkt_ew_ret16`, `mkt_breadth`, `mkt_dispersion` | legacy #269 aliases | one implementation, no duplicate formula |
 | `btc_volume_share` | `BTC volume / total PIT member volume` | needs the raw `volume` column |
 
+Gate-menu columns (#1270), the inputs of the pre-registered regime gates
+(`docs/compose.md`). They are in `--features cross` and have no device kernel:
+`--gpu auto` prices them on the CPU.
+
+| column | definition | lookback (`rcsr-lookback/1`) |
+|---|---|---|
+| `btc_r168` | `ln(C_BTC,t / C_BTC,t-168)` at the same timestamp | 168 bars |
+| `mkt_r672` | equal-weight mean of PIT member `r672` at `t`, same member rule as `mkt_r96` | 672 bars |
+| `btc_trend_ma100_ratio` | the BTC series' `trend_ma100_ratio` at the same timestamp | that of `trend_ma100_ratio`, 101 days |
+| `mkt_trend_ma100_ratio` | `I / SMA100(I) - 1` on the closed daily equal-weight index `I` | 102 days |
+| `btc_vol_ratio_168_2160` | population sd of BTC one-bar log returns over 168 bars divided by the same over 2160 bars | 2160 bars |
+| `mkt_trend_hi90_dist` | `I / max(I over the last 90 closed days) - 1` | 92 days |
+
+The daily index is `I_d = I_(d-1) exp(m_d)`, `m_d` the equal-weight mean of the
+PIT members' log returns of closed UTC day `d` (last base bar of the day over the
+last base bar of the day before). A symbol counts on a day when it is a PIT
+member at its last bar of that day. A day with fewer than 20 returns, or a day
+with no bar, has no level; the index restarts at 1 after it, and every window
+that holds such a day is `NaN`. A base row reads the closed day before its own
+day, never the running one. The warm-up of the three daily columns is counted in
+days. `--embargo auto` over a gate column gives the lookback in the table.
+
 Every cross-sectional column requires at least **20** valid point-in-time
 members at the timestamp. With `N < 20` the whole timestamp is `NaN`; a
 member with a non-finite source is excluded from the count but does not make a
