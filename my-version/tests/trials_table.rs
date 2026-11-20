@@ -1725,5 +1725,5 @@ fn table_output_without_baseline_wf_is_unchanged() {
         assert_eq!(code(&o), 0, "{}", stderr(&o));
         bytes.extend_from_slice(&o.stdout);
     }
-    assert_eq!(rcsr::manifest::sha256_hex(&bytes), "PIN");
+    assert_eq!(rcsr::manifest::sha256_hex(&bytes), "6e9ce731d4f5b40197e0548e8aced76bc1997ff76079b5d15d86e04fea28eca9");
 }
