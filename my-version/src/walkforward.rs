@@ -2873,12 +2873,15 @@ impl Accum {
 /// (#1214), the same in every window and command. Every on-run of the labelled
 /// rows becomes its own group (a flat start and a paid exit, unique across
 /// windows, so no position carries over a seam) and the target of every off row
-/// becomes NaN, which drops the row from the book.
+/// becomes NaN, which drops the row from the book. #1278: the groups are the
+/// search's (`regime_gate::masked_groups` over the rows with a finite target),
+/// so an unlabelled row neither starts nor ends a run.
 fn apply_mask(d: &mut WindowData, k: usize, window_index: usize) {
     let n = d.test_rows.len();
-    let on: Vec<bool> = (0..n).map(|i| d.test_rows[i].target.is_finite() && d.test_states[k][i] > 0.5).collect();
+    let on: Vec<bool> = d.test_states[k].iter().map(|&s| s > 0.5).collect();
+    let labelled: Vec<bool> = d.test_rows.iter().map(|r| r.target.is_finite()).collect();
     let all_groups: Vec<u64> = d.test_rows.iter().map(|r| r.group).collect();
-    let ids = crate::regime_gate::run_ids(&all_groups, &on);
+    let ids = crate::regime_gate::masked_groups(&all_groups, &on, &labelled);
     let base = (window_index as u64 + 1) << 40;
     for i in 0..n {
         d.test_rows[i].group = base + ids[i];

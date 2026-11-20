@@ -2832,6 +2832,11 @@ fn three_day_gate(h: i64, j: usize) -> f64 {
 /// `y` and the return `r` are finite at hour 0 of each day only (a stride-24 label), so `--fill drop`
 /// keeps one row per symbol and day.
 fn strided_text(days: usize, gate: fn(i64, usize) -> f64) -> String {
+    strided_text_every(days, gate, 24)
+}
+
+/// [`strided_text`] with the label and the return finite at every `stride`-th hour.
+fn strided_text_every(days: usize, gate: fn(i64, usize) -> f64, stride: i64) -> String {
     let mut text = String::from("t,s,x1,x2,g,r,y\n");
     for h in 0..(days * 24) as i64 {
         for (j, sym) in ["a", "b"].iter().enumerate() {
@@ -2840,7 +2845,7 @@ fn strided_text(days: usize, gate: fn(i64, usize) -> f64) -> String {
             let x2 = frac(f * 0.754_877_666_246_692_7) - 0.5;
             let noise = frac(f * 0.324_717_957_244_746) - 0.5;
             let r = 0.01 * x1 + 0.0005 * noise;
-            let (r, y) = if h % 24 == 0 { (r.to_string(), (r + 0.05 * x2).to_string()) } else { (String::new(), String::new()) };
+            let (r, y) = if h % stride == 0 { (r.to_string(), (r + 0.05 * x2).to_string()) } else { (String::new(), String::new()) };
             text.push_str(&format!("{},{},{},{},{},{},{}\n", T0 + HOUR * h, sym, x1, x2, gate(h, j), r, y));
         }
     }
@@ -2855,13 +2860,20 @@ fn write_strided_csv(dir: &std::path::Path, gate: fn(i64, usize) -> f64) -> Stri
 
 /// A one-day forward-return label on `y` with return column `r`.
 fn write_daily_spec(dir: &std::path::Path) -> String {
-    let text = "{\"schema\":\"rcsr-target-spec/1\",\"targets\":[{\"column\":\"y\",\"name\":\"raw_target\",\
+    write_horizon_spec(dir, DAY)
+}
+
+/// A forward-return label on `y` with return column `r` and a horizon of `seconds`.
+fn write_horizon_spec(dir: &std::path::Path, seconds: i64) -> String {
+    let text = format!(
+        "{{\"schema\":\"rcsr-target-spec/1\",\"targets\":[{{\"column\":\"y\",\"name\":\"raw_target\",\
          \"kind\":\"forward_return\",\"deprecated\":false,\"return_column\":\"r\",\"return_units\":\"log\",\
-         \"horizon_seconds\":86400,\"entry_offset_seconds\":0,\"delay_seconds\":0,\
+         \"horizon_seconds\":{seconds},\"entry_offset_seconds\":0,\"delay_seconds\":0,\
          \"entry_price\":\"open\",\"exit_price\":\"close\",\"offset\":0.0,\
-         \"scale\":{\"kind\":\"constant\",\"value\":1.0},\"clip\":null,\"units\":\"log_return\",\
-         \"cost_bps\":null,\"cost_in_label\":false,\"construction_columns\":[],\"note\":null}]}";
-    let path = dir.join("daily.json");
+         \"scale\":{{\"kind\":\"constant\",\"value\":1.0}},\"clip\":null,\"units\":\"log_return\",\
+         \"cost_bps\":null,\"cost_in_label\":false,\"construction_columns\":[],\"note\":null}}]}}"
+    );
+    let path = dir.join(format!("h{seconds}.json"));
     std::fs::write(&path, text).unwrap();
     path.to_string_lossy().into_owned()
 }
@@ -3041,4 +3053,274 @@ fn a_masked_checkpoint_of_the_training_row_rule_refuses_resume() {
     let old = dir.join("before.rcsr");
     with_book_hash(&cp, STRIDED_MASK_HASH_BEFORE, &old);
     usage_error(&resume(&old.to_string_lossy()), "--pnl-mask");
+}
+
+// ---- #1278: the masked book skips unlabelled rows ----
+
+use rcsr::lockbox::{self, Lockbox};
+
+const BAND_SD: [&str; 6] = ["--band", "0.5", "--band-units", "sd", "--min-holding", "2"];
+const DENSE_DAYS: usize = 60;
+
+/// The strided fixture of [`three_day_gate`] over `days` days with the label every `stride` hours.
+fn write_strided_every(dir: &std::path::Path, name: &str, days: usize, stride: i64) -> String {
+    let path = dir.join(name);
+    std::fs::write(&path, strided_text_every(days, three_day_gate, stride)).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+/// The windows whose test blocks are the validation and the test rows of run `j` on the strided
+/// fixture. The test rows are the last `test_rows / 2` labelled stamps, the same for both symbols.
+fn strided_block_windows(j: &Json, days: usize, stride: i64, test_rows: f64) -> [(&'static str, String); 2] {
+    let (vlo, vhi) = time_range(j, "validation_time");
+    let (vlo, vhi) = (vlo as i64, vhi as i64);
+    let stamps = (days as i64 * 24 + stride - 1) / stride;
+    let start = T0 + HOUR * stride * (stamps - test_rows as i64 / 2);
+    let end = T0 + DAY * days as i64;
+    // A training range that ends two label strides (at least two days) before the test block.
+    let gap = (2 * HOUR * stride).max(2 * DAY);
+    [("validation", format!("v,{T0},{},{vlo},{}", vlo - gap, vhi + 1)), ("test", format!("t,{T0},{},{start},{end}", start - gap))]
+}
+
+/// Window 0 of `walkforward --from-run run` on `data` with `window`, `extra` added.
+fn walk_window(data: &str, run: &str, window: &str, extra: &[&str]) -> Json {
+    let mut args = vec!["walkforward", "--data", data, "--time", "t", "--group-by", "s", "--from-run", run, "--window", window, "--json"];
+    args.extend_from_slice(extra);
+    let report = json(&rcsr_cmd::rcsr().args(&args).output().unwrap());
+    match at(&report, &["windows"]) {
+        Json::Arr(a) => a[0].clone(),
+        _ => panic!("windows is not an array"),
+    }
+}
+
+/// The rows of symbol `sym` of the CSV `data`, written beside it.
+fn symbol_csv(data: &str, sym: &str) -> String {
+    let text = std::fs::read_to_string(data).unwrap();
+    let mut lines = text.lines();
+    let mut out = format!("{}\n", lines.next().unwrap());
+    for line in lines.filter(|l| l.split(',').nth(1) == Some(sym)) {
+        out.push_str(line);
+        out.push('\n');
+    }
+    let path = format!("{data}.{sym}.csv");
+    std::fs::write(&path, out).unwrap();
+    path
+}
+
+/// The net of a walk-forward window of one symbol: one priced row per period.
+fn symbol_net(w: &Json) -> f64 {
+    let m = at(w, &["metrics"]);
+    if num(m, &["rows"]) == 0.0 {
+        0.0
+    } else {
+        num(m, &["mean_return"]) * num(m, &["periods"])
+    }
+}
+
+/// A JSON value in the engine's text form (`devlog::num` keeps every bit).
+fn json_text(j: &Json) -> String {
+    match j {
+        Json::Null => "null".to_string(),
+        Json::Bool(b) => b.to_string(),
+        Json::Num(v) => rcsr::devlog::num(*v),
+        Json::Str(v) => rcsr::devlog::text(v),
+        Json::Arr(a) => format!("[{}]", a.iter().map(json_text).collect::<Vec<_>>().join(",")),
+        Json::Obj(o) => format!("{{{}}}", o.iter().map(|(k, v)| format!("{}:{}", rcsr::devlog::text(k), json_text(v))).collect::<Vec<_>>().join(",")),
+    }
+}
+
+/// Walk-forward of the validation and the test block of run `j` (`run` on `data`) gives the run's
+/// books: the rows, trades, entries and cost of the two-symbol window, and the net as the sum of
+/// the windows of each symbol alone (a period return is the mean over the rows priced at its stamp,
+/// so the two-symbol net is not a multiple of it when the symbols' gates differ).
+fn assert_blocks_reproduced(tag: &str, j: &Json, data: &str, run: &str, days: usize, stride: i64, test_rows: f64) {
+    let one = [symbol_csv(data, "a"), symbol_csv(data, "b")];
+    for (slot, window) in strided_block_windows(j, days, stride, test_rows) {
+        let want = at(j, &["objective", slot]);
+        let m = at(&walk_window(data, run, &window, &["--allow-in-sample-windows"]), &["metrics"]).clone();
+        for key in ["rows", "trades", "entries"] {
+            assert_eq!(num(&m, &[key]), num(want, &[key]), "{tag} {slot} {key}");
+        }
+        assert!((num(&m, &["total_cost"]) - num(want, &["total_cost"])).abs() <= 1e-12, "{tag} {slot} total_cost");
+        let net: f64 = one.iter().map(|d| symbol_net(&walk_window(d, run, &window, &["--allow-in-sample-windows"]))).sum();
+        assert!((net - num(want, &["net_pnl"])).abs() <= 1e-12, "{tag} {slot}: walkforward net {net} vs objective {}", num(want, &["net_pnl"]));
+    }
+}
+
+#[test]
+fn strided_masked_walkforward_reproduces_objective_test() {
+    let (_scratch, dir) = scratch();
+    let band: Vec<&str> = [&STRIDED_ARGS[..], &BAND_SD[..]].concat();
+    for (stride, days) in [(24i64, STRIDED_DAYS), (72, 2 * STRIDED_DAYS)] {
+        // A label horizon equal to the stride: one period per labelled row.
+        let spec = write_horizon_spec(&dir, HOUR * stride);
+        let data = write_strided_every(&dir, &format!("strided{stride}.csv"), days, stride);
+        for (book, args) in [("unmasked", &STRIDED_ARGS[..6]), ("threshold", &STRIDED_ARGS[..]), ("band", &band[..])] {
+            let tag = format!("stride {stride} {book}");
+            let out = run(&data, &spec, args);
+            let j = json(&out);
+            if book != "unmasked" {
+                assert!(num(&j, &["objective", "test", "mask", "runs"]) >= 2.0, "{tag}: the mask must cut several runs");
+            }
+            assert!(num(&j, &["objective", "test", "trades"]) > 0.0, "{tag}: the book must trade");
+            let run_path = dir.join(format!("strided{stride}-{book}.run.json")).to_string_lossy().into_owned();
+            std::fs::write(&run_path, &out.stdout).unwrap();
+            assert_blocks_reproduced(&tag, &j, &data, &run_path, days, stride, num(&j, &["test_rows"]));
+        }
+    }
+}
+
+/// #1278: rows whose fit label is missing and whose book return is finite stay in the book
+/// (`--book-target`, #948). The fit label `y` is missing on every fifth labelled day; the book label
+/// `yb` shares the return column `r`, so walk-forward prices the rows the search prices.
+#[test]
+fn strided_masked_book_keeps_rows_without_a_fit_label() {
+    let (_scratch, dir) = scratch();
+    let mut text = String::from("t,s,x1,x2,g,r,y,yb\n");
+    for line in strided_text(STRIDED_DAYS, three_day_gate).lines().skip(1) {
+        let c: Vec<&str> = line.split(',').collect();
+        let day = (c[0].parse::<i64>().unwrap() - T0) / DAY;
+        let y = if day % 5 == 2 { "" } else { c[6] };
+        text.push_str(&format!("{},{},{},{},{},{},{},{}\n", c[0], c[1], c[2], c[3], c[4], c[5], y, c[6]));
+    }
+    let data = dir.join("book.csv").to_string_lossy().into_owned();
+    std::fs::write(&data, text).unwrap();
+    let entry = |column: &str| {
+        format!(
+            "{{\"column\":\"{column}\",\"name\":\"{column}\",\"kind\":\"forward_return\",\"deprecated\":false,\"return_column\":\"r\",\
+             \"return_units\":\"log\",\"horizon_seconds\":86400,\"entry_offset_seconds\":0,\"delay_seconds\":0,\"entry_price\":\"open\",\
+             \"exit_price\":\"close\",\"offset\":0.0,\"scale\":{{\"kind\":\"constant\",\"value\":1.0}},\"clip\":null,\"units\":\"log_return\",\
+             \"cost_bps\":null,\"cost_in_label\":false,\"construction_columns\":[],\"note\":null}}"
+        )
+    };
+    let spec = dir.join("book.json").to_string_lossy().into_owned();
+    std::fs::write(&spec, format!("{{\"schema\":\"rcsr-target-spec/1\",\"targets\":[{},{}]}}", entry("y"), entry("yb"))).unwrap();
+    let mut book_rows = 0.0;
+    for (book, mask) in [("unmasked", &[][..]), ("masked", &STRIDED_ARGS[6..])] {
+        let args: Vec<&str> = [&STRIDED_ARGS[..6], mask, &["--book-target", "yb"][..]].concat();
+        let out = run(&data, &spec, &args);
+        let j = json(&out);
+        if book == "unmasked" {
+            book_rows = num(&j, &["objective", "test", "rows"]);
+            assert!(book_rows > num(&j, &["test_rows"]), "the test book holds rows without a fit label");
+        }
+        let run_path = dir.join(format!("book-{book}.run.json")).to_string_lossy().into_owned();
+        std::fs::write(&run_path, &out.stdout).unwrap();
+        assert_blocks_reproduced(book, &j, &data, &run_path, STRIDED_DAYS, 24, book_rows);
+    }
+}
+
+/// #1278: on hourly labels (every row labelled) the books are unchanged: `objective.validation`,
+/// `objective.test` and the walk-forward metrics of both blocks of the unmasked, the masked
+/// threshold and the masked band book of two symbols, pinned to the bytes of the base build.
+#[test]
+fn dense_masked_books_are_pinned() {
+    let (_scratch, dir) = scratch();
+    let spec = write_horizon_spec(&dir, HOUR);
+    let data = write_strided_every(&dir, "dense.csv", DENSE_DAYS, 1);
+    let band: Vec<&str> = [&STRIDED_ARGS[..], &BAND_SD[..]].concat();
+    let mut got: Vec<String> = Vec::new();
+    for (book, args) in [("unmasked", &STRIDED_ARGS[..6]), ("threshold", &STRIDED_ARGS[..]), ("band", &band[..])] {
+        let out = run(&data, &spec, args);
+        let j = json(&out);
+        let run_path = dir.join(format!("dense-{book}.run.json")).to_string_lossy().into_owned();
+        std::fs::write(&run_path, &out.stdout).unwrap();
+        for (slot, window) in strided_block_windows(&j, DENSE_DAYS, 1, num(&j, &["test_rows"])) {
+            let w = walk_window(&data, &run_path, &window, &["--allow-in-sample-windows"]);
+            for (part, text) in [("objective", json_text(at(&j, &["objective", slot]))), ("walkforward", json_text(at(&w, &["metrics"])))] {
+                got.push(format!("{book}.{slot}.{part} {}", rcsr::manifest::sha256_hex(text.as_bytes())));
+            }
+        }
+    }
+    let all = rcsr::manifest::sha256_hex(got.join("\n").as_bytes());
+    assert_eq!(all, PINNED_DENSE_BOOKS, "{}", got.join("\n"));
+}
+
+const PINNED_DENSE_BOOKS: &str = "4ab830e2ea9b23584cca27e12f9a366c37e3582c7d4c51a46bd6024e50a9459b";
+
+/// #1278: the sealed read prices the masked book of a strided label like the search: a synthetic
+/// lock over the run's test block, a development window on the validation rows, a final seal and
+/// one locked read of the test block.
+#[test]
+fn sealed_read_prices_the_strided_masked_book() {
+    let (_scratch, dir) = scratch();
+    let spec = write_daily_spec(&dir);
+    let data = write_strided_csv(&dir, three_day_gate);
+    let out = run(&data, &spec, &STRIDED_ARGS);
+    let j = json(&out);
+    let run_path = dir.join("sealed.run.json").to_string_lossy().into_owned();
+    std::fs::write(&run_path, &out.stdout).unwrap();
+    let [(_, validation_window), (_, test_window)] = strided_block_windows(&j, STRIDED_DAYS, 24, num(&j, &["test_rows"]));
+    let field = |w: &str, k: usize| -> i64 { w.split(',').nth(k).unwrap().parse().unwrap() };
+    let (vlo, start) = (field(&validation_window, 3), field(&test_window, 3));
+    let lock_end = T0 + DAY * STRIDED_DAYS as i64;
+    let locked = write_strided_every(&dir, "locked.csv", STRIDED_DAYS, 24);
+    lockbox::write_sidecar(&locked, &Lockbox { start, end: lock_end }, "test").unwrap();
+    let ledger = dir.join("ledger.jsonl").to_string_lossy().into_owned();
+    let sealed = dir.join("sealed.json").to_string_lossy().into_owned();
+    let dev = format!("dev,{T0},{},{vlo},{}", vlo - 2 * DAY, vlo + 10 * DAY);
+    walk_window(&locked, &run_path, &dev, &["--ledger", &ledger, "--allow-in-sample-windows"]);
+    let seal = rcsr_cmd::rcsr().args(["protocol", "seal", "--final", "--ledger", &ledger, "--out", &sealed]).output().unwrap();
+    assert_eq!(code(&seal), 0, "{}", stderr(&seal));
+    let read = walk_window(&locked, &run_path, &test_window, &["--ledger", &ledger, "--allow-in-sample-windows", "--locked-test", "--sealed", &sealed]);
+    let open = walk_window(&data, &run_path, &test_window, &["--allow-in-sample-windows"]);
+    let m = at(&read, &["metrics"]);
+    assert_eq!(json_text(m), json_text(at(&open, &["metrics"])), "the sealed read prices the open book");
+    let want = at(&j, &["objective", "test"]);
+    for key in ["rows", "trades", "entries"] {
+        assert_eq!(num(m, &[key]), num(want, &[key]), "{key}");
+    }
+    assert!((num(m, &["total_cost"]) - num(want, &["total_cost"])).abs() <= 1e-12);
+}
+
+/// #1278: a row the masked book cannot price (no finite return: an unlabelled row of a strided
+/// label) neither starts nor ends an on-run, whatever its gate state: `masked_slice` over every row
+/// prices the book of `masked_slice` over the priced rows alone.
+#[test]
+fn masked_slice_skips_rows_without_a_return() {
+    let mut seed = 0x1278u64;
+    let mut uniform = move || {
+        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        (seed >> 11) as f64 / (1u64 << 53) as f64
+    };
+    let spec = TradingSpec { cost_bps: 5.0, threshold: 0.0, min_trades: 0, ..TradingSpec::default() };
+    let mut inside = 0usize;
+    for case in 0..200 {
+        let groups = 1 + case % 3;
+        let mut full = TradingSlice { rows: TradingRows::default(), ret: Vec::new() };
+        let (mut on, mut pred) = (Vec::new(), Vec::new());
+        for k in 0..40 {
+            for g in 0..groups {
+                full.rows.time.push(1.6e9 + 3600.0 * k as f64);
+                full.rows.group.push(g as u64);
+                full.ret.push(if uniform() < 0.4 { f64::NAN } else { 0.01 * (uniform() - 0.45) });
+                on.push(uniform() < 0.7);
+                pred.push(uniform() - 0.4);
+            }
+        }
+        let keep: Vec<usize> = (0..full.ret.len()).filter(|&i| full.ret[i].is_finite()).collect();
+        for g in 0..groups as u64 {
+            let rows: Vec<usize> = (0..full.ret.len()).filter(|&i| full.rows.group[i] == g).collect();
+            inside += rows.windows(3).filter(|w| on[w[0]] && !on[w[1]] && on[w[2]] && full.ret[w[0]].is_finite() && !full.ret[w[1]].is_finite() && full.ret[w[2]].is_finite()).count();
+        }
+        let pick = |v: &[f64]| -> Vec<f64> { keep.iter().map(|&i| v[i]).collect() };
+        let sub = TradingSlice {
+            rows: TradingRows { time: pick(&full.rows.time), group: keep.iter().map(|&i| full.rows.group[i]).collect(), funding: Vec::new() },
+            ret: pick(&full.ret),
+        };
+        let sub_on: Vec<bool> = keep.iter().map(|&i| on[i]).collect();
+        let a_book = regime_gate::masked_slice(&full, &on);
+        let b_book = regime_gate::masked_slice(&sub, &sub_on);
+        let a = trading::evaluate(&pred, &a_book.ret, &a_book.rows, &spec);
+        let b = trading::evaluate(&pick(&pred), &b_book.ret, &b_book.rows, &spec);
+        match (a, b) {
+            (Ok(a), Ok(b)) => {
+                assert_eq!(a.net_pnl.to_bits(), b.net_pnl.to_bits(), "case {case}: net {} vs {}", a.net_pnl, b.net_pnl);
+                assert_eq!((a.rows, a.trades, a.entries), (b.rows, b.trades, b.entries), "case {case}");
+            }
+            (Err(_), Err(_)) => {}
+            (a, b) => panic!("case {case}: {:?} vs {:?}", a.map(|s| s.net_pnl), b.map(|s| s.net_pnl)),
+        }
+    }
+    assert!(inside > 0, "the cases put an off row without a return inside an on-run");
 }

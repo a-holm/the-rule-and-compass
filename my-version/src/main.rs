@@ -388,8 +388,11 @@ INPUT:
                              label, target, return or construction column
                              exits 5 (D13). The gate is on when the value is
                              > 0. Rows outside are flat; every run of on rows
-                             of a group starts flat and pays its exit; the
-                             hindsight bound is taken on those runs. The
+                             of a group starts flat and pays its exit, and a
+                             row without a return (an unlabelled row of a
+                             strided label) neither starts nor ends a run, in
+                             walk-forward too; the hindsight bound is taken on
+                             those runs. The
                              training, validation and test books read one gate
                              state, rcsr-gate-state/1: the kernel over every
                              row of the data file from each group's first row
@@ -6220,8 +6223,9 @@ fn main() {
     if let (Some(_), Some(split)) = (&gate_spec, prepared.trading.as_mut()) {
         if let Some(masks) = split.masks.clone() {
             let share = |slice: &data::TradingSlice, on: &[bool]| {
-                let (rows_on, runs) = rcsr::regime_gate::run_count(&slice.rows.group, on);
-                (rows_on as f64 / on.len().max(1) as f64, runs)
+                let priced = rcsr::regime_gate::priced_rows(slice);
+                let (rows_on, runs) = rcsr::regime_gate::run_count(&slice.rows.group, on, &priced);
+                (rows_on as f64 / priced.iter().filter(|&&p| p).count().max(1) as f64, runs)
             };
             let validation = split.validation.as_ref().zip(masks.validation.as_ref()).map(|(s, on)| share(s, on));
             let test = share(&split.test, &masks.test);

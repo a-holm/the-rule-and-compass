@@ -178,6 +178,8 @@ struct Planted {
     spec: String,
     bull: String,
     bear: String,
+    /// `STAMPS * stride` stamps with the label on every `stride`-th ([`write_strided_csv`]).
+    stride: i64,
 }
 
 fn planted(bull: &[&str], bear: &[&str]) -> Planted {
@@ -191,7 +193,7 @@ fn planted_with(bull: &[&str], bear: &[&str], extra: &[&str]) -> Planted {
     let spec = write_spec(&dir);
     let bull = pool_run(&dir, "bull.json", &data, &spec, &[&["--pnl-mask", "g"][..], extra].concat(), bull);
     let bear = pool_run(&dir, "bear.json", &data, &spec, &[&["--pnl-mask", "0 - g"][..], extra].concat(), bear);
-    Planted { _scratch: scratch, dir, data, spec, bull, bear }
+    Planted { _scratch: scratch, dir, data, spec, bull, bear, stride: 1 }
 }
 
 const XS: [&str; 2] = ["--pnl-excess", "xs-mean"];
@@ -276,7 +278,7 @@ fn replays_in_walkforward(p: &Planted, extra: &[&str]) -> Json {
     let j = json(&compose(&p.data, &p.spec, &args));
     let expr = s(&j, &["objective", "finalist", "expression_exact"]).to_string();
     let test_rows = num(&j, &["test_rows"]) as i64;
-    let k_test = STAMPS as i64 - test_rows / SYMBOLS.len() as i64;
+    let k_test = p.stride * (STAMPS as i64 - test_rows / SYMBOLS.len() as i64);
     let first_val = num(&arr(&j, &["split", "validation_time"])[0], &[]) as i64;
     let last_val = num(&arr(&j, &["split", "validation_time"])[1], &[]) as i64;
     let net_of = |report: &Json| {
@@ -285,7 +287,7 @@ fn replays_in_walkforward(p: &Planted, extra: &[&str]) -> Json {
     };
     // The run's book on its test rows.
     let wf_out = p.dir.join("wf.json").to_string_lossy().into_owned();
-    let w = format!("t,{},{},{},{}", T0, first_val, T0 + STEP * k_test, T0 + STEP * STAMPS as i64);
+    let w = format!("t,{},{},{},{}", T0, first_val, T0 + STEP * k_test, T0 + STEP * p.stride * STAMPS as i64);
     let wf = rcsr(&[
         "walkforward", "--data", &p.data, "--target", "y", "--from-run", &out, "--time", "t", "--group-by", "s", "--window", &w, "--out", &wf_out,
     ]);
@@ -296,7 +298,7 @@ fn replays_in_walkforward(p: &Planted, extra: &[&str]) -> Json {
     assert_eq!(num(&at(&arr(&report, &["windows"])[0], &["metrics"]), &["rows"]), test_rows as f64);
     // The printed expression priced directly on the validation rows is the composite's validation book.
     let wv_out = p.dir.join("wv.json").to_string_lossy().into_owned();
-    let w = format!("v,{},{},{},{}", T0, first_val - STEP, first_val, last_val + 1);
+    let w = format!("v,{},{},{},{}", T0, first_val - STEP * p.stride, first_val, last_val + 1);
     let wv = rcsr(&[
         "walkforward", "--data", &p.data, "--target", "y", "--target-spec", &p.spec, "--expr", &expr, "--vars", "g,x1,x2", "--time", "t", "--group-by", "s",
         "--window", &w, "--threshold-fixed", "0", "--cost-bps", "5", "--out", &wv_out,
@@ -1008,4 +1010,65 @@ fn compose_training_states_equal_the_pool_masks() {
         }
     }
     assert!(compared > 0, "the chosen composite holds a branch: {:?}", chosen);
+}
+
+// ---- #1278: the masked book skips unlabelled rows ----
+
+/// [`write_strided_csv`] with the return and the label-family column missing where the label is,
+/// so walk-forward, which prices the return column, prices the rows the search keeps.
+fn write_strided_book_csv(dir: &Path, name: &str, stride: i64) -> String {
+    let path = write_strided_csv(dir, name, stride);
+    let mut text = String::new();
+    for line in std::fs::read_to_string(&path).unwrap().lines() {
+        let cells: Vec<&str> = line.split(',').collect();
+        if cells[7].is_empty() {
+            text.push_str(&format!("{},,,\n", cells[..6].join(",")));
+        } else {
+            text.push_str(line);
+            text.push('\n');
+        }
+    }
+    std::fs::write(&path, text).unwrap();
+    path
+}
+
+/// #1278: pools searched under `--pnl-mask` on a label finite at every fourth stamp and their
+/// composite: `walkforward --from-run` gives each pool's validation and test books and the
+/// composite's nets.
+#[test]
+fn strided_pools_and_their_composite_price_the_same_in_walkforward() {
+    const STRIDE: i64 = 4;
+    let (scratch, dir) = scratch();
+    let data = write_strided_book_csv(&dir, "strided.csv", STRIDE);
+    let spec = write_spec_horizon(&dir, "strided.json", STEP * STRIDE);
+    let bull = pool_run(&dir, "bull.json", &data, &spec, &["--fill", "drop", "--pnl-mask", "g"], &BULL);
+    let bear = pool_run(&dir, "bear.json", &data, &spec, &["--fill", "drop", "--pnl-mask", "0 - g"], &BEAR);
+    for pool in [&bull, &bear] {
+        let j = Json::parse(std::fs::read_to_string(pool).unwrap().trim()).unwrap();
+        let k_test = STRIDE * (STAMPS as i64 - num(&j, &["test_rows"]) as i64 / SYMBOLS.len() as i64);
+        let first_val = num(&arr(&j, &["split", "validation_time"])[0], &[]) as i64;
+        let last_val = num(&arr(&j, &["split", "validation_time"])[1], &[]) as i64;
+        let windows = [
+            ("validation", format!("v,{},{},{},{}", T0, first_val - STEP * STRIDE, first_val, last_val + 1)),
+            ("test", format!("t,{},{},{},{}", T0, first_val, T0 + STEP * k_test, T0 + STEP * STRIDE * STAMPS as i64)),
+        ];
+        for (slot, w) in windows {
+            let report = json(&rcsr(&[
+                "walkforward", "--data", &data, "--target", "y", "--from-run", pool, "--time", "t", "--group-by", "s", "--window", &w,
+                "--allow-in-sample-windows", "--json",
+            ]));
+            let m = at(&arr(&report, &["windows"])[0], &["metrics"]);
+            let want = at(&j, &["objective", slot]);
+            assert!(num(want, &["mask", "runs"]) >= 2.0, "{pool} {slot}: the mask must cut several runs");
+            for key in ["rows", "trades", "entries"] {
+                assert_eq!(num(m, &[key]), num(want, &[key]), "{pool} {slot} {key}");
+            }
+            assert!((num(m, &["total_cost"]) - num(want, &["total_cost"])).abs() <= 1e-12, "{pool} {slot} total_cost");
+            // One gate for every symbol: each priced stamp holds all three rows.
+            let net = num(m, &["mean_return"]) * num(m, &["periods"]) * SYMBOLS.len() as f64;
+            assert!((net - num(want, &["net_pnl"])).abs() <= 1e-12, "{pool} {slot}: walkforward {net} vs objective {}", num(want, &["net_pnl"]));
+        }
+    }
+    let p = Planted { _scratch: scratch, dir, data, spec, bull, bear, stride: STRIDE };
+    replays_in_walkforward(&p, &["--fill", "drop"]);
 }

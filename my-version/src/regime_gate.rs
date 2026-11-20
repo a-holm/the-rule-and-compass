@@ -530,14 +530,26 @@ impl Switch {
     }
 }
 
-/// A distinct id for every maximal run of on rows of a group and for every off
-/// row, in row order. Rows of one group may interleave with other groups.
-pub fn run_ids(group: &[u64], on: &[bool]) -> Vec<u64> {
+/// #1278: the group of every row of a masked book, in row order: a distinct id
+/// for every maximal run of priced on rows of a group and for every priced off
+/// row. A row that is not priced (no finite return: an unlabelled row of a
+/// strided label) neither starts nor ends a run, whatever its state; it takes
+/// the id of the run or off row before it in its group. Rows of one group may
+/// interleave with other groups.
+pub fn masked_groups(group: &[u64], on: &[bool], priced: &[bool]) -> Vec<u64> {
     let mut open: HashMap<u64, bool> = HashMap::new();
     let mut current: HashMap<u64, u64> = HashMap::new();
     let mut next = 0u64;
     let mut out = Vec::with_capacity(group.len());
     for i in 0..group.len() {
+        if !priced[i] {
+            let id = *current.entry(group[i]).or_insert_with(|| {
+                next += 1;
+                next - 1
+            });
+            out.push(id);
+            continue;
+        }
         let continues = on[i] && open.get(&group[i]).copied().unwrap_or(false);
         if !continues {
             current.insert(group[i], next);
@@ -549,13 +561,19 @@ pub fn run_ids(group: &[u64], on: &[bool]) -> Vec<u64> {
     out
 }
 
-/// Rows on, and maximal on-runs per group.
-pub fn run_count(group: &[u64], on: &[bool]) -> (usize, usize) {
-    let ids = run_ids(group, on);
+/// #1278: the rows a book prices: a finite return, time and funding.
+pub fn priced_rows(slice: &TradingSlice) -> Vec<bool> {
+    let r = &slice.rows;
+    (0..slice.ret.len()).map(|i| slice.ret[i].is_finite() && r.time[i].is_finite() && (r.funding.is_empty() || r.funding[i].is_finite())).collect()
+}
+
+/// Priced rows on, and maximal on-runs per group ([`masked_groups`]).
+pub fn run_count(group: &[u64], on: &[bool], priced: &[bool]) -> (usize, usize) {
+    let ids = masked_groups(group, on, priced);
     let mut seen = std::collections::HashSet::new();
     let mut rows = 0;
     for i in 0..on.len() {
-        if on[i] {
+        if on[i] && priced[i] {
             rows += 1;
             seen.insert(ids[i]);
         }
@@ -607,13 +625,14 @@ pub fn switch_stats(states: &[bool], periods_per_year: f64) -> Switches {
 
 /// The slice priced under a mask: every on-run is its own group (flat start,
 /// exit paid at the run's last row) and the return of an off row is NaN, so the
-/// pricing drops it as an unusable row.
+/// pricing drops it as an unusable row. #1278: the runs are those of
+/// [`masked_groups`] over the priced rows, the groups walk-forward prices.
 pub fn masked_slice(slice: &TradingSlice, on: &[bool]) -> TradingSlice {
     let mut out = slice.clone();
     if on.iter().all(|&o| o) {
         return out;
     }
-    out.rows.group = run_ids(&slice.rows.group, on);
+    out.rows.group = masked_groups(&slice.rows.group, on, &priced_rows(slice));
     for (r, &keep) in out.ret.iter_mut().zip(on) {
         if !keep {
             *r = f64::NAN;
@@ -844,13 +863,65 @@ mod tests {
     fn runs_split_at_off_rows_and_group_changes() {
         let g = [1u64, 1, 1, 1, 2, 2];
         let on = [true, true, false, true, true, true];
-        let ids = run_ids(&g, &on);
+        let ids = masked_groups(&g, &on, &[true; 6]);
         assert_eq!(ids[0], ids[1]);
         assert_ne!(ids[1], ids[2]);
         assert_ne!(ids[2], ids[3]);
         assert_ne!(ids[3], ids[4]);
         assert_eq!(ids[4], ids[5]);
-        assert_eq!(run_count(&g, &on), (5, 3));
+        assert_eq!(run_count(&g, &on, &[true; 6]), (5, 3));
+    }
+
+    #[test]
+    fn masked_groups_skips_unlabelled_rows() {
+        // on, unlabelled, on, off, on: the unlabelled row neither ends nor starts a run, whatever its state.
+        for state in [true, false] {
+            let ids = masked_groups(&[7; 5], &[true, state, true, false, true], &[true, false, true, true, true]);
+            assert_eq!(ids, vec![0, 0, 0, 1, 2], "unlabelled row {state}");
+        }
+        // Two interleaved groups: group 1 is on, unlabelled, on, off; group 2 starts unlabelled.
+        let g = [1u64, 2, 1, 2, 1, 2, 1, 2];
+        let on = [true, false, false, true, true, false, false, true];
+        let priced = [true, false, false, true, true, false, true, true];
+        assert_eq!(masked_groups(&g, &on, &priced), vec![0, 1, 0, 2, 0, 2, 3, 2]);
+        assert_eq!(run_count(&g, &on, &priced), (4, 2));
+    }
+
+    /// The run ids before #1278: every row counts.
+    fn every_row_run_ids(group: &[u64], on: &[bool]) -> Vec<u64> {
+        let mut open: HashMap<u64, bool> = HashMap::new();
+        let mut current: HashMap<u64, u64> = HashMap::new();
+        let mut next = 0u64;
+        let mut out = Vec::with_capacity(group.len());
+        for i in 0..group.len() {
+            if !(on[i] && open.get(&group[i]).copied().unwrap_or(false)) {
+                current.insert(group[i], next);
+                next += 1;
+            }
+            open.insert(group[i], on[i]);
+            out.push(current[&group[i]]);
+        }
+        out
+    }
+
+    #[test]
+    fn masked_slice_unchanged_for_labelled_rows() {
+        let mut seed = 0x1278u64;
+        for case in 0..300 {
+            let groups = 1 + case % 4;
+            let n = 1 + (uniform(&mut seed) * 120.0) as usize;
+            let group: Vec<u64> = (0..n).map(|_| (uniform(&mut seed) * groups as f64) as u64).collect();
+            let on: Vec<bool> = (0..n).map(|_| uniform(&mut seed) < 0.6).collect();
+            let slice = TradingSlice {
+                rows: trading::TradingRows { time: (0..n).map(|i| i as f64).collect(), group: group.clone(), funding: Vec::new() },
+                ret: (0..n).map(|_| uniform(&mut seed) - 0.5).collect(),
+            };
+            let book = masked_slice(&slice, &on);
+            let want = if on.iter().all(|&o| o) { group.clone() } else { every_row_run_ids(&group, &on) };
+            assert_eq!(book.rows.group, want, "case {case}");
+            let ret: Vec<u64> = slice.ret.iter().zip(&on).map(|(r, &o)| if o { r.to_bits() } else { f64::NAN.to_bits() }).collect();
+            assert_eq!(book.ret.iter().map(|r| r.to_bits()).collect::<Vec<_>>(), ret, "case {case}");
+        }
     }
 
     #[test]
