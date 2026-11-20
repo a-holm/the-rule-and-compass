@@ -754,15 +754,26 @@ struct Sibling {
     n_eff: f64,
     nominal: f64,
     spa_p: f64,
+    /// [`report_key`] of every `inputs.reports` entry.
+    reports: Vec<String>,
 }
 
 fn same_file(a: &str, b: &str) -> bool {
     a == b || matches!((std::fs::canonicalize(a), std::fs::canonicalize(b)), (Ok(x), Ok(y)) if x == y)
 }
 
+/// A report path as compared across tables: its canonical path when it resolves from the
+/// current directory, else the path as given. Tables record no report sha256.
+fn report_key(p: &str) -> String {
+    std::fs::canonicalize(p).map_or_else(|_| p.to_string(), |c| c.to_string_lossy().into_owned())
+}
+
 /// The sibling tables with their own `trials.n_eff`, `trials.nominal` and `spa.p_consistent`;
 /// a sibling's own `trials.family` is never read, so tables that list each other count once.
-fn load_family(paths: &[String], out: Option<&str>, locked: &[(f64, f64)]) -> Res<Vec<Sibling>> {
+/// A report of this table (`own`) or of an earlier sibling in a sibling's `inputs.reports`
+/// would count its rows twice.
+fn load_family(paths: &[String], own: &[String], out: Option<&str>, locked: &[(f64, f64)]) -> Res<Vec<Sibling>> {
+    let own_keys: Vec<String> = if paths.is_empty() { Vec::new() } else { own.iter().map(|r| report_key(r)).collect() };
     let mut family: Vec<Sibling> = Vec::new();
     for p in paths {
         if let Some(o) = out.filter(|o| same_file(p, o)) {
@@ -786,7 +797,25 @@ fn load_family(paths: &[String], out: Option<&str>, locked: &[(f64, f64)]) -> Re
         let n_eff = field(&["trials", "n_eff"], |v| v >= 1.0)?;
         let nominal = field(&["trials", "nominal"], |v| v >= 1.0)?;
         let spa_p = field(&["spa", "p_consistent"], |v| (0.0..=1.0).contains(&v))?;
-        family.push(Sibling { path: p.clone(), sha256, n_eff, nominal, spa_p });
+        let listed: Vec<&str> = match at(&j, &["inputs", "reports"]) {
+            Some(Json::Arr(a)) if !a.is_empty() && a.iter().all(|x| x.as_str().is_some()) => a.iter().filter_map(Json::as_str).collect(),
+            _ => return usage(format!("--family-table {}: field 'inputs.reports' is missing or invalid (a list of report paths)", p)),
+        };
+        let reports: Vec<String> = listed.iter().map(|r| report_key(r)).collect();
+        for (r, key) in listed.iter().zip(&reports) {
+            let other = if own_keys.contains(key) {
+                Some("this table (--wf)".to_string())
+            } else {
+                family.iter().find(|s| s.reports.contains(key)).map(|s| format!("the family table {}", s.path))
+            };
+            if let Some(other) = other {
+                return usage(format!(
+                    "--family-table {}: its report {} is also a report of {} (compared by canonical path); a report counts in one table only",
+                    p, r, other
+                ));
+            }
+        }
+        family.push(Sibling { path: p.clone(), sha256, n_eff, nominal, spa_p, reports });
     }
     Ok(family)
 }
@@ -1237,7 +1266,7 @@ fn metric_cell(name: &str, v: &Val) -> String {
 
 fn table(o: &Options, t: &TableArgs, rule: &Rule, rule_sha: &str, rule_source: &str) -> Res<Out> {
     let map: Option<FreezeMap> = t.freeze_map.as_deref().map(trials_freeze::load_map).transpose()?;
-    let family = load_family(&t.family, o.out.as_deref(), &t.locked)?;
+    let family = load_family(&t.family, &o.wf, o.out.as_deref(), &t.locked)?;
     let entries = load_entries(o, &t.locked)?;
     let first = &entries[0];
     let n = first.wf.net.len();

@@ -130,8 +130,10 @@ counts the sibling horizon tables. Output rcsr-trials-table/1.\n\
                          spa.p_consistent) for k siblings; trials.family lists each sibling's path, sha256, n_eff,\n\
                          nominal and spa_p, the family sha256 and the totals. A sibling's own trials.family is not\n\
                          read. Two siblings with one sha256, a sibling that is the --out file, a sibling that is not\n\
-                         an rcsr-trials-table/1 output or lacks trials.n_eff, trials.nominal or spa.p_consistent, and\n\
-                         a sibling with a locked read exit 2 naming the file\n\
+                         an rcsr-trials-table/1 output or lacks trials.n_eff, trials.nominal, spa.p_consistent or\n\
+                         inputs.reports, a sibling with a locked read, and a sibling whose inputs.reports share a report\n\
+                         with --wf or with an earlier sibling (by canonical path when the path resolves from the current\n\
+                         directory, else as given) exit 2 naming the file (and the shared report and the other table)\n\
   --alpha <a>            family error rate of StepM and q of BH-FDR (default 0.05)\n\
   --locked-test <S,E>    refuse a report with a period or test window in [S, E) (repeatable)\n\
   --occam <files...>     run.json of a --select-rule occam re-selection or of rcsr compose: bits, p_occam and\n\
