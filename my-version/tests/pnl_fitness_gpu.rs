@@ -867,6 +867,135 @@ fn wide_block_stat_search_archives_device_scores() {
     }
 }
 
+/// #1267: a `--fitness pnl` search with `--fit-strategy gpu` is a pure function
+/// of the seed: front, archive hash and counted fit work repeat exactly.
+fn search_sample(f: &Fixture) -> Sample {
+    let x = (0..f.n)
+        .map(|i| (0..2).map(|v| f.cols[v * f.n + i] as f64).collect())
+        .collect();
+    Sample { x, y: f.slice.ret.clone(), w: Vec::new(), ys: Vec::new(), pairs: None }
+}
+
+fn counted_fit_work(g: &rcsr::search::GpuRunStats) -> String {
+    format!(
+        "{:?}{:?}",
+        (
+            g.fit_attempts,
+            g.fit_gpu,
+            g.fit_fallback,
+            g.fit_screened,
+            g.fit_admitted_wide,
+            g.fit_folded,
+            g.fit_refits,
+            g.fit_refit_candidates,
+            g.fit_carried_kept,
+            g.fit_calls,
+            g.fit_call_candidates,
+        ),
+        (
+            &g.fit_fallback_by_cause,
+            &g.fit_fallback_improved_by_cause,
+            &g.fit_status_by_label,
+            &g.fit_fallback_skipped_by_cause,
+        )
+    )
+}
+
+fn assert_pnl_gpu_fit_is_deterministic(label: &str, sample: &Sample, b: &Arc<FitnessBook>) {
+    for pipeline_depth in [0usize, 2] {
+        let seen: Archived = Arc::default();
+        let cfg = Config {
+            fit_strategy: rcsr::fit::FitStrategy::Gpu,
+            fit_admission: rcsr::fit::FitAdmission::All,
+            pipeline_depth,
+            ..config(b, &seen)
+        };
+        let runs: Vec<_> = (0..2).map(|_| search::run(&cfg, sample, sample)).collect();
+        for out in &runs {
+            assert_device_scored(out);
+            let g = out.gpu.as_ref().unwrap();
+            assert!(g.fit_gpu > 0, "{label} depth {pipeline_depth}: the device fitted constants");
+            assert!(g.fit_refits > 0, "{label} depth {pipeline_depth}: finalists were refit");
+            assert!(!out.archive.items.is_empty());
+            for s in &out.archive.items {
+                let pred: Vec<f64> = sample.x.iter().map(|r| rcsr::expr::eval(&s.tree, r)).collect();
+                assert_eq!(s.error.to_bits(), b.regret(&pred).to_bits(), "{label} depth {pipeline_depth}: {}", show(&s.tree));
+            }
+        }
+        let front = |o: &search::Outcome| {
+            o.archive
+                .items
+                .iter()
+                .map(|s| (s.error.to_bits(), s.complexity, show(&s.tree)))
+                .collect::<Vec<_>>()
+        };
+        let (a, c) = (&runs[0], &runs[1]);
+        assert_eq!(front(a), front(c), "{label} depth {pipeline_depth}: front");
+        assert_eq!(a.archive.hash(), c.archive.hash(), "{label} depth {pipeline_depth}: archive hash");
+        assert_eq!(
+            counted_fit_work(a.gpu.as_ref().unwrap()),
+            counted_fit_work(c.gpu.as_ref().unwrap()),
+            "{label} depth {pipeline_depth}: fit counters"
+        );
+    }
+}
+
+fn skip_without_device() -> bool {
+    if GpuEvaluator::new(&[0.0], 1, 1, &[0.0]).is_none() {
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
+        return true;
+    }
+    false
+}
+
+#[test]
+fn pnl_gpu_fit_is_deterministic_on_a_plain_book() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    if skip_without_device() {
+        return;
+    }
+    let (sample, b) = search_fixture();
+    assert_pnl_gpu_fit_is_deterministic("plain", &sample, &b);
+}
+
+#[test]
+fn pnl_gpu_fit_is_deterministic_on_a_masked_score_unit_book() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    if skip_without_device() {
+        return;
+    }
+    let f = fixture(&[0, 600, 1200, 1800], 2_400, 17);
+    let b = Arc::new(band_book(&f, 0.3, BandUnits::Score, 4, 1));
+    assert!(!b.is_plain());
+    assert_pnl_gpu_fit_is_deterministic("masked score-unit", &search_sample(&f), &b);
+}
+
+#[test]
+fn pnl_gpu_fit_is_deterministic_on_a_nine_block_book() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    if skip_without_device() {
+        return;
+    }
+    let (sample, b) = search_fixture_blocks(9);
+    assert_eq!(b.blocks(), 9);
+    assert_pnl_gpu_fit_is_deterministic("9 blocks", &sample, &b);
+}
+
+#[test]
+fn pnl_gpu_fit_is_deterministic_on_an_xs_mean_book() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    if skip_without_device() {
+        return;
+    }
+    let f = fixture(&[0, 600, 1200, 1800], 2_400, 17);
+    let b = Arc::new(
+        FitnessBook::new(&f.slice, &TradingSpec { pnl_excess: PnlExcess::XsMean, ..spec(1) }, 900.0)
+            .expect("a profitable xs-mean book"),
+    );
+    assert_ne!(b.hash(), book(&f, 1).hash());
+    assert_pnl_gpu_fit_is_deterministic("xs-mean", &search_sample(&f), &b);
+}
+
 /// Throughput of the blocked kernel against the unblocked one on the same
 /// 1,000,000 rows and programs.
 #[test]
