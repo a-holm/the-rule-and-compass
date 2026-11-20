@@ -1723,7 +1723,7 @@ fn table_output_without_baseline_wf_is_unchanged() {
         }
         let o = run(&args);
         assert_eq!(code(&o), 0, "{}", stderr(&o));
-        bytes.extend_from_slice(&o.stdout);
+        bytes.extend_from_slice(String::from_utf8_lossy(&o.stdout).replace(dir.to_str().unwrap(), "DIR").as_bytes());
     }
-    assert_eq!(rcsr::manifest::sha256_hex(&bytes), "6e9ce731d4f5b40197e0548e8aced76bc1997ff76079b5d15d86e04fea28eca9");
+    assert_eq!(rcsr::manifest::sha256_hex(&bytes), "7bea7caf3851d6523eec12324de315b2a7326e45bff3339a58f045dd93287d3a");
 }
