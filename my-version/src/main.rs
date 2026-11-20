@@ -390,10 +390,10 @@ INPUT:
                              > 0. Rows outside are flat; every run of on rows
                              of a group starts flat and pays its exit; the
                              hindsight bound is taken on those runs. The
-                             validation and test books apply the same mask with
-                             the gate state of rcsr-gate-state/1: the kernel
-                             over every row of the data file from each group's
-                             first row (never a label or a row filter); the
+                             training, validation and test books read one gate
+                             state, rcsr-gate-state/1: the kernel over every
+                             row of the data file from each group's first row
+                             (never a label or a row filter); the training and
                              validation rows never read a test interval.
                              --gpu scores it on the device, except with
                              --band-units sd (exit 2). Needs --fitness pnl;
@@ -403,7 +403,9 @@ INPUT:
                              on above +h, off below -h, else the previous
                              state. Needs --pnl-mask
   --pnl-mask-dwell D        minimum rows per gate state, per group (default 1,
-                             integer >= 1). Needs --pnl-mask
+                             integer >= 1), in rows of the data file in every
+                             slice: unlabelled and dropped rows count, so 168
+                             is a week on hourly rows. Needs --pnl-mask
   --gate-search             search a regime gate g over --vars (required)
                              between two frozen branches (#1182). A candidate
                              is scored at its best cut c of the 16-quantile
@@ -6242,10 +6244,18 @@ fn main() {
     }
     if let Some(cp) = &resume_checkpoint {
         if cp.config.fitness.key() != cfg.fitness.key() {
+            let mask = gate_spec.as_ref().map_or(String::new(), |g| {
+                format!(
+                    "; under --pnl-mask '{}' it also holds the training gate states of {} (the kernel over every row of the data file), which a checkpoint of the per-segment training rule does not have",
+                    g.source,
+                    rcsr::regime_gate::STATE_RULE
+                )
+            });
             trading_usage(&format!(
-                "--resume conflicts with the saved search settings: fitness {} (saved {}); the book depends on the cost, threshold, band, band units, minimum hold, min-trades, pnl excess and training rows",
+                "--resume conflicts with the saved search settings: fitness {} (saved {}); the book depends on the cost, threshold, band, band units, minimum hold, min-trades, pnl excess and training rows{}",
                 cfg.fitness.key(),
-                cp.config.fitness.key()
+                cp.config.fitness.key(),
+                mask
             ));
         }
     }
