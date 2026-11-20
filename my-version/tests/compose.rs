@@ -66,13 +66,20 @@ fn write_csv(dir: &Path, name: &str, alter: impl Fn(i64) -> Option<(f64, f64, f6
 }
 
 fn write_spec(dir: &Path) -> String {
-    let text = "{\"schema\":\"rcsr-target-spec/1\",\"targets\":[{\"column\":\"y\",\"name\":\"raw_target\",\
+    write_spec_horizon(dir, "s.json", 900)
+}
+
+/// The target spec of `y` with return column `r` and a label horizon of `horizon` seconds.
+fn write_spec_horizon(dir: &Path, name: &str, horizon: i64) -> String {
+    let text = format!(
+        "{{\"schema\":\"rcsr-target-spec/1\",\"targets\":[{{\"column\":\"y\",\"name\":\"raw_target\",\
          \"kind\":\"forward_return\",\"deprecated\":false,\"return_column\":\"r\",\"return_units\":\"log\",\
-         \"horizon_seconds\":900,\"entry_offset_seconds\":0,\"delay_seconds\":0,\
+         \"horizon_seconds\":{horizon},\"entry_offset_seconds\":0,\"delay_seconds\":0,\
          \"entry_price\":\"open\",\"exit_price\":\"close\",\"offset\":0.0,\
-         \"scale\":{\"kind\":\"constant\",\"value\":1.0},\"clip\":null,\"units\":\"log_return\",\
-         \"cost_bps\":null,\"cost_in_label\":false,\"construction_columns\":[],\"note\":null}]}";
-    let path = dir.join("s.json");
+         \"scale\":{{\"kind\":\"constant\",\"value\":1.0}},\"clip\":null,\"units\":\"log_return\",\
+         \"cost_bps\":null,\"cost_in_label\":false,\"construction_columns\":[],\"note\":null}}]}}"
+    );
+    let path = dir.join(name);
     std::fs::write(&path, text).unwrap();
     path.to_string_lossy().into_owned()
 }
@@ -870,6 +877,11 @@ fn searched_pool(dir: &Path, name: &str, data: &str, spec: &str, extra: &[&str])
     (path.to_string_lossy().into_owned(), j)
 }
 
+/// `search_fitness.mask.off_rows`; the block is absent when every training row is on.
+fn off_rows(run: &Json) -> f64 {
+    at(run, &["search_fitness"]).get("mask").map_or(0.0, |m| num(m, &["off_rows"]))
+}
+
 /// The training net of a pool's top member (the lowest archive rank), on its masked book.
 fn top_train_net(run: &Json) -> f64 {
     let front = arr(run, &["pareto"]);
@@ -885,7 +897,7 @@ fn compose_training_states_equal_the_pool_masks() {
     const DWELL: usize = 24;
     let (_scratch, dir) = scratch();
     let data = write_strided_csv(&dir, "strided.csv", STRIDE);
-    let spec = write_spec(&dir);
+    let spec = write_spec_horizon(&dir, "strided.json", STEP * STRIDE);
     let dwell = DWELL.to_string();
     let (bull, bull_run) = searched_pool(&dir, "bull.json", &data, &spec, &["--fill", "drop", "--pnl-mask", "g", "--pnl-mask-dwell", &dwell]);
     let (bear, bear_run) = searched_pool(&dir, "bear.json", &data, &spec, &["--fill", "drop", "--pnl-mask", "0 - g", "--pnl-mask-dwell", &dwell]);
@@ -899,8 +911,8 @@ fn compose_training_states_equal_the_pool_masks() {
     let rows = (SYMBOLS.len() * train.len()) as f64;
     let off = (SYMBOLS.len() * train.iter().filter(|&&k| !state[k]).count()) as f64;
     assert!(off > 0.0 && off < rows, "{off} of {rows}");
-    assert_eq!(num(&bull_run, &["search_fitness", "mask", "off_rows"]), off, "bull training mask");
-    assert_eq!(num(&bear_run, &["search_fitness", "mask", "off_rows"]), rows - off, "bear training mask");
+    assert_eq!(off_rows(&bull_run), off, "bull training mask");
+    assert_eq!(off_rows(&bear_run), rows - off, "bear training mask");
     // The training seam of the composite reads the same states as the pools' masked books.
     let menu = write_menu(&dir, "menu.json", &[("g", "000", "g", 0.0, DWELL)], None);
     let j = json(&compose(&data, &spec, &["--fill", "drop", "--gates", &menu, "--bull", &bull, "--bear", &bear, "--top", "1", "--json"]));

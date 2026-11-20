@@ -2912,6 +2912,11 @@ fn slice_kernel_states(table: &rcsr::data::Table, gate: &GateSpec, rows: &Tradin
     regime_gate::gate_states(gate, &rows.group, &rows.time, &[values]).unwrap()
 }
 
+/// `search_fitness.mask.off_rows`; the block is absent when every training row is on.
+fn off_rows(run: &Json) -> f64 {
+    at(run, &["search_fitness"]).get("mask").map_or(0.0, |m| num(m, &["off_rows"]))
+}
+
 /// `(group, time)` of the first row of every maximal on-run of a group.
 fn on_run_starts(rows: &TradingRows, on: &[bool]) -> Vec<(u64, f64)> {
     (0..on.len()).filter(|&i| on[i] && (i == 0 || rows.group[i] != rows.group[i - 1] || !on[i - 1])).map(|i| (rows.group[i], rows.time[i])).collect()
@@ -2978,7 +2983,7 @@ fn strided_training_states_agree_with_validation_and_walkforward() {
     assert_eq!(train.len() as f64, num(&j, &["train_rows"]));
     let off = train.iter().filter(|r| !r.3).count();
     assert!(off > 0 && off < train.len(), "{off} of {}", train.len());
-    assert_eq!(num(&j, &["search_fitness", "mask", "off_rows"]), off as f64, "training off rows");
+    assert_eq!(off_rows(&j), off as f64, "training off rows");
     let (vlo, vhi) = time_range(&j, "validation_time");
     let validation = labelled(vlo, vhi);
     let on = validation.iter().filter(|r| r.3).count();
@@ -3008,7 +3013,7 @@ fn strided_training_states_agree_with_validation_and_walkforward() {
 
 /// The book hash of `STRIDED_ARGS` with `--generations 10` on the three-day strided fixture under the
 /// training rule before #1268: the kernel over the training rows alone.
-const STRIDED_MASK_HASH_BEFORE: u64 = 0;
+const STRIDED_MASK_HASH_BEFORE: u64 = 0xe370_75dd_e50d_5673;
 
 /// A copy of checkpoint `cp` at `out` whose book hash is `to`, with its config hash recomputed.
 fn with_book_hash(cp: &str, to: u64, out: &std::path::Path) {
