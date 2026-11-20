@@ -840,3 +840,52 @@ fn gap_split_windows_batch_resets() {
     assert_eq!(at(&wf, &["pooled_seam", "reset_flat"]), &Json::Bool(true));
     assert_eq!(at(&wf, &["batch_pnl", "pooled"]), &Json::Null);
 }
+
+/// Hourly rows with the gate columns of #1270 as plain columns, so the search
+/// resolves their registered lookbacks.
+fn write_gate_series(dir: &Path, hours: usize) -> String {
+    let mut text = String::from("ts,btc_r168,btc_trend_ma100_ratio,r,y\n");
+    for i in 0..hours {
+        let f = i as f64;
+        let a = frac(f * 0.618_033_988_749_894_9) - 0.5;
+        let b = frac(f * 0.754_877_666_246_692_7) - 0.5;
+        let r = 0.01 * a + 0.004 * (frac(f * 0.324_717_957_244_746) - 0.5);
+        text.push_str(&format!("{},{},{},{},{}\n", T0 + H * i as i64, a, b, r, r));
+    }
+    let path = dir.join("gate_series.csv");
+    std::fs::write(&path, text).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+#[test]
+fn embargo_auto_follows_the_gate_column_lookbacks() {
+    let s = Scratch::new("interval-split-embargo-gate");
+    let dir = s.path();
+    let data = write_gate_series(dir, 3600);
+    let table = write_table(
+        dir,
+        "t.csv",
+        &[("c", "train", hour(0), hour(720)), ("c", "test", hour(720), hour(960)), ("c", "train", hour(960), hour(3600))],
+    );
+    let h1 = write_spec(dir, "h1.json", H, H);
+    let run = |column: &str| {
+        let args = ["--vars", column, "--split-table", &table, "--split-id", "c", "--generations", "1", "--pop", "8"];
+        ok_json(&search(&data, &h1, &args))
+    };
+    let j = run("btc_r168");
+    assert_eq!(num(&j, &["split", "embargo_seconds"]), (168 * H) as f64);
+    assert_eq!(at(&j, &["split", "embargo_source"]).as_str(), Some("lookback"));
+    assert_eq!(at(&j, &["split", "embargo_column"]).as_str(), Some("btc_r168"));
+    // The ratio of the 100-day average reads the same 101 days as `trend_ma100_ratio` (`docs/trend-inventory.json`).
+    let trend = rcsr::trend::lookback_seconds("trend_ma100_ratio").unwrap();
+    assert_eq!(trend, 101 * D);
+    let j = run("btc_trend_ma100_ratio");
+    assert_eq!(num(&j, &["split", "embargo_seconds"]), trend as f64);
+    assert_eq!(at(&j, &["split", "embargo_column"]).as_str(), Some("btc_trend_ma100_ratio"));
+    let args = [
+        "--vars", "btc_trend_ma100_ratio", "--split-table", &table, "--split-id", "c", "--generations", "1", "--pop", "8", "--embargo", "3600",
+    ];
+    let out = search(&data, &h1, &args);
+    assert_eq!(code(&out), 2, "{}", stderr(&out));
+    assert!(stderr(&out).contains(&format!("below the automatic embargo {trend}")), "{}", stderr(&out));
+}

@@ -1148,3 +1148,34 @@ fn view_ids_of_fully_delivered_sizes_are_pinned() {
     let golden: [&str; 6] = ["2abdb5320a08", "c498b629e472", "41f0170017d4", "8ed29caee6cb", "a32035702727", "558b4954cb4b"];
     assert_eq!(got, golden, "{got:?}");
 }
+
+#[test]
+fn all_appends_the_six_gate_columns_and_the_schema_verifies() {
+    let (_scratch, dir) = tmp_dir("append-gates");
+    let symbols = ["AAA", "BTCUSDT"];
+    let sym_major = bar_rows(&symbols, 60);
+    let panel = path(&dir, "panel.rcsb");
+    write_rows(&panel, &time_major(&sym_major), 37);
+    registry::write_schema(&panel, "2").unwrap();
+    let gates = [
+        "btc_r168",
+        "mkt_r672",
+        "btc_trend_ma100_ratio",
+        "mkt_trend_ma100_ratio",
+        "btc_vol_ratio_168_2160",
+        "mkt_trend_hi90_dist",
+    ];
+    let family = enrich_family(&dir, "gates", &sym_major, &gates.join(","));
+    let out = path(&dir, "all.rcsb");
+    let run = rcsr_cmd::rcsr()
+        .args(["panel", "append", "--data", &panel, "--family", &family, "--columns", "@all", "--out", &out])
+        .output()
+        .unwrap();
+    assert_eq!(run.status.code(), Some(0), "{}", String::from_utf8_lossy(&run.stderr));
+    let got = FileStore::open(&out).unwrap();
+    for n in gates {
+        assert!(got.header().column_index(n).is_some(), "{n} was not appended");
+    }
+    let verify = rcsr_cmd::rcsr().args(["panel", "schema", "--data", &out, "--verify"]).output().unwrap();
+    assert_eq!(verify.status.code(), Some(0), "{}", String::from_utf8_lossy(&verify.stderr));
+}
