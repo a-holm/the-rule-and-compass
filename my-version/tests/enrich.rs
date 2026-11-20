@@ -6166,3 +6166,46 @@ fn min_cross_members_mixing_is_refused_by_panel_append() {
     assert_eq!(r.status.code(), Some(0), "{}", stderr_of(&r));
     assert_eq!(schema_floors(&fourth).get("xs_rank_r1"), Some(&20));
 }
+
+#[test]
+fn min_cross_members_floor_survives_a_chained_enrich() {
+    let (_scratch, dir) = tmp_dir("floor-chain");
+    let rows = member_rows(8, 120, 900);
+    let mut time_major_rows = rows.clone();
+    time_major_rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    let panel = dir.join("panel.rcsb").to_string_lossy().into_owned();
+    write_panel_store(&panel, &time_major_rows, 64);
+    let base = dir.join("base.rcsb").to_string_lossy().into_owned();
+    write_panel_store(&base, &rows, 64);
+    let p = |name: &str| dir.join(name).to_string_lossy().into_owned();
+
+    // Step 1 builds the cross columns at 5, step 2 builds no cross column: its features[] lists only r1.
+    let (s1, s2, f20) = (p("s1.rcsb"), p("s2.rcsb"), p("f20.rcsb"));
+    cli_enrich_ok(&base, &s1, "mkt_r16,mkt_r96", &["--min-cross-members", "5"]);
+    cli_enrich_ok(&s1, &s2, "r1", &[]);
+    cli_enrich_ok(&base, &f20, "mkt_vol96", &[]);
+    let text = std::fs::read_to_string(format!("{s2}.enrich.json")).unwrap();
+    assert!(text.contains("\"cross_floor\":{\"members\":5,\"rank_members\":5}"), "{text}");
+
+    let append = |target: &str, family: &str, columns: &str, out: &str| {
+        rcsr_cmd::rcsr()
+            .args(["panel", "append", "--data", target, "--family", family, "--columns", columns, "--out", out])
+            .output()
+            .unwrap()
+    };
+    let (first, second) = (p("first.rcsb"), p("second.rcsb"));
+    let r = append(&panel, &s2, "mkt_r16", &first);
+    assert_eq!(r.status.code(), Some(0), "{}", stderr_of(&r));
+    let schema = std::fs::read_to_string(format!("{first}.schema.json")).unwrap();
+    let line = schema.lines().find(|l| l.starts_with("{\"name\":\"mkt_r16\"")).unwrap();
+    assert!(line.contains("\"min_members\":5") && line.contains("N>=5") && !line.contains("N>=20"), "{line}");
+    let r = append(&first, &f20, "mkt_vol96", &second);
+    assert_eq!(r.status.code(), Some(3), "{}", stderr_of(&r));
+    let text = stderr_of(&r);
+    assert!(text.contains("min_members 20") && text.contains("min_members 5"), "{text}");
+    assert!(!std::path::Path::new(&second).exists());
+
+    // enrich of a default floor onto the chained store is still refused.
+    let r = cli_enrich(&s2, &p("s3.rcsb"), "mkt_vol96", &[]);
+    assert_eq!(r.status.code(), Some(2), "{}", stderr_of(&r));
+}
