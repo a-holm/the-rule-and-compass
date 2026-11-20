@@ -6,8 +6,9 @@
 //! their training positions are computed once and never change. A candidate
 //! gate is scored at its best cut of the 16-quantile grid of its training
 //! values: for every inner grid cut `c` the state of a row is the hysteresis
-//! and dwell kernel of `--pnl-mask` over `g - c` (`rcsr-gate-state/1` on the
-//! training rows: per group and training segment), the composite holds the on
+//! and dwell kernel of `--pnl-mask` over `g - c` (`rcsr-gate-state/1` over
+//! every data row with the selection barriers, read on the training rows), the
+//! composite holds the on
 //! branch in state on and the off branch elsewhere, and the fitness is the
 //! `--fitness pnl` statistic of that one book. A gate with fewer than two
 //! distinct training values is constant: it scores the better branch alone.
@@ -20,7 +21,7 @@
 //! price.
 
 use crate::compose::{self, Member, Pool, PoolRun};
-use crate::data::{TradingSlice, TradingSplit};
+use crate::data::{GatePlan, GateRows, TradingSlice, TradingSplit};
 use crate::devlog::{num, text, Json};
 use crate::expr::{self, Node, Op};
 use crate::occam::{self, CodeSpec};
@@ -339,36 +340,54 @@ pub struct Choice {
     pub states: Vec<bool>,
 }
 
-/// #1182: the composite of two frozen branches under a gate, as a position
-/// layer of the training book: the prediction is the gate value.
+thread_local! {
+    static CANDIDATE: std::cell::RefCell<Option<Node>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f` with `tree` as the candidate that a gate layer on this thread prices:
+/// the layer reads the gate values of every gate row from it.
+pub fn with_candidate<R>(tree: &Node, f: impl FnOnce() -> R) -> R {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            CANDIDATE.with(|c| *c.borrow_mut() = None);
+        }
+    }
+    CANDIDATE.with(|c| *c.borrow_mut() = Some(tree.clone()));
+    let _reset = Reset;
+    f()
+}
+
+/// #1182, #1279: the composite of two frozen branches under a gate, as a
+/// position layer of the training book: the prediction is the gate value. The
+/// states of a gate follow `rcsr-gate-state/1` over every gate row.
 #[derive(Debug)]
 pub struct GateLayer {
     /// The plain training book, without a layer.
     inner: FitnessBook,
     on: Vec<bool>,
     off: Vec<bool>,
-    /// State group of every row: its group and training segment, numbered from 0.
-    group: Vec<u32>,
-    groups: usize,
+    plan: GatePlan,
+    /// The normalised search variables on every gate row, one vector each; `None`
+    /// when the gate rows are the training rows and the prediction is the gate value.
+    columns: Option<Vec<Vec<f64>>>,
     band: f64,
     dwell: usize,
     identity: String,
 }
 
 impl GateLayer {
-    /// `on` and `off` are the long rows of the two branches on the book's rows;
-    /// `state_group` numbers each row's group and training segment from 0.
-    pub fn new(inner: FitnessBook, on: Vec<bool>, off: Vec<bool>, state_group: Vec<u32>, band: f64, dwell: usize, identity: &str) -> Result<GateLayer, String> {
+    /// `on` and `off` are the long rows of the two branches on the book's rows.
+    pub fn new(inner: FitnessBook, on: Vec<bool>, off: Vec<bool>, plan: GatePlan, columns: Option<Vec<Vec<f64>>>, band: f64, dwell: usize, identity: &str) -> Result<GateLayer, String> {
         let n = inner.len();
-        if on.len() != n || off.len() != n || state_group.len() != n {
-            return Err(format!("gate layer: {} on, {} off and {} group entries for {} rows", on.len(), off.len(), state_group.len(), n));
+        if on.len() != n || off.len() != n || plan.train_len() != n {
+            return Err(format!("gate layer: {} on, {} off and {} training gate rows for {} rows", on.len(), off.len(), plan.train_len(), n));
         }
         if inner.has_layer() || inner.is_masked() || !inner.is_plain() {
             return Err("gate layer: the training book must be plain, unmasked and without a layer".to_string());
         }
-        let groups = state_group.iter().map(|&g| g as usize + 1).max().unwrap_or(0);
-        let identity = format!("gate|{}|band={:016x}|dwell={}|q={}", identity, band.to_bits(), dwell, QUANTILES);
-        Ok(GateLayer { inner, on, off, group: state_group, groups, band, dwell, identity })
+        let identity = format!("gate|{}|rule={}|band={:016x}|dwell={}|q={}", identity, regime_gate::STATE_RULE, band.to_bits(), dwell, QUANTILES);
+        Ok(GateLayer { inner, on, off, plan, columns, band, dwell, identity })
     }
 
     pub fn inner(&self) -> &FitnessBook {
@@ -388,28 +407,29 @@ impl GateLayer {
         pred
     }
 
-    /// The states of the cut at value `c`: the kernel over `g - c`.
+    /// The training states of the cut at value `c` of the gate values `g` on every gate row.
     pub fn states_at(&self, g: &[f64], c: f64) -> Vec<bool> {
-        let mut st = vec![false; g.len()];
-        regime_gate::hysteresis_states_dense(|i| g[i] - c, &self.group, self.groups, self.band, self.dwell, &mut st);
+        let mut st = vec![false; self.plan.train_len()];
+        self.plan.train_states(|r| g[r], c, self.band, self.dwell, &mut Vec::new(), &mut st);
         st
     }
 
-    /// The best cut of gate values `g` on the training rows: the lowest
-    /// fitness over the inner cuts of the 16-quantile grid (ties to the lower
-    /// cut), or the better branch alone for a constant gate (ties to on).
-    /// `None` when a value is not finite.
+    /// The best cut of gate values `g` on every gate row: the lowest
+    /// fitness over the inner cuts of the 16-quantile grid of the training
+    /// values (ties to the lower cut), or the better branch alone for a
+    /// constant gate (ties to on). `None` when a training value is not finite.
     pub fn choose(&self, g: &[f64]) -> Option<Choice> {
         let n = self.inner.len();
-        assert_eq!(g.len(), n, "gate layer: {} gate values for {} rows", g.len(), n);
-        if g.iter().any(|v| !v.is_finite()) {
+        let train: Vec<f64> = self.plan.train_rows().iter().map(|&r| g[r]).collect();
+        if train.iter().any(|v| !v.is_finite()) {
             return None;
         }
         let mut pred = vec![0.0f64; n];
         let mut st = vec![false; n];
+        let mut scratch: Vec<bool> = Vec::new();
         let mut best: Option<Choice> = None;
-        for (t, c) in grid_cuts(g, QUANTILES) {
-            regime_gate::hysteresis_states_dense(|i| g[i] - c, &self.group, self.groups, self.band, self.dwell, &mut st);
+        for (t, c) in grid_cuts(&train, QUANTILES) {
+            self.plan.train_states(|r| g[r], c, self.band, self.dwell, &mut scratch, &mut st);
             self.composite_into(&st, &mut pred);
             let f = self.inner.regret(&pred);
             if best.as_ref().map_or(true, |b| f < b.fitness) {
@@ -427,11 +447,35 @@ impl GateLayer {
         let (fb, sb) = side(false);
         Some(if fa <= fb { Choice { cut: Cut::Constant { on: true }, fitness: fa, states: sa } } else { Choice { cut: Cut::Constant { on: false }, fitness: fb, states: sb } })
     }
+
+    /// The gate values of the candidate on every gate row.
+    fn candidate_values(&self, pred: &[f64]) -> Vec<f64> {
+        let Some(cols) = &self.columns else { return pred.to_vec() };
+        let n = cols.first().map_or(0, Vec::len);
+        CANDIDATE.with(|c| {
+            let c = c.borrow();
+            let tree = c.as_ref().expect("gate layer: a gate candidate is priced inside with_candidate");
+            let mut out = vec![0.0f64; n];
+            match crate::eval_soa::compile(tree) {
+                Some(program) => crate::eval_soa::eval_batch_into(&program, cols, n, &mut out, &mut crate::eval_soa::Scratch::default()),
+                None => {
+                    let mut row = vec![0.0f64; cols.len()];
+                    for (r, o) in out.iter_mut().enumerate() {
+                        for (k, c) in cols.iter().enumerate() {
+                            row[k] = c[r];
+                        }
+                        *o = expr::eval(tree, &row);
+                    }
+                }
+            }
+            out
+        })
+    }
 }
 
 impl PositionLayer for GateLayer {
     fn positions(&self, pred: &[f64]) -> Vec<f64> {
-        match self.choose(pred) {
+        match self.choose(&self.candidate_values(pred)) {
             Some(c) => self.composite(&c.states),
             None => vec![f64::NAN; pred.len()],
         }
@@ -499,7 +543,13 @@ pub struct Setup<'a> {
     pub train: &'a TradingSlice,
     /// Raw values of [`Request::columns`] on the training rows.
     pub train_values: &'a [Vec<f64>],
-    pub train_segments: &'a [f64],
+    /// The normalised search variables on the training rows.
+    pub train_x: &'a [Vec<f64>],
+    /// #1279: every gate row with the selection barriers, the training rows included.
+    pub gate_rows: &'a GateRows,
+    /// The centre and scale of every search variable.
+    pub means: &'a [f64],
+    pub stds: &'a [f64],
     pub vars: &'a [String],
     pub ops: &'a [Op],
     pub target: &'a str,
@@ -548,9 +598,19 @@ pub fn setup(req: &Request, inner: &FitnessBook, s: &Setup) -> Arc<FitnessBook> 
     if on == off {
         fail("--branch-on and --branch-off hold the same positions on every training row: nothing to switch");
     }
-    let groups: Vec<u32> = compose::state_groups(&s.train.rows, s.train_segments).into_iter().map(|g| g as u32).collect();
+    let plan = s.gate_rows.plan().unwrap_or_else(|e| fail(&e));
+    let mut all_columns: Vec<Vec<f64>> = Vec::with_capacity(s.vars.len());
+    for (k, name) in s.vars.iter().enumerate() {
+        let raw = s.gate_rows.column(name).unwrap_or_else(|e| fail(&e));
+        let (m, sd) = (s.means[k], s.stds[k]);
+        let norm: Vec<f64> = raw.iter().map(|v| (v - m) / sd).collect();
+        if plan.train_rows().iter().zip(s.train_x).any(|(&r, x)| norm[r].to_bits() != x[k].to_bits()) {
+            fail(&format!("the normalised values of variable '{}' on the gate rows differ from the training sample: the gate states need the raw column", name));
+        }
+        all_columns.push(norm);
+    }
     let identity = format!("on={}|off={}", req.on.text, req.off.text);
-    let layer = GateLayer::new(inner.clone(), on, off, groups, req.band, req.dwell, &identity).unwrap_or_else(|e| fail(&e));
+    let layer = GateLayer::new(inner.clone(), on, off, plan, Some(all_columns), req.band, req.dwell, &identity).unwrap_or_else(|e| fail(&e));
     let layer = Arc::new(layer);
     let _ = LAYER.set(layer.clone());
     let book = inner.clone().with_layer(layer).unwrap_or_else(|e| fail(&e));
@@ -593,7 +653,6 @@ pub fn finish(req: &Request, f: &Finish, trading: Option<&TradingSplit>, tspec: 
     let gate_rows = split.gate_rows.take().unwrap_or_else(|| fail("the gate rows were not kept"));
     let train_values = split.train_values.clone();
     let n = inner.len();
-    let pick = |name: &str| -> &Vec<f64> { &train_values[carried_names.iter().position(|c| c == name).expect("a carried column")] };
 
     // The code of the composite: the search alphabet and variables plus what the branches read.
     let mut code_vars: Vec<String> = f.vars.to_vec();
@@ -619,8 +678,7 @@ pub fn finish(req: &Request, f: &Finish, trading: Option<&TradingSplit>, tspec: 
         let den = expr::simplify_display(&expr::denormalize(&expr::simplify_display(&sol.tree), means, stds));
         let src = expr::to_string_exact(&den, f.vars);
         let raw = GateSpec::parse(&src, req.band, req.dwell).unwrap_or_else(|e| fail(&format!("front member '{}': {}", src, e)));
-        let cols: Vec<Vec<f64>> = raw.columns.iter().map(|c| pick(c).clone()).collect();
-        let g = raw.values(&cols, n).unwrap_or_else(|e| fail(&e));
+        let g = gate_rows.values(&raw).unwrap_or_else(|e| fail(&e));
         let Some(choice) = layer.choose(&g) else { continue };
         let gate = match choice.cut {
             Cut::Grid { value, .. } => GateSpec::parse(&format!("({}) - ({:?})", src, value), req.band, req.dwell),
@@ -719,11 +777,12 @@ pub fn finish(req: &Request, f: &Finish, trading: Option<&TradingSplit>, tspec: 
         })
         .collect();
     let json = format!(
-        "{{\"schema\":\"{}\",\"branch_on\":{},\"branch_off\":{},\"band\":{},\"dwell\":{},\"form\":\"{}\",\"variables\":[{}],\
+        "{{\"schema\":\"{}\",\"train_state_rule\":\"{}\",\"branch_on\":{},\"branch_off\":{},\"band\":{},\"dwell\":{},\"form\":\"{}\",\"variables\":[{}],\
          \"cut\":{{\"rule\":\"lowest training fitness over the inner cuts of the quantile grid of the gate's training values; a gate with fewer than two distinct values is constant and holds the better branch\",\"quantiles\":{}}},\
          \"generations\":{},\"candidates_evaluated\":{},\"front\":{},\"bound\":{},\
          \"branches_train\":{{\"on\":{{\"fitness\":{},\"net\":{}}},\"off\":{{\"fitness\":{},\"net\":{}}}}},\"gates\":[{}]}}",
         SCHEMA,
+        regime_gate::STATE_RULE,
         req.on.json(),
         req.off.json(),
         num(req.band),
@@ -824,8 +883,8 @@ mod tests {
         (a, b, g)
     }
 
-    fn groups(slice: &TradingSlice) -> Vec<u32> {
-        compose::state_groups(&slice.rows, &[]).into_iter().map(|g| g as u32).collect()
+    fn groups(slice: &TradingSlice) -> GatePlan {
+        GatePlan::dense(compose::state_groups(&slice.rows, &[]).into_iter().map(|g| g as u32).collect())
     }
 
     #[test]
@@ -836,7 +895,7 @@ mod tests {
         let cuts = grid_cuts(&g, QUANTILES);
         let ranks: Vec<usize> = cuts.iter().map(|c| c.0).collect();
         assert_eq!(ranks, sweep.grid(QUANTILES));
-        let layer = GateLayer::new(b.clone(), a.clone(), bb.clone(), groups(&slice), 0.0, 1, "t").unwrap();
+        let layer = GateLayer::new(b.clone(), a.clone(), bb.clone(), groups(&slice), None, 0.0, 1, "t").unwrap();
         for &(t, c) in &cuts {
             assert_eq!(c.to_bits(), sweep.value(&g, t).to_bits(), "cut value of rank {t}");
             // Band 0 and dwell 1: the kernel state of g - c is the sweep's state of rank t.
@@ -855,7 +914,7 @@ mod tests {
         for (blocks, band, dwell) in [(1, 0.0, 1), (4, 0.0, 1), (1, 0.05, 3), (4, 0.05, 2)] {
             let (b, slice) = book(96, blocks);
             let (a, bb, g) = branches(&slice);
-            let layer = Arc::new(GateLayer::new(b.clone(), a, bb, groups(&slice), band, dwell, "t").unwrap());
+            let layer = Arc::new(GateLayer::new(b.clone(), a, bb, groups(&slice), None, band, dwell, "t").unwrap());
             let choice = layer.choose(&g).unwrap();
             let layered = b.clone().with_layer(layer.clone()).unwrap();
             assert_ne!(layered.hash(), b.hash(), "the layer joins the hash");
@@ -875,7 +934,7 @@ mod tests {
         let (b, slice) = book(64, 1);
         let (a, _, g) = branches(&slice);
         let n = a.len();
-        let layer = GateLayer::new(b, a.clone(), vec![false; n], groups(&slice), 0.0, 1, "t").unwrap();
+        let layer = GateLayer::new(b, a.clone(), vec![false; n], groups(&slice), None, 0.0, 1, "t").unwrap();
         let choice = layer.choose(&g).unwrap();
         let pos = layer.composite(&choice.states);
         for i in 0..n {
@@ -892,7 +951,7 @@ mod tests {
         let (b, slice) = book(64, 1);
         let (a, bb, _) = branches(&slice);
         let n = a.len();
-        let layer = Arc::new(GateLayer::new(b.clone(), a.clone(), bb.clone(), groups(&slice), 0.0, 1, "t").unwrap());
+        let layer = Arc::new(GateLayer::new(b.clone(), a.clone(), bb.clone(), groups(&slice), None, 0.0, 1, "t").unwrap());
         let choice = layer.choose(&vec![0.25; n]).unwrap();
         let fa = b.regret(&layer.composite(&vec![true; n]));
         let fb = b.regret(&layer.composite(&vec![false; n]));
@@ -911,7 +970,7 @@ mod tests {
         let n = b.len();
         let spec = TradingSpec { cost_bps: 5.0, min_holding: 2, ..Default::default() };
         let held = FitnessBook::new(&slice, &spec, 3600.0).unwrap();
-        assert!(GateLayer::new(held, vec![true; n], vec![false; n], groups(&slice), 0.0, 1, "t").is_err());
-        assert!(GateLayer::new(b, vec![true; n - 1], vec![false; n], groups(&slice), 0.0, 1, "t").is_err());
+        assert!(GateLayer::new(held, vec![true; n], vec![false; n], groups(&slice), None, 0.0, 1, "t").is_err());
+        assert!(GateLayer::new(b, vec![true; n - 1], vec![false; n], groups(&slice), None, 0.0, 1, "t").is_err());
     }
 }
