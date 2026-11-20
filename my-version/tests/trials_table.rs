@@ -1587,7 +1587,7 @@ fn baseline_fx(dir: &Path, edit: &dyn Fn(&mut Fx)) -> BaselineFx {
 fn baseline_run(fx: &BaselineFx, baselines: &[String], extra: &[&str]) -> Output {
     let mut args = vec!["trials", "--wf"];
     args.extend(fx.candidates.iter().map(String::as_str));
-    args.extend(["--table", "--draws", "200", "--block-len", "4", "--pbo-blocks", "4", "--cluster-rho", "0.7", "--gates", "net10>-100", "--baseline-wf"]);
+    args.extend(["--table", "--draws", "200", "--block-len", "4", "--pbo-blocks", "4", "--cluster-rho", "0.7", "--baseline-wf"]);
     args.extend(baselines.iter().map(String::as_str));
     args.extend(extra);
     run(&args)
