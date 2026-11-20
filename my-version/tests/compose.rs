@@ -838,6 +838,87 @@ fn compose_refuses_masked_sd_band_run() {
     assert!(stderr(&o).contains("priced a band or a minimum hold"), "{}", stderr(&o));
 }
 
+/// `data` with extra numeric columns appended: each is `offset + 0.1 * g` on every row.
+fn with_columns(dir: &Path, data: &str, extra: &[(&str, f64)]) -> String {
+    let text = std::fs::read_to_string(data).unwrap();
+    let mut lines = text.lines();
+    let mut out = String::from(lines.next().unwrap());
+    for (name, _) in extra {
+        out.push_str(&format!(",{name}"));
+    }
+    out.push('\n');
+    for line in lines {
+        let g: f64 = line.split(',').nth(4).unwrap().parse().unwrap();
+        out.push_str(line);
+        for (_, offset) in extra {
+            out.push_str(&format!(",{}", offset + 0.1 * g));
+        }
+        out.push('\n');
+    }
+    let path = dir.join("gates.csv");
+    std::fs::write(&path, out).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+#[test]
+fn compose_runs_the_eight_gate_menu_of_the_broad_pilot() {
+    let p = planted(&BULL, &BEAR);
+    let columns = [
+        ("btc_r672", 0.0),
+        ("mkt_r672", 0.0),
+        ("mkt_breadth", 0.5),
+        ("btc_trend_ma100_ratio", 0.0),
+        ("mkt_trend_ma100_ratio", 0.0),
+        ("btc_vol_ratio_168_2160", 1.0),
+        ("mkt_trend_hi90_dist", -0.2),
+        ("btc_r168", 0.0),
+    ];
+    let data = with_columns(&p.dir, &p.data, &columns);
+    let gates = [
+        ("btc28", "000", "btc_r672", 0.02, 168),
+        ("mkt28", "001", "mkt_r672", 0.02, 168),
+        ("breadth", "010", "mkt_breadth - 0.5", 0.05, 168),
+        ("btc_ma100", "011", "btc_trend_ma100_ratio", 0.02, 168),
+        ("mkt_ma100", "100", "mkt_trend_ma100_ratio", 0.02, 168),
+        ("volratio", "101", "1 - btc_vol_ratio_168_2160", 0.05, 168),
+        ("hi90", "110", "mkt_trend_hi90_dist + 0.2", 0.0, 168),
+        ("btc7", "111", "btc_r168", 0.01, 48),
+    ];
+    for (_, _, expr, _, _) in &gates {
+        for column in rcsr::regime_gate::referenced_columns(expr) {
+            assert!(rcsr::registry::lookup(&column).is_some(), "{column} is not a registered column");
+        }
+    }
+    let menu = write_menu(&p.dir, "menu8.json", &gates, None);
+    let j = json(&compose(&data, &p.spec, &["--gates", &menu, "--bull", &p.bull, "--bear", &p.bear, "--json"]));
+    assert_eq!(num(&j, &["compose", "count", "composites"]), (8 * (3 * 3 + 3 + 3)) as f64);
+}
+
+#[test]
+fn the_docs_example_menu_reads_registered_columns_and_runs() {
+    let docs = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/compose.md")).unwrap();
+    let after = &docs[docs.find("## The gate menu").unwrap()..];
+    let start = after.find("```json\n").unwrap() + "```json\n".len();
+    let menu_text = &after[start..start + after[start..].find("```").unwrap()];
+    let menu = Json::parse(menu_text.trim()).expect("the docs example menu is json");
+    let mut columns: Vec<String> = Vec::new();
+    for gate in arr(&menu, &["gates"]) {
+        for column in rcsr::regime_gate::referenced_columns(s(gate, &["expr"])) {
+            assert!(rcsr::registry::lookup(&column).is_some(), "the docs example reads {column}, which is not registered");
+            columns.push(column);
+        }
+    }
+    columns.sort();
+    columns.dedup();
+    let p = planted(&BULL, &BEAR);
+    let extra: Vec<(&str, f64)> = columns.iter().map(|c| (c.as_str(), if c == "mkt_breadth" { 0.5 } else { 0.0 })).collect();
+    let data = with_columns(&p.dir, &p.data, &extra);
+    let path = p.dir.join("docs_menu.json");
+    std::fs::write(&path, menu_text.trim()).unwrap();
+    let j = json(&compose(&data, &p.spec, &["--gates", &path.to_string_lossy(), "--bull", &p.bull, "--bear", &p.bear, "--json"]));
+    assert_eq!(num(&j, &["compose", "count", "composites"]), (3 * (3 * 3 + 3 + 3)) as f64);
+}
+
 // ---- #1268: compose and the pools read one training state ----
 
 /// A gate positive for 72 stamps and negative for the next 24, the same for every symbol.
