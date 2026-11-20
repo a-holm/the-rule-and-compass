@@ -915,6 +915,7 @@ fn the_docs_example_menu_reads_registered_columns_and_runs() {
     std::fs::write(&path, menu_text.trim()).unwrap();
     let j = json(&compose(&data, &p.spec, &["--gates", &path.to_string_lossy(), "--bull", &p.bull, "--bear", &p.bear, "--json"]));
     assert_eq!(num(&j, &["compose", "count", "composites"]), (3 * (3 * 3 + 3 + 3)) as f64);
+}
 
 // ---- #1268: compose and the pools read one training state ----
 
