@@ -62,6 +62,10 @@ pub const INTERIM_REFUSAL: &str = "run.json comes from an --interim-chunk run: i
 pub const STALE_COMPOSE_REFUSAL: &str = "run.json comes from rcsr compose with a carried finalist gate (compose.gate.carried) and no objective.finalist.switch: \
      it was written before the switch block; run rcsr compose again";
 
+/// #1279: the refusal for a gate-search run written before its training states followed
+/// `rcsr-gate-state/1`: its `gate_search` record has no `train_state_rule`.
+pub const STALE_GATE_SEARCH_REFUSAL: &str = "run.json comes from rcsr --gate-search without gate_search.train_state_rule: its gate was searched under the per-segment training rule, not rcsr-gate-state/1; run rcsr --gate-search again";
+
 /// #1237 (D19): the compose provenance of a run's finalist, `compose.chosen` of an `rcsr compose` run.json.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CompositeMarker {
@@ -168,6 +172,11 @@ impl RunFile {
         let carried = matches!(j.get("compose").and_then(|c| c.get("gate")).and_then(|g| g.get("carried")), Some(Json::Bool(true)));
         if carried && j.get("objective").and_then(|o| o.get("finalist")).and_then(|f| f.get("switch")).is_none() {
             return Err(STALE_COMPOSE_REFUSAL.to_string());
+        }
+        if let Some(gs) = j.get("gate_search") {
+            if gs.get("train_state_rule").and_then(Json::as_str) != Some(crate::regime_gate::STATE_RULE) {
+                return Err(STALE_GATE_SEARCH_REFUSAL.to_string());
+            }
         }
         let variables = match j.get("variables") {
             Some(Json::Arr(a)) => a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),

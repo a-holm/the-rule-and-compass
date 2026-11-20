@@ -372,6 +372,16 @@ fn gate_search_prices_the_same_in_walkforward() {
     assert_eq!(at(&again, &["objective", "finalist", "switch"]), sw);
     assert_eq!(at(&again, &["gate_search"]), at(&j, &["gate_search"]));
     assert_eq!(num(&again, &["search", "candidates_evaluated"]), num(&j, &["search", "candidates_evaluated"]));
+    // A run searched under the per-segment training kernel has no train_state_rule and is refused.
+    assert_eq!(s(&j, &["gate_search", "train_state_rule"]), "rcsr-gate-state/1");
+    let old = p.dir.join("old.json").to_string_lossy().into_owned();
+    let body = std::fs::read_to_string(&out).unwrap();
+    assert!(body.contains("\"train_state_rule\":\"rcsr-gate-state/1\","));
+    std::fs::write(&old, body.replace("\"train_state_rule\":\"rcsr-gate-state/1\",", "")).unwrap();
+    let window = format!("t,{},{},{},{}", T0, first_val, T0 + STEP * k_test, T0 + STEP * STAMPS as i64);
+    let refused = rcsr(&["walkforward", "--data", p.data.as_str(), "--target", "y", "--from-run", old.as_str(), "--time", "t", "--group-by", "s", "--window", window.as_str(), "--json"]);
+    assert_ne!(code(&refused), 0);
+    assert!(stderr(&refused).contains("gate_search.train_state_rule") && stderr(&refused).contains("rcsr-gate-state/1"), "{}", stderr(&refused));
 }
 
 #[test]
@@ -458,4 +468,84 @@ fn gate_search_pays_full_bits_and_counts_every_candidate() {
     for name in ["--gate-search", "--branch-on", "--branch-off", "--gate-band", "--gate-dwell"] {
         assert!(help.contains(name), "--help is missing {name}");
     }
+}
+
+const HOUR: i64 = 3600;
+const STRIDED_DAYS: usize = 160;
+
+/// Hourly rows of symbols a and b with a gate `g` that changes sign every 3 days, a day later for
+/// symbol b. The label `y` and the return `r` are finite at hour 0 of each day only (a stride-24
+/// label), so `--fill drop` keeps one row per symbol and day.
+fn strided_csv(dir: &Path) -> String {
+    let mut text = String::from("t,s,x1,x2,g,r,y\n");
+    for h in 0..(STRIDED_DAYS * 24) as i64 {
+        for (j, sym) in ["a", "b"].iter().enumerate() {
+            let f = (2 * h + j as i64) as f64;
+            let x1 = frac(f * 0.618_033_988_749_894_9) - 0.5;
+            let x2 = frac(f * 0.754_877_666_246_692_7) - 0.5;
+            let noise = frac(f * 0.324_717_957_244_746) - 0.5;
+            let g = if ((h + 24 * j as i64) / 72) % 2 == 0 { 1.0 } else { -1.0 };
+            let r = g * 0.01 * x1 + 0.0005 * noise;
+            let (r, y) = if h % 24 == 0 { (r.to_string(), (r + 0.05 * x2).to_string()) } else { (String::new(), String::new()) };
+            text.push_str(&format!("{},{},{},{},{},{},{}\n", T0 + HOUR * h, sym, x1, x2, g, r, y));
+        }
+    }
+    let path = dir.join("strided.csv");
+    std::fs::write(&path, text).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+fn daily_spec(dir: &Path) -> String {
+    let text = "{\"schema\":\"rcsr-target-spec/1\",\"targets\":[{\"column\":\"y\",\"name\":\"raw_target\",\
+         \"kind\":\"forward_return\",\"deprecated\":false,\"return_column\":\"r\",\"return_units\":\"log\",\
+         \"horizon_seconds\":86400,\"entry_offset_seconds\":0,\"delay_seconds\":0,\
+         \"entry_price\":\"open\",\"exit_price\":\"close\",\"offset\":0.0,\
+         \"scale\":{\"kind\":\"constant\",\"value\":1.0},\"clip\":null,\"units\":\"log_return\",\
+         \"cost_bps\":null,\"cost_in_label\":false,\"construction_columns\":[],\"note\":null}]}";
+    let path = dir.join("daily.json");
+    std::fs::write(&path, text).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+/// A gate search of the one-variable gate `g` on the strided fixture.
+fn strided_gate_search(data: &str, spec: &str, extra: &[&str]) -> Output {
+    let mut args = vec![
+        "--data", data, "--target-spec", spec, "--vars", "g", "--target", "y", "--time", "t", "--group-by", "s", "--fill", "drop", "--split", "temporal", "--objective", "pnl", "--cost-bps", "5",
+        "--validation-frac", "0.3", "--test-frac", "0.2", "--no-dev-log", "--quiet", "--gate-search", "--branch-on", "x1", "--branch-off", "0 - x1", "--gate-dwell", "24", "--max-complexity", "1", "--json",
+    ];
+    args.extend_from_slice(&SHORT[..8]);
+    args.extend_from_slice(extra);
+    rcsr(&args)
+}
+
+#[test]
+fn gate_search_training_states_equal_evaluation_states_on_strided_labels() {
+    let scratch = Scratch::new("gate-search-strided");
+    let dir = scratch.path().to_path_buf();
+    let data = strided_csv(&dir);
+    let spec = daily_spec(&dir);
+    let j = json(&strided_gate_search(&data, &spec, &[]));
+    let gates = arr(&j, &["gate_search", "gates"]);
+    assert_eq!(gates.len(), 1);
+    let cut = num(&gates[0], &["cut"]);
+    let gate = rcsr::regime_gate::GateSpec::parse(&format!("({}) - ({:?})", s(&gates[0], &["expression"]), cut), 0.0, 24).unwrap();
+    let text = std::fs::read_to_string(&data).unwrap();
+    let rows: Vec<Vec<&str>> = text.lines().skip(1).map(|l| l.split(',').collect()).collect();
+    let group: Vec<u64> = rows.iter().map(|r| u64::from(r[1] == "b")).collect();
+    let time: Vec<f64> = rows.iter().map(|r| r[0].parse().unwrap()).collect();
+    let g: Vec<f64> = rows.iter().map(|r| r[4].parse().unwrap()).collect();
+    let (lo, hi) = (num(&arr(&j, &["split", "train_time"])[0], &[]), num(&arr(&j, &["split", "train_time"])[1], &[]));
+    let train: Vec<usize> = (0..rows.len()).filter(|&i| !rows[i][6].is_empty() && time[i] >= lo && time[i] <= hi).collect();
+    assert_eq!(train.len() as f64, num(&j, &["train_rows"]));
+    // The evaluation rule: the kernel over every row of the file, read on the training rows.
+    let every = rcsr::regime_gate::gate_states(&gate, &group, &time, &[g.clone()]).unwrap();
+    let on = train.iter().filter(|&&i| every[i]).count();
+    assert!(on > 0 && on < train.len(), "{on} of {}", train.len());
+    // The rule before the change: the kernel over the training rows alone.
+    let (tg, tgroup): (Vec<f64>, Vec<u64>) = train.iter().map(|&i| (g[i], group[i])).unzip();
+    let alone = rcsr::regime_gate::hysteresis_states(&tg.iter().map(|v| v - cut).collect::<Vec<_>>(), &tgroup, 0.0, 24);
+    assert_ne!(alone.iter().filter(|&&o| o).count(), on, "the fixture separates the row sets: 24 training rows are 24 days");
+    let share = on as f64 / train.len() as f64;
+    assert!((num(&gates[0], &["on_share"]) - share).abs() <= 1e-12, "training on share {} vs the evaluation rule {share}", num(&gates[0], &["on_share"]));
+    assert_eq!(s(&j, &["gate_search", "train_state_rule"]), "rcsr-gate-state/1");
 }

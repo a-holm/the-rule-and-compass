@@ -4538,7 +4538,7 @@ fn fitness_scored(
         return (f64::INFINITY, None, None);
     }
     let nvars = s.x.first().map(Vec::len).unwrap_or(0);
-    with_predictions(tree, data, |pred| {
+    let run = || with_predictions(tree, data, |pred| {
         let (error, descriptor) = if want_descriptor && cfg.qd_descriptor == qd::DescriptorKind::Book {
             // #1084: the descriptor reads the reduction that gives the regret.
             let (error, shape) = book.regret_and_shape(pred);
@@ -4549,7 +4549,12 @@ fn fitness_scored(
         };
         let cases = (want_cases && error.is_finite()).then(|| book.case_errors(pred).into());
         (error, descriptor, cases)
-    })
+    });
+    if book.has_layer() {
+        crate::gate_search::with_candidate(tree, run)
+    } else {
+        run()
+    }
 }
 
 /// #1084: the configured QD descriptor of `tree` on `data` by one evaluation,
@@ -4703,7 +4708,7 @@ fn score_tree_checked_work(tree: &Node, data: &EvalSample, cfg: &Config) -> (f64
         && s.x.len() == s.len()
         && s.w.is_empty()
         && match book {
-            Some(b) => b.len() == s.len(),
+            Some(b) => b.len() == s.len() && !b.has_layer(),
             None => !cfg.metric.is_implicit(),
         };
     if !modelled {

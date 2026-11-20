@@ -5012,7 +5012,7 @@ fn build_trading(
     let deferred_gate_rows = if cols.gate_rows.is_empty() {
         None
     } else {
-        Some(GateRows::new(spec, gate_rows, &cols.gate_rows, (None, slices.1, slices.2))?)
+        Some(GateRows::new(spec, gate_rows, &cols.gate_rows, slices)?)
     };
     let mut train_values = Vec::with_capacity(cols.train_values.len());
     if cols.train {
@@ -5161,12 +5161,7 @@ impl GateRows {
         let pick = |state: &[u8], rows: &[usize], what: &str| -> Result<Vec<bool>, String> {
             rows.iter()
                 .map(|&r| match state[r] {
-                    2 => Err(format!(
-                        "the {} row at time {} lies inside a gate barrier: the gate state rule {} needs every training and validation row outside the test block and the test intervals with the split's embargo (a temporal split or a split table) and no slice row inside a locked range",
-                        what,
-                        self.time[r],
-                        crate::regime_gate::STATE_RULE
-                    )),
+                    2 => Err(barrier_error(what, self.time[r])),
                     s => Ok(s == 1),
                 })
                 .collect()
@@ -5187,6 +5182,122 @@ impl GateRows {
         }
         Ok(SliceGateStates { train, validation, test, validation_start, test_start: priced_start[0] })
     }
+
+    /// #1279: the readable gate rows under the selection barriers, for a search
+    /// that scores many gates on the training rows.
+    pub fn plan(&self) -> Result<GatePlan, String> {
+        let train = self.train.as_ref().ok_or("the gate plan needs the training rows")?;
+        struct Lane {
+            seen: f64,
+            last: f64,
+            id: Option<u32>,
+        }
+        let barred = |t: f64| self.selection.iter().any(|b| b.contains(t));
+        let restarts = |last: f64, t: f64| self.selection.iter().any(|b| last < b.start && b.start <= t);
+        let mut lanes: std::collections::HashMap<u64, Lane> = std::collections::HashMap::new();
+        let (mut rows, mut group, mut groups) = (Vec::new(), Vec::new(), 0u32);
+        let mut at = vec![u32::MAX; self.time.len()];
+        for r in 0..self.time.len() {
+            let t = self.time[r];
+            if !t.is_finite() {
+                continue;
+            }
+            let lane = lanes.entry(self.group[r]).or_insert(Lane { seen: f64::NEG_INFINITY, last: f64::NEG_INFINITY, id: None });
+            if t < lane.seen {
+                return Err(format!("rows of group {} are not in time order at time {}", self.group[r], t));
+            }
+            lane.seen = t;
+            if barred(t) {
+                continue;
+            }
+            if lane.id.is_some() && restarts(lane.last, t) {
+                lane.id = None;
+            }
+            let id = *lane.id.get_or_insert_with(|| {
+                groups += 1;
+                groups - 1
+            });
+            lane.last = t;
+            at[r] = rows.len() as u32;
+            rows.push(r);
+            group.push(id);
+        }
+        let positions = train
+            .iter()
+            .map(|&r| match at[r] {
+                u32::MAX => Err(barrier_error("training", self.time[r])),
+                k => Ok(k as usize),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(GatePlan { rows, group, groups: groups as usize, train_rows: train.clone(), train: positions })
+    }
+
+    /// The gate value of every gate row.
+    pub fn values(&self, gate: &crate::regime_gate::GateSpec) -> Result<Vec<f64>, String> {
+        let cols = gate
+            .columns
+            .iter()
+            .map(|name| self.column(name).map(<[f64]>::to_vec))
+            .collect::<Result<Vec<_>, _>>()?;
+        gate.values(&cols, self.time.len())
+    }
+
+    /// The raw values of column `name` on every gate row.
+    pub fn column(&self, name: &str) -> Result<&[f64], String> {
+        self.columns.iter().position(|c| c == name).map(|k| self.values[k].as_slice()).ok_or_else(|| format!("mask column: no column '{}' among the gate rows", name))
+    }
+}
+
+/// #1279: the gate rows a gate state reads under the selection barriers, in file
+/// order, with a state group per run of readable rows (a barrier restarts the
+/// state of its group), and the position of every training row among them.
+#[derive(Clone, Debug)]
+pub struct GatePlan {
+    /// Gate row of every readable row.
+    rows: Vec<usize>,
+    group: Vec<u32>,
+    groups: usize,
+    /// Gate row of every training row.
+    train_rows: Vec<usize>,
+    /// Position of every training row among the readable rows.
+    train: Vec<usize>,
+}
+
+impl GatePlan {
+    /// Gate rows that are exactly the `group.len()` training rows, all readable.
+    pub fn dense(group: Vec<u32>) -> GatePlan {
+        let n = group.len();
+        GatePlan { rows: (0..n).collect(), groups: group.iter().map(|&g| g as usize + 1).max().unwrap_or(0), group, train_rows: (0..n).collect(), train: (0..n).collect() }
+    }
+
+    pub fn train_len(&self) -> usize {
+        self.train.len()
+    }
+
+    /// The gate rows of the training rows.
+    pub fn train_rows(&self) -> &[usize] {
+        &self.train_rows
+    }
+
+    /// The `rcsr-gate-state/1` states of the training rows of the gate `value(r) - cut`
+    /// over gate rows `r`, into `out` (one entry per training row). `scratch` holds
+    /// the states of every readable row.
+    pub fn train_states(&self, value: impl Fn(usize) -> f64, cut: f64, band: f64, dwell: usize, scratch: &mut Vec<bool>, out: &mut [bool]) {
+        scratch.resize(self.rows.len(), false);
+        crate::regime_gate::hysteresis_states_dense(|k| value(self.rows[k]) - cut, &self.group, self.groups, band, dwell, scratch);
+        for (o, &p) in out.iter_mut().zip(&self.train) {
+            *o = scratch[p];
+        }
+    }
+}
+
+fn barrier_error(what: &str, time: f64) -> String {
+    format!(
+        "the {} row at time {} lies inside a gate barrier: the gate state rule {} needs every training and validation row outside the test block and the test intervals with the split's embargo (a temporal split or a split table) and no slice row inside a locked range",
+        what,
+        time,
+        crate::regime_gate::STATE_RULE
+    )
 }
 
 /// Comparable ordering key for every row of a time column.
