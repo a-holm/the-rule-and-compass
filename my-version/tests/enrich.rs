@@ -1052,7 +1052,8 @@ fn default_financial_registry_is_complete_and_explicit() {
             .unwrap_or_else(|| panic!("{name} missing from registry"));
         assert!(e.available, "{name} must be available");
         assert_eq!(e.family, "cross", "{name} family");
-        assert_eq!(e.timeframe, "15m");
+        let daily = matches!(name.as_str(), "btc_trend_ma100_ratio" | "mkt_trend_ma100_ratio" | "mkt_trend_hi90_dist");
+        assert_eq!(e.timeframe, if daily { "1d" } else { "15m" });
         assert!(!e.formula.is_empty());
         assert!(enrich::expand(&name).is_ok(), "{name} must expand");
     }
@@ -1947,6 +1948,13 @@ fn cross_family_is_exactly_the_registry_and_market_state_is_ex_self_pit() {
     assert_eq!(&names[start..], &expected[..], "cross emission order");
     assert!(rcsr::schema::json().contains("\"family\":\"cross\""));
     for name in &expected {
+        // The fixture spans 800 bars of 15 minutes: too short for these four gate columns.
+        if matches!(
+            name.as_str(),
+            "btc_trend_ma100_ratio" | "mkt_trend_ma100_ratio" | "mkt_trend_hi90_dist" | "btc_vol_ratio_168_2160"
+        ) {
+            continue;
+        }
         let vals = column(&out, name);
         assert!(
             vals.iter().any(|v| v.is_finite()),
@@ -5488,6 +5496,13 @@ fn gate_lexical() -> Vec<usize> {
     ks
 }
 
+/// Market-wide slow wave plus per-symbol drift and wave, so the equal-weight
+/// index rises and falls and its 90-day high distance is not identically zero.
+fn gate_close(k: usize, i: usize) -> f64 {
+    let t = i as f64;
+    100.0 * (0.00008 * (k as f64 - 11.5) * t + 0.15 * (t * 0.004).sin() + 0.03 * (t * 0.23 + k as f64 * 0.41).sin()).exp()
+}
+
 struct GateFixture {
     path: String,
     /// `index[k][i]`: store row of symbol `k` at hour `i`, `None` when the bar is absent.
@@ -5510,7 +5525,7 @@ fn gate_fixture(
             if skip(k, i) {
                 continue;
             }
-            let p = panel_close(&gate_symbol(k), i) * edit(k, i);
+            let p = gate_close(k, i) * edit(k, i);
             index[k][i] = Some(rows.len());
             times.push(i as i64 * 3600);
             rows.push((i as i64 * 3600, gate_symbol(k), p * 0.999, p * 1.002, p * 0.998, p, 1000.0 + k as f64, 0.0));
@@ -5575,7 +5590,7 @@ fn gate_day_closes(f: &GateFixture) -> Vec<Vec<Option<f64>>> {
                     (d * 24..last)
                         .rev()
                         .find(|i| f.index[k][*i].is_some())
-                        .map(|i| panel_close(&gate_symbol(k), i))
+                        .map(|i| gate_close(k, i))
                 })
                 .collect()
         })
@@ -5598,7 +5613,7 @@ fn market_gate_columns_match_hand_built_series() {
     let f = gate_fixture(&dir, "in", |_, _| false, |_, _| 1.0);
     let out = gate_build(&f, &dir, "hand");
     let lex = gate_lexical();
-    let close = |k: usize, i: usize| panel_close(&gate_symbol(k), i);
+    let close = gate_close;
     let btc = |i: usize| close(0, i);
     let ret1 = |i: usize| (btc(i) / btc(i - 1)).ln();
     let sd = |i: usize, w: usize| {
@@ -5654,6 +5669,8 @@ fn market_gate_columns_match_hand_built_series() {
     for (c, name) in GATE_NAMES.iter().enumerate() {
         assert!(finite[c] > GATE_SYMBOLS * 100, "{name} is nearly all NaN: {}", finite[c]);
     }
+    let hi = column(&out, "mkt_trend_hi90_dist");
+    assert!(hi.iter().filter(|v| **v < -0.01).count() > GATE_SYMBOLS * 100, "hi90 must leave the running high");
 }
 
 #[test]

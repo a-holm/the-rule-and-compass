@@ -41,6 +41,8 @@ A difference exits 2 and names the field. A run.json records no data hash, so th
   {"name":"btc7","codeword":"111","expr":"btc_r168","band":0.0,"dwell":1}]}
 ```
 
+The columns of the example are registered (`btc_r672`, `mkt_breadth`, `btc_r168`). The six market-level gate columns of the broad pilot, `btc_r168`, `mkt_r672`, `btc_trend_ma100_ratio`, `mkt_trend_ma100_ratio`, `btc_vol_ratio_168_2160` and `mkt_trend_hi90_dist`, come from `rcsr enrich --features cross` (`docs/ohlcv.md`); each has a registered lookback, so `--embargo auto` over them is the lookback of the longest one.
+
 The menu is pre-registered: each gate fixes its expression, band, dwell and codeword, so the menu index is the only free choice. The composite code (`docs/occam-code-v1.json`) registers 8 menu gates, so a menu holds 1 to 8 gates and each codeword is 3 binary digits, distinct; the codeword read as a binary number is the gate's menu index in the code. The menu's sha256 is in `compose.menu`.
 
 The state of a row follows the kernel of `--pnl-mask` (#1180, `regime_gate::hysteresis_states`): on above `+band`, off below `-band`, else the previous state; a change waits until the current state has held `dwell` rows of the group; a non-finite value is off. Band 0 and dwell 1 is the sign of the gate through the same kernel, so a `+inf` gate value is off.
