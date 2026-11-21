@@ -11969,7 +11969,9 @@ OPTIONS:
                              (0, 1], required). A member with a non-finite score drops the row.
                              --band B (whole number) keeps a long book long while votes >=
                              ceil(Q x K) - B; --min-hold applies after voting. K=1, Q=1 equals the
-                             threshold book. --locked-test reads the whole book once:
+                             threshold book. Q x K up to 0.05 above a whole number (0.67 of 3) rounds the
+                             votes up: a stderr warning names the count. --locked-test reads the whole
+                             book once:
                              the sealed entry binds members, order, quorum, band, min-hold
                              and threshold. --device-pnl, --batch-pnl, --select-band and
                              --band-units are refused
@@ -13307,6 +13309,9 @@ fn run_walkforward(args: &[String]) -> ! {
     if spec.policy == walkforward::Policy::Vote {
         if let Some(msg) = walkforward::vote_refusal(&spec, &popts) {
             usage_fail(&msg);
+        }
+        if let Some(msg) = walkforward::vote_quorum_warning(popts.quorum.unwrap_or(1.0), spec.candidates.len()) {
+            eprintln!("{}", msg);
         }
     }
     if let Some(msg) = walkforward::threshold_fit_refusal(&spec, &popts) {

@@ -3168,3 +3168,49 @@ fn masked_book_skips_unlabelled_rows() {
     let net = m.mean_return * m.periods as f64 * 2.0;
     assert!((net - want.net_pnl).abs() <= 1e-12, "walkforward {net} vs masked book {}", want.net_pnl);
 }
+
+#[test]
+fn vote_quorum_warning_just_above_integer() {
+    assert_eq!(walkforward::votes_required(0.67, 3), 3);
+    let msg = walkforward::vote_quorum_warning(0.67, 3).expect("0.67 of 3 rounds up");
+    assert!(msg.starts_with("warning: "), "{msg}");
+    assert!(msg.contains("requires 3 votes"), "{msg}");
+    assert!(msg.contains("--quorum 0.66"), "{msg}");
+    assert!(msg.contains("for 2 votes"), "{msg}");
+    for (q, k) in [(0.66, 3), (1.0, 3), (0.5, 4), (0.05, 1), (0.34, 1), (0.98, 2)] {
+        assert_eq!(walkforward::vote_quorum_warning(q, k), None, "{q} of {k}");
+    }
+    assert!(walkforward::vote_quorum_warning(0.34, 3).is_some());
+}
+
+#[test]
+fn walkforward_vote_quorum_warning_stderr() {
+    let dir = Scratch::new("wf-vote-quorum-warning");
+    let data = dir.path().join("d.csv");
+    let mut csv = String::from("ts,x,target\n");
+    for i in 0..8 {
+        csv.push_str(&format!("{},{},0.001\n", 3600 * i, i));
+    }
+    std::fs::write(&data, csv).unwrap();
+    let run = |quorum: &str| {
+        rcsr_cmd::rcsr()
+            .args([
+                "walkforward", "--data", data.to_str().unwrap(), "--target", "target", "--expr", "x", "--expr", "x - 1", "--expr", "x - 2",
+                "--time", "ts", "--horizon", "3600", "--cost-bps", "5", "--periods-per-year", "365",
+                "--window", "w,0,7200,14400,28800", "--json", "--threshold-fixed", "1.5", "--policy", "vote", "--quorum", quorum,
+            ])
+            .output()
+            .unwrap()
+    };
+    let up = run("0.67");
+    assert_eq!(up.status.code(), Some(0), "{}", String::from_utf8_lossy(&up.stderr));
+    let err = String::from_utf8_lossy(&up.stderr);
+    let lines: Vec<&str> = err.lines().filter(|l| l.starts_with("warning:")).collect();
+    assert_eq!(lines.len(), 1, "{err}");
+    assert!(lines[0].contains("3 votes"), "{err}");
+    assert!(String::from_utf8_lossy(&up.stdout).contains("\"votes_required\":3"));
+    let exact = run("0.66");
+    assert_eq!(exact.status.code(), Some(0), "{}", String::from_utf8_lossy(&exact.stderr));
+    assert!(!String::from_utf8_lossy(&exact.stderr).contains("warning:"));
+    assert!(String::from_utf8_lossy(&exact.stdout).contains("\"votes_required\":2"));
+}
