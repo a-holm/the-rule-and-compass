@@ -11836,7 +11836,11 @@ USAGE:
   every finite return, as the search did. Data without the fit label column exits
   2 under --from-run and --front; with --target-spec the return alone labels
   a row and stderr says so. The JSON split records labelled_rows {{rule:
-  fit_label|book_target|return, column}}.
+  fit_label|book_target|return, column}}. The candidate id binds the rule and
+  every input of it (#1312): procedure_spec holds one rows= line with the
+  rule, the fit label column, the return column, the run's preparation.fill,
+  top-tercile and the book label, so a sealed candidate read under another
+  fit label, fill or run target_spec.column is not in the sealed list (exit 3).
   Book label (#1212): --book-target, or the book label of a --from-run or
   --front run, prices the book on another label than the fit label: its
   return column, horizon, stride and cost set the rows, the period grid, the
@@ -12197,7 +12201,12 @@ OPTIONS:
   --locked-test              read the locked test once for a sealed candidate.
                              Needs --ledger and --sealed. A second read, an
                              unsealed candidate or a code/data hash that differs
-                             from the sealed entry is refused. After `protocol seal
+                             from the sealed entry is refused. The candidate id
+                             binds procedure_spec (with its rows= line), the data
+                             hash and the build commit, so a list sealed by another
+                             build is not readable by this one; the refusal names
+                             the cause (another build, other data or another
+                             procedure). After `protocol seal
                              --final`: at most the sealed number of reads, a read
                              through another ledger of the same store is refused
                              (<data>.locked_reads.jsonl), --batch-pnl is refused
@@ -13091,17 +13100,17 @@ fn run_walkforward(args: &[String]) -> ! {
         popts.horizon_from_spec = s.horizon_seconds > 0.0;
         popts.stride_seconds = s.stride_seconds;
         popts.entry_offset = agree("--entry-offset", entry_offset_flag, s.entry_offset_seconds);
-        let fit_column = book_label.as_ref().map_or(&s.column, |b| &b.fit.column);
-        popts.fit_label = target::label_report_for(&data_path, fit_column).and_then(|r| rcsr::labels::fit_label_json(&r));
+        let fit_spec = book_label.as_ref().map_or(s, |b| &b.fit);
+        popts.fit_label = target::label_report_for(&data_path, &fit_spec.column).and_then(|r| rcsr::labels::fit_label_json(&r));
         popts.fit_label_required = front_run.is_some();
         let top_tercile = policy == walkforward::Policy::TopTercile;
-        let fills_labels = front_run.as_ref().is_some_and(|r| r.fills_labels());
         let book_column = book_label.as_ref().map(|b| b.book.column.clone());
-        popts.labelled_rows = walkforward::LabelledRows::of_search(Some(s), s.return_column.as_deref().unwrap_or(&s.column), top_tercile, fills_labels, book_column);
+        popts.row_rule = walkforward::RowRule::of_search(Some(fit_spec), s.return_column.as_deref().unwrap_or(&s.column), top_tercile, front_run.as_ref(), book_column);
         popts.delay = agree("--delay", delay_flag, s.delay_seconds);
     } else {
         popts.entry_offset = entry_offset_flag.unwrap_or(0.0);
         popts.delay = delay_flag.unwrap_or(0.0);
+        popts.row_rule = walkforward::RowRule::of_search(None, target.as_deref().unwrap_or(""), policy == walkforward::Policy::TopTercile, front_run.as_ref(), None);
     }
     popts.book_label = book_label;
     let resolved = match run_cost {
@@ -13565,7 +13574,7 @@ fn run_walkforward(args: &[String]) -> ! {
             std::process::exit(if e.contains("overlapping returns") || e.contains("purge gap") || e.contains("are not in time order") || e.starts_with("--periods-per-year") || e.starts_with("missing stride_seconds") || e.starts_with("stride_seconds") || e.starts_with(walkforward::FIT_LABEL_REFUSAL) || e.starts_with(walkforward::BOOK_LABEL_REFUSAL) { EXIT_USAGE } else { EXIT_INPUT });
         }
     };
-    if let (Some(c), walkforward::LabelledRows::Return) = (popts.labelled_rows.fit_label(), &report.labelled_rows) {
+    if let (Some(c), walkforward::LabelledRows::Return) = (popts.row_rule.rows().fit_label(), &report.labelled_rows) {
         eprintln!("note: the data has no column '{}' (the target spec's label column): a row is labelled by its finite return alone (split.labelled_rows)", c);
     }
     if let (Some(path), Some(run)) = (&from_run_path, &front_run) {
