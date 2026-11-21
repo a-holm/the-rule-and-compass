@@ -6231,6 +6231,8 @@ fn main() {
             target: &target_names[0],
             per_side_bps: trading_spec.as_ref().map_or(0.0, |s| s.per_side_bps()),
             segments: interval_split.as_ref().map_or(1, |s| s.segment_starts().len().max(1)),
+            budget,
+            force,
         };
         rcsr::switch::run(sw, book, slice, &split.train_values, &ctx);
     }
