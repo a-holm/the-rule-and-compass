@@ -1360,12 +1360,53 @@ fn freeze_cli(args: &[String]) -> ! {
     std::process::exit(0)
 }
 
+/// The usage of one subcommand when `rest` asks for help, else `None`. `regimes`,
+/// `cpcv` and `verdict` own their text; the others are cut from the generic usage.
+fn subcommand_usage(sub: &str, rest: &[String]) -> Option<String> {
+    if !rest.iter().any(|a| a == "-h" || a == "--help") {
+        return None;
+    }
+    let from_block = |text: &str| -> Option<String> {
+        let mut lines = text.lines();
+        let mut block = String::new();
+        let head = format!("  {} ", sub);
+        for line in lines.by_ref() {
+            if line.starts_with(&head) {
+                block.push_str(&format!("rcsr protocol {}\n", line.trim_start()));
+                break;
+            }
+        }
+        if block.is_empty() {
+            return None;
+        }
+        for line in lines {
+            if !(line.is_empty() || line.starts_with("   ")) {
+                break;
+            }
+            block.push_str(line);
+            block.push('\n');
+        }
+        Some(block.trim_end().to_string() + "\n")
+    };
+    match sub {
+        "regimes" => Some(crate::regime_dating::usage().to_string()),
+        "cpcv" => from_block(crate::cpcv::protocol_usage()),
+        "verdict" => from_block(crate::verdict::usage()),
+        "windows" | "seal" | "verify" | "retire" | "candidates" | "selectors" | "freeze" => from_block(protocol_usage()),
+        _ => None,
+    }
+}
+
 /// `rcsr protocol ...`.
 pub fn run(args: &[String]) -> ! {
     let fail = |msg: String, code: i32| -> ! {
         eprintln!("error: {}", msg);
         std::process::exit(code)
     };
+    if let Some(text) = args.split_first().and_then(|(sub, rest)| subcommand_usage(sub, rest)) {
+        print!("{}", text);
+        std::process::exit(0);
+    }
     if args.is_empty() || args.iter().any(|a| a == "-h" || a == "--help") {
         print!("{}{}{}", protocol_usage(), crate::verdict::usage(), crate::cpcv::protocol_usage());
         std::process::exit(if args.is_empty() { 2 } else { 0 });
