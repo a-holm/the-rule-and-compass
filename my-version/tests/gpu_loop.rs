@@ -863,12 +863,13 @@ fn assert_no_device_score_after(site: &str, cfg: &search::Config) {
     assert!(reason.contains(rcsr::gpu::INJECTED_REFUSAL), "{reason}");
     let at_three = rows.iter().find(|r| r.0 == 3).copied().expect("a checkpoint at generation 3");
     let checked = at_three.3 + at_three.4;
+    let need = cfg.pop * cfg.islands - cfg.islands;
     assert!(
-        checked + cfg.islands >= cfg.pop * cfg.islands,
-        "only {checked} members were checked at generation 3; (generations, members, carried, finite, non-finite): {rows:?}"
+        checked >= need && wrong_inf == 0 && worst < 1e-9,
+        "{checked} members checked at generation 3 (need {need}); {wrong_inf} non-finite errors on a tree with a \
+         finite CPU score (need 0); worst relative gap to the CPU score {worst} (need < 1e-9); \
+         (generations, members, carried, finite, non-finite): {rows:?}"
     );
-    assert_eq!(wrong_inf, 0, "a non-finite error on a tree with a finite CPU score: {rows:?}");
-    assert!(worst < 1e-9, "a population error is not the CPU score of its tree: relative gap {worst}; {rows:?}");
 }
 
 /// #1089: narrow admission, the re-score after the fit fails.
