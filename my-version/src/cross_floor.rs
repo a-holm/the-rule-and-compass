@@ -148,9 +148,9 @@ pub fn recorded_floor(store_path: &str) -> Option<CrossFloor> {
     Some(CrossFloor { members: int_after(obj, "members")?, rank_members: int_after(obj, "rank_members")? })
 }
 
-/// Floors of the cross columns among `names`: the per-column record when the store has one, else the top-level
-/// `cross_floor` of its `.enrich.json` (a later enrich run lists only its own columns, and `enrich` refuses a run whose
-/// floors differ from the top-level record, so it holds for every cross column the store carries), else 20.
+/// The one resolver of a cross column's floor, used by `enrich` and by `panel append` and the schema writers: its
+/// per-column record in `<store>.schema.json`, else in `<store>.enrich.json` (which also lists the columns a run
+/// carried over as `cross_columns`), else the top-level `cross_floor` of `<store>.enrich.json`, else 20.
 pub fn resolved_columns(store_path: &str, names: &[String]) -> BTreeMap<String, usize> {
     let mut out = recorded_columns(store_path);
     let top = recorded_floor(store_path);
@@ -160,6 +160,15 @@ pub fn resolved_columns(store_path: &str, names: &[String]) -> BTreeMap<String, 
         }
     }
     out
+}
+
+/// `--min-cross-members <k>` or `--min-cross-members-rank <k>`, whichever flag sets the floor of `name`.
+pub fn flag_text(name: &str, k: usize) -> String {
+    if MARKET_COLUMNS.contains(&name) {
+        format!("--min-cross-members {}", k)
+    } else {
+        format!("--min-cross-members-rank {}", k)
+    }
 }
 
 /// Per-column floors recorded next to a store, from its schema and enrich sidecars.

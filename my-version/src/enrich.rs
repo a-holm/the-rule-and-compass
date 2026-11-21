@@ -1842,6 +1842,8 @@ pub struct Report {
     pub lockbox_embargo: (i64, String),
     /// Floors this run built its cross-section columns with, or the input store's when it built none (#1274).
     pub cross_floor: Option<crate::cross_floor::CrossFloor>,
+    /// Floors of the cross columns the input holds and this run keeps; the sidecar lists them as `cross_columns` (#1274).
+    pub carried_floors: Vec<(String, usize)>,
     pub features: Vec<FeatureReport>,
     pub plans: Vec<GroupPlan>,
     /// Long-only label families written by this run (#262).
@@ -2118,7 +2120,8 @@ impl Report {
              \"plan_rates\":{},\n  \"projection\":{{\"hash\":{},\"columns\":[{}]}},\n  \
              \"timing\":{{\"read_s\":{:.6},\"feature_s\":{:.6},\"feature_read_s\":{:.6},\"feature_context_s\":{:.6},\"feature_gpu_s\":{:.6},\"feature_cpu_s\":{:.6},\"feature_other_s\":{:.6},\"xs_s\":{:.6},\"write_s\":{:.6},\"write_read_s\":{:.6},\"write_write_s\":{:.6},\"write_hash_wait_s\":{:.6},\"total_s\":{:.6}}},\n  \"ledger\":{},\n  \
              \"peak_rss_bytes\":{},\n  \"features\":[{}],\n  \"long_labels\":[{}],\n  \"plan\":[{}]\n}}\n",
-            self.cross_floor.map(|c| format!("  \"cross_floor\":{},\n", c.json())).unwrap_or_default(),
+            self.cross_floor.map(|c| format!("  \"cross_floor\":{},\n", c.json())).unwrap_or_default()
+                + &cross_columns_json(&self.carried_floors),
             jstr(&self.input),
             jstr(&self.output),
             jstr(&self.input_sha256),
@@ -7752,38 +7755,72 @@ pub fn build(opts: &Options) -> Result<Report, String> {
 pub const CROSS_FLOOR_REFUSAL: &str = "cross-section member floors differ";
 
 /// Validate the floors of `opts` and refuse mixing them with the floors the input store's cross
-/// columns were built with. Returns the floors the output records: this run's when it builds a
-/// floored column, else the input's (#1274).
+/// columns were built with. Every kept cross column resolves to one floor
+/// ([`crate::cross_floor::resolved_columns`]); a run that builds a floored column must ask for the same floor
+/// for each of them. Returns the floors the output records at the top level (only when every cross column of
+/// the output agrees) and the floors of the kept cross columns, which the sidecar carries (#1274).
 fn check_cross_floor(
     opts: &Options,
     requested: &[String],
     names: &[String],
     data_is_store: bool,
-) -> Result<Option<crate::cross_floor::CrossFloor>, String> {
+) -> Result<(Option<crate::cross_floor::CrossFloor>, Vec<(String, usize)>), String> {
     use crate::cross_floor as cf;
     for (flag, v) in [("--min-cross-members", opts.cross_floor.members), ("--min-cross-members-rank", opts.cross_floor.rank_members)] {
         if !(cf::MIN..=cf::MAX).contains(&v) {
             return Err(format!("{}: {} needs an integer in {}..={}, got '{}'", CROSS_FLOOR_REFUSAL, flag, cf::MIN, cf::MAX, v));
         }
     }
-    let recorded = if data_is_store { cf::recorded_floor(&opts.data) } else { None };
-    if !requested.iter().any(|n| cf::is_floored(n)) {
-        return Ok(recorded);
-    }
-    let kept_floored = names.iter().any(|n| cf::is_floored(n) && !(opts.replace && requested.contains(n)));
-    if data_is_store && kept_floored {
-        let have = recorded.unwrap_or_default();
-        if have != opts.cross_floor {
-            return Err(format!(
-                "{}: {} was built with {}; this run asks for {}",
-                CROSS_FLOOR_REFUSAL,
-                opts.data,
-                have.describe(),
-                opts.cross_floor.describe()
-            ));
+    let kept: Vec<String> = names
+        .iter()
+        .filter(|n| cf::is_floored(n) && !(opts.replace && requested.contains(n)))
+        .cloned()
+        .collect();
+    let resolved = if data_is_store { cf::resolved_columns(&opts.data, &kept) } else { Default::default() };
+    let carried: Vec<(String, usize)> = kept.iter().map(|n| (n.clone(), resolved.get(n).copied().unwrap_or(cf::DEFAULT))).collect();
+    let builds = requested.iter().any(|n| cf::is_floored(n));
+    if builds {
+        for (n, have) in &carried {
+            let want = opts.cross_floor.of(n).unwrap_or(cf::DEFAULT);
+            if *have != want {
+                return Err(format!(
+                    "{}: column '{}' of {} was built with {}; this run asks for {}",
+                    CROSS_FLOOR_REFUSAL,
+                    n,
+                    opts.data,
+                    cf::flag_text(n, *have),
+                    cf::flag_text(n, want)
+                ));
+            }
         }
     }
-    Ok(Some(opts.cross_floor))
+    let mut market: Vec<usize> = Vec::new();
+    let mut rank: Vec<usize> = Vec::new();
+    for (n, k) in carried.iter().cloned().chain(requested.iter().filter(|n| cf::is_floored(n)).map(|n| (n.clone(), opts.cross_floor.of(n).unwrap_or(cf::DEFAULT)))) {
+        let set = if cf::MARKET_COLUMNS.contains(&n.as_str()) { &mut market } else { &mut rank };
+        if !set.contains(&k) {
+            set.push(k);
+        }
+    }
+    let top = if market.len() > 1 || rank.len() > 1 || (market.is_empty() && rank.is_empty()) {
+        None
+    } else {
+        let input = if data_is_store { cf::recorded_floor(&opts.data) } else { None }.unwrap_or_default();
+        Some(cf::CrossFloor {
+            members: market.first().copied().unwrap_or(if builds { opts.cross_floor.members } else { input.members }),
+            rank_members: rank.first().copied().unwrap_or(if builds { opts.cross_floor.rank_members } else { input.rank_members }),
+        })
+    };
+    Ok((top, carried))
+}
+
+/// `"cross_columns":[...]` sidecar lines for the cross columns this run keeps from its input.
+fn cross_columns_json(carried: &[(String, usize)]) -> String {
+    if carried.is_empty() {
+        return String::new();
+    }
+    let items: Vec<String> = carried.iter().map(|(n, k)| format!("{{\"name\":{},\"min_members\":{}}}", jstr(n), k)).collect();
+    format!("  \"cross_columns\":[{}],\n", items.join(","))
 }
 
 /// Run an enrichment into a temporary output file.
@@ -7994,7 +8031,7 @@ fn enrich_inner(
     if requested.iter().any(|n| crate::trend::is_trend(n) || is_gate_daily(n)) {
         crate::trend::check_bar(step)?;
     }
-    let cross_floor_out = check_cross_floor(opts, &requested, &names, data_is_store)?;
+    let (cross_floor_out, carried_floors) = check_cross_floor(opts, &requested, &names, data_is_store)?;
     // The target spec names `vol<W>` as the scale column, so the store carries it.
     for src in opts.labels.iter().filter(|l| l.trim_start().starts_with("long:")) {
         let scale = format!("vol{}", crate::labels::LongLabelSpec::declared_sigma_window(src));
@@ -9374,6 +9411,7 @@ fn enrich_inner(
             bar_seconds: step,
             lockbox_embargo: embargo_l.clone(),
             cross_floor: cross_floor_out,
+            carried_floors: carried_floors.clone(),
             features: reports,
             plans,
             long_labels: long_outputs,
@@ -9451,6 +9489,7 @@ fn enrich_inner(
         bar_seconds: step,
         lockbox_embargo: embargo_l.clone(),
         cross_floor: cross_floor_out,
+        carried_floors,
         features: reports,
         plans,
         long_labels: long_outputs,
