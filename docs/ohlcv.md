@@ -335,7 +335,7 @@ so a multi-gigabyte store is not read a second time just to checksum it.
 | `donchian` | `don20 don96` | close position in the trailing high/low channel; `don96` is centred on 0 |
 | `calendar` | `dow_* hour_* month_* dom_*` (sin/cos) | UTC calendar cycles |
 | `lags` | `lag_r1_1` .. `lag_r1_10` | causal copies of `r1`, refused across a gap |
-| `xs` | `xs_rank_r1 xs_rank_r20 xs_rank_vol20` | per-timestamp PIT rank in `[-1,1]`, `N>=20` |
+| `xs` | `xs_rank_r1 xs_rank_r20 xs_rank_vol20` | per-timestamp PIT rank in `[-1,1]`, `N>=20` by default (`--min-cross-members-rank`) |
 | `btc` | `btc_r1 btc_r20 btc_vol20 rel_btc_r1 rel_btc_r20 beta_btc_60` | benchmark joins by exact timestamp |
 | `cross` | 45 columns | the complete #273 cross-asset, ETH, market-state, breadth, dispersion, average-correlation and rank family |
 | `py15m` | 35 columns | the legacy 15 m enrichment set, kept for parity |
@@ -349,7 +349,7 @@ so a multi-gigabyte store is not read a second time just to checksum it.
 The five `py15m` names `mkt_r16`, `mkt_r96`, `mkt_vol96`, `rel_r16` and
 `rel_r96` predate #273. `mkt_*` are now the canonical equal-weight market
 columns below; on a single-symbol slice they are `NaN` because the market
-requires 20 PIT members. `rel_r16`/`rel_r96` remain the legacy BTC-relative
+requires the member floor (20 by default). `rel_r16`/`rel_r96` remain the legacy BTC-relative
 py15m columns. This is a deliberate correction of the old six BTC joins, not a
 second implementation.
 
@@ -548,20 +548,29 @@ Gate-menu columns (#1270), the inputs of the pre-registered regime gates
 The daily index is `I_d = I_(d-1) exp(m_d)`, `m_d` the equal-weight mean of the
 PIT members' log returns of closed UTC day `d` (last base bar of the day over the
 last base bar of the day before). A symbol counts on a day when it is a PIT
-member at its last bar of that day. A day with fewer than 20 returns, or a day
+member at its last bar of that day. A day with fewer returns than the member floor (`--min-cross-members`, 20 by default), or a day
 with no bar, has no level; the index restarts at 1 after it, and every window
 that holds such a day is `NaN`. A base row reads the closed day before its own
 day, never the running one. The warm-up of the three daily columns is counted in
 days. `--embargo auto` over a gate column gives the lookback in the table.
 
-Every cross-sectional column requires at least **20** valid point-in-time
-members at the timestamp. With `N < 20` the whole timestamp is `NaN`; a
-member with a non-finite source is excluded from the count but does not make a
-different member's market state `NaN`.
+Every cross-sectional column requires a minimum number of valid point-in-time
+members at the timestamp; with fewer the whole timestamp is `NaN`. A member with a
+non-finite source is excluded from the count but does not make a different
+member's market state `NaN`.
+
+### Member floor (#1274)
+
+The floor is a parameter of `rcsr enrich`, default **20** for both classes, an integer in `5..=200` (`0`, `4`, `201` or a non-number exits 2). Below 5 members the sd, the rank grid and the correlation proxy carry no information. `--min-cross-members <n>` sets the floor of the mean, share, sd and sum-ratio columns (class M): `mkt_r16`, `mkt_ew_ret16`, `breadth`, `mkt_breadth`, `dispersion`, `mkt_dispersion`, `rel_mkt16`, `mkt_r96`, `rel_mkt96`, `mkt_vol96`, `mkt_ew_ret1`, `btc_volume_share`, `mkt_r672`, `mkt_trend_ma100_ratio` and `mkt_trend_hi90_dist` (the daily index counts the member returns of a day). `--min-cross-members-rank <m>` sets the floor of the rank columns `xs_rank_*`, `cs_rank_r60` and of `avg_corr` (class R); it defaults to `n`. A rank over 5 members takes 5 values and `avg_corr` includes each member in the market mean it is correlated with, so the pilot can keep class R stricter than class M. The formulas, the warm-up and `lookback_seconds` do not change; only the comparison `count < floor` reads the parameter. `btc_*` and `eth_*` columns have no member floor. A floor of `n` finite members is finite, `n - 1` is `NaN`.
+
+With the default floors every output column is byte-identical to the engine before the parameter existed. `<out>.enrich.json` records `cross_floor` (`{"members":n,"rank_members":m}`) and `min_members` on each class M and class R column it built; a column outside the two classes has no `min_members`. The sidecar also lists the floors of the cross columns the run keeps from its input as `cross_columns`. The top-level `cross_floor` is written when the output holds at least one cross column and every cross column of a class has one floor; a class with no column takes this run's value when the run builds a class M or class R column, else the input's `cross_floor`, else 20. With mixed floors inside one class, or no cross column, it is omitted and the per-column records speak. `rcsr enrich` moves an existing `<out>.schema.json` to `<out>.schema.json.prev` when it writes the store, as `<out>.enrich.json` keeps its previous generation, so a rebuilt store never keeps the schema of the old one; `rcsr panel schema` writes the schema of the new store. `rcsr panel append` copies `min_members` into the column entry of `<panel>.schema.json`, and the `transform` and `pit_rule` text of that entry states `N>=<k>` with the recorded value.
+
+Floors are never mixed silently. The floor of a cross column is its record in `<store>.schema.json`, else in `<store>.enrich.json` (the per-column `min_members`, or `cross_columns` for the columns a run kept from its input), else the top-level `cross_floor`, else 20; a schema record counts only while its `sha256` equals the hash of the column's current data; `enrich` and `panel append` read it through one resolver, and the top-level `cross_floor` is written only when every cross column of the output agrees. `rcsr enrich` with a class M or class R column onto a store whose cross columns were built with other floors exits 2 and names the column and both values (a store without the record counts as 20, `--replace` of a column lifts the check for it; a run that builds no class M or class R column is not checked). `rcsr panel append` of a column whose `min_members` differs from a column of the same class already in the panel exits 3 and names both values; a family store without the record counts as 20. The device kernels take the floor as an argument, so `--gpu` and the CPU produce identical bytes at every floor (`min_cross_members_device_parity`).
+
 
 Ranks (`xs_rank_r1 r16 r20 vol20 amihud96`, plus the legacy `cs_rank_r60`) are
 `2*(rank-1)/(n-1)-1` in `[-1,1]`. They use finite PIT members only, require
-`N>=20`, and break ties by symbol name then row order. `-0.0` and `+0.0` are one
+`N>=20` by default (`--min-cross-members-rank`), and break ties by symbol name then row order. `-0.0` and `+0.0` are one
 value for that tie order. `xs_rank_amihud96` inherits the #270 Amihud input
 requirement (`quote_volume`); a missing raw field fails closed naming both the
 rank and the field.
@@ -681,7 +690,7 @@ that truncating the store never changes an earlier value.
 
 `xs_rank_*` ranks each timestamp across PIT symbols, ignores non-finite source
 values and non-members, breaks ties by symbol name then row order, maps the rank
-to `[-1,1]`, and returns `NaN` when fewer than 20 finite members are present.
+to `[-1,1]`, and returns `NaN` when fewer than the floor (`--min-cross-members-rank`, 20 by default) finite members are present.
 `-0.0` and `+0.0` are one tie. The pass holds one source column, the time column,
 a row permutation and the rank column (about 32 B/row), never the whole panel.
 `rcsr enrich` refuses the pass when that exceeds the detected hard memory limit.
@@ -1085,7 +1094,7 @@ itself gets `1.0` once its window is complete, as on the CPU.
 mkt_dispersion rel_mkt16 mkt_r96 rel_mkt96 mkt_vol96 mkt_ew_ret1 avg_corr
 btc_volume_share`. One thread per timestamp group walks the group in the CPU's
 `(time, symbol, row)` order (the permutation #295 builds), so the sums use the
-CPU addition order and the same `member_asof <= t` mask and 20-member floor. For
+CPU addition order and the same `member_asof <= t` mask and member floor (`--min-cross-members`, `--min-cross-members-rank`; passed to the kernels as an argument). For
 an identical source column the kernels are bit-for-bit equal to the CPU
 (`tests/bench_gpu.rs` asserts `to_bits` equality). The sources (`r1 r16 r96
 vol96`) are themselves `1e-12` columns when the device produced them, so those

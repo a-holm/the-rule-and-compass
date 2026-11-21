@@ -377,7 +377,7 @@
       "formula": "equal-weight mean of PIT member r16 at t",
       "formula_sha256": "719c04731868aaac0fb27b55de0747da754de9ad414465c5887079664e1cc851",
       "source": "all PIT members at the same timestamp",
-      "pit": "rows present at t with member_asof <= t; N>=20; no forward fill; gaps are NaN",
+      "pit": "rows present at t with member_asof <= t; N>=20 by default (--min-cross-members, --min-cross-members-rank); no forward fill; gaps are NaN",
       "reason": null,
       "test": "tests/enrich.rs::cross_family_is_exactly_the_registry_and_market_state_is_ex_self_pit"
     },
@@ -391,7 +391,7 @@
       "formula": "equal-weight mean of PIT member r96 at t",
       "formula_sha256": "08b2dc822789388e7f825a95010fc6e62d6bc18e73181ffcebf55ae38009742f",
       "source": "all PIT members at the same timestamp",
-      "pit": "rows present at t with member_asof <= t; N>=20; no forward fill; gaps are NaN",
+      "pit": "rows present at t with member_asof <= t; N>=20 by default (--min-cross-members, --min-cross-members-rank); no forward fill; gaps are NaN",
       "reason": null,
       "test": "tests/enrich.rs::cross_family_is_exactly_the_registry_and_market_state_is_ex_self_pit"
     },
@@ -405,7 +405,7 @@
       "formula": "equal-weight mean of PIT member vol96 at t",
       "formula_sha256": "6b8ad59cadc61dc8ca48b924ce11e5d80295a9a51fce06babbfa557fc1aa3b78",
       "source": "all PIT members at the same timestamp",
-      "pit": "rows present at t with member_asof <= t; N>=20; no forward fill; gaps are NaN",
+      "pit": "rows present at t with member_asof <= t; N>=20 by default (--min-cross-members, --min-cross-members-rank); no forward fill; gaps are NaN",
       "reason": null,
       "test": "tests/enrich.rs::cross_family_is_exactly_the_registry_and_market_state_is_ex_self_pit"
     },
@@ -419,7 +419,7 @@
       "formula": "share of PIT members with r16 > 0",
       "formula_sha256": "933b864dcc5429c00822c45ad8af38bdc1fe2d5caa6e2ea4f2ece71cca54b2be",
       "source": "all PIT members at the same timestamp",
-      "pit": "rows present at t with member_asof <= t; N>=20; no forward fill; gaps are NaN",
+      "pit": "rows present at t with member_asof <= t; N>=20 by default (--min-cross-members, --min-cross-members-rank); no forward fill; gaps are NaN",
       "reason": null,
       "test": "tests/enrich.rs::cross_family_is_exactly_the_registry_and_market_state_is_ex_self_pit"
     },
@@ -433,7 +433,7 @@
       "formula": "population sd of PIT member r16 at t",
       "formula_sha256": "d0eb88901c849b3cd4ffcca23f4811fcb1fd5440f8ef56ebc8874203e6af67d7",
       "source": "all PIT members at the same timestamp",
-      "pit": "rows present at t with member_asof <= t; N>=20; no forward fill; gaps are NaN",
+      "pit": "rows present at t with member_asof <= t; N>=20 by default (--min-cross-members, --min-cross-members-rank); no forward fill; gaps are NaN",
       "reason": null,
       "test": "tests/enrich.rs::cross_family_is_exactly_the_registry_and_market_state_is_ex_self_pit"
     },
@@ -447,7 +447,7 @@
       "formula": "mean_i corr(r_i,mkt_r1,96) over PIT members; proxy for average pairwise correlation",
       "formula_sha256": "ae149e60e791471270f1c533e6a2542980ad4dec16b8b7fb2523f08c40a4e831",
       "source": "all PIT members at the same timestamp",
-      "pit": "rows present at t with member_asof <= t; N>=20; no forward fill; gaps are NaN",
+      "pit": "rows present at t with member_asof <= t; N>=20 by default (--min-cross-members, --min-cross-members-rank); no forward fill; gaps are NaN",
       "reason": null,
       "test": "tests/enrich.rs::cross_family_is_exactly_the_registry_and_market_state_is_ex_self_pit"
     },
@@ -461,7 +461,7 @@
       "formula": "r16_i - ex-self equal-weight mean of member r16",
       "formula_sha256": "49dbdb757f93fb8d86ef1f138d7ebff4062394a8dd73fc96b5f0b90307e01a51",
       "source": "all PIT members at the same timestamp",
-      "pit": "rows present at t with member_asof <= t; N>=20; no forward fill; gaps are NaN",
+      "pit": "rows present at t with member_asof <= t; N>=20 by default (--min-cross-members, --min-cross-members-rank); no forward fill; gaps are NaN",
       "reason": null,
       "test": "tests/enrich.rs::cross_family_is_exactly_the_registry_and_market_state_is_ex_self_pit"
     },
@@ -475,7 +475,7 @@
       "formula": "r96_i - ex-self equal-weight mean of member r96",
       "formula_sha256": "71c760e773bd89cce5cb11429b5ef2056c99c7301b5ac0b92b2aba8b35ac0f7d",
       "source": "all PIT members at the same timestamp",
-      "pit": "rows present at t with member_asof <= t; N>=20; no forward fill; gaps are NaN",
+      "pit": "rows present at t with member_asof <= t; N>=20 by default (--min-cross-members, --min-cross-members-rank); no forward fill; gaps are NaN",
       "reason": null,
       "test": "tests/enrich.rs::cross_family_is_exactly_the_registry_and_market_state_is_ex_self_pit"
     },
@@ -486,10 +486,10 @@
       "warmup": 1,
       "available": true,
       "derived": false,
-      "formula": "2*(rank-1)/(n-1)-1 per timestamp; PIT finite, N>=20, ties symbol then row",
+      "formula": "2*(rank-1)/(n-1)-1 per timestamp; PIT finite, N>=20 by default (--min-cross-members-rank), ties symbol then row",
       "formula_sha256": "5896b8254c11e59097edeaa0a82db972f5e2e7662dff48917048ed01bd00a3c2",
       "source": "all PIT members at the same timestamp",
-      "pit": "rows present at t with member_asof <= t; N>=20; no forward fill; gaps are NaN",
+      "pit": "rows present at t with member_asof <= t; N>=20 by default (--min-cross-members, --min-cross-members-rank); no forward fill; gaps are NaN",
       "reason": null,
       "test": "tests/enrich.rs::cross_sectional_ranks_require_twenty_members_and_scale_to_minus_one_one"
     },
@@ -500,10 +500,10 @@
       "warmup": 16,
       "available": true,
       "derived": false,
-      "formula": "2*(rank-1)/(n-1)-1 per timestamp; PIT finite, N>=20, ties symbol then row",
+      "formula": "2*(rank-1)/(n-1)-1 per timestamp; PIT finite, N>=20 by default (--min-cross-members-rank), ties symbol then row",
       "formula_sha256": "5896b8254c11e59097edeaa0a82db972f5e2e7662dff48917048ed01bd00a3c2",
       "source": "all PIT members at the same timestamp",
-      "pit": "rows present at t with member_asof <= t; N>=20; no forward fill; gaps are NaN",
+      "pit": "rows present at t with member_asof <= t; N>=20 by default (--min-cross-members, --min-cross-members-rank); no forward fill; gaps are NaN",
       "reason": null,
       "test": "tests/enrich.rs::cross_sectional_ranks_require_twenty_members_and_scale_to_minus_one_one"
     },
@@ -514,10 +514,10 @@
       "warmup": 20,
       "available": true,
       "derived": false,
-      "formula": "2*(rank-1)/(n-1)-1 per timestamp; PIT finite, N>=20, ties symbol then row",
+      "formula": "2*(rank-1)/(n-1)-1 per timestamp; PIT finite, N>=20 by default (--min-cross-members-rank), ties symbol then row",
       "formula_sha256": "5896b8254c11e59097edeaa0a82db972f5e2e7662dff48917048ed01bd00a3c2",
       "source": "all PIT members at the same timestamp",
-      "pit": "rows present at t with member_asof <= t; N>=20; no forward fill; gaps are NaN",
+      "pit": "rows present at t with member_asof <= t; N>=20 by default (--min-cross-members, --min-cross-members-rank); no forward fill; gaps are NaN",
       "reason": null,
       "test": "tests/enrich.rs::cross_sectional_ranks_require_twenty_members_and_scale_to_minus_one_one"
     },
@@ -528,10 +528,10 @@
       "warmup": 20,
       "available": true,
       "derived": false,
-      "formula": "2*(rank-1)/(n-1)-1 per timestamp; PIT finite, N>=20, ties symbol then row",
+      "formula": "2*(rank-1)/(n-1)-1 per timestamp; PIT finite, N>=20 by default (--min-cross-members-rank), ties symbol then row",
       "formula_sha256": "5896b8254c11e59097edeaa0a82db972f5e2e7662dff48917048ed01bd00a3c2",
       "source": "all PIT members at the same timestamp",
-      "pit": "rows present at t with member_asof <= t; N>=20; no forward fill; gaps are NaN",
+      "pit": "rows present at t with member_asof <= t; N>=20 by default (--min-cross-members, --min-cross-members-rank); no forward fill; gaps are NaN",
       "reason": null,
       "test": "tests/enrich.rs::cross_sectional_ranks_require_twenty_members_and_scale_to_minus_one_one"
     },
@@ -542,10 +542,10 @@
       "warmup": 96,
       "available": true,
       "derived": false,
-      "formula": "2*(rank-1)/(n-1)-1 per timestamp; PIT finite, N>=20, ties symbol then row",
+      "formula": "2*(rank-1)/(n-1)-1 per timestamp; PIT finite, N>=20 by default (--min-cross-members-rank), ties symbol then row",
       "formula_sha256": "5896b8254c11e59097edeaa0a82db972f5e2e7662dff48917048ed01bd00a3c2",
       "source": "all PIT members at the same timestamp",
-      "pit": "rows present at t with member_asof <= t; N>=20; no forward fill; gaps are NaN",
+      "pit": "rows present at t with member_asof <= t; N>=20 by default (--min-cross-members, --min-cross-members-rank); no forward fill; gaps are NaN",
       "reason": null,
       "test": "tests/enrich.rs::cross_sectional_ranks_require_twenty_members_and_scale_to_minus_one_one"
     },
@@ -559,7 +559,7 @@
       "formula": "equal-weight mean of PIT member r1 at t",
       "formula_sha256": "7f6fdd3a2470e22b45a82fade9ece92c20cadd5260c9d29f22a4cd0e4559fece",
       "source": "all PIT members at the same timestamp",
-      "pit": "rows present at t with member_asof <= t; N>=20; no forward fill; gaps are NaN",
+      "pit": "rows present at t with member_asof <= t; N>=20 by default (--min-cross-members, --min-cross-members-rank); no forward fill; gaps are NaN",
       "reason": null,
       "test": "tests/enrich.rs::cross_family_is_exactly_the_registry_and_market_state_is_ex_self_pit"
     },
@@ -573,7 +573,7 @@
       "formula": "equal-weight mean of PIT member r16 at t",
       "formula_sha256": "719c04731868aaac0fb27b55de0747da754de9ad414465c5887079664e1cc851",
       "source": "all PIT members at the same timestamp",
-      "pit": "rows present at t with member_asof <= t; N>=20; no forward fill; gaps are NaN",
+      "pit": "rows present at t with member_asof <= t; N>=20 by default (--min-cross-members, --min-cross-members-rank); no forward fill; gaps are NaN",
       "reason": null,
       "test": "tests/enrich.rs::cross_family_is_exactly_the_registry_and_market_state_is_ex_self_pit"
     },
@@ -587,7 +587,7 @@
       "formula": "share of PIT members with r16 > 0",
       "formula_sha256": "933b864dcc5429c00822c45ad8af38bdc1fe2d5caa6e2ea4f2ece71cca54b2be",
       "source": "all PIT members at the same timestamp",
-      "pit": "rows present at t with member_asof <= t; N>=20; no forward fill; gaps are NaN",
+      "pit": "rows present at t with member_asof <= t; N>=20 by default (--min-cross-members, --min-cross-members-rank); no forward fill; gaps are NaN",
       "reason": null,
       "test": "tests/enrich.rs::cross_family_is_exactly_the_registry_and_market_state_is_ex_self_pit"
     },
@@ -601,7 +601,7 @@
       "formula": "population sd of PIT member r16 at t",
       "formula_sha256": "d0eb88901c849b3cd4ffcca23f4811fcb1fd5440f8ef56ebc8874203e6af67d7",
       "source": "all PIT members at the same timestamp",
-      "pit": "rows present at t with member_asof <= t; N>=20; no forward fill; gaps are NaN",
+      "pit": "rows present at t with member_asof <= t; N>=20 by default (--min-cross-members, --min-cross-members-rank); no forward fill; gaps are NaN",
       "reason": null,
       "test": "tests/enrich.rs::cross_family_is_exactly_the_registry_and_market_state_is_ex_self_pit"
     },
@@ -615,7 +615,7 @@
       "formula": "BTC volume / total PIT member volume at t",
       "formula_sha256": "cedcae831ee9a87bf6f9812eb9b9fbd9be3dfc987bed8312fb94a7843a86b0c8",
       "source": "raw volume + all PIT members",
-      "pit": "rows present at t with member_asof <= t; N>=20; no forward fill; gaps are NaN",
+      "pit": "rows present at t with member_asof <= t; N>=20 by default (--min-cross-members, --min-cross-members-rank); no forward fill; gaps are NaN",
       "reason": null,
       "test": "tests/enrich.rs::btc_and_eth_joins_use_the_same_timestamp_and_a_shift_fails"
     },
@@ -626,10 +626,10 @@
       "warmup": 60,
       "available": true,
       "derived": false,
-      "formula": "2*(rank-1)/(n-1)-1 per timestamp; PIT finite, N>=20, ties symbol then row",
+      "formula": "2*(rank-1)/(n-1)-1 per timestamp; PIT finite, N>=20 by default (--min-cross-members-rank), ties symbol then row",
       "formula_sha256": "5896b8254c11e59097edeaa0a82db972f5e2e7662dff48917048ed01bd00a3c2",
       "source": "all PIT members at the same timestamp",
-      "pit": "rows present at t with member_asof <= t; N>=20; no forward fill; gaps are NaN",
+      "pit": "rows present at t with member_asof <= t; N>=20 by default (--min-cross-members, --min-cross-members-rank); no forward fill; gaps are NaN",
       "reason": null,
       "test": "tests/enrich.rs::cross_sectional_ranks_require_twenty_members_and_scale_to_minus_one_one"
     },
@@ -657,7 +657,7 @@
       "formula": "equal-weight mean of PIT member r672 at t",
       "formula_sha256": "5aa6c122b47292f6eaa972732778b8ca495f34da93cccbad6e166351262ec767",
       "source": "all PIT members at the same timestamp",
-      "pit": "rows present at t with member_asof <= t; N>=20; no forward fill; gaps are NaN",
+      "pit": "rows present at t with member_asof <= t; N>=20 by default (--min-cross-members, --min-cross-members-rank); no forward fill; gaps are NaN",
       "reason": null,
       "test": "tests/enrich.rs::market_gate_columns_match_hand_built_series"
     },
@@ -682,10 +682,10 @@
       "warmup": 100,
       "available": true,
       "derived": false,
-      "formula": "I/SMA100(I) - 1 on the closed daily equal-weight index I; I_d = I_(d-1) exp(m_d), m_d the equal-weight mean of PIT member daily log returns, N>=20",
+      "formula": "I/SMA100(I) - 1 on the closed daily equal-weight index I; I_d = I_(d-1) exp(m_d), m_d the equal-weight mean of PIT member daily log returns, N>=20 by default (--min-cross-members)",
       "formula_sha256": "3cc7d01ad036e600e7cb3808416874273369fbc3ffb9c3f4fecfa2cd3b02707b",
       "source": "daily closes of all PIT members",
-      "pit": "closed UTC daily bars only (the running day is never used); the index uses member_asof <= t at the last bar of each day, N>=20 members per day, a day below the floor or a missing day is NaN, a window holding it is NaN; no forward fill",
+      "pit": "closed UTC daily bars only (the running day is never used); the index uses member_asof <= t at the last bar of each day, N>=20 members per day by default (--min-cross-members), a day below the floor or a missing day is NaN, a window holding it is NaN; no forward fill",
       "reason": null,
       "test": "tests/enrich.rs::market_gate_columns_match_hand_built_series"
     },
@@ -713,7 +713,7 @@
       "formula": "I/max(I over the last 90 closed days) - 1 on the closed daily equal-weight index I",
       "formula_sha256": "f9c461c1286c417cf4ab8ec0352787e23cdcb2465a318642ed52b08d90f2a8f5",
       "source": "daily closes of all PIT members",
-      "pit": "closed UTC daily bars only (the running day is never used); the index uses member_asof <= t at the last bar of each day, N>=20 members per day, a day below the floor or a missing day is NaN, a window holding it is NaN; no forward fill",
+      "pit": "closed UTC daily bars only (the running day is never used); the index uses member_asof <= t at the last bar of each day, N>=20 members per day by default (--min-cross-members), a day below the floor or a missing day is NaN, a window holding it is NaN; no forward fill",
       "reason": null,
       "test": "tests/enrich.rs::market_gate_columns_match_hand_built_series"
     }

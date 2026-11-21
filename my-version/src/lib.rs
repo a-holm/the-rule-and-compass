@@ -18,6 +18,7 @@ pub mod dispatch; // #290: per-stage CPU/GPU cost model and route ledger
 pub mod dispatch_plan; // #861: route plan of a calibration over a size grid
 pub mod enrich; // #200: append-only OHLCV feature enrichment
 pub mod enrich_probe; // #778: enrich planner probe for `rcsr calibrate`
+pub mod cross_floor; // #1274: member floor of the cross-section columns
 #[cfg(feature = "cuda")]
 pub mod enrich_gpu; // #200: resident CUDA enrichment kernels
 #[cfg(feature = "cuda")]

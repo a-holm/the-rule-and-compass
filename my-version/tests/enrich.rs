@@ -5793,3 +5793,496 @@ fn cross_inventory_and_schema_list_the_six_gate_columns() {
     assert_eq!(enrich::lookback_seconds("mkt_trend_ma100_ratio", 3600), Some(102 * 86_400));
     assert_eq!(enrich::lookback_seconds("mkt_trend_hi90_dist", 3600), Some(92 * 86_400));
 }
+
+// ---------------------------------------------------------------------------
+// Member floor of the cross-section columns (#1274)
+// ---------------------------------------------------------------------------
+
+/// The 19 columns of the cross family that read a member floor before #1270.
+const FLOORED_19: &[&str] = &[
+    "mkt_r16", "mkt_ew_ret16", "breadth", "mkt_breadth", "dispersion", "mkt_dispersion", "rel_mkt16", "mkt_r96",
+    "rel_mkt96", "mkt_vol96", "mkt_ew_ret1", "avg_corr", "btc_volume_share", "xs_rank_r1", "xs_rank_r16",
+    "xs_rank_r20", "xs_rank_vol20", "xs_rank_amihud96", "cs_rank_r60",
+];
+const CLASS_R_19: &[&str] =
+    &["avg_corr", "xs_rank_r1", "xs_rank_r16", "xs_rank_r20", "xs_rank_vol20", "xs_rank_amihud96", "cs_rank_r60"];
+
+/// A symbol-major panel of `symbols` members, BTCUSDT first, all members from the first bar.
+fn member_rows(symbols: usize, n: usize, step: i64) -> Vec<(i64, String, f64, f64, f64, f64, f64, f64)> {
+    let mut rows = Vec::new();
+    for k in 0..symbols {
+        let sym = if k == 0 { "BTCUSDT".to_string() } else { format!("ALT{:02}USDT", k) };
+        let mu = 0.0002 * (k as f64 - 3.0);
+        let phase = k as f64 * 0.41;
+        for i in 0..n {
+            let p = 100.0 * (mu * i as f64 + 0.03 * (i as f64 * 0.23 + phase).sin()).exp();
+            let v = 1000.0 + 10.0 * k as f64 + (i % 7) as f64;
+            rows.push((i as i64 * step, sym.clone(), p * 0.999, p * 1.002, p * 0.998, p, v, 0.0));
+        }
+    }
+    rows
+}
+
+fn cli_enrich(src: &str, out: &str, features: &str, extra: &[&str]) -> std::process::Output {
+    rcsr_cmd::rcsr()
+        .args(["enrich", "--data", src, "--out", out, "--cpu", "--features", features, "--eth-symbol", "BTCUSDT", "--locked-test", "none"])
+        .args(extra)
+        .output()
+        .unwrap()
+}
+
+fn cli_enrich_ok(src: &str, out: &str, features: &str, extra: &[&str]) {
+    let r = cli_enrich(src, out, features, extra);
+    assert_eq!(r.status.code(), Some(0), "{}", String::from_utf8_lossy(&r.stderr));
+}
+
+/// `min_members` of every `{"name":..}` entry of a sidecar text.
+fn column_floors(text: &str) -> std::collections::BTreeMap<String, usize> {
+    let mut out = std::collections::BTreeMap::new();
+    for part in text.split("{\"name\":\"").skip(1) {
+        let name = part.split('"').next().unwrap_or_default();
+        let body = part.split('}').next().unwrap_or_default();
+        if let Some(at) = body.find("\"min_members\":") {
+            let digits: String = body[at + 14..].chars().take_while(|c| c.is_ascii_digit()).collect();
+            out.insert(name.to_string(), digits.parse().unwrap());
+        }
+    }
+    out
+}
+
+fn stderr_of(r: &std::process::Output) -> String {
+    String::from_utf8_lossy(&r.stderr).into_owned()
+}
+
+fn symbol_store(dir: &std::path::Path, name: &str, symbols: usize, n: usize, step: i64) -> String {
+    let path = dir.join(name).to_string_lossy().into_owned();
+    write_panel_store(&path, &member_rows(symbols, n, step), 64);
+    path
+}
+
+/// Golden `sha256` of the 19 columns on the 20-member fixture, taken from the engine before the floor became a parameter.
+const GOLDEN_DEFAULT_HASHES: &[(&str, &str)] = &[
+    ("mkt_r16", "e9b795fa1195e480f1cb76f1be02b15356521d02749953b84d74e62773ed42ce"),
+    ("mkt_ew_ret16", "e9b795fa1195e480f1cb76f1be02b15356521d02749953b84d74e62773ed42ce"),
+    ("breadth", "67b32f55a8d4f3fa0edbb839fb0e5432a8e80f2803b42a88ed1032c845bee509"),
+    ("mkt_breadth", "67b32f55a8d4f3fa0edbb839fb0e5432a8e80f2803b42a88ed1032c845bee509"),
+    ("dispersion", "c190d78501e509f47447ee25f8c70b92acca72bcf35d2debf8c2c29b2db99010"),
+    ("mkt_dispersion", "c190d78501e509f47447ee25f8c70b92acca72bcf35d2debf8c2c29b2db99010"),
+    ("rel_mkt16", "859e6b828f5ec8d5021356f7a2180de66ca40168a58fecaf1dc0210622dcaaef"),
+    ("mkt_r96", "5b2e412a32c98ee02361f1db742fe2cb5ba5b8d7cdfd3d09e2fd1a509af5cbc1"),
+    ("rel_mkt96", "0ac8cd2cbb7650e013a8259771a22def40c767d8ac4bea8fd88fd67259a9b581"),
+    ("mkt_vol96", "8e1cea6b4d1de472ba22466d01b65438253291c86e04252d399798be261e0b36"),
+    ("mkt_ew_ret1", "149a5c76653882c4d96afc56f939448acc44ed37cc46bd93f11e720af22cc60b"),
+    ("avg_corr", "df15f070709875b5938a97ba6b526bf28153a6401788091267f2f5b9d083906a"),
+    ("btc_volume_share", "298a3e09af665757cb07d0cf4c1e7166917c6b387af59d21611aed80a1f91cc4"),
+    ("xs_rank_r1", "3ac4d5bbcd4e89834067214423d1a3fdbfa0aca02a476830a49176571e53827d"),
+    ("xs_rank_r16", "af068f064ac1a20a4c02d66641d59790fcba81e5ed6304ab2c0d5b0d9ee0de95"),
+    ("xs_rank_r20", "33f607a42960598c3e619495e678fddce8d8084ec4f5b880698934f1ae3d8d9b"),
+    ("xs_rank_vol20", "c82443154d7160ae9a66e16db198c3fb516d7cb398dcd340a8ed2bed612d87b8"),
+    ("xs_rank_amihud96", "449115020d0b15f92293e140afbc7e12871644e82607283962b8054904de1092"),
+    ("cs_rank_r60", "863a567fc38920ba1dd0ac80e3ce4ad7a81235151ee9ff9fa5bb13a4e6d4f2ec"),
+];
+
+#[test]
+fn min_cross_members_default_is_byte_identical() {
+    let (_scratch, dir) = tmp_dir("floor-default");
+    let input = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let rows = cross_panel_rows(300, 900, 0.0, Some("ALT01USDT"), 1.0e12);
+    write_panel_store(&input, &rows, 64);
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    let report = enrich::build(&cross_opts(&input, &out, &FLOORED_19.join(","))).unwrap();
+    let got: Vec<(String, String)> = report.features.iter().map(|f| (f.name.clone(), f.hash.clone())).collect();
+    for name in FLOORED_19 {
+        assert!(column(&out, name).iter().any(|v| v.is_finite()), "{name} has no finite value at 20 members");
+    }
+    let want: Vec<(String, String)> = GOLDEN_DEFAULT_HASHES.iter().map(|(n, h)| (n.to_string(), h.to_string())).collect();
+    assert_eq!(got, want, "the default floor changed a cross column");
+
+    let explicit = dir.join("explicit.rcsb").to_string_lossy().into_owned();
+    cli_enrich_ok(&input, &explicit, &FLOORED_19.join(","), &["--min-cross-members", "20", "--min-cross-members-rank", "20"]);
+    for name in FLOORED_19 {
+        assert_eq!(
+            column(&out, name).iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            column(&explicit, name).iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "{name}: explicit 20 differs from the default"
+        );
+    }
+}
+
+#[test]
+fn min_cross_members_5_fills_a_thin_cross_section() {
+    let (_scratch, dir) = tmp_dir("floor-thin");
+    let input = symbol_store(&dir, "in.rcsb", 7, 300, 900);
+    let features = FLOORED_19.join(",");
+    let default = dir.join("default.rcsb").to_string_lossy().into_owned();
+    cli_enrich_ok(&input, &default, &features, &[]);
+    for name in FLOORED_19 {
+        assert!(column(&default, name).iter().all(|v| v.is_nan()), "{name} must be NaN with 7 members at the default floor");
+    }
+    let five = dir.join("five.rcsb").to_string_lossy().into_owned();
+    cli_enrich_ok(&input, &five, &features, &["--min-cross-members", "5"]);
+    for name in FLOORED_19 {
+        let v = column(&five, name);
+        for sym in 0..7usize {
+            for i in 200..300usize {
+                assert!(v[symbol_index(sym, i, 300)].is_finite(), "{name} symbol {sym} bar {i} is NaN at floor 5");
+            }
+        }
+    }
+}
+
+#[test]
+fn min_cross_members_five_member_values() {
+    let (_scratch, dir) = tmp_dir("floor-values");
+    let n = 200usize;
+    let input = symbol_store(&dir, "in.rcsb", 5, n, 900);
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    cli_enrich_ok(&input, &out, "r16,mkt_r16,breadth,dispersion,xs_rank_r16", &["--min-cross-members", "5"]);
+    let r16 = column(&out, "r16");
+    let (mkt, breadth, disp, rank) =
+        (column(&out, "mkt_r16"), column(&out, "breadth"), column(&out, "dispersion"), column(&out, "xs_rank_r16"));
+    for i in 100..n {
+        let vals: Vec<f64> = (0..5).map(|k| r16[symbol_index(k, i, n)]).collect();
+        let mean = vals.iter().sum::<f64>() / 5.0;
+        let share = vals.iter().filter(|v| **v > 0.0).count() as f64 / 5.0;
+        let sd = (vals.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / 5.0).sqrt();
+        let mut order: Vec<usize> = (0..5).collect();
+        order.sort_by(|&a, &b| vals[a].partial_cmp(&vals[b]).unwrap());
+        for k in 0..5usize {
+            let at = symbol_index(k, i, n);
+            closeish(mean, mkt[at], 1e-12, "mkt_r16");
+            closeish(share, breadth[at], 1e-12, "breadth");
+            closeish(sd, disp[at], 1e-12, "dispersion");
+            let pos = order.iter().position(|&o| o == k).unwrap();
+            closeish(-1.0 + 0.5 * pos as f64, rank[at], 1e-12, "xs_rank_r16");
+        }
+    }
+}
+
+#[test]
+fn min_cross_members_rank_floor_is_separate() {
+    let (_scratch, dir) = tmp_dir("floor-rank");
+    let features = FLOORED_19.join(",");
+    let seven = symbol_store(&dir, "seven.rcsb", 7, 300, 900);
+    let out7 = dir.join("out7.rcsb").to_string_lossy().into_owned();
+    cli_enrich_ok(&seven, &out7, &features, &["--min-cross-members", "5", "--min-cross-members-rank", "10"]);
+    for name in FLOORED_19 {
+        let v = column(&out7, name);
+        if CLASS_R_19.contains(name) {
+            assert!(v.iter().all(|x| x.is_nan()), "{name} must be NaN at 7 members with rank floor 10");
+        } else {
+            assert!(v[symbol_index(0, 250, 300)].is_finite(), "{name} must be finite at 7 members with floor 5");
+        }
+    }
+    let ten = symbol_store(&dir, "ten.rcsb", 10, 300, 900);
+    let out10 = dir.join("out10.rcsb").to_string_lossy().into_owned();
+    cli_enrich_ok(&ten, &out10, &features, &["--min-cross-members", "5", "--min-cross-members-rank", "10"]);
+    for name in FLOORED_19 {
+        assert!(column(&out10, name)[symbol_index(0, 250, 300)].is_finite(), "{name} must be finite at 10 members");
+    }
+}
+
+#[test]
+fn min_cross_members_boundary_per_column() {
+    let (_scratch, dir) = tmp_dir("floor-boundary");
+    let mut features: Vec<&str> = FLOORED_19.to_vec();
+    features.push("mkt_r672");
+    let features = features.join(",");
+    for floor in [5usize, 20] {
+        let flag = floor.to_string();
+        for (members, finite) in [(floor, true), (floor - 1, false)] {
+            let input = symbol_store(&dir, &format!("in{floor}-{members}.rcsb"), members, 720, 900);
+            let out = dir.join(format!("out{floor}-{members}.rcsb")).to_string_lossy().into_owned();
+            cli_enrich_ok(&input, &out, &features, &["--min-cross-members", &flag]);
+            for name in features.split(',') {
+                let at = symbol_index(0, 710, 720);
+                assert_eq!(column(&out, name)[at].is_finite(), finite, "{name} with {members} members at floor {floor}");
+            }
+        }
+        for (members, finite) in [(floor, true), (floor - 1, false)] {
+            let input = symbol_store(&dir, &format!("day{floor}-{members}.rcsb"), members, 150, 86_400);
+            let out = dir.join(format!("dayout{floor}-{members}.rcsb")).to_string_lossy().into_owned();
+            cli_enrich_ok(&input, &out, "mkt_trend_ma100_ratio,mkt_trend_hi90_dist", &["--min-cross-members", &flag]);
+            for name in ["mkt_trend_ma100_ratio", "mkt_trend_hi90_dist"] {
+                let at = symbol_index(0, 149, 150);
+                assert_eq!(column(&out, name)[at].is_finite(), finite, "{name} with {members} members at floor {floor}");
+            }
+        }
+    }
+}
+
+#[test]
+fn min_cross_members_flag_validation() {
+    let (_scratch, dir) = tmp_dir("floor-flags");
+    let input = symbol_store(&dir, "in.rcsb", 6, 40, 900);
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    for flag in ["--min-cross-members", "--min-cross-members-rank"] {
+        for bad in ["0", "4", "201", "x"] {
+            let _ = std::fs::remove_file(&out);
+            let r = cli_enrich(&input, &out, "mkt_r16", &[flag, bad]);
+            assert_eq!(r.status.code(), Some(2), "{flag} {bad}: {}", stderr_of(&r));
+            assert!(stderr_of(&r).contains("5..=200"), "{flag} {bad}: {}", stderr_of(&r));
+            assert!(!std::path::Path::new(&out).exists());
+        }
+        for ok in ["5", "200"] {
+            let r = cli_enrich(&input, &out, "mkt_r16", &[flag, ok]);
+            assert_eq!(r.status.code(), Some(0), "{flag} {ok}: {}", stderr_of(&r));
+        }
+    }
+    let help = rcsr_cmd::rcsr().args(["enrich", "--help"]).output().unwrap();
+    let help = String::from_utf8_lossy(&help.stdout).into_owned();
+    let schema = rcsr::schema::json();
+    for flag in ["--min-cross-members", "--min-cross-members-rank"] {
+        assert!(help.contains(flag), "enrich --help misses {flag}");
+        assert!(schema.contains(&format!("\"name\":\"{flag}\"")), "rcsr schema misses {flag}");
+    }
+}
+
+#[test]
+fn min_cross_members_is_recorded_in_the_sidecar() {
+    let (_scratch, dir) = tmp_dir("floor-sidecar");
+    let input = symbol_store(&dir, "in.rcsb", 8, 120, 900);
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    cli_enrich_ok(&input, &out, "r16,mkt_r16,breadth,xs_rank_r1,avg_corr", &["--min-cross-members", "5", "--min-cross-members-rank", "8"]);
+    let text = std::fs::read_to_string(format!("{out}.enrich.json")).unwrap();
+    assert!(text.contains("\"cross_floor\":{\"members\":5,\"rank_members\":8}"), "{text}");
+    let floors = column_floors(&text);
+    assert_eq!(floors.get("mkt_r16"), Some(&5));
+    assert_eq!(floors.get("breadth"), Some(&5));
+    assert_eq!(floors.get("xs_rank_r1"), Some(&8));
+    assert_eq!(floors.get("avg_corr"), Some(&8));
+    assert_eq!(floors.len(), 4, "a column outside the table must carry no min_members: {floors:?}");
+
+    let default = dir.join("default.rcsb").to_string_lossy().into_owned();
+    cli_enrich_ok(&input, &default, "r16,mkt_r16,xs_rank_r1", &[]);
+    let text = std::fs::read_to_string(format!("{default}.enrich.json")).unwrap();
+    assert!(text.contains("\"cross_floor\":{\"members\":20,\"rank_members\":20}"), "{text}");
+    assert_eq!(column_floors(&text).len(), 2);
+
+    let plain = dir.join("plain.rcsb").to_string_lossy().into_owned();
+    cli_enrich_ok(&input, &plain, "r16,r1", &[]);
+    let text = std::fs::read_to_string(format!("{plain}.enrich.json")).unwrap();
+    assert!(!text.contains("cross_floor") && !text.contains("min_members"), "{text}");
+}
+
+#[test]
+fn min_cross_members_mixing_is_refused_by_enrich() {
+    let (_scratch, dir) = tmp_dir("floor-mix");
+    let input = symbol_store(&dir, "in.rcsb", 8, 120, 900);
+    let five = dir.join("five.rcsb").to_string_lossy().into_owned();
+    cli_enrich_ok(&input, &five, "mkt_r16", &["--min-cross-members", "5"]);
+    let next = dir.join("next.rcsb").to_string_lossy().into_owned();
+    let r = cli_enrich(&five, &next, "mkt_r96", &[]);
+    assert_eq!(r.status.code(), Some(2), "{}", stderr_of(&r));
+    let text = stderr_of(&r);
+    assert!(text.contains("--min-cross-members 5") && text.contains("--min-cross-members 20"), "{text}");
+    assert!(!std::path::Path::new(&next).exists());
+    cli_enrich_ok(&five, &next, "mkt_r96", &["--min-cross-members", "5"]);
+    let text = std::fs::read_to_string(format!("{next}.enrich.json")).unwrap();
+    assert!(text.contains("\"cross_floor\":{\"members\":5,\"rank_members\":5}"), "{text}");
+
+    // Columns that carry no floor never conflict, and a run that builds none keeps the recorded floors.
+    let plain = dir.join("plain.rcsb").to_string_lossy().into_owned();
+    cli_enrich_ok(&five, &plain, "r1", &[]);
+    let text = std::fs::read_to_string(format!("{plain}.enrich.json")).unwrap();
+    assert!(text.contains("\"cross_floor\":{\"members\":5,\"rank_members\":5}"), "{text}");
+    let again = dir.join("again.rcsb").to_string_lossy().into_owned();
+    let r = cli_enrich(&plain, &again, "mkt_r96", &[]);
+    assert_eq!(r.status.code(), Some(2), "{}", stderr_of(&r));
+
+    // A store without the record counts as 20.
+    let legacy = dir.join("legacy.rcsb").to_string_lossy().into_owned();
+    cli_enrich_ok(&input, &legacy, "mkt_r16", &["--min-cross-members", "5"]);
+    std::fs::remove_file(format!("{legacy}.enrich.json")).unwrap();
+    let out = dir.join("legacy-next.rcsb").to_string_lossy().into_owned();
+    let r = cli_enrich(&legacy, &out, "mkt_r96", &["--min-cross-members", "5"]);
+    assert_eq!(r.status.code(), Some(2), "{}", stderr_of(&r));
+    let text = stderr_of(&r);
+    assert!(text.contains("--min-cross-members 20") && text.contains("--min-cross-members 5"), "{text}");
+    cli_enrich_ok(&legacy, &out, "mkt_r96", &[]);
+}
+
+#[test]
+fn min_cross_members_mixing_is_refused_by_panel_append() {
+    let (_scratch, dir) = tmp_dir("floor-panel");
+    let rows = member_rows(8, 120, 900);
+    let mut time_major_rows = rows.clone();
+    time_major_rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    let panel = dir.join("panel.rcsb").to_string_lossy().into_owned();
+    write_panel_store(&panel, &time_major_rows, 64);
+    let base = dir.join("base.rcsb").to_string_lossy().into_owned();
+    write_panel_store(&base, &rows, 64);
+    let family = |name: &str, features: &str, floor: &str| {
+        let out = dir.join(name).to_string_lossy().into_owned();
+        cli_enrich_ok(&base, &out, features, &["--min-cross-members", floor]);
+        out
+    };
+    let append = |target: &str, family: &str, columns: &str, out: &str| {
+        rcsr_cmd::rcsr()
+            .args(["panel", "append", "--data", target, "--family", family, "--columns", columns, "--out", out])
+            .output()
+            .unwrap()
+    };
+    let schema_floors = |out: &str| {
+        let text = std::fs::read_to_string(format!("{out}.schema.json")).unwrap();
+        column_floors(&text)
+    };
+
+    let f5 = family("f5.rcsb", "r16,mkt_r16,mkt_r96", "5");
+    let first = dir.join("first.rcsb").to_string_lossy().into_owned();
+    let r = append(&panel, &f5, "mkt_r16,r16", &first);
+    assert_eq!(r.status.code(), Some(0), "{}", stderr_of(&r));
+    let floors = schema_floors(&first);
+    assert_eq!(floors.get("mkt_r16"), Some(&5), "{floors:?}");
+    assert_eq!(floors.len(), 1, "{floors:?}");
+    let text = std::fs::read_to_string(format!("{first}.schema.json")).unwrap();
+    let line = text.lines().find(|l| l.starts_with("{\"name\":\"mkt_r16\"")).unwrap();
+    assert!(line.contains("N>=5") && !line.contains("N>=20"), "{line}");
+
+    // Matching floors append.
+    let second = dir.join("second.rcsb").to_string_lossy().into_owned();
+    let r = append(&first, &f5, "mkt_r96", &second);
+    assert_eq!(r.status.code(), Some(0), "{}", stderr_of(&r));
+    assert_eq!(schema_floors(&second).get("mkt_r96"), Some(&5));
+
+    // A family built at 20 and a panel holding floor-5 columns: exit 3, both values named.
+    let f20 = family("f20.rcsb", "mkt_vol96", "20");
+    let third = dir.join("third.rcsb").to_string_lossy().into_owned();
+    let r = append(&second, &f20, "mkt_vol96", &third);
+    assert_eq!(r.status.code(), Some(3), "{}", stderr_of(&r));
+    let text = stderr_of(&r);
+    assert!(text.contains("min_members 20") && text.contains("min_members 5"), "{text}");
+    assert!(!std::path::Path::new(&third).exists());
+
+    // A family store without the record counts as 20.
+    std::fs::remove_file(format!("{f20}.enrich.json")).unwrap();
+    let r = append(&second, &f20, "mkt_vol96", &third);
+    assert_eq!(r.status.code(), Some(3), "{}", stderr_of(&r));
+
+    // A rank column is its own class: it may carry another floor than the mean columns.
+    let rank = family("rank.rcsb", "xs_rank_r1", "20");
+    let fourth = dir.join("fourth.rcsb").to_string_lossy().into_owned();
+    let r = append(&second, &rank, "xs_rank_r1", &fourth);
+    assert_eq!(r.status.code(), Some(0), "{}", stderr_of(&r));
+    assert_eq!(schema_floors(&fourth).get("xs_rank_r1"), Some(&20));
+}
+
+#[test]
+fn min_cross_members_floor_survives_a_chained_enrich() {
+    let (_scratch, dir) = tmp_dir("floor-chain");
+    let rows = member_rows(8, 120, 900);
+    let mut time_major_rows = rows.clone();
+    time_major_rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    let panel = dir.join("panel.rcsb").to_string_lossy().into_owned();
+    write_panel_store(&panel, &time_major_rows, 64);
+    let base = dir.join("base.rcsb").to_string_lossy().into_owned();
+    write_panel_store(&base, &rows, 64);
+    let p = |name: &str| dir.join(name).to_string_lossy().into_owned();
+
+    // Step 1 builds the cross columns at 5, step 2 builds no cross column: its features[] lists only r1.
+    let (s1, s2, f20) = (p("s1.rcsb"), p("s2.rcsb"), p("f20.rcsb"));
+    cli_enrich_ok(&base, &s1, "mkt_r16,mkt_r96", &["--min-cross-members", "5"]);
+    cli_enrich_ok(&s1, &s2, "r1", &[]);
+    cli_enrich_ok(&base, &f20, "mkt_vol96", &[]);
+    let text = std::fs::read_to_string(format!("{s2}.enrich.json")).unwrap();
+    assert!(text.contains("\"cross_floor\":{\"members\":5,\"rank_members\":5}"), "{text}");
+
+    let append = |target: &str, family: &str, columns: &str, out: &str| {
+        rcsr_cmd::rcsr()
+            .args(["panel", "append", "--data", target, "--family", family, "--columns", columns, "--out", out])
+            .output()
+            .unwrap()
+    };
+    let (first, second) = (p("first.rcsb"), p("second.rcsb"));
+    let r = append(&panel, &s2, "mkt_r16", &first);
+    assert_eq!(r.status.code(), Some(0), "{}", stderr_of(&r));
+    let schema = std::fs::read_to_string(format!("{first}.schema.json")).unwrap();
+    let line = schema.lines().find(|l| l.starts_with("{\"name\":\"mkt_r16\"")).unwrap();
+    assert!(line.contains("\"min_members\":5") && line.contains("N>=5") && !line.contains("N>=20"), "{line}");
+    let r = append(&first, &f20, "mkt_vol96", &second);
+    assert_eq!(r.status.code(), Some(3), "{}", stderr_of(&r));
+    let text = stderr_of(&r);
+    assert!(text.contains("min_members 20") && text.contains("min_members 5"), "{text}");
+    assert!(!std::path::Path::new(&second).exists());
+
+    // enrich of a default floor onto the chained store is still refused.
+    let r = cli_enrich(&s2, &p("s3.rcsb"), "mkt_vol96", &[]);
+    assert_eq!(r.status.code(), Some(2), "{}", stderr_of(&r));
+}
+
+#[test]
+fn min_cross_members_panel_append_floor_is_seen_by_a_later_enrich() {
+    let (_scratch, dir) = tmp_dir("floor-append-enrich");
+    let rows = member_rows(8, 120, 900);
+    let base = dir.join("base.rcsb").to_string_lossy().into_owned();
+    write_panel_store(&base, &rows, 64);
+    let p = |name: &str| dir.join(name).to_string_lossy().into_owned();
+    let (s1, o, oe) = (p("s1.rcsb"), p("o.rcsb"), p("oe.rcsb"));
+    cli_enrich_ok(&base, &s1, "mkt_r16,mkt_r96", &["--min-cross-members", "5"]);
+    let append = |target: &str, family: &str, columns: &str, out: &str| {
+        rcsr_cmd::rcsr()
+            .args(["panel", "append", "--data", target, "--family", family, "--columns", columns, "--out", out])
+            .output()
+            .unwrap()
+    };
+    // A floor-5 column appended into a symbol-major store: the floor lives only in o.rcsb.schema.json.
+    let r = append(&base, &s1, "mkt_r16", &o);
+    assert_eq!(r.status.code(), Some(0), "{}", stderr_of(&r));
+    assert!(!std::path::Path::new(&format!("{o}.enrich.json")).exists());
+
+    let r = cli_enrich(&o, &oe, "mkt_vol96", &[]);
+    assert_eq!(r.status.code(), Some(2), "{}", stderr_of(&r));
+    let text = stderr_of(&r);
+    assert!(text.contains("'mkt_r16'") && text.contains("--min-cross-members 5") && text.contains("--min-cross-members 20"), "{text}");
+    assert!(!std::path::Path::new(&oe).exists());
+
+    cli_enrich_ok(&o, &oe, "mkt_vol96", &["--min-cross-members", "5"]);
+    let text = std::fs::read_to_string(format!("{oe}.enrich.json")).unwrap();
+    assert!(text.contains("\"cross_floor\":{\"members\":5,\"rank_members\":5}"), "{text}");
+    let floors = column_floors(&text);
+    assert_eq!(floors.get("mkt_r16"), Some(&5), "the carried column keeps its floor: {floors:?}");
+    assert_eq!(floors.get("mkt_vol96"), Some(&5));
+
+    // The floor of the carried column reaches a later append.
+    let panel = dir.join("panel.rcsb").to_string_lossy().into_owned();
+    let mut time_major = rows.clone();
+    time_major.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    write_panel_store(&panel, &time_major, 64);
+    let out = p("final.rcsb");
+    let r = append(&panel, &oe, "mkt_r16,mkt_vol96", &out);
+    assert_eq!(r.status.code(), Some(0), "{}", stderr_of(&r));
+    let floors = column_floors(&std::fs::read_to_string(format!("{out}.schema.json")).unwrap());
+    assert_eq!((floors.get("mkt_r16"), floors.get("mkt_vol96")), (Some(&5), Some(&5)), "{floors:?}");
+}
+
+#[test]
+fn min_cross_members_rebuild_does_not_keep_a_stale_schema_floor() {
+    let (_scratch, dir) = tmp_dir("floor-rebuild");
+    let base = symbol_store(&dir, "base.rcsb", 8, 120, 900);
+    let p = |name: &str| dir.join(name).to_string_lossy().into_owned();
+    let x = p("x.rcsb");
+    cli_enrich_ok(&base, &x, "mkt_r16", &["--min-cross-members", "5"]);
+    let r = rcsr_cmd::rcsr().args(["panel", "schema", "--data", &x]).output().unwrap();
+    assert_eq!(r.status.code(), Some(0), "{}", stderr_of(&r));
+    let schema = format!("{x}.schema.json");
+    assert_eq!(column_floors(&std::fs::read_to_string(&schema).unwrap()).get("mkt_r16"), Some(&5));
+    let stale = std::fs::read_to_string(&schema).unwrap();
+
+    // Rebuild the store into the same path at the default floor.
+    cli_enrich_ok(&base, &x, "mkt_r16", &[]);
+    assert!(!std::path::Path::new(&schema).exists(), "a rebuilt store must not keep the schema of the old one");
+    assert!(std::path::Path::new(&format!("{schema}.prev")).exists());
+    let next = p("next.rcsb");
+    let r = cli_enrich(&x, &next, "mkt_vol96", &["--min-cross-members", "5"]);
+    assert_eq!(r.status.code(), Some(2), "{}", stderr_of(&r));
+    let text = stderr_of(&r);
+    assert!(text.contains("'mkt_r16'") && text.contains("--min-cross-members 20") && text.contains("--min-cross-members 5"), "{text}");
+    cli_enrich_ok(&x, &next, "mkt_vol96", &[]);
+
+    // A stale schema that is put back (its hash no longer matches the column) is ignored by the resolver.
+    std::fs::write(&schema, &stale).unwrap();
+    let again = p("again.rcsb");
+    let r = cli_enrich(&x, &again, "mkt_vol96", &["--min-cross-members", "5"]);
+    assert_eq!(r.status.code(), Some(2), "{}", stderr_of(&r));
+    cli_enrich_ok(&x, &again, "mkt_vol96", &[]);
+}

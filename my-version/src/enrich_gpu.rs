@@ -125,7 +125,7 @@ extern "C" {
     fn rc_enrich_batch_capacity(ctx: *mut Raw) -> c_int;
     fn rc_enrich_batch_host(ctx: *mut Raw) -> *mut f64;
     fn rc_enrich_batch_run(ctx: *mut Raw, ops: *const BatchOp, nops: c_int) -> c_int;
-    fn rc_enrich_xs_rank(ctx: *mut Raw, src: *const f64, out: *mut f64) -> c_int;
+    fn rc_enrich_xs_rank(ctx: *mut Raw, src: *const f64, floor: c_int, out: *mut f64) -> c_int;
 }
 
 /// Where one projected column lands in the enrichment context.
@@ -879,13 +879,13 @@ impl EnrichGpu {
     /// Cross-sectional ranks against the cached device permutation. The stable
     /// segmented sort keeps the CPU's `(time, symbol, row)` tie order and treats
     /// `-0.0`/`+0.0` as one tie; non-members and non-finite values are `NaN`,
-    /// and a timestamp with fewer than 20 finite PIT members is all `NaN`.
-    pub fn rank(&mut self, src: &[f64]) -> Option<Vec<f64>> {
+    /// and a timestamp with fewer than `floor` finite PIT members is all `NaN`.
+    pub fn rank(&mut self, src: &[f64], floor: usize) -> Option<Vec<f64>> {
         if src.len() != self.n {
             return None;
         }
         let ctx = self.ctx;
-        self.one(|p| unsafe { rc_enrich_xs_rank(ctx, src.as_ptr(), p) })
+        self.one(|p| unsafe { rc_enrich_xs_rank(ctx, src.as_ptr(), floor as c_int, p) })
     }
 
     /// #300: how many output columns fit in the 64 MiB per-family arena.
@@ -1065,7 +1065,7 @@ mod tests {
                     .then(a.cmp(&b))
             });
             let m = group.len();
-            if m >= 20 {
+            if m >= crate::enrich::MIN_CROSS_MEMBERS {
                 for (rank, &r) in group.iter().enumerate() {
                     out[r] = 2.0 * rank as f64 / (m - 1) as f64 - 1.0;
                 }
@@ -1141,7 +1141,7 @@ mod tests {
         assert!(gpu.prepare_cross_section(&sym, Some(&member)));
         // The permutation is idempotent and shared by every column.
         assert!(gpu.prepare_cross_section(&sym, Some(&member)));
-        let got = gpu.rank(&src).expect("device rank");
+        let got = gpu.rank(&src, 20).expect("device rank");
         let want = cpu_rank(&src, &times, &sym, &member);
         let finite = want.iter().filter(|v| v.is_finite()).count();
         assert!(finite > 0, "fixture must produce finite ranks");
@@ -1172,11 +1172,11 @@ mod tests {
         let (times, sym, src, member, seg_start, seg_len) = fixture(10_000, 21);
         let mut gpu = open_context(&times, &seg_start, &seg_len);
         assert!(gpu.prepare_cross_section(&sym, Some(&member)));
-        let first = gpu.rank(&src).unwrap();
-        let second = gpu.rank(&src).unwrap();
+        let first = gpu.rank(&src, 20).unwrap();
+        let second = gpu.rank(&src, 20).unwrap();
         let other: Vec<f64> = src.iter().map(|v| -v).collect();
-        let other_rank = gpu.rank(&other).unwrap();
-        let third = gpu.rank(&src).unwrap();
+        let other_rank = gpu.rank(&other, 20).unwrap();
+        let third = gpu.rank(&src, 20).unwrap();
         assert_eq!(
             first.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
             second.iter().map(|v| v.to_bits()).collect::<Vec<_>>()

@@ -149,15 +149,15 @@ rows that are live at the timestamp. The pass reads `member_asof` when the
 store carries it and requires `member_asof <= t`; a pre-listing or
 post-delisting row is excluded from every statistic and receives `NaN` for the
 cross-sectional columns. It never injects a symbol from a later membership
-decision, never forward-fills a missing timestamp, and requires at least 20
-valid members. A symbol whose last bar is before the panel end therefore
+decision, never forward-fills a missing timestamp, and requires at least the member floor of valid members (20 by default;
+`--min-cross-members` and `--min-cross-members-rank`, recorded as `min_members`). A symbol whose last bar is before the panel end therefore
 cannot enter a later breadth, dispersion or rank value. See
 [`ohlcv.md`](ohlcv.md#cross-asset-breadth-and-rank-family-273).
 
 Under `--features cuda` the market columns (`mkt_*`, `breadth`, `dispersion`,
 `rel_mkt*`, `avg_corr`, `btc_volume_share`) reduce each timestamp group on the
 device in the same `(time, symbol, row)` order, with the same `member_asof <= t`
-mask and the same 20-member floor, so a pre-listing or post-delisting row is
+mask and the same member floor (passed to the kernels), so a pre-listing or post-delisting row is
 excluded exactly as on the CPU. The benchmark joins use exact timestamp
 equality; a missing benchmark bar is `NaN`
 ([`ohlcv.md`](ohlcv.md#device-benchmark-joins-beta-and-cross-means-299)).

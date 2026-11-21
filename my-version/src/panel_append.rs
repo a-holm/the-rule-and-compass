@@ -170,6 +170,39 @@ pub fn resolve_all(panel: &FileStore, family: &FileStore) -> Vec<String> {
         .collect()
 }
 
+/// The member floor of every cross-section column of the output (#1274). A column the panel already holds keeps
+/// the floor recorded next to the panel, an appended one takes the floor recorded next to the family store; a store
+/// without the record counts as 20. Appended and existing columns of one class must agree.
+fn merged_floors(
+    target_path: &str,
+    family_path: &str,
+    target: &FileStore,
+    columns: &[String],
+) -> Result<std::collections::BTreeMap<String, usize>, String> {
+    use crate::cross_floor as cf;
+    let panel_rec = cf::resolved_columns(target_path, &target.header().names());
+    let family_rec = cf::resolved_columns(family_path, columns);
+    let mut floors = std::collections::BTreeMap::new();
+    for n in target.header().names().iter().filter(|n| cf::is_floored(n)) {
+        floors.insert(n.clone(), panel_rec.get(n).copied().unwrap_or(cf::DEFAULT));
+    }
+    let class_of = |n: &str| cf::MARKET_COLUMNS.contains(&n);
+    for n in columns.iter().filter(|n| cf::is_floored(n)) {
+        if floors.contains_key(n) {
+            continue;
+        }
+        let k = family_rec.get(n).copied().unwrap_or(cf::DEFAULT);
+        if let Some((other, have)) = floors.iter().find(|(o, h)| class_of(o) == class_of(n) && **h != k) {
+            return Err(format!(
+                "member floors differ: column '{}' of {} was built with min_members {}; the panel {} holds '{}' with min_members {}",
+                n, family_path, k, target_path, other, have
+            ));
+        }
+        floors.insert(n.clone(), k);
+    }
+    Ok(floors)
+}
+
 fn bits_equal(a: f64, b: f64) -> bool {
     a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan())
 }
@@ -201,6 +234,7 @@ pub fn append_family_locked(opts: &AppendOptions, record: Option<&crate::lockrec
     let target = FileStore::open(&opts.target)?;
     let family = FileStore::open(&opts.family)?;
     check_columns(&target, &family, &opts.columns, opts.skip_existing)?;
+    let floors = merged_floors(&opts.target, &opts.family, &target, &opts.columns)?;
     let before = manifest::sha256_file(&opts.target)?;
     let tk = read_keys(&target)?;
     let fk = read_keys(&family)?;
@@ -293,7 +327,7 @@ pub fn append_family_locked(opts: &AppendOptions, record: Option<&crate::lockrec
             .flatten()
             .map(|(_, s)| s)
             .max();
-        let schema = registry::write_schema_locked(&opts.out, &opts.panel_version, declared.as_ref(), also.as_ref(), floor, retired.as_ref(), record)?;
+        let schema = registry::write_schema_floors(&opts.out, &opts.panel_version, declared.as_ref(), also.as_ref(), floor, retired.as_ref(), record, &floors)?;
         crate::lockbox::finish_output(&opts.out, declared.as_ref(), &["schema.json"]).map_err(|e| e.message)?;
         Ok(schema)
     };
