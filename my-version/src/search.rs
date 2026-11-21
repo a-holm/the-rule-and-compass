@@ -13173,7 +13173,7 @@ mod tests {
             }
         }
         let mut results: Vec<Vec<Option<PipelineResult>>> = vec![vec![None; 3]; 2];
-        results[0][0] = Some(PipelineResult { error: 42.0, nonfinite: DeviceInf::None, offered: 0, tree: None });
+        results[0][0] = Some(PipelineResult { error: 42.0, nonfinite: DeviceInf::None, offered: 0, tree: None, book: None });
         finish_pipeline_loss(&mut islands, &mut results, &rows, &cfg, &FallbackPool::new(2, 2), None);
         assert!(results.iter().flatten().all(|r| r.is_none()), "device results are dropped");
         let mut differs = false;
