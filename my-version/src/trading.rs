@@ -153,6 +153,17 @@ impl MissingScore {
     }
 }
 
+/// #1273: where the fitness book takes the flat-row return. `TrainMean` is the
+/// mean return of the book's training rows (the drift of the assets' own
+/// returns, never an interest rate); only the fitness book reads it, every
+/// reported book keeps `cash_return`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CashMode {
+    #[default]
+    Constant,
+    TrainMean,
+}
+
 /// #1179: the benchmark the `--fitness pnl` book subtracts from every return.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PnlExcess {
@@ -534,6 +545,9 @@ pub struct TradingSpec {
     pub funding_col: Option<String>,
     /// Return per period earned while flat.
     pub cash_return: f64,
+    /// #1273: `TrainMean` makes the fitness book earn the training mean return
+    /// while flat; the books of `cash_return` (validation, test, reports) are unchanged.
+    pub cash_mode: CashMode,
     pub min_trades: usize,
     /// Minimum consecutive long rows, entry row included, before an exit
     /// (indicator rule only).
@@ -574,6 +588,7 @@ impl Default for TradingSpec {
             slippage_bps: 0.0,
             funding_col: None,
             cash_return: 0.0,
+            cash_mode: CashMode::Constant,
             min_trades: 1,
             min_holding: 1,
             band: BandSpec::default(),
@@ -609,6 +624,9 @@ impl TradingSpec {
         }
         if !self.cash_return.is_finite() {
             return Err("cash_return must be finite".to_string());
+        }
+        if self.pnl_excess == PnlExcess::XsMean && self.cash_mode == CashMode::TrainMean {
+            return Err("--pnl-excess xs-mean needs --cash-return 0, got train-mean: the benchmark is the equal-weight cross-section, not a drift".to_string());
         }
         if self.pnl_excess == PnlExcess::XsMean && self.cash_return != 0.0 {
             return Err(format!(
@@ -1870,6 +1888,8 @@ pub struct FitnessBook {
     off_rows: usize,
     /// #1179: what `excess` is measured against.
     excess_mode: PnlExcess,
+    cash_return: f64,
+    cash_mode: CashMode,
     /// #1178: the statistic of the block regrets.
     stat: BlockStat,
     /// #1178: the time block of every row; empty for a single block.
@@ -1984,10 +2004,19 @@ impl FitnessBook {
             );
         }
         check_return_spacing(rows, horizon_seconds)?;
+        // #1273: the drift of the rows the book can trade, from this slice only.
+        let cash_return = match spec.cash_mode {
+            CashMode::Constant => spec.cash_return,
+            CashMode::TrainMean => {
+                let tradable = |i: usize| mask.as_ref().map_or(true, |k| k.on.len() != n || k.on[i]);
+                let (sum, count) = (0..n).filter(|&i| tradable(i)).fold((0.0f64, 0usize), |(s, c), i| (s + slice.ret[i], c + 1));
+                if count == 0 { 0.0 } else { sum / count as f64 }
+            }
+        };
         let mut excess = Vec::with_capacity(n);
         for i in 0..n {
             let f = if rows.funding.is_empty() { 0.0 } else { rows.funding[i] };
-            let e = slice.ret[i] - f - spec.cash_return;
+            let e = slice.ret[i] - f - cash_return;
             if !e.is_finite() || !rows.time[i].is_finite() {
                 return Err(format!("training row {} has a non-finite return, funding or time", i));
             }
@@ -2139,6 +2168,9 @@ impl FitnessBook {
         if spec.pnl_excess == PnlExcess::XsMean {
             fnv_u64(&mut hash, 0x7873_6d65_616e_u64);
         }
+        if spec.cash_mode == CashMode::TrainMean {
+            fnv_u64(&mut hash, 0x746d_6561_6e_u64);
+        }
         if mask.is_some() && spec.band.units == BandUnits::Sd {
             fnv_u64(&mut hash, MASKED_SD_ALGORITHM);
         }
@@ -2159,10 +2191,22 @@ impl FitnessBook {
             cases: std::sync::OnceLock::new(),
             off_rows,
             excess_mode: spec.pnl_excess,
+            cash_return,
+            cash_mode: spec.cash_mode,
             stat: BlockStat::MeanSd,
             block_id,
             layer: None,
         })
+    }
+
+    /// #1273: the flat-row return the excess subtracts: `spec.cash_return`, or the
+    /// training mean under [`CashMode::TrainMean`].
+    pub fn cash_return(&self) -> f64 {
+        self.cash_return
+    }
+
+    pub fn cash_mode(&self) -> CashMode {
+        self.cash_mode
     }
 
     /// #1179: the benchmark of [`FitnessBook::excess`].
@@ -4921,5 +4965,66 @@ mod book_family_tests {
         // The observed book with shifted copies of it is one family.
         let books = family_books(&s, 4, 0.0, 3);
         assert_eq!(BookFamily::new(books.iter().collect()).unwrap().books().len(), 4);
+    }
+}
+
+#[cfg(test)]
+mod cash_mode_tests {
+    use super::*;
+    use crate::data::TradingSlice;
+
+    fn slice() -> TradingSlice {
+        let mut rows = TradingRows::default();
+        let mut ret = Vec::new();
+        for g in 0..3u64 {
+            for i in 0..80 {
+                rows.group.push(g);
+                rows.time.push(900.0 * i as f64);
+                let x = (g * 80 + i) as f64 * 0.618_033_988_749_894_9;
+                ret.push(0.004 * (x - x.floor() - 0.4));
+            }
+        }
+        TradingSlice { rows, ret }
+    }
+
+    fn spec(mode: CashMode) -> TradingSpec {
+        TradingSpec { cost_bps: 5.0, min_trades: 0, cash_mode: mode, ..Default::default() }
+    }
+
+    #[test]
+    fn train_mean_subtracts_the_mean_of_the_slice() {
+        let s = slice();
+        let m = s.ret.iter().sum::<f64>() / s.ret.len() as f64;
+        let book = FitnessBook::new(&s, &spec(CashMode::TrainMean), 900.0).unwrap();
+        assert_eq!(book.cash_return().to_bits(), m.to_bits());
+        for i in 0..s.ret.len() {
+            assert_eq!(book.excess()[i].to_bits(), (s.ret[i] - m).to_bits());
+        }
+        let same = FitnessBook::new(&s, &TradingSpec { cash_return: m, ..spec(CashMode::Constant) }, 900.0).unwrap();
+        assert_eq!(same.excess(), book.excess());
+        assert_ne!(same.hash(), book.hash());
+        let zero = FitnessBook::new(&s, &spec(CashMode::Constant), 900.0).unwrap();
+        assert_eq!(zero.cash_return(), 0.0);
+    }
+
+    #[test]
+    fn train_mean_under_a_mask_is_the_mean_of_the_rows_the_book_trades() {
+        let s = slice();
+        let on: Vec<bool> = (0..s.ret.len()).map(|i| i % 3 != 0).collect();
+        let (sum, n) = (0..s.ret.len()).filter(|&i| on[i]).fold((0.0, 0usize), |(a, c), i| (a + s.ret[i], c + 1));
+        let m = sum / n as f64;
+        let book = FitnessBook::with_segments(&s, &spec(CashMode::TrainMean), 900.0, 1, 1.0, &[], Some(BookMask { on: &on, identity: "g" })).unwrap();
+        assert_eq!(book.cash_return().to_bits(), m.to_bits());
+        for i in 0..s.ret.len() {
+            let want = if on[i] { s.ret[i] - m } else { 0.0 };
+            assert_eq!(book.excess()[i].to_bits(), want.to_bits(), "row {i}");
+        }
+    }
+
+    #[test]
+    fn xs_mean_refuses_train_mean() {
+        let bad = TradingSpec { pnl_excess: PnlExcess::XsMean, ..spec(CashMode::TrainMean) };
+        assert!(bad.validate().unwrap_err().contains("--pnl-excess xs-mean needs --cash-return 0"));
+        assert!(TradingSpec { pnl_excess: PnlExcess::XsMean, ..spec(CashMode::Constant) }.validate().is_ok());
     }
 }

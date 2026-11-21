@@ -3432,7 +3432,15 @@ fn cash_return_train_mean_reads_training_rows_only() {
     std::fs::write(&edited, text).unwrap();
     let edited = edited.to_string_lossy().into_owned();
     let go = |d: &str| {
-        let out = run_panel(d, &spec, &[&["--split-table", &table, "--split-id", "a"][..], &TRAIN_MEAN].concat());
+        let out = rcsr_cmd::rcsr()
+            .args([
+                "--data", d, "--target", "y", "--vars", "x1,x2", "--time", "t", "--group-by", "sym", "--split-table", &table,
+                "--split-id", "a", "--target-spec", &spec, "--cpu", "--no-dev-log", "--seed", "3", "--generations", "10", "--pop",
+                "32", "--metric", "squared", "--json", "--quiet", "--objective", "pnl", "--cost-bps", "5", "--fitness", "pnl",
+                "--cash-return", "train-mean",
+            ])
+            .output()
+            .unwrap();
         json(&out)
     };
     let (a, b) = (go(&data), go(&edited));

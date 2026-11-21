@@ -1550,6 +1550,16 @@ xs-mean  e_i = (r_i - m_t) - funding_i      m_t = mean of r_j over the book's ro
 * Needs `--fitness pnl` and `--cash-return 0` (exit 2 otherwise): the benchmark is the cross-section, never a cash or interest rate. `rcsr switch` reports its gate-cut profile, fitness and bound on the excess (`excess: xs_mean`; [`walkforward.md`](walkforward.md#two-books-and-a-gate-rcsr-switch-1185)). `rcsr compose` takes pools searched under the flag with the same flag: it prunes on the training excess, ranks composites on absolute net and alpha and reports `xs_excess_net` ([`compose.md`](compose.md)). `--gate-search` exits 2 on it.
 * The fitness alone changes. The validation and test books, `--select-rule robust`, the finalist choice and walk-forward keep the absolute net; `walkforward --from-run` of an `xs-mean` run reproduces `objective.test.net_pnl` (`xs_mean_reports_absolute_net`). The positions stay long-only.
 * `objective.validation` and `objective.test` gain `xs_excess_net` beside `net_pnl`: the net minus `sum_t p_t m_t`, with `m_t` the timestamp mean of the usable rows of that slice (a row without a score still counts in the mean). Under the missing-score rule of the book it is the net of the same book on `r - m` (`xs_excess_net_is_the_net_over_the_timestamp_mean`); on training rows it equals the fitness net.
+
+#### `--cash-return train-mean`: the drift of the training rows (#1273)
+
+`--cash-return train-mean` (needs `--fitness pnl`) sets `m` to the mean return of the book's training rows and prices the fitness excess as `e_i = r_i - funding_i - m`. `m` is the drift of the assets' own returns (buy-and-hold), never an interest, bond or T-bill rate. It removes the constant market drift from the regret, so the fitness measures timing over the average move of the traded assets.
+
+* `m` is the mean of the return column over the training book rows of the split, in simple-return units, after the row filters and the missing-cell drop. Under `--pnl-mask` it is the mean over the rows with the gate on, the rows the book can trade. It reads the training rows only (`cash_return_train_mean_reads_training_rows_only`) and is computed once, before generation 0.
+* Only the fitness reads `m`. The validation and test books, `--select-rule robust`, `objective.spec.cash_return` and walk-forward keep cash at 0, so every reported net, Sharpe and alpha is measured against non-interest cash at 0 or buy-and-hold (`cash_return_train_mean_keeps_reports_at_cash_zero`).
+* `search_fitness` gains `cash_return` (the number) and `cash_return_source: "train_mean"`; both are omitted for a constant. The book hash covers the mode, so a resume with another value exits 2.
+* `--pnl-excess xs-mean`, `rcsr compose`, `--gate-search` and `rcsr enumerate` exit 2 with `--cash-return`.
+* The device scores the uploaded CPU excess, so `--gpu` ranks on the same excess.
 * The device scores the excess the CPU built and uploaded, so a `--gpu` run ranks on the same excess; `device_xs_mean_parity` checks the totals and the regret bit for bit on the device's own `f32` predictions.
 * The mode enters the book hash: a resume with another `--pnl-excess` exits 2. `--json`: `search_fitness.excess` and `objective.spec.pnl_excess` (`xs_mean`), and `xs_excess_net`; all are omitted under `none`, so a run without the flag is byte-identical.
 
