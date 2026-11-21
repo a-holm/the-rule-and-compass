@@ -2464,7 +2464,7 @@ fn declared_return(opts: &Options) -> Option<String> {
 }
 
 /// The panel's return column: `--return-col`, else the target spec's, else `--target`.
-fn return_name(inp: &Input, opts: &Options) -> String {
+pub fn return_name(inp: &Input, opts: &Options) -> String {
     inp.ret.clone().or_else(|| declared_return(opts)).unwrap_or_else(|| inp.target.clone())
 }
 
@@ -2473,11 +2473,15 @@ fn return_name(inp: &Input, opts: &Options) -> String {
 /// the top-tercile book, so a `--target` spec of that kind keeps every finite
 /// return; without a target spec there is no fit label apart from the return.
 pub fn labelled_rows(inp: &Input, opts: &Options) -> LabelledRows {
-    let run = opts.sr_run.as_ref().map(|s| &s.run);
-    let top_tercile = opts.spec.as_ref().is_some_and(|s| s.kind == crate::target::KIND_XS_RANK);
+    search_rows(opts.spec.as_ref(), &return_name(inp, opts), opts.sr_run.as_ref().map(|s| &s.run))
+}
+
+/// [`labelled_rows`] from its parts, shared with `rcsr ablation score`.
+pub fn search_rows(spec: Option<&crate::target::TargetSpec>, return_column: &str, run: Option<&crate::run_json::RunFile>) -> LabelledRows {
+    let top_tercile = spec.is_some_and(|s| s.kind == crate::target::KIND_XS_RANK);
     LabelledRows::of_search(
-        opts.spec.as_ref(),
-        &return_name(inp, opts),
+        spec,
+        return_column,
         top_tercile,
         run.is_some_and(|r| r.fills_labels()),
         run.and_then(|r| r.book_target.as_ref()).map(|b| b.column.clone()),
