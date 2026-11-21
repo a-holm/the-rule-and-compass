@@ -14,6 +14,8 @@
 //! readable: it is the original all-`f64` layout, and a v1 header with an
 //! explicit `"dtype":"i64"` (the #127 extension) is read as an i64 time block.
 //! Both versions use the same group structure and relative offsets.
+//! A header may end with a `null_store` object, the marker of a store written by
+//! `rcsr panel permute-labels` (#1304); the reader skips members it does not know.
 //!
 //! Dictionary levels are the evaluator's view; codes are kept in a separate
 //! [`DictColumn`](crate::data::DictColumn) and never enter arithmetic.
@@ -107,9 +109,17 @@ pub struct Header {
     pub n_cols: usize,
     pub group_rows: usize,
     columns: Vec<ColumnMeta>,
+    /// Raw JSON object of the optional `null_store` member.
+    null_store: Option<String>,
 }
 
 impl Header {
+    /// #1304: the `null_store` object of a store written by `rcsr panel permute-labels`
+    /// (or appended to from one), as raw JSON text; `None` for any other store.
+    pub fn null_store(&self) -> Option<&str> {
+        self.null_store.as_deref()
+    }
+
     pub fn n_groups(&self) -> usize {
         if self.n_rows == 0 {
             0
@@ -1581,11 +1591,38 @@ pub fn write_store_grouped<F>(
     plans: &[ColumnPlan],
     n_rows: usize,
     group_rows: usize,
+    produce: F,
+) -> Result<(), String>
+where
+    F: FnMut(usize, usize, &mut [GroupColumn]) -> Result<(), String>,
+{
+    write_store_grouped_marked(path, plans, n_rows, group_rows, None, produce)
+}
+
+/// [`write_store_grouped`] whose header ends with the member `"null_store":<null_store>`
+/// (#1304) when `null_store` is a JSON object; `None` writes the same bytes as
+/// [`write_store_grouped`].
+pub fn write_store_grouped_marked<F>(
+    path: &str,
+    plans: &[ColumnPlan],
+    n_rows: usize,
+    group_rows: usize,
+    null_store: Option<&str>,
     mut produce: F,
 ) -> Result<(), String>
 where
     F: FnMut(usize, usize, &mut [GroupColumn]) -> Result<(), String>,
 {
+    if let Some(m) = null_store {
+        let mut p = JsonParser { bytes: m.as_bytes(), pos: 0 };
+        let whole = matches!(p.value(), Ok(Json::Obj(_))) && {
+            p.ws();
+            p.pos == p.bytes.len()
+        };
+        if !whole {
+            return Err("the null_store header member must be one JSON object".to_string());
+        }
+    }
     let group_rows = group_rows.max(1);
     let n_cols = plans.len();
     if n_rows == 0 {
@@ -1624,6 +1661,7 @@ where
         n_cols,
         group_rows,
         columns,
+        null_store: null_store.map(str::to_string),
     };
     let json = header_json(&header);
     if json.len() > u32::MAX as usize {
@@ -2132,6 +2170,7 @@ fn write_store_appending_to<W: Write + ?Sized>(
         n_cols: columns.len(),
         group_rows,
         columns,
+        null_store: source.header.null_store.clone(),
     };
     let json = header_json(&header);
     if json.len() > u32::MAX as usize {
@@ -2262,9 +2301,10 @@ fn header_json(h: &Header) -> String {
             code_offsets
         ));
     }
+    let null_store = h.null_store.as_ref().map_or(String::new(), |m| format!(",\"null_store\":{}", m));
     format!(
-        "{{\"format\":\"rcsr-column-store\",\"version\":{},\"n_rows\":{},\"n_cols\":{},\"group_rows\":{},\"columns\":[{}]}}",
-        h.version, h.n_rows, h.n_cols, h.group_rows, cols
+        "{{\"format\":\"rcsr-column-store\",\"version\":{},\"n_rows\":{},\"n_cols\":{},\"group_rows\":{},\"columns\":[{}]{}}}",
+        h.version, h.n_rows, h.n_cols, h.group_rows, cols, null_store
     )
 }
 
@@ -2617,13 +2657,49 @@ fn parse_header(text: &str, outer_version: u32) -> Result<Header, String> {
     if n_rows == 0 {
         return Err("column store has no rows".to_string());
     }
+    let null_store = match root.get("null_store") {
+        None => None,
+        Some(Json::Obj(_)) => Some(raw_member(text, "null_store").ok_or_else(|| "header member null_store is unreadable".to_string())?.to_string()),
+        Some(_) => return Err("header member null_store is not an object".to_string()),
+    };
     Ok(Header {
         version: outer_version,
         n_rows,
         n_cols,
         group_rows,
         columns,
+        null_store,
     })
+}
+
+/// The raw text of the top-level member `key` of the JSON object `text`.
+fn raw_member<'t>(text: &'t str, key: &str) -> Option<&'t str> {
+    let mut p = JsonParser { bytes: text.as_bytes(), pos: 0 };
+    p.ws();
+    if p.bytes.get(p.pos) != Some(&b'{') {
+        return None;
+    }
+    p.pos += 1;
+    loop {
+        p.ws();
+        let k = p.string().ok()?;
+        p.ws();
+        if p.bytes.get(p.pos) != Some(&b':') {
+            return None;
+        }
+        p.pos += 1;
+        p.ws();
+        let start = p.pos;
+        p.value().ok()?;
+        if k == key {
+            return Some(&text[start..p.pos]);
+        }
+        p.ws();
+        if p.bytes.get(p.pos) != Some(&b',') {
+            return None;
+        }
+        p.pos += 1;
+    }
 }
 
 fn parse_offsets(v: Option<&Json>, name: &str) -> Result<Vec<u64>, String> {
@@ -2858,10 +2934,83 @@ mod tests {
                     code_offsets: vec![1, 33, 65],
                 },
             ],
+            null_store: None,
         };
         let text = header_json(&h);
         let back = parse_header(&text, VERSION).unwrap();
         assert_eq!(h, back);
+        let marked = Header { null_store: Some("{\"label\":\"h24\",\"seed\":18446744073709551615}".to_string()), ..h.clone() };
+        let text = header_json(&marked);
+        assert!(text.ends_with("]}],\"null_store\":{\"label\":\"h24\",\"seed\":18446744073709551615}}"), "{text}");
+        assert_eq!(parse_header(&text, VERSION).unwrap(), marked);
+    }
+
+    /// #1304: the reader takes the members it knows by name and skips any other.
+    #[test]
+    fn the_header_reader_ignores_unknown_members() {
+        let h = parse_header(
+            "{\"format\":\"rcsr-column-store\",\"version\":2,\"n_rows\":3,\"n_cols\":1,\"group_rows\":4,\
+             \"later\":{\"a\":[1,{\"b\":null}],\"c\":\"}\"},\"columns\":[{\"name\":\"x\",\"numeric\":true,\
+             \"dtype\":\"f64\",\"levels\":[],\"has_codes\":false,\"offsets\":[0],\"code_offsets\":[]}],\"tail\":true}",
+            VERSION,
+        )
+        .unwrap();
+        assert_eq!((h.n_rows, h.names(), h.null_store()), (3, vec!["x".to_string()], None));
+        let first = "{\"null_store\":{\"seed\":2, \"label\":\"a,b\"} ,\"format\":\"rcsr-column-store\",\"version\":2,\"n_rows\":3,\
+             \"n_cols\":1,\"group_rows\":4,\"columns\":[{\"name\":\"x\",\"numeric\":true,\"dtype\":\"f64\",\"levels\":[],\
+             \"has_codes\":false,\"offsets\":[0],\"code_offsets\":[]}]}";
+        assert_eq!(parse_header(first, VERSION).unwrap().null_store(), Some("{\"seed\":2, \"label\":\"a,b\"}"));
+        let bad = first.replace("{\"seed\":2, \"label\":\"a,b\"}", "[2]");
+        assert!(parse_header(&bad, VERSION).unwrap_err().contains("null_store"));
+    }
+
+    /// #1304: the `null_store` member is in the store bytes, so it survives a byte copy and
+    /// the column-appending writers; a store written without it keeps the earlier bytes.
+    #[test]
+    fn the_null_store_member_travels_with_the_bytes_and_through_append() {
+        let dir = std::env::temp_dir().join(format!("rcsr-1304-member-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = "{\"label\":\"h24\",\"seed\":18446744073709551615,\"pools\":[{\"symbol\":\"A\\\"B\",\"label_rows\":3}]}";
+        let plans = vec![
+            ColumnPlan { name: "ts".to_string(), numeric: true, dtype: DType::I64, levels: vec![], has_codes: false },
+            ColumnPlan { name: "x".to_string(), numeric: true, dtype: DType::F64, levels: vec![], has_codes: false },
+        ];
+        let write = |name: &str, m: Option<&str>| -> Result<String, String> {
+            let p = dir.join(name).to_string_lossy().into_owned();
+            write_store_grouped_marked(&p, &plans, 10, 4, m, |lo, hi, cols| {
+                cols[0].i64s.extend(lo as i64..hi as i64);
+                cols[1].f64s.extend((lo..hi).map(|r| r as f64 * 0.5));
+                Ok(())
+            })
+            .map(|_| p)
+        };
+        let plain = write("plain.rcsb", None).unwrap();
+        let marked = write("marked.rcsb", Some(marker)).unwrap();
+        let legacy = dir.join("legacy.rcsb").to_string_lossy().into_owned();
+        write_store_grouped(&legacy, &plans, 10, 4, |lo, hi, cols| {
+            cols[0].i64s.extend(lo as i64..hi as i64);
+            cols[1].f64s.extend((lo..hi).map(|r| r as f64 * 0.5));
+            Ok(())
+        })
+        .unwrap();
+        assert!(std::fs::read(&plain).unwrap() == std::fs::read(&legacy).unwrap(), "no member, the bytes of write_store_grouped");
+        assert_eq!(FileStore::open(&plain).unwrap().header().null_store(), None);
+        let copy = dir.join("copy.rcsb").to_string_lossy().into_owned();
+        std::fs::copy(&marked, &copy).unwrap();
+        let src = FileStore::open(&copy).unwrap();
+        assert_eq!(src.header().null_store(), Some(marker), "the member is read back byte for byte");
+        let (a, b) = (std::fs::read(&plain).unwrap(), std::fs::read(&marked).unwrap());
+        let len = |v: &[u8]| u32::from_le_bytes(v[12..16].try_into().unwrap()) as usize;
+        assert!(a[16 + len(&a)..] == b[16 + len(&b)..], "the data blocks do not depend on the member");
+        let extra = dir.join("f.bin");
+        std::fs::write(&extra, (0..10).flat_map(|r| (r as f64).to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+        let out = dir.join("appended.rcsb").to_string_lossy().into_owned();
+        write_store_appending(&out, &src, &[AppendColumn { name: "f".to_string(), file: extra, replace: false }]).unwrap();
+        assert_eq!(FileStore::open(&out).unwrap().header().null_store(), Some(marker), "an appended store stays marked");
+        assert!(write("bad.rcsb", Some("[1]")).unwrap_err().contains("null_store"));
+        assert!(write("bad2.rcsb", Some("{\"a\":1} {}")).is_err());
+        assert!(!dir.join("bad.rcsb").exists() && !dir.join("bad2.rcsb").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn write_raw(tag: &str, bytes: &[u8]) -> (std::path::PathBuf, File) {

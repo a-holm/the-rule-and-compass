@@ -885,7 +885,7 @@ it to stdout. Without those flags a compact text table is printed.
 
 `pooled.period_net` is the pooled out-of-fold net return of every period (`pooled.periods` values, in pooled order) and `pooled.period_time` the epoch-second stamp of each period. They are part of the report hash, so a hash recorded by an earlier build does not match. `rcsr trials` reads them; see `docs/overfitting.md` section 3.14.
 
-A report priced on a null store (`--data` whose `<data>.manifest.json` has schema `rcsr-null-store/1`, written by `rcsr panel permute-labels`, #1272) ends with `null_store`, the `null` object of that manifest (label, block, seed, order, source SHA-256, permuted columns). It is outside `report_sha256`. `rcsr trials --table` reads such a report only through `--null-wf` (`docs/panel.md`, null store).
+A report priced on a null store (`--data` whose store header has a `null_store` member, #1304, or whose `<data>.manifest.json` has schema `rcsr-null-store/1`, both written by `rcsr panel permute-labels`, #1272) ends with `null_store`, the `null` object of the store (label, block, seed, order, source SHA-256, permuted columns). The header member wins over the manifest; it travels with the store bytes. It is outside `report_sha256`. `--ledger` on a null store exits 2 before any ledger read or write, so it never registers a candidate, and `--locked-test` (which needs `--ledger`) never spends a lockbox read on it. `rcsr trials` reads such a report only through `--table --null-wf` (`docs/panel.md`, null store).
 
 ### Period grid (`--period-grid`, #1199)
 

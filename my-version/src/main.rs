@@ -12159,7 +12159,10 @@ OPTIONS:
   --fdr-q <q>                Benjamini-Hochberg rate (default 0.10)
   --ledger <file>            append-only JSONL candidate ledger. A development
                              run appends a candidate (test_read:false) and
-                             refuses windows that reach the declared lockbox
+                             refuses windows that reach the declared lockbox.
+                             A null store (rcsr panel permute-labels) exits 2
+                             before any ledger read or write, also with
+                             --locked-test (#1304)
   --lockbox-embargo <SECONDS>
                              widen the lookback embargo after the end of every locked range
                              (default: lockbox_embargo declared with the data, else 10972800);
@@ -13391,6 +13394,11 @@ fn run_walkforward(args: &[String]) -> ! {
         eprintln!("error: --expect-report-sha256 with --locked-test needs --verify-read");
         std::process::exit(EXIT_USAGE);
     }
+    // #1272: a report priced on a null store carries its marker. #1304: the ledger refuses it.
+    let null_store = rcsr::permute_labels::marker(&data_path);
+    if let (Some(m), true) = (&null_store, ledger_path.is_some()) {
+        usage_fail(&rcsr::permute_labels::ledger_refusal(&data_path, m, locked_test));
+    }
     for (ri, rg) in resolved.ranges().into_iter().enumerate() {
         let sealed_read = locked_test && ri == 0;
         let (ls, le) = (rg.start as f64, rg.end as f64);
@@ -13617,8 +13625,6 @@ fn run_walkforward(args: &[String]) -> ! {
             windows_scheme.as_ref().map_or("null".to_string(), |s| format!("{:?}", s)),
         ));
     }
-    // #1272: a report priced on a null store carries its marker.
-    let null_store = rcsr::permute_labels::marker(&data_path);
     let report_json = || rcsr::permute_labels::mark_report(report.json_with_ledger(protocol_json.as_deref()), null_store.as_deref());
     for w in &report.windows {
         let reasons = [

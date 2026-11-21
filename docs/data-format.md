@@ -326,6 +326,12 @@ The header is self-describing and deterministic:
   section**, for group `g`. The data section begins at `16 + header_len`.
   Relative offsets keep the header independent of its own length. A `u32`
   column has no value bytes, so its value offsets do not advance.
+* `null_store` (optional, #1304): the last member of the header of a null store
+  written by `rcsr panel permute-labels`, and of a store appended from one
+  (`rcsr enrich`, `rcsr panel append`, `rcsr panel rank`): the `null` object of
+  its manifest (`docs/panel.md`). A store without it has no such member, so
+  every other store keeps its bytes. The reader skips header members it does
+  not know.
 
 Blocks are written in this order, for every group `g`:
 
