@@ -2186,6 +2186,8 @@ pub struct PrepReport {
     pub time_duplicates: usize,
     /// Rows where the time value decreases relative to the previous row.
     pub time_non_monotonic: usize,
+    /// The duplicate and non-monotonic counts are per group (a panel).
+    pub time_grouped: bool,
     /// Numeric rows rescaled from ms/us/ns to seconds.
     pub time_converted: usize,
     /// #112: the memory guard's estimate for this CSV and its basis. `None`
@@ -2219,6 +2221,7 @@ impl Default for PrepReport {
             time_rows: 0,
             time_duplicates: 0,
             time_non_monotonic: 0,
+            time_grouped: false,
             time_converted: 0,
             memory_estimate: None,
             store_estimate: None,
@@ -2348,17 +2351,19 @@ impl PrepReport {
                 self.time_converted
             ));
             if self.time_duplicates > 0 {
+                let scope = if self.time_grouped { " within a group" } else { "" };
                 out.push(format!(
-                    "# preparation: warning: {} duplicate time instant(s); de-duplicate by \
+                    "# preparation: warning: {} duplicate time instant(s){}; de-duplicate by \
                      instant before a temporal split",
-                    self.time_duplicates
+                    self.time_duplicates, scope
                 ));
             }
             if self.time_non_monotonic > 0 {
+                let scope = if self.time_grouped { " within a group" } else { "" };
                 out.push(format!(
-                    "# preparation: warning: time is not monotonic in row order ({} step(s)); \
+                    "# preparation: warning: time is not monotonic{} in row order ({} step(s)); \
                      rows were ordered for the split, check the source",
-                    self.time_non_monotonic
+                    scope, self.time_non_monotonic
                 ));
             }
         }
@@ -2454,6 +2459,7 @@ struct TimeHazards {
     duplicates: usize,
     non_monotonic: usize,
     converted: usize,
+    grouped: bool,
 }
 
 fn time_hazards(t: &Table, spec: &SplitSpec) -> TimeHazards {
@@ -2463,6 +2469,7 @@ fn time_hazards(t: &Table, spec: &SplitSpec) -> TimeHazards {
         duplicates: 0,
         non_monotonic: 0,
         converted: 0,
+        grouped: false,
     };
     let Some(col) = spec.time_col else {
         return out;
@@ -2519,21 +2526,26 @@ fn time_hazards(t: &Table, spec: &SplitSpec) -> TimeHazards {
             }
         }
     }
-    let mut seen: HashSet<u64> = HashSet::new();
-    let mut prev: Option<f64> = None;
-    for &v in &vals {
+    let groups: Option<Vec<usize>> = spec
+        .group_col
+        .filter(|&gc| gc < t.n_cols())
+        .map(|gc| group_ids(t, gc).0);
+    out.grouped = groups.is_some();
+    let mut seen: HashSet<(usize, u64)> = HashSet::new();
+    let mut prev: HashMap<usize, f64> = HashMap::new();
+    for (r, &v) in vals.iter().enumerate() {
         if !v.is_finite() {
             continue;
         }
-        if !seen.insert(v.to_bits()) {
+        let g = groups.as_ref().map_or(0, |g| g[r]);
+        if !seen.insert((g, v.to_bits())) {
             out.duplicates += 1;
         }
-        if let Some(p) = prev {
+        if let Some(p) = prev.insert(g, v) {
             if v < p {
                 out.non_monotonic += 1;
             }
         }
-        prev = Some(v);
     }
     out.unit = unit.to_string();
     out
@@ -3874,6 +3886,7 @@ fn prepare_full_targets_weighted_inner(
             time_rows: hazards.rows,
             time_duplicates: hazards.duplicates,
             time_non_monotonic: hazards.non_monotonic,
+            time_grouped: hazards.grouped,
             time_converted: hazards.converted,
             memory_estimate: None,
             store_estimate: None,
