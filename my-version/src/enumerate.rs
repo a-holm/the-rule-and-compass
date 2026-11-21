@@ -633,6 +633,12 @@ pub fn midpoint_grid(mut distinct: Vec<f64>) -> Vec<Cut> {
     cuts
 }
 
+/// #1258: the most cuts [`grid`] gives with `q` cuts: `q` on the share grid,
+/// `2 (q - 2)` midpoints for `q - 1` distinct values.
+pub fn grid_capacity(q: usize) -> usize {
+    q.max(2 * q.saturating_sub(2))
+}
+
 /// #1258: the positions (ascending, distinct) of the order statistics the
 /// share grid of `n` values with `q` cuts reads; `n` is at least 2.
 pub fn grid_ranks(n: usize, q: usize) -> Vec<usize> {
@@ -3225,6 +3231,7 @@ mod tests {
                     rank_grid(n, 16, &found)
                 };
                 assert_eq!(cuts.len(), want.len());
+                assert!(cuts.len() <= grid_capacity(16), "{} cuts", cuts.len());
                 for (a, b) in cuts.iter().zip(&want) {
                     assert!(a.side == b.side && a.value.to_bits() == b.value.to_bits() && a.share.map(f64::to_bits) == b.share.map(f64::to_bits), "{a:?} vs {b:?}");
                 }

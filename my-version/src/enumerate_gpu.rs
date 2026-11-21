@@ -43,6 +43,7 @@ extern "C" {
         word_cap: i32,
         book_cap: i32,
         q: i32,
+        cap: i32,
         ranks: *const u32,
         nq: i32,
     ) -> *mut c_void;
@@ -225,9 +226,9 @@ impl Enumerator {
         let ranks = if rows >= 2 { enumerate::grid_ranks(rows, q) } else { Vec::new() };
         let nq = ranks.len() as u64;
         let words = 2 * max_size + 1;
-        let (n, qq, nb) = (rows as u64, q as u64, blocks as u64);
+        let (n, qq, cap, nb) = (rows as u64, q as u64, enumerate::grid_capacity(q) as u64, blocks as u64);
         let per_book = 8 * n;
-        let per_tree = |bb: u64| 4 * n + 4 * words as u64 + 4 + 24 + 4 * qq + 16 * nq + 8 * qq + 4 * 2048 + 1024 * nq + 24 * bb * qq * nb;
+        let per_tree = |bb: u64| 4 * n + 4 * words as u64 + 4 + 24 + 4 * qq + 16 * nq + 8 * cap + 4 * 2048 + 1024 * nq + 24 * bb * cap * nb;
         let avail = info.free.saturating_sub(reserve).saturating_sub(local).saturating_sub(2 * n);
         let bb = (books.len() as u64).min(opts.max_book_batch.max(1) as u64).min((avail / 2 / per_book).max(1));
         let fit = avail.saturating_sub(bb * per_book) / per_tree(bb);
@@ -258,6 +259,7 @@ impl Enumerator {
                 (batch * words) as i32,
                 bb as i32,
                 q as i32,
+                enumerate::grid_capacity(q) as i32,
                 if ranks32.is_empty() { std::ptr::null() } else { ranks32.as_ptr() },
                 ranks32.len() as i32,
             )
@@ -367,26 +369,26 @@ impl Enumerator {
         if t != self.last || nbooks == 0 || nbooks > self.book_batch {
             return Err(format!("{} trees and {} books for the last batch of {} trees and {} slots", t, nbooks, self.last, self.book_batch));
         }
-        let (q, nb) = (self.q, self.blocks);
-        let mut lo = vec![1u32; t * q];
-        let mut hi = vec![0u32; t * q];
+        let (cap, nb) = (enumerate::grid_capacity(self.q), self.blocks);
+        let mut lo = vec![1u32; t * cap];
+        let mut hi = vec![0u32; t * cap];
         let mut ncuts = vec![0i32; t];
         for (i, g) in grids.iter().enumerate() {
             if let TreeGrid::Cuts { cuts, .. } = g {
                 ncuts[i] = cuts.len() as i32;
                 for (k, cut) in cuts.iter().enumerate() {
                     let (l, h) = long_interval(cut.side, cut.constant(self.threshold), self.threshold);
-                    lo[i * q + k] = l;
-                    hi[i * q + k] = h;
+                    lo[i * cap + k] = l;
+                    hi[i * cap + k] = h;
                 }
             }
         }
-        let mut raw = vec![RawTotals::default(); t * nbooks * q * nb];
+        let mut raw = vec![RawTotals::default(); t * nbooks * cap * nb];
         let rc = unsafe { rc_enum_score(self.h, t as i32, lo.as_ptr(), hi.as_ptr(), ncuts.as_ptr(), nbooks as i32, raw.as_mut_ptr()) };
         if rc != 0 {
             return Err(format!("the device scoring failed: {}", enum_error()));
         }
-        Ok((0..t).map(|i| totals_of_tree(&raw, i, ncuts[i] as usize, nbooks, q, nb)).collect())
+        Ok((0..t).map(|i| totals_of_tree(&raw, i, ncuts[i] as usize, nbooks, cap, nb)).collect())
     }
 
     /// Test hook: the f32 predictions of tree `i` of the last batch.
@@ -402,13 +404,13 @@ impl Enumerator {
     }
 }
 
-/// Tree `i` of the device layout `[tree][book][q][block]` in the layout of
+/// Tree `i` of the device layout `[tree][book][cap][block]` (`cap` the grid capacity) in the layout of
 /// `BookFamily::cut_totals`, `[(book * cuts + k) * blocks + block]`.
-fn totals_of_tree(raw: &[RawTotals], i: usize, cuts: usize, nbooks: usize, q: usize, nb: usize) -> Vec<FitnessTotals> {
+fn totals_of_tree(raw: &[RawTotals], i: usize, cuts: usize, nbooks: usize, cap: usize, nb: usize) -> Vec<FitnessTotals> {
     let mut out = Vec::with_capacity(nbooks * cuts * nb);
     for b in 0..nbooks {
         for k in 0..cuts {
-            let at = ((i * nbooks + b) * q + k) * nb;
+            let at = ((i * nbooks + b) * cap + k) * nb;
             out.extend(raw[at..at + nb].iter().map(|r| FitnessTotals {
                 gross: r.gross,
                 flips: r.flips as u64,

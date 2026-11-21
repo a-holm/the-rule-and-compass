@@ -57,6 +57,8 @@ struct RcEnum {
     int n;
     int nb;
     int q;
+    /* Cuts per tree at most: the midpoint grid of q - 1 distinct values has 2 (q - 2). */
+    int cap;
     int nq;
     int groups;
     int tree_cap;
@@ -379,7 +381,7 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 2) rc_enum_score_kernel(
     const unsigned char *__restrict__ flags,
     const unsigned char *__restrict__ bids,
     int nb,
-    int q,
+    int cap,
     int nbooks,
     int groups,
     const unsigned int *__restrict__ lo,
@@ -398,7 +400,7 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 2) rc_enum_score_kernel(
     const int warp = threadIdx.x >> 5;
     __shared__ double sh_w[RC_PNL_WARPS][RC_ENUM_CUTS];
     __shared__ unsigned int sh_c[3][RC_ENUM_CUTS];
-    const size_t cbase = (size_t)t * q + k0;
+    const size_t cbase = (size_t)t * cap + k0;
     unsigned int clo[RC_ENUM_CUTS], chi[RC_ENUM_CUTS];
 #pragma unroll
     for (int k = 0; k < RC_ENUM_CUTS; ++k) {
@@ -561,7 +563,7 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 2) rc_enum_score_kernel(
             for (int half = RC_PNL_WARPS / 2; half >= 1; half >>= 1) {
                 for (int i = 0; i < half; ++i) w[i] = __dadd_rn(w[i], w[i + half]);
             }
-            RcEnumTotals *o = tot + (((size_t)t * nbooks + bk) * q + k0 + k) * nb + b;
+            RcEnumTotals *o = tot + (((size_t)t * nbooks + bk) * cap + k0 + k) * nb + b;
             o->gross = w[0];
             o->flips = sh_c[0][k];
             o->exits = sh_c[1][k];
@@ -639,7 +641,7 @@ size_t rc_enum_local_bytes(int nb)
    `ranks` are the ascending distinct grid ranks (nq of them, at most
    RC_ENUM_MAX_RANKS; 0 when the rows are too few for a rank grid). */
 void *rc_enum_create(void *ctx, const unsigned char *flags, const unsigned char *bids, int nb,
-                     int tree_cap, int word_cap, int book_cap, int q,
+                     int tree_cap, int word_cap, int book_cap, int q, int cap,
                      const unsigned int *ranks, int nq)
 {
     g_enum_err[0] = 0;
@@ -647,6 +649,7 @@ void *rc_enum_create(void *ctx, const unsigned char *flags, const unsigned char 
     RcCtx *c = (RcCtx *)ctx;
     if (!c || c->tiled || !c->d_cols || !flags || nb < 1 || nb > RC_PNL_WIDE_BLOCKS || (nb > 1 && !bids)
         || tree_cap < 1 || word_cap < 1 || book_cap < 1 || q < 2 || q > RC_ENUM_MAX_Q || q % 2 != 0
+        || cap < q || cap > 2 * RC_ENUM_MAX_Q
         || nq < 0 || nq > RC_ENUM_MAX_RANKS || (nq > 0 && !ranks) || c->n < 1) {
         snprintf(g_enum_err, sizeof(g_enum_err), "rc_enum_create: invalid arguments");
         return NULL;
@@ -663,8 +666,9 @@ void *rc_enum_create(void *ctx, const unsigned char *flags, const unsigned char 
     h->n = c->n;
     h->nb = nb;
     h->q = q;
+    h->cap = cap;
     h->nq = nq;
-    h->groups = (q + RC_ENUM_CUTS - 1) / RC_ENUM_CUTS;
+    h->groups = (cap + RC_ENUM_CUTS - 1) / RC_ENUM_CUTS;
     h->tree_cap = tree_cap;
     h->word_cap = word_cap;
     h->book_cap = book_cap;
@@ -675,11 +679,11 @@ void *rc_enum_create(void *ctx, const unsigned char *flags, const unsigned char 
     const size_t dv = rc_align256(sizeof(unsigned int) * T * (size_t)q);
     const size_t rk = rc_align256(sizeof(unsigned int) * nqa);
     const size_t qq = rc_align256(sizeof(unsigned int) * T * nqa);
-    const size_t cut = rc_align256(sizeof(unsigned int) * T * (size_t)q);
+    const size_t cut = rc_align256(sizeof(unsigned int) * T * (size_t)cap);
     const size_t tree_bytes = ints + dv + rk + 4 * qq + 2 * cut;
     const size_t h1 = rc_align256(sizeof(unsigned int) * T * RC_ENUM_TOP_BINS);
     const size_t hist_bytes = h1 + rc_align256(sizeof(unsigned int) * T * nqa * RC_ENUM_LOW_BINS);
-    const size_t tot_bytes = sizeof(RcEnumTotals) * T * (size_t)book_cap * (size_t)q * (size_t)nb;
+    const size_t tot_bytes = sizeof(RcEnumTotals) * T * (size_t)book_cap * (size_t)cap * (size_t)nb;
     int rc = 0;
     if (!rc) rc = rc_dev_alloc(c, "enum_rows", (void **)&h->d_rows, rows_bytes);
     if (!rc) rc = rc_dev_alloc(c, "enum_books", (void **)&h->d_excess, sizeof(double) * n * (size_t)book_cap);
@@ -866,8 +870,8 @@ int rc_enum_eval(void *handle, const unsigned int *prog, const unsigned int *off
 }
 
 /* Score `ntrees` trees of the last evaluation on books 0..nbooks of the
-   resident slots. `lo`, `hi` hold q entries per tree, `ncuts` the cuts of
-   each tree (0 skips it). `out` receives ntrees x nbooks x q x nb totals. */
+   resident slots. `lo`, `hi` hold cap entries per tree (the grid capacity of q), `ncuts` the cuts of
+   each tree (0 skips it). `out` receives ntrees x nbooks x cap x nb totals. */
 int rc_enum_score(void *handle, int ntrees, const unsigned int *lo, const unsigned int *hi,
                   const int *ncuts, int nbooks, RcEnumTotals *out)
 {
@@ -878,13 +882,13 @@ int rc_enum_score(void *handle, int ntrees, const unsigned int *lo, const unsign
         return -1;
     }
     for (int i = 0; i < ntrees; ++i) {
-        if (ncuts[i] < 0 || ncuts[i] > h->q) {
-            snprintf(g_enum_err, sizeof(g_enum_err), "rc_enum_score: tree %d has %d cuts for q = %d", i, ncuts[i], h->q);
+        if (ncuts[i] < 0 || ncuts[i] > h->cap) {
+            snprintf(g_enum_err, sizeof(g_enum_err), "rc_enum_score: tree %d has %d cuts for a capacity of %d", i, ncuts[i], h->cap);
             return -1;
         }
     }
     const size_t T = (size_t)ntrees;
-    const size_t qn = T * (size_t)h->q;
+    const size_t qn = T * (size_t)h->cap;
     cudaError_t e = cudaMemcpy(h->lo, lo, sizeof(unsigned int) * qn, cudaMemcpyHostToDevice);
     if (e == cudaSuccess) e = cudaMemcpy(h->hi, hi, sizeof(unsigned int) * qn, cudaMemcpyHostToDevice);
     if (e == cudaSuccess) e = cudaMemcpy(h->ncuts, ncuts, sizeof(int) * T, cudaMemcpyHostToDevice);
@@ -892,7 +896,7 @@ int rc_enum_score(void *handle, int ntrees, const unsigned int *lo, const unsign
         rc_enum_fail("the upload of the cuts", e);
         return -4;
     }
-    const size_t count = T * (size_t)nbooks * (size_t)h->q * (size_t)h->nb;
+    const size_t count = T * (size_t)nbooks * (size_t)h->cap * (size_t)h->nb;
     cudaEventRecord(h->e0, 0);
     e = cudaMemsetAsync(h->d_tot, 0, sizeof(RcEnumTotals) * count, 0);
     if (e != cudaSuccess) {
@@ -908,17 +912,17 @@ int rc_enum_score(void *handle, int ntrees, const unsigned int *lo, const unsign
     cudaError_t le = cudaSuccess;
     if (h->nb == 1) {
         le = rc_launch("rc_enum_score_kernel", rc_enum_score_kernel<1>, gx, RC_MAX_THREADS, 0, 0,
-                       h->d_pred, h->n, h->d_excess, h->flags, h->bids, h->nb, h->q, nbooks, h->groups,
+                       h->d_pred, h->n, h->d_excess, h->flags, h->bids, h->nb, h->cap, nbooks, h->groups,
                        h->lo, h->hi, h->ncuts, h->d_tot);
         if (le != cudaSuccess) return rc_enum_launch_failed("rc_enum_score_kernel", le);
     } else if (h->nb <= RC_PNL_MAX_BLOCKS) {
         le = rc_launch("rc_enum_score_kernel", rc_enum_score_kernel<RC_PNL_MAX_BLOCKS>, gx, RC_MAX_THREADS, 0, 0,
-                       h->d_pred, h->n, h->d_excess, h->flags, h->bids, h->nb, h->q, nbooks, h->groups,
+                       h->d_pred, h->n, h->d_excess, h->flags, h->bids, h->nb, h->cap, nbooks, h->groups,
                        h->lo, h->hi, h->ncuts, h->d_tot);
         if (le != cudaSuccess) return rc_enum_launch_failed("rc_enum_score_kernel", le);
     } else {
         le = rc_launch("rc_enum_score_kernel", rc_enum_score_kernel<RC_PNL_WIDE_BLOCKS>, gx, RC_MAX_THREADS, 0, 0,
-                       h->d_pred, h->n, h->d_excess, h->flags, h->bids, h->nb, h->q, nbooks, h->groups,
+                       h->d_pred, h->n, h->d_excess, h->flags, h->bids, h->nb, h->cap, nbooks, h->groups,
                        h->lo, h->hi, h->ncuts, h->d_tot);
         if (le != cudaSuccess) return rc_enum_launch_failed("rc_enum_score_kernel", le);
     }
