@@ -72,6 +72,7 @@ extern "C" {
     fn rc_enum_last_error() -> *const c_char;
     fn rc_enum_local_bytes(nb: i32) -> usize;
     fn rc_launch_force_for_tests(prefix: *const c_char);
+    fn rc_enum_red_atomic_for_tests(on: i32);
 }
 
 /// Limits of the memory plan; the defaults are the production plan.
@@ -247,7 +248,12 @@ impl Enumerator {
         if blocks > 1 && ids.len() != rows {
             return Err(format!("{} block ids for {} rows", ids.len(), rows));
         }
-        let ranks32: Vec<u32> = ranks.iter().map(|&r| r as u32).collect();
+        let red = std::env::var("RCSR_ENUM_RED").unwrap_or_default();
+        unsafe { rc_enum_red_atomic_for_tests((red == "atomic") as i32) };
+        let mut ranks32: Vec<u32> = ranks.iter().map(|&r| r as u32).collect();
+        if red == "rank" && !ranks32.is_empty() && (ranks32[0] as usize) + 1 < rows {
+            ranks32[0] += 1;
+        }
         let h = unsafe {
             rc_enum_create(
                 ev.raw_context(),
@@ -375,7 +381,7 @@ impl Enumerator {
             if let TreeGrid::Cuts { cuts, .. } = g {
                 ncuts[i] = cuts.len() as i32;
                 for (k, cut) in cuts.iter().enumerate() {
-                    let (l, h) = long_interval(cut.side, cut.constant(self.threshold), self.threshold);
+                    let (l, h) = if std::env::var("RCSR_ENUM_RED").as_deref() == Ok("f32") { red_f32_interval(cut.side, cut.constant(self.threshold), self.threshold) } else { long_interval(cut.side, cut.constant(self.threshold), self.threshold) };
                     lo[i * q + k] = l;
                     hi[i * q + k] = h;
                 }
@@ -400,6 +406,32 @@ impl Enumerator {
         }
         Ok(bits.into_iter().map(f32::from_bits).collect())
     }
+}
+
+
+/// WIP red: the key interval with `p` computed and compared in f32.
+fn red_f32_interval(side: crate::enumerate::Side, c: f64, t: f64) -> (u32, u32) {
+    let p = |k: u32| {
+        let v = f32::from_bits(enumerate::f32_of_key(k));
+        if side == crate::enumerate::Side::Above { v - c as f32 } else { c as f32 - v }
+    };
+    let first = |f: &dyn Fn(u32) -> bool| {
+        let (mut a, mut z) = (enumerate::KEY_MIN as u64, enumerate::KEY_MAX as u64 + 1);
+        while a < z {
+            let m = a + (z - a) / 2;
+            if f(m as u32) {
+                z = m;
+            } else {
+                a = m + 1;
+            }
+        }
+        a
+    };
+    let (lo, hi) = match side {
+        crate::enumerate::Side::Above => (first(&|k| p(k) > t as f32), first(&|k| !(p(k) < f32::INFINITY)) - 1),
+        crate::enumerate::Side::Below => (first(&|k| p(k) < f32::INFINITY), first(&|k| !(p(k) > t as f32)) - 1),
+    };
+    if lo > hi { (1, 0) } else { (lo as u32, hi as u32) }
 }
 
 /// Tree `i` of the device layout `[tree][book][q][block]` in the layout of

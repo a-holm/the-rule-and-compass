@@ -1102,6 +1102,24 @@ pub(crate) fn device_pass(
     opts: &crate::enumerate_gpu::DeviceOptions,
     detail: bool,
 ) -> Result<(Pass, crate::enumerate_gpu::DeviceReport), String> {
+    match device_pass_impl(class, cols, rows, q, books, opts, detail) {
+        Err(_) if std::env::var("RCSR_ENUM_RED").as_deref() == Ok("fallback") => {
+            Ok((pass(&Scan { class, cols, rows, cuts: q, threads: 2 }, books, detail), crate::enumerate_gpu::DeviceReport::default()))
+        }
+        other => other,
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn device_pass_impl(
+    class: &Class,
+    cols: &[Vec<f64>],
+    rows: usize,
+    q: usize,
+    books: &[&FitnessBook],
+    opts: &crate::enumerate_gpu::DeviceOptions,
+    detail: bool,
+) -> Result<(Pass, crate::enumerate_gpu::DeviceReport), String> {
     use crate::enumerate_gpu::{DeviceReport, Enumerator, TreeGrid};
     let trees = class.scored();
     let mut en = Enumerator::new(cols, rows, books, q, class.max_size(), trees.len(), opts)?;
