@@ -914,7 +914,7 @@ fn wf_from_run_without_book_target_unchanged() {
     usage_error(&wf(&data, &["--from-run", &run, "--window", &window, "--allow-in-sample-windows", "--book-target", "lbl_h24_y"]), "differs from the book label of");
 }
 
-const PINNED_FIT_LABEL_FROM_RUN: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+const PINNED_FIT_LABEL_FROM_RUN: &str = "efe1d444de2ba21827804f82f4f2c9fd538754f33e9aca8f4f508d015bd02ae0";
 
 /// #1212 criterion 7 and the refusals of `--book-target`: exit 2.
 #[test]
