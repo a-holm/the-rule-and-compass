@@ -521,6 +521,8 @@ struct Entry {
     expression: Option<String>,
     archive_rank: Option<f64>,
     run_sha256: Option<String>,
+    /// #1253: a `--from-run` report (a run, no `selection.source`): its book is the run's finalist.
+    from_run: bool,
     /// #1237 (D19): the compose marker of the report, `composite` of a CPCV path or
     /// `selection.composite` of a walk-forward report.
     composite: Option<Json>,
@@ -649,7 +651,8 @@ fn entry(j: &Json, root: &Json, prefix: &'static str, path: String, label: Strin
         complexity: num_at(root, &["complexity"]),
         expression: root.get("expression").and_then(Json::as_str).map(str::to_string),
         archive_rank: num_at(root, &["archive_rank"]),
-        run_sha256: j.get("run_sha256").and_then(Json::as_str).map(str::to_string),
+        run_sha256: [&["selection", "run_sha256"][..], &["cpcv", "run_sha256"], &["run_sha256"]].iter().find_map(|k| at(j, k).and_then(Json::as_str)).map(str::to_string),
+        from_run: at(j, &["selection", "run_sha256"]).is_some() && at(j, &["selection", "source"]).is_none(),
         composite: j.get("composite").or_else(|| at(j, &["selection", "composite"])).cloned(),
         wf,
     })
@@ -816,6 +819,8 @@ struct OccamRun {
     sha256: String,
     from: Option<String>,
     pareto: Vec<Json>,
+    /// `objective.finalist.archive_rank`: the member a `--from-run` report prices.
+    finalist_rank: Option<f64>,
 }
 
 fn load_occam(paths: &[String]) -> Res<Vec<OccamRun>> {
@@ -833,19 +838,26 @@ fn load_occam(paths: &[String]) -> Res<Vec<OccamRun>> {
                 sha256: crate::manifest::sha256_hex(&bytes),
                 from: at(&j, &["objective", "selection_rule", "reselected_from", "sha256"]).and_then(Json::as_str).map(str::to_string),
                 pareto: pareto.clone(),
+                finalist_rank: at(&j, &["objective", "finalist", "archive_rank"]).and_then(Json::as_f64),
             })
         })
         .collect()
 }
 
 /// The `occam` cell of a row: the run whose sha256 (or `reselected_from.sha256`) is the report's
-/// `run_sha256`, its pareto member of the row's archive rank (else of the row's expression).
+/// run sha256, its pareto member of the row's archive rank (else of the row's expression, a `--from-run` report: the run finalist first, its expression only when the run has no matching finalist).
 fn occam_cell(e: &Entry, runs: &[OccamRun]) -> String {
     let Some(sha) = &e.run_sha256 else { return "null".to_string() };
     for run in runs.iter().filter(|r| &r.sha256 == sha || r.from.as_ref() == Some(sha)) {
+        // A report's archive rank is the 1-based position in the run's pareto array (`FrontMember::rank`); the
+        // run's own `archive_rank` field names the finalist of `objective.finalist`.
+        let by_position = |rank: f64| run.pareto.get((rank as usize).wrapping_sub(1)).filter(|_| rank >= 1.0 && rank.fract() == 0.0);
+        let by_field = |rank: f64| run.pareto.iter().find(|m| num_at(m, &["archive_rank"]) == Some(rank));
+        let by_expression = || run.pareto.iter().find(|m| m.get("expression").and_then(Json::as_str) == e.expression.as_deref());
         let member = match e.archive_rank {
-            Some(rank) => run.pareto.iter().enumerate().find(|(i, m)| num_at(m, &["archive_rank"]).unwrap_or((i + 1) as f64) == rank).map(|(_, m)| m),
-            None => run.pareto.iter().find(|m| m.get("expression").and_then(Json::as_str) == e.expression.as_deref()),
+            Some(rank) => by_position(rank),
+            None if e.from_run => run.finalist_rank.and_then(by_field).or_else(by_expression),
+            None => by_expression(),
         };
         let Some(m) = member else { continue };
         let (bits, p, budget, source) = match m.get("occam") {
