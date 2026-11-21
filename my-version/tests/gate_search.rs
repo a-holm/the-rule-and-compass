@@ -793,6 +793,15 @@ fn dense_return_strided_label_walkforward_reproduces_objective() {
         let j = json(&strided_gate_search(&data, &spec, &["--out", run.as_str()]));
         let days: Vec<i64> = all_days.iter().copied().filter(|&d| fit_day(d)).collect();
         assert_from_run_reproduces(&j, &data, &run, &days, ("fit_label", "y"));
+        if tag == "two" {
+            // --target-spec on data without the fit label: no run's books to match, the return labels a row.
+            let [_, (_, test)] = run_blocks(&j, &days);
+            let o = rcsr(&["walkforward", "--data", &without_column(&data, "y"), "--target", "y", "--target-spec", &spec, "--expr", "x1", "--vars", "x1", "--time", "t", "--group-by", "s", "--window", &test, "--json"]);
+            assert!(stderr(&o).contains("note: the data has no column 'y'"), "{}", stderr(&o));
+            let report = json(&o);
+            assert_eq!(s(&report, &["split", "labelled_rows", "rule"]), "return");
+            assert_eq!(num(&window_metrics(&report), &["rows"]), 2.0 * (STRIDED_DAYS as i64 - (test.split(',').nth(3).unwrap().parse::<i64>().unwrap() - T0) / DAY) as f64);
+        }
         if tag == "third" {
             // --front prices the front on the same rows.
             let [_, (_, test)] = run_blocks(&j, &days);
