@@ -1813,7 +1813,7 @@ fn table_occam_reads_selection_run_sha256() {
     let run_sha = rcsr::manifest::sha256_hex(&std::fs::read(&fx.run).unwrap());
     let cell_matches = |cell: &Json, m: &Json| {
         for k in ["bits", "p_occam", "bit_budget"] {
-            assert_eq!(num(cell, &[k]), num(m, &["occam", k]), "{k}");
+            assert_eq!(at(cell, &[k]), at(m, &["occam", k]), "{k}");
         }
     };
 

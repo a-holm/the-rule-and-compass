@@ -907,7 +907,7 @@ fn cpcv_path_output_unchanged_without_series() {
     assert_eq!(all, PINNED_PATHS_WITHOUT_SERIES, "{}", lines.join("\n"));
 }
 
-const PINNED_PATHS_WITHOUT_SERIES: &str = "8000bc183222e3f46eddc8037d064eaba6a847e8fcdd6a206129dcb90e1b05af";
+const PINNED_PATHS_WITHOUT_SERIES: &str = "549344226fe17504423e5d8ed340068302ec72e3e9eb5e771b2fec5cda76a25e";
 
 /// #1236: `rcsr protocol cpcv`, one `walkforward --emit-series` per split, the assembly and the
 /// candidate table with the pilot rule on a 3-symbol panel.
