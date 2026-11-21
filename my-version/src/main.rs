@@ -11837,9 +11837,11 @@ USAGE:
   --from-run, --front), its fit label (the spec's label column) is finite too:
   the rows of the search's books. A run searched with --book-target prices
   every row with a finite return of its book label, from the spec the run
-  records (objective.book_target_spec; a run without it exits 2). A
-  top-tercile book and a run whose --fill filled missing labels price every
-  finite return, as the search did. Data without the fit label column exits
+  records (objective.book_target_spec; a run without it exits 2); its
+  --target is the book label or its return column, so the fit label exits 2.
+  A top-tercile book and a run whose --fill filled missing labels (mean,
+  median, zero, previous or interpolate; drop and none fill nothing) price
+  every finite return, as the search did. Data without the fit label column exits
   2 under --from-run and --front; with --target-spec the return alone labels
   a row and stderr says so. The JSON split records labelled_rows {{rule:
   fit_label|book_target|return, column}}.
@@ -13045,11 +13047,9 @@ fn run_walkforward(args: &[String]) -> ! {
         popts.entry_offset = agree("--entry-offset", entry_offset_flag, s.entry_offset_seconds);
         popts.fit_label = target::label_report_for(&data_path, &s.column).and_then(|r| rcsr::labels::fit_label_json(&r));
         popts.fit_label_required = front_run.is_some();
-        let every_return = policy == walkforward::Policy::TopTercile || front_run.as_ref().is_some_and(|r| r.fills_labels());
-        popts.labelled_rows = match book_target.take() {
-            Some(b) => walkforward::LabelledRows::BookTarget(b),
-            None => walkforward::LabelledRows::for_spec(&s.column, s.return_column.as_deref(), every_return),
-        };
+        let top_tercile = policy == walkforward::Policy::TopTercile;
+        let fills_labels = front_run.as_ref().is_some_and(|r| r.fills_labels());
+        popts.labelled_rows = walkforward::LabelledRows::of_search(Some(s), s.return_column.as_deref().unwrap_or(&s.column), top_tercile, fills_labels, book_target.take());
         popts.delay = agree("--delay", delay_flag, s.delay_seconds);
     } else {
         popts.entry_offset = entry_offset_flag.unwrap_or(0.0);

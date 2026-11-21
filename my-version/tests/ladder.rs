@@ -133,7 +133,8 @@ fn folds_keep_fit_validation_and_test_apart() {
 }
 
 /// #1291: the ladder prices the rows of the search's books. A row with a finite return and no
-/// finite `--target` leaves every fold, unless the SR run priced `--book-target`.
+/// finite `--target` leaves every fold, unless the SR run priced `--book-target`, the label is an
+/// `xs_rank` (a top-tercile book in the search) or no target spec names a fit label.
 #[test]
 fn folds_take_only_rows_with_a_fit_label() {
     use rcsr::walkforward::LabelledRows;
@@ -146,7 +147,10 @@ fn folds_take_only_rows_with_a_fit_label() {
     let o = Options { cost: Some(target::CostDecl::new(Some(&f.spec), 5.0, target::CostSource::Flag)), ..options(&f) };
     let rule = ladder::labelled_rows(&inp("y"), &o);
     assert_eq!(rule, LabelledRows::FitLabel("y".to_string()));
-    assert_eq!(ladder::labelled_rows(&inp("ret"), &o), LabelledRows::Return, "--target equal to the return column");
+    let no_spec = Options { spec: None, cost: None, ..options(&f) };
+    assert_eq!(ladder::labelled_rows(&ladder::Input { ret: Some("ret".to_string()), ..inp("y") }, &no_spec), LabelledRows::Return, "no target spec, no fit label apart from the return");
+    let xs = Options { spec: Some(target::TargetSpec { kind: target::KIND_XS_RANK.to_string(), ..f.spec.clone() }), ..o.clone() };
+    assert_eq!(ladder::labelled_rows(&inp("y"), &xs), LabelledRows::Return, "an xs_rank label is priced as the top-tercile book");
     let test_rows = |p: &Panel| -> Vec<usize> { ladder::make_folds(p, &f.rows, 2.0 * STEP, &[], 0.0).unwrap().iter().flat_map(|k| k.fit.iter().chain(&k.valid).chain(&k.test).copied().collect::<Vec<_>>()).collect() };
     let mut kept = panel.clone();
     ladder::keep_labelled_rows(&mut kept, &rule);

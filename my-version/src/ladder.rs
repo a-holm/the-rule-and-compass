@@ -2468,15 +2468,20 @@ fn return_name(inp: &Input, opts: &Options) -> String {
     inp.ret.clone().or_else(|| declared_return(opts)).unwrap_or_else(|| inp.target.clone())
 }
 
-/// #1291: the rows the ladder prices, the rows of the search's threshold
-/// books: a finite return and a finite `--target`, or every finite return when
-/// the SR run priced `--book-target` or filled missing labels.
+/// #1291: the rows the ladder prices, by the rule of the search's books
+/// ([`LabelledRows::of_search`]). The search prices an `xs_rank` label only as
+/// the top-tercile book, so a `--target` spec of that kind keeps every finite
+/// return; without a target spec there is no fit label apart from the return.
 pub fn labelled_rows(inp: &Input, opts: &Options) -> LabelledRows {
     let run = opts.sr_run.as_ref().map(|s| &s.run);
-    match run.and_then(|r| r.book_target.as_ref()) {
-        Some(b) => LabelledRows::BookTarget(b.column.clone()),
-        None => LabelledRows::for_spec(&inp.target, Some(return_name(inp, opts).as_str()), run.is_some_and(|r| r.fills_labels())),
-    }
+    let top_tercile = opts.spec.as_ref().is_some_and(|s| s.kind == crate::target::KIND_XS_RANK);
+    LabelledRows::of_search(
+        opts.spec.as_ref(),
+        &return_name(inp, opts),
+        top_tercile,
+        run.is_some_and(|r| r.fills_labels()),
+        run.and_then(|r| r.book_target.as_ref()).map(|b| b.column.clone()),
+    )
 }
 
 /// #1291: under [`LabelledRows::FitLabel`] a row without a finite `y` gets a NaN
@@ -2603,7 +2608,7 @@ Long-only baseline ladder on one panel, one set of folds and one cost model.\n\
 \n\
   --data <path>             CSV or .rcsb store (the pinned panel projection)\n\
   --target <col>            fit target (the label); the return is --return-col\n\
-  --return-col <col>        realised forward return of the row (default: --target). #1291: a fold takes a row when its return and its --target are finite, the rows of the search's threshold books; with an --sr-run searched with --book-target or a --fill other than drop every row with a finite return; the JSON split.labelled_rows {rule, column} names the rule\n\
+  --return-col <col>        realised forward return of the row (default: --target). #1291: a fold takes a row when its return and its --target are finite, the rows of the search's threshold books; it takes every row with a finite return when the --target spec entry is kind xs_rank (the search prices it only as the top-tercile book, which keeps rows whose label alone is missing), when no --target-spec names a fit label, and when the --sr-run was searched with --book-target or with a --fill that fills missing labels (mean, median, zero, previous or interpolate; drop and none fill nothing); the JSON split.labelled_rows {rule, column} names the rule\n\
   --time <col>              epoch seconds or ISO dates\n\
   --group <col>             symbol column (default: one group)\n\
   --features <a,b,...>      feature columns (default: every other numeric column)\n\

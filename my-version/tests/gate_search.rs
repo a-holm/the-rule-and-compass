@@ -829,11 +829,15 @@ fn dense_return_strided_label_walkforward_reproduces_objective() {
     assert_eq!(s(&j, &["objective", "book_target"]), "yd");
     assert_eq!(s(&j, &["objective", "book_target_spec", "column"]), "yd");
     assert_from_run_reproduces(&j, &data, &run, &all_days, ("book_target", "yd"));
+    // The books were priced on the book label's return column: the fit label as --target exits 2.
+    let [_, (_, test)] = run_blocks(&j, &all_days);
+    let o = rcsr(&["walkforward", "--data", &data, "--target", "y", "--time", "t", "--group-by", "s", "--from-run", &run, "--window", &test, "--allow-in-sample-windows", "--json"]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).contains("--target y is not the spec's return column 'r' or label column 'yd'"), "{}", stderr(&o));
     // A run written without objective.book_target_spec cannot name the book's return column and rows.
     let text = std::fs::read_to_string(&run).unwrap();
     let old = dir.join("book-run-old.json");
     std::fs::write(&old, rcsr::verdict::remove_member(&text, &["objective", "book_target_spec"]).unwrap()).unwrap();
-    let [_, (_, test)] = run_blocks(&j, &all_days);
     let o = walk(&data, "--from-run", old.to_str().unwrap(), &test);
     assert_eq!(code(&o), 2, "{}", stderr(&o));
     assert!(stderr(&o).contains("records no objective.book_target_spec"), "{}", stderr(&o));

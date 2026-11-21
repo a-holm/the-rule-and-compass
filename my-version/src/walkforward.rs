@@ -309,13 +309,17 @@ pub enum LabelledRows {
 }
 
 impl LabelledRows {
-    /// The search's book rows under the target spec entry `column` with `return_column`.
-    /// `every_return` holds when the search priced every finite return: a top-tercile book
-    /// (#493: a row without a label stays in its cross-section and earns its return) or a run
-    /// that filled missing labels (`--fill` other than drop or none).
-    pub fn for_spec(column: &str, return_column: Option<&str>, every_return: bool) -> LabelledRows {
-        match return_column {
-            Some(r) if r != column && !every_return => LabelledRows::FitLabel(column.to_string()),
+    /// The rule of the search's books, for walk-forward and the ladder alike. `spec` is the
+    /// target spec entry of the fit label (`None`: no spec, so no fit label apart from the
+    /// return), priced on `return_column`. A run searched with `--book-target` prices every
+    /// finite return of its book label. The search prices every finite return of a top-tercile
+    /// book (#493: a row whose label alone is missing stays in the cross-section and earns its
+    /// return) and of a run whose `--fill` filled missing labels (`fills_labels`; drop and none
+    /// fill nothing). Otherwise a row needs a finite fit label, the spec's `column`.
+    pub fn of_search(spec: Option<&crate::target::TargetSpec>, return_column: &str, top_tercile: bool, fills_labels: bool, book_target: Option<String>) -> LabelledRows {
+        match (book_target, spec) {
+            (Some(b), _) => LabelledRows::BookTarget(b),
+            (None, Some(s)) if s.column != return_column && !top_tercile && !fills_labels => LabelledRows::FitLabel(s.column.clone()),
             _ => LabelledRows::Return,
         }
     }
