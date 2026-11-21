@@ -355,8 +355,10 @@ INPUT:
                              the band book of walkforward --policy band (the
                              device holds at most 32 rows; above that --gpu
                              exits 2 and auto falls back to the CPU scorer).
-                             Resume needs the same cost, threshold, band,
-                             band units, minimum hold and rows
+                             Resume needs every input of the book hash: the
+                             message lists the flags (cost, cash, funding,
+                             threshold, band, hold, blocks, statistic, mask,
+                             split table, rows)
   --pnl-blocks K          1 to 64 time blocks for --fitness pnl (default 1 =
                              off, the plain regret). The training timestamps
                              are cut into K equal runs, each block is its own
@@ -5765,13 +5767,8 @@ fn main() {
             )),
         };
         if let (Some(b), Some(f)) = (&book_resolved, &target_resolved) {
-            for s in [&b.spec, &f.spec] {
-                if s.kind != "forward_return" {
-                    trading_usage(&format!(
-                        "--book-target needs forward_return labels on both sides, '{}' declares '{}'",
-                        s.column, s.kind
-                    ));
-                }
+            if let Some(e) = target::book_pair_refusal(&f.spec, &b.spec) {
+                trading_usage(&e);
             }
         }
         if ts.kind != "forward_return" && ts.kind != target::KIND_XS_RANK {
@@ -5816,14 +5813,6 @@ fn main() {
                 "the target is scaled, clipped or offset: declare a return_column in the \
                  target spec so the P&L uses realised returns",
             );
-        }
-        if let Some(b) = &book_resolved {
-            if b.spec.return_column.is_none() {
-                trading_usage(&format!(
-                    "--book-target: book target '{}' declares no return_column, so the book would be priced on the fit label: declare a return_column in the target spec",
-                    b.spec.column
-                ));
-            }
         }
         trading_cols = Some(data::TradingColumns {
             return_column: ts.return_column.clone(),
@@ -6279,9 +6268,10 @@ fn main() {
                 )
             });
             trading_usage(&format!(
-                "--resume conflicts with the saved search settings: fitness {} (saved {}); the book depends on the cost, threshold, band, band units, minimum hold, min-trades, pnl excess and training rows{}",
+                "--resume conflicts with the saved search settings: fitness {} (saved {}); {}{}",
                 cfg.fitness.key(),
                 cp.config.fitness.key(),
+                rcsr::trading::book_conflict_text(&args),
                 mask
             ));
         }
@@ -11847,6 +11837,12 @@ USAGE:
   2 under --from-run and --front; with --target-spec the return alone labels
   a row and stderr says so. The JSON split records labelled_rows {{rule:
   fit_label|book_target|return, column}}.
+  Book label (#1212): --book-target, or the book label of a --from-run or
+  --front run, prices the book on another label than the fit label: its
+  return column, horizon, stride and cost set the rows, the period grid, the
+  bootstrap block and the annualisation; the purge is the larger of the two
+  labels' entry offset + horizon + delay. The JSON book block adds target,
+  fit_target and source (flag|run), and the candidate id binds both labels.
   See docs/walkforward.md.
 
 OPTIONS:
@@ -11916,6 +11912,20 @@ OPTIONS:
                              --delay, the return column, return units (log is
                              converted with exp_m1) and the cost come from the entry
                              matching --target; a flag that disagrees is refused
+  --book-target <col>        #1212: price the book on another label of the
+                             --target-spec file than --target (the fit label): its
+                             return column, horizon, stride and cost price the book on
+                             every row with a finite book return; the purge is the
+                             larger of the two labels' entry offset + horizon + delay
+                             (a shorter gap exits 2 naming the label that binds). Both
+                             labels forward_return and a book return_column, a data
+                             file with that column, else exit 2; the fit label itself
+                             changes nothing. With --from-run or --front it names the
+                             run's book label (objective.book_target, else the fit
+                             label), priced without the flag too; another label exits 2.
+                             --device-pnl and --batch-pnl exit 2. JSON: book.target,
+                             book.fit_target, book.source (flag|run); split.fit_label is
+                             the fit label's; procedure_spec binds both labels
   --from-run <run.json>      the book a search with --objective selected: expression,
                              variables, fixed threshold, per-side cost and target spec
                              of the run. A run that priced a band or a minimum hold
@@ -12367,6 +12377,7 @@ fn run_walkforward(args: &[String]) -> ! {
     let mut period_series = false;
     let mut emit_series = false;
     let mut all_members = false;
+    let mut book_target_arg: Option<String> = None;
 
     let need = |args: &[String], i: usize, flag: &str| -> String {
         match args.get(i) {
@@ -12454,6 +12465,10 @@ fn run_walkforward(args: &[String]) -> ! {
             }
             "--from-run" => {
                 from_run_path = Some(need(args, i + 1, "--from-run"));
+                i += 1;
+            }
+            "--book-target" => {
+                book_target_arg = Some(need(args, i + 1, "--book-target"));
                 i += 1;
             }
             "--front" => {
@@ -12805,18 +12820,40 @@ fn run_walkforward(args: &[String]) -> ! {
     let mut cost_spec: Option<rcsr::target::TargetSpec> = None;
     let mut run_cost: Option<(f64, rcsr::target::CostSource)> = None;
     let mut front_run: Option<rcsr::run_json::RunFile> = None;
-    // #1291: the book label of a run searched with --book-target prices its books on every finite book return.
-    let mut book_target: Option<String> = None;
-    let run_book_target = |run: &rcsr::run_json::RunFile, path: &str| -> Option<rcsr::target::TargetSpec> {
-        let b = run.book_target.as_ref()?;
-        match &b.spec {
-            Some(s) => Some(s.clone()),
-            None => usage_fail(&format!(
-                "{}: the run priced --book-target {} (objective.book_target) and records no objective.book_target_spec, \
-                 so the return column, horizon and rows of its books are unknown here; search again with this build",
-                path, b.column
-            )),
+    // #1291, #1212: the book label of a run searched with --book-target prices its books on every finite
+    // book return, and its fit label keeps its purge. --book-target names the run's book label.
+    let mut book_label: Option<walkforward::BookLabel> = None;
+    let run_book_label = |run: &rcsr::run_json::RunFile, path: &str, fit: Option<rcsr::target::TargetSpec>| -> Option<walkforward::BookLabel> {
+        let book = match run.book_target.as_ref() {
+            None => None,
+            Some(b) => match &b.spec {
+                Some(s) => Some(s.clone()),
+                None => usage_fail(&format!(
+                    "{}: the run priced --book-target {} (objective.book_target) and records no objective.book_target_spec, \
+                     so the return column, horizon and rows of its books are unknown here; search again with this build",
+                    path, b.column
+                )),
+            },
+        };
+        let Some(fit) = fit else {
+            if book.is_some() || book_target_arg.is_some() {
+                usage_fail(&format!("{}: the run records no target_spec, so its fit label is unknown here", path));
+            }
+            return None;
+        };
+        if let Some(arg) = &book_target_arg {
+            let label = book.as_ref().unwrap_or(&fit);
+            if rcsr::target::entry_for(std::slice::from_ref(label), arg).is_none() {
+                usage_fail(&format!(
+                    "--book-target {} differs from the book label of {}: the run priced its books on '{}'{}",
+                    arg,
+                    path,
+                    label.column,
+                    if book.is_none() { ", its fit label (no objective.book_target); search with --book-target to trade another label" } else { "" }
+                ));
+            }
         }
+        book.and_then(|b| walkforward::BookLabel::pair(&fit, &b, walkforward::BookSource::Run).unwrap_or_else(|e| usage_fail(&e)))
     };
     if let Some(path) = &from_run_path {
         if !expressions.is_empty() {
@@ -12869,13 +12906,8 @@ fn run_walkforward(args: &[String]) -> ! {
             band_units_arg = None;
         }
         run_cost = Some((book.per_side_bps, book.source));
-        cost_spec = Some(match run_book_target(&run, path) {
-            Some(s) => {
-                book_target = Some(s.column.clone());
-                s
-            }
-            None => book.spec,
-        });
+        book_label = run_book_label(&run, path, Some(book.spec.clone()));
+        cost_spec = Some(book_label.as_ref().map_or(book.spec, |b| b.book.clone()));
         popts.composite = run.composite.clone();
         front_run = Some(run);
     } else if let Some(path) = &front_path {
@@ -12923,9 +12955,9 @@ fn run_walkforward(args: &[String]) -> ! {
         if vars_src.is_none() && !run.variables.is_empty() {
             vars_src = Some(run.variables.join(","));
         }
-        let front_book = run_book_target(&run, path);
+        book_label = run_book_label(&run, path, run.target_spec());
         if target.is_none() {
-            target = front_book.as_ref().map_or_else(|| run.return_column.clone(), |s| s.return_column.clone());
+            target = book_label.as_ref().map_or_else(|| run.return_column.clone(), |b| b.book.return_column.clone());
         }
         // The front is priced as the books the search compared: the run's
         // fixed threshold, cost and target spec.
@@ -12968,13 +13000,7 @@ fn run_walkforward(args: &[String]) -> ! {
         }
         if let Some(bps) = run.per_side_bps {
             run_cost = Some((bps, run.cost_source()));
-            cost_spec = match front_book {
-                Some(s) => {
-                    book_target = Some(s.column.clone());
-                    Some(s)
-                }
-                None => run.target_spec(),
-            };
+            cost_spec = book_label.as_ref().map(|b| b.book.clone()).or_else(|| run.target_spec());
         }
         popts.composite = run.composite.clone();
         front_run = Some(run);
@@ -12983,8 +13009,33 @@ fn run_walkforward(args: &[String]) -> ! {
         let specs = rcsr::target::parse_file(&text).unwrap_or_else(|e| input_fail(&format!("{}: {}", path, e)));
         let want = target.clone().unwrap_or_else(|| usage_fail("--target-spec needs --target to pick the spec entry"));
         match rcsr::target::entry_for(&specs, &want) {
-            Some(s) => cost_spec = Some(s.clone()),
+            Some(s) => {
+                // #1212: --target picks the fit label and --book-target the label that prices the book.
+                if let Some(arg) = &book_target_arg {
+                    let book = rcsr::target::entry_for(&specs, arg).unwrap_or_else(|| {
+                        usage_fail(&format!("--book-target {}: {} has no entry whose column, name or return_column is '{}'", arg, path, arg))
+                    });
+                    book_label = walkforward::BookLabel::pair(s, book, walkforward::BookSource::Flag).unwrap_or_else(|e| usage_fail(&e));
+                }
+                cost_spec = Some(book_label.as_ref().map_or(s, |b| &b.book).clone());
+                if book_label.is_some() {
+                    target = None;
+                }
+            }
             None => input_fail(&format!("{}: no entry for target '{}'", path, want)),
+        }
+    }
+    if book_target_arg.is_some() && target_spec_path.is_none() && from_run_path.is_none() && front_path.is_none() {
+        usage_fail("--book-target needs --target-spec (the spec file that declares the fit label and the book label), --from-run or --front");
+    }
+    if let Some(b) = &book_label {
+        for (on, flag) in [(device_pnl, "--device-pnl"), (popts.batch_pnl, "--batch-pnl")] {
+            if on {
+                usage_fail(&format!(
+                    "{} conflicts with the book label '{}' (--book-target or the run's objective.book_target): a book on another label than the fit label '{}' is priced on the CPU",
+                    flag, b.book.column, b.fit.column
+                ));
+            }
         }
     }
     if unmasked && from_run_path.is_none() && front_path.is_none() {
@@ -13047,16 +13098,19 @@ fn run_walkforward(args: &[String]) -> ! {
         popts.horizon_from_spec = s.horizon_seconds > 0.0;
         popts.stride_seconds = s.stride_seconds;
         popts.entry_offset = agree("--entry-offset", entry_offset_flag, s.entry_offset_seconds);
-        popts.fit_label = target::label_report_for(&data_path, &s.column).and_then(|r| rcsr::labels::fit_label_json(&r));
+        let fit_column = book_label.as_ref().map_or(&s.column, |b| &b.fit.column);
+        popts.fit_label = target::label_report_for(&data_path, fit_column).and_then(|r| rcsr::labels::fit_label_json(&r));
         popts.fit_label_required = front_run.is_some();
         let top_tercile = policy == walkforward::Policy::TopTercile;
         let fills_labels = front_run.as_ref().is_some_and(|r| r.fills_labels());
-        popts.labelled_rows = walkforward::LabelledRows::of_search(Some(s), s.return_column.as_deref().unwrap_or(&s.column), top_tercile, fills_labels, book_target.take());
+        let book_column = book_label.as_ref().map(|b| b.book.column.clone());
+        popts.labelled_rows = walkforward::LabelledRows::of_search(Some(s), s.return_column.as_deref().unwrap_or(&s.column), top_tercile, fills_labels, book_column);
         popts.delay = agree("--delay", delay_flag, s.delay_seconds);
     } else {
         popts.entry_offset = entry_offset_flag.unwrap_or(0.0);
         popts.delay = delay_flag.unwrap_or(0.0);
     }
+    popts.book_label = book_label;
     let resolved = match run_cost {
         Some((per_side, source)) => match (cost_flag, cost_override) {
             (Some(_), Some(_)) => Err("--cost-bps and --cost-override are alternatives; pass one of them".to_string()),
@@ -13107,17 +13161,17 @@ fn run_walkforward(args: &[String]) -> ! {
         if popts.regime_exprs.iter().any(|e| e.name == name) {
             usage_fail(&format!("--regime-name '{}' is used twice", name));
         }
-        let specs: Vec<&target::TargetSpec> = cost_spec.iter().collect();
+        let specs: Vec<&target::TargetSpec> = cost_spec.iter().chain(popts.book_label.iter().map(|b| &b.fit)).collect();
         let mut names: Vec<String> = target.iter().cloned().collect();
-        names.extend(cost_spec.iter().map(|s| s.column.clone()));
+        names.extend(specs.iter().map(|s| s.column.clone()));
         enforce_gate_columns("--regime-expr", &gate.columns, &specs, &names, false);
         popts.regime_exprs.push(rcsr::regimes::ExprSpec { name, gate });
     }
     // #1214: a switch or mask gate column of the label family, the target, its return column or a construction column exits 5.
     {
-        let specs: Vec<&target::TargetSpec> = cost_spec.iter().collect();
+        let specs: Vec<&target::TargetSpec> = cost_spec.iter().chain(popts.book_label.iter().map(|b| &b.fit)).collect();
         let mut names: Vec<String> = target.iter().cloned().collect();
-        names.extend(cost_spec.iter().map(|s| s.column.clone()));
+        names.extend(specs.iter().map(|s| s.column.clone()));
         for c in popts.switches.iter().flatten() {
             enforce_gate_columns(&c.source, &c.switch.gate.columns, &specs, &names, false);
         }
@@ -13510,7 +13564,7 @@ fn run_walkforward(args: &[String]) -> ! {
         Ok(r) => r,
         Err(e) => {
             eprintln!("error: {}", e);
-            std::process::exit(if e.contains("overlapping returns") || e.contains("purge gap") || e.contains("are not in time order") || e.starts_with("--periods-per-year") || e.starts_with("missing stride_seconds") || e.starts_with("stride_seconds") || e.starts_with(walkforward::FIT_LABEL_REFUSAL) { EXIT_USAGE } else { EXIT_INPUT });
+            std::process::exit(if e.contains("overlapping returns") || e.contains("purge gap") || e.contains("are not in time order") || e.starts_with("--periods-per-year") || e.starts_with("missing stride_seconds") || e.starts_with("stride_seconds") || e.starts_with(walkforward::FIT_LABEL_REFUSAL) || e.starts_with(walkforward::BOOK_LABEL_REFUSAL) { EXIT_USAGE } else { EXIT_INPUT });
         }
     };
     if let (Some(c), walkforward::LabelledRows::Return) = (popts.labelled_rows.fit_label(), &report.labelled_rows) {

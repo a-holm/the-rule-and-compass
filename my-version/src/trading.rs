@@ -1674,6 +1674,54 @@ pub const FITNESS_BLOCK_SHIFT: u8 = 2;
 /// #1180: bit 5 of a [`FitnessBook::flags`] byte marks a row outside the regime mask.
 pub const FITNESS_MASK_OFF: u8 = 0x20;
 
+/// One input of the fitness book hash ([`FitnessBook::hash`], the `--resume`
+/// guard) with the flags that set it.
+pub struct BookInput {
+    pub id: &'static str,
+    pub what: &'static str,
+    pub flags: &'static [&'static str],
+}
+
+/// Every input of the book hash. The `--resume` conflict message names these
+/// flags; a new hashed input needs a row here.
+pub const BOOK_INPUTS: &[BookInput] = &[
+    BookInput { id: "cost", what: "the per-side cost", flags: &["--cost-bps", "--cost-override", "--slippage-bps"] },
+    BookInput { id: "cash", what: "the cash return", flags: &["--cash-return"] },
+    BookInput { id: "funding", what: "the funding column", flags: &["--funding"] },
+    BookInput { id: "excess", what: "the excess benchmark", flags: &["--pnl-excess"] },
+    BookInput { id: "threshold", what: "the threshold", flags: &["--threshold"] },
+    BookInput { id: "min_trades", what: "the minimum trades", flags: &["--min-trades"] },
+    BookInput { id: "band", what: "the band", flags: &["--band"] },
+    BookInput { id: "band_units", what: "the band units", flags: &["--band-units"] },
+    BookInput { id: "min_hold", what: "the minimum hold", flags: &["--min-holding"] },
+    BookInput { id: "blocks", what: "the time blocks", flags: &["--pnl-blocks"] },
+    BookInput { id: "lambda", what: "the block spread weight", flags: &["--pnl-block-lambda"] },
+    BookInput { id: "stat", what: "the block statistic", flags: &["--pnl-stat", "--pnl-cvar-q"] },
+    BookInput { id: "mask", what: "the regime mask", flags: &["--pnl-mask", "--pnl-mask-band", "--pnl-mask-dwell"] },
+    BookInput { id: "segments", what: "the interval split", flags: &["--split-table", "--split-id", "--embargo"] },
+    BookInput {
+        id: "rows",
+        what: "the training rows",
+        flags: &["--data", "--time", "--group-by", "--split", "--validation-frac", "--test-frac", "--target-spec"],
+    },
+];
+
+/// The `--resume` conflict text: every flag that shapes the book, then the
+/// ones of those given on this command line.
+pub fn book_conflict_text(args: &[String]) -> String {
+    let inputs: Vec<String> = BOOK_INPUTS.iter().map(|i| format!("{} ({})", i.what, i.flags.join(", "))).collect();
+    let given: Vec<&str> = BOOK_INPUTS
+        .iter()
+        .flat_map(|i| i.flags.iter().copied())
+        .filter(|f| args.iter().any(|a| a == f))
+        .collect();
+    format!(
+        "the book hash covers {}; compare them with the original command (flags given now: {})",
+        inputs.join("; "),
+        if given.is_empty() { "none".to_string() } else { given.join(", ") }
+    )
+}
+
 /// #1178: the statistic of the block regrets `r_k = 1 - c_k` that a fitness
 /// book ranks by (`--pnl-stat`); `c_k = net_k / B_k` is the capture of block `k`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]

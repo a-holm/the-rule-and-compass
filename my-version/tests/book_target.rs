@@ -667,3 +667,309 @@ fn require_edge_reads_the_book_rows_under_book_target() {
     assert_eq!(num(&j, &["objective", "usable_candidates"]), 3.0);
     assert!(at(&j, &["objective", "selection_rule"]).get("verdict").is_none());
 }
+
+// #1212: `rcsr walkforward` prices the book label of a formula fitted on another label, out of fold.
+
+/// 2021-01-04T00:00:00Z.
+const WF_T0: i64 = 1_609_718_400;
+const WF_DAY: i64 = 86_400;
+const WF_WEEK: i64 = 7 * WF_DAY;
+const WF_DAYS: i64 = 364;
+
+fn wf_return(d: i64, j: i64) -> f64 {
+    let i = (2 * d + j) as usize;
+    0.01 * x1(i) + 0.0005 * (frac(i as f64 * 0.324_717_957_244_746) - 0.5)
+}
+
+/// Daily rows of symbols a and b. The daily label `lbl_h24_y` and its return `lbl_h24_fwd` are
+/// finite on every day; the weekly label `lbl_h168_y` and its return `lbl_h168_fwd`, the sum of the
+/// next seven daily returns, only on every seventh day with a full week ahead. `d.labels.json`
+/// holds the label reports `rcsr enrich` writes, the source of `split.fit_label`.
+fn wf_csv(dir: &std::path::Path) -> String {
+    let mut text = String::from("t,s,x1,x2,lbl_h24_y,lbl_h24_fwd,lbl_h168_y,lbl_h168_fwd\n");
+    for d in 0..WF_DAYS {
+        for (j, sym) in ["a", "b"].iter().enumerate() {
+            let j = j as i64;
+            let i = (2 * d + j) as usize;
+            let x2 = frac(i as f64 * 0.754_877_666_246_692_7) - 0.5;
+            let r = wf_return(d, j);
+            let week = if d % 7 == 0 && d + 7 <= WF_DAYS {
+                let w: f64 = (d..d + 7).map(|k| wf_return(k, j)).sum();
+                format!("{w},{w}")
+            } else {
+                ",".to_string()
+            };
+            text.push_str(&format!("{},{sym},{},{x2},{r},{r},{week}\n", WF_T0 + WF_DAY * d, x1(i)));
+        }
+    }
+    let path = dir.join("d.csv");
+    std::fs::write(&path, text).unwrap();
+    let report = |column: &str, name: &str, stride: i64| {
+        format!(
+            "{{\"target\":\"{column}\",\"report\":{{\"name\":\"{name}\",\"stride\":{stride},\"average_uniqueness\":1,\"effective_n\":104,\"effective_n_hours\":17472}}}}"
+        )
+    };
+    std::fs::write(dir.join("d.labels.json"), format!("[\n{},\n{}\n]\n", report("lbl_h168_y", "h168", 168), report("lbl_h24_y", "h24", 24))).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+fn wf_entry(column: &str, return_column: Option<&str>, horizon: i64, stride: Option<i64>) -> String {
+    format!(
+        "{{\"column\":\"{column}\",\"name\":\"{column}\",\"kind\":\"forward_return\",\"deprecated\":false,\"return_column\":{},\
+         \"return_units\":\"log\",\"horizon_seconds\":{horizon},{}\"entry_offset_seconds\":0,\"delay_seconds\":0,\"entry_price\":\"open\",\
+         \"exit_price\":\"close\",\"offset\":0.0,\"scale\":{{\"kind\":\"constant\",\"value\":1.0}},\"clip\":null,\"units\":\"log_return\",\
+         \"cost_bps\":10,\"cost_in_label\":false,\"construction_columns\":[],\"note\":null}}",
+        return_column.map_or("null".to_string(), |c| format!("\"{c}\"")),
+        stride.map_or(String::new(), |s| format!("\"stride_seconds\":{s},"))
+    )
+}
+
+/// The weekly fit label, the daily book label, a second label on the daily return, a label without
+/// a return column and a label whose return column the data lacks.
+fn wf_spec(dir: &std::path::Path) -> String {
+    let entries = [
+        wf_entry("lbl_h168_y", Some("lbl_h168_fwd"), WF_WEEK, Some(WF_WEEK)),
+        wf_entry("lbl_h24_y", Some("lbl_h24_fwd"), WF_DAY, None),
+        wf_entry("lbl_d1_y", Some("lbl_h24_fwd"), WF_DAY, None),
+        wf_entry("lbl_noret_y", None, WF_DAY, None),
+        wf_entry("lbl_h48_y", Some("lbl_h48_fwd"), 2 * WF_DAY, None),
+    ];
+    let path = dir.join("wf-spec.json");
+    std::fs::write(&path, format!("{{\"schema\":\"rcsr-target-spec/1\",\"targets\":[{}]}}", entries.join(","))).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+fn wf(data: &str, args: &[&str]) -> Output {
+    let mut a = vec!["walkforward", "--data", data, "--time", "t", "--group-by", "s", "--json"];
+    a.extend_from_slice(args);
+    rcsr_cmd::rcsr().args(&a).output().expect("run rcsr walkforward")
+}
+
+/// A window in days from `WF_T0`; training starts at day 0.
+fn wf_window(label: &str, train_end: i64, test_start: i64, test_end: i64) -> String {
+    format!("{label},{WF_T0},{},{},{}", WF_T0 + WF_DAY * train_end, WF_T0 + WF_DAY * test_start, WF_T0 + WF_DAY * test_end)
+}
+
+/// `x1` priced with the weekly fit label picked by `--target`.
+fn wf_expr<'a>(spec: &'a str, window: &'a str) -> Vec<&'a str> {
+    vec!["--target-spec", spec, "--target", "lbl_h168_fwd", "--expr", "x1", "--vars", "x1", "--window", window]
+}
+
+fn text_at<'a>(j: &'a Json, path: &[&str]) -> &'a str {
+    at(j, path).as_str().unwrap_or_else(|| panic!("{path:?} is not a string"))
+}
+
+fn first_window(j: &Json) -> &Json {
+    match at(j, &["windows"]) {
+        Json::Arr(w) => &w[0],
+        _ => panic!("windows is not an array"),
+    }
+}
+
+/// The printed report without the phase ledger, which holds wall-clock seconds.
+fn stable_report(o: &Output) -> String {
+    assert_eq!(code(o), 0, "{}", stderr(o));
+    rcsr::verdict::remove_member(String::from_utf8_lossy(&o.stdout).trim(), &["ledger"]).unwrap()
+}
+
+/// A search fitted on the weekly label; `extra` adds `--book-target`. Returns the run.json path.
+fn wf_search(dir: &std::path::Path, data: &str, spec: &str, name: &str, extra: &[&str]) -> String {
+    let run = dir.join(name).to_string_lossy().into_owned();
+    let mut args = vec![
+        "--data", data, "--target-spec", spec, "--target", "lbl_h168_y", "--vars", "x1,x2", "--time", "t", "--group-by", "s", "--fill", "drop",
+        "--split", "temporal", "--objective", "pnl", "--validation-frac", "0.3", "--test-frac", "0.2", "--min-trades", "0", "--cpu", "--no-dev-log",
+        "--seed", "3", "--generations", "12", "--pop", "32", "--quiet", "--json", "--json-out", run.as_str(),
+    ];
+    args.extend_from_slice(extra);
+    let o = rcsr_cmd::rcsr().args(&args).output().expect("run rcsr");
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    run
+}
+
+/// #1212 criteria 1 and 2: the formula fitted on the weekly label, traded on the daily label, is
+/// priced on the daily label: one period per test day, daily annualisation, the report names both.
+#[test]
+fn wf_book_target_prices_daily_over_weekly_fit() {
+    let scratch = Scratch::new("wf_book_target_daily");
+    let (data, spec) = (wf_csv(scratch.path()), wf_spec(scratch.path()));
+    let window = wf_window("w", 200, 207, 300);
+    let weekly = ok(&wf(&data, &wf_expr(&spec, &window)));
+    assert_eq!(num(&weekly, &["annualization", "period_seconds"]), WF_WEEK as f64, "without the flag the fit label prices the book");
+    assert!(at(&weekly, &["book"]).get("target").is_none());
+    let mut args = wf_expr(&spec, &window);
+    args.extend_from_slice(&["--book-target", "lbl_h24_fwd"]);
+    let daily = ok(&wf(&data, &args));
+    assert_eq!(num(&daily, &["pooled", "periods_per_year"]), 365.0);
+    assert_eq!(num(&daily, &["annualization", "period_seconds"]), 86400.0);
+    assert_eq!(text_at(&daily, &["target"]), "lbl_h24_fwd");
+    assert_eq!(num(&daily, &["pooled", "periods"]), 93.0, "one period per test day");
+    assert_eq!(num(first_window(&daily), &["metrics", "rows"]), 186.0, "both symbols on every test day");
+    assert_eq!(text_at(&daily, &["split", "fit_label", "name"]), "h168");
+    assert_eq!(text_at(&daily, &["book", "target", "column"]), "lbl_h24_y");
+    assert_eq!(text_at(&daily, &["book", "target", "return_column"]), "lbl_h24_fwd");
+    assert_eq!(num(&daily, &["book", "target", "horizon_seconds"]), 86400.0);
+    assert_eq!(text_at(&daily, &["book", "fit_target", "column"]), "lbl_h168_y");
+    assert_eq!(text_at(&daily, &["book", "source"]), "flag");
+    assert_eq!(num(&daily, &["split", "required_purge_seconds"]), WF_WEEK as f64, "the fit label's purge binds");
+    assert_eq!(text_at(&daily, &["split", "labelled_rows", "rule"]), "book_target");
+}
+
+/// #1212 criterion 6: a book label equal to the fit label is the report without the flag.
+#[test]
+fn wf_book_target_same_label_identical() {
+    let scratch = Scratch::new("wf_book_target_same");
+    let (data, spec) = (wf_csv(scratch.path()), wf_spec(scratch.path()));
+    let window = wf_window("w", 200, 207, 300);
+    let plain = wf(&data, &wf_expr(&spec, &window));
+    let want = stable_report(&plain);
+    for same in ["lbl_h168_fwd", "lbl_h168_y"] {
+        let mut args = wf_expr(&spec, &window);
+        args.extend_from_slice(&["--book-target", same]);
+        let o = wf(&data, &args);
+        assert_eq!(stable_report(&o), want, "--book-target {same}");
+        assert_eq!(text_at(&json(&o), &["protocol", "report_sha256"]), text_at(&json(&plain), &["protocol", "report_sha256"]));
+    }
+}
+
+/// #1212 criterion 3: the purge covers the longer fit horizon; a 24 h gap names the weekly fit label.
+#[test]
+fn wf_book_target_purge_covers_fit_horizon() {
+    let scratch = Scratch::new("wf_book_target_purge");
+    let (data, spec) = (wf_csv(scratch.path()), wf_spec(scratch.path()));
+    let window = wf_window("w", 200, 201, 300);
+    ok(&wf(&data, &["--target-spec", &spec, "--target", "lbl_h24_fwd", "--expr", "x1", "--vars", "x1", "--window", &window]));
+    let mut args = wf_expr(&spec, &window);
+    args.extend_from_slice(&["--book-target", "lbl_h24_fwd"]);
+    let o = wf(&data, &args);
+    usage_error(&o, "fit label 'lbl_h168_y'");
+    assert!(stderr(&o).contains("purge gap is 86400 seconds") && stderr(&o).contains("604800"), "{}", stderr(&o));
+}
+
+/// #1212 criterion 4: `--from-run`, `--front` and `--front --all-members` price the run's book label.
+#[test]
+fn wf_from_run_honours_book_target() {
+    let scratch = Scratch::new("wf_book_target_from_run");
+    let dir = scratch.path();
+    let (data, spec) = (wf_csv(dir), wf_spec(dir));
+    let run = wf_search(dir, &data, &spec, "book-run.json", &["--book-target", "lbl_h24_y"]);
+    let j = Json::parse(std::fs::read_to_string(&run).unwrap().trim()).expect("run.json");
+    assert_eq!(text_at(&j, &["objective", "book_target"]), "lbl_h24_y");
+    let window = wf_window("t", 293, 300, WF_DAYS);
+    let from_run = |extra: &[&str]| {
+        let mut a = vec!["--from-run", run.as_str(), "--window", window.as_str(), "--allow-in-sample-windows"];
+        a.extend_from_slice(extra);
+        wf(&data, &a)
+    };
+    let r = ok(&from_run(&[]));
+    assert_eq!(text_at(&r, &["target"]), "lbl_h24_fwd");
+    assert_eq!(text_at(&r, &["book", "source"]), "run");
+    assert_eq!(text_at(&r, &["book", "target", "column"]), "lbl_h24_y");
+    assert_eq!(text_at(&r, &["split", "fit_label", "name"]), "h168");
+    assert_eq!(num(&r, &["annualization", "period_seconds"]), 86400.0);
+    assert_eq!(num(&r, &["pooled", "periods_per_year"]), 365.0);
+    assert_eq!(num(&r, &["pooled", "periods"]), 64.0, "one period per test day");
+    assert_eq!(num(&r, &["split", "required_purge_seconds"]), WF_WEEK as f64);
+    // Naming the run's book label changes nothing; another label exits 2.
+    assert_eq!(stable_report(&from_run(&["--book-target", "lbl_h24_fwd"])), stable_report(&from_run(&[])));
+    usage_error(&from_run(&["--book-target", "lbl_h168_y"]), "differs from the book label of");
+    for flag in ["--device-pnl", "--batch-pnl"] {
+        usage_error(&from_run(&[flag]), "is priced on the CPU");
+    }
+    let front = |extra: &[&str]| {
+        let mut a = vec!["--front", run.as_str(), "--window", window.as_str(), "--allow-in-sample-windows", "--validation-frac", "0.2"];
+        a.extend_from_slice(extra);
+        ok(&wf(&data, &a))
+    };
+    let f = front(&[]);
+    assert_eq!(text_at(&f, &["target"]), "lbl_h24_fwd");
+    assert_eq!(text_at(&f, &["book", "source"]), "run");
+    assert_eq!(num(&f, &["annualization", "period_seconds"]), 86400.0);
+    assert_eq!(num(first_window(&f), &["metrics", "rows"]), 128.0);
+    let m = front(&["--all-members"]);
+    let Json::Arr(members) = at(&m, &["members"]) else { panic!("members is not an array") };
+    assert!(!members.is_empty());
+    for member in members {
+        assert_eq!(num(member, &["pooled", "periods_per_year"]), 365.0);
+        assert_eq!(num(first_window(member), &["test_rows"]), num(first_window(&f), &["test_rows"]));
+    }
+}
+
+/// #1212 criterion 5: `--from-run` of a run without `--book-target` keeps the report of the build
+/// before #1212, byte for byte (the hashed report without the run file's own hash).
+#[test]
+fn wf_from_run_without_book_target_unchanged() {
+    let scratch = Scratch::new("wf_book_target_plain_run");
+    let dir = scratch.path();
+    let (data, spec) = (wf_csv(dir), wf_spec(dir));
+    let run = wf_search(dir, &data, &spec, "fit-run.json", &[]);
+    let window = wf_window("t", 293, 300, WF_DAYS);
+    let o = wf(&data, &["--from-run", &run, "--window", &window, "--allow-in-sample-windows"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let text = String::from_utf8_lossy(&o.stdout).into_owned();
+    let hashed = rcsr::verdict::hashed_report_text(&text).unwrap();
+    let before = rcsr::verdict::remove_member(&hashed, &["selection", "run_sha256"]).unwrap();
+    assert_eq!(rcsr::manifest::sha256_hex(before.as_bytes()), PINNED_FIT_LABEL_FROM_RUN, "{before}");
+    let r = json(&o);
+    assert!(at(&r, &["book"]).get("target").is_none() && at(&r, &["book"]).get("source").is_none());
+    usage_error(&wf(&data, &["--from-run", &run, "--window", &window, "--allow-in-sample-windows", "--book-target", "lbl_h24_y"]), "differs from the book label of");
+}
+
+const PINNED_FIT_LABEL_FROM_RUN: &str = "efe1d444de2ba21827804f82f4f2c9fd538754f33e9aca8f4f508d015bd02ae0";
+
+/// #1212 criterion 7 and the refusals of `--book-target`: exit 2.
+#[test]
+fn wf_book_target_refusals_are_usage_errors() {
+    let scratch = Scratch::new("wf_book_target_refusals");
+    let (data, spec) = (wf_csv(scratch.path()), wf_spec(scratch.path()));
+    let window = wf_window("w", 200, 207, 300);
+    let with = |extra: &[&str]| {
+        let mut a = wf_expr(&spec, &window);
+        a.extend_from_slice(extra);
+        wf(&data, &a)
+    };
+    for flag in ["--device-pnl", "--batch-pnl"] {
+        usage_error(&with(&["--book-target", "lbl_h24_fwd", flag]), "is priced on the CPU");
+    }
+    usage_error(&with(&["--book-target", "nope"]), "has no entry whose column, name or return_column is 'nope'");
+    usage_error(&with(&["--book-target", "lbl_noret_y"]), "book target 'lbl_noret_y' declares no return_column");
+    usage_error(&with(&["--book-target", "lbl_h48_y"]), "'lbl_h48_fwd'");
+    usage_error(&wf(&data, &["--target", "lbl_h24_fwd", "--expr", "x1", "--vars", "x1", "--window", &window, "--book-target", "lbl_h24_fwd"]), "--book-target needs --target-spec");
+}
+
+/// #1212 criterion 8: the candidate id binds the book label, so a locked read of another book label
+/// is not the sealed candidate (exit 3), even on the same return column.
+#[test]
+fn wf_book_target_binds_the_sealed_candidate() {
+    let scratch = Scratch::new("wf_book_target_seal");
+    let dir = scratch.path();
+    let (data, spec) = (wf_csv(dir), wf_spec(dir));
+    rcsr::lockbox::write_sidecar(&data, &rcsr::lockbox::Lockbox { start: WF_T0 + 300 * WF_DAY, end: WF_T0 + WF_DAYS * WF_DAY }, "test").unwrap();
+    let ledger = dir.join("ledger.jsonl").to_string_lossy().into_owned();
+    let sealed = dir.join("sealed.json").to_string_lossy().into_owned();
+    let (dev_window, locked_window) = (wf_window("dev", 200, 207, 290), wf_window("locked", 290, 300, WF_DAYS));
+    let books: [&[&str]; 3] = [&["--book-target", "lbl_h24_fwd"], &["--book-target", "lbl_d1_y"], &[]];
+    let ids: Vec<String> = books
+        .iter()
+        .map(|b| {
+            let mut a = wf_expr(&spec, &dev_window);
+            a.extend_from_slice(&["--ledger", ledger.as_str()]);
+            a.extend_from_slice(b);
+            text_at(&ok(&wf(&data, &a)), &["protocol", "candidate_id"]).to_string()
+        })
+        .collect();
+    assert!(ids[0] != ids[1] && ids[0] != ids[2] && ids[1] != ids[2], "{ids:?}");
+    let o = rcsr_cmd::rcsr().args(["protocol", "seal", "--ledger", &ledger, "--out", &sealed, "--id", &ids[0]]).output().unwrap();
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let read = |b: &[&str]| {
+        let mut a = wf_expr(&spec, &locked_window);
+        a.extend_from_slice(&["--ledger", ledger.as_str(), "--locked-test", "--sealed", sealed.as_str()]);
+        a.extend_from_slice(b);
+        wf(&data, &a)
+    };
+    for b in &books[1..] {
+        let o = read(b);
+        assert_eq!(code(&o), 3, "{b:?}: {}", stderr(&o));
+        assert!(stderr(&o).contains("is not in the sealed list"), "{b:?}: {}", stderr(&o));
+    }
+    ok(&read(books[0]));
+}

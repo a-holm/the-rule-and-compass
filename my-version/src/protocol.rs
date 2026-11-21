@@ -1220,6 +1220,10 @@ pub fn procedure_spec(spec: &crate::walkforward::EvalSpec, o: &crate::walkforwar
             s.push_str(&format!("period_width={:?}\n", width));
         }
     }
+    // #1212: a book on another label than the fit label binds both labels and the fit label's purge.
+    if let Some(b) = &o.book_label {
+        s.push_str(&format!("book_target={}|fit_label={}|fit_purge={:?}\n", b.book.column, b.fit.column, b.fit_purge_seconds()));
+    }
     // #1214: a composed candidate's book is its switch, one line per candidate.
     if o.switches.iter().any(Option::is_some) {
         for c in &o.switches {

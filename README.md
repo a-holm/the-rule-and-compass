@@ -204,6 +204,7 @@ long/flat from the training mean, matched-exposure random long seeded by
 `src/baselines.rs`.
 `--front run.json` takes the candidates from the Pareto front of a run, carries the run's threshold and per-side cost, defaults `--trials` to the front size (the search trials only when a window is in sample; `--from-run` uses one trial for an out-of-sample book) and refuses a window that tests rows the run trained or selected on (`docs/walkforward.md`).
 `--front run.json --all-members` (#1176) also prices every front member alone, with its own carried threshold and band, into `members[]` (per-window and pooled metrics, cost ladder, entry timestamps and per-period series) without changing the selection; `--emit-series` writes the per-period gross, cost, exposure, entries, entry stamps and buy-and-hold net beside `pooled.period_net`, and `rcsr trials --members all` reads one series per member (`docs/walkforward.md`).
+`--book-target COL` (#1212) prices the book of a formula fitted on `--target` on another label of the `--target-spec` file, for example a weekly fit traded on a daily book: the book label's return column, horizon, stride and cost set the priced rows, the period grid and the annualisation, the purge of every window is the larger of the two labels' `entry_offset + horizon + delay` (a shorter gap exits 2 and names the label that binds), and the report's `book` block names the book label (`target`), the fit label (`fit_target`) and the `source`: `flag`, or `run` for a `--from-run` or `--front` run searched with `--book-target`, which needs no flag. The candidate id binds both labels; `--device-pnl` and `--batch-pnl` exit 2 with a book label.
 Pass `--batch-pnl` to score every candidate on every window in one batch (`src/wf_batch.rs`, kernel `src/cuda/wf_batch.cu`), per window and pooled, with the baseline ladder; finalist values stay exact CPU f64 and batch values are labelled `gpu_proxy`. Its timings are printed in a separate `batch_timings` object, outside `report_sha256`.
 `--policy top-tercile` holds the top `floor(n/3)` finite scores of each timestamp long and the rest flat (no threshold); it prices the book of a search run with `--position top_tercile` on an `xs_rank` target made by `rcsr panel rank` (`docs/time-series.md`).
 
@@ -864,8 +865,8 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
   `band_resolved`). The device holds at most 32 rows (`--gpu` exits 2 above that).
   On the GPU the device scores the regret natively, fused with the program interpreter
   (`search_fitness.scorer_backend` `cuda`); it equals the CPU book on the device's own `f32`
-  predictions bit for bit, and every reported value stays exact CPU `f64`. Resume needs the
-  same cost, threshold, band, band units, minimum hold and rows (an sd-unit checkpoint written
+  predictions bit for bit, and every reported value stays exact CPU `f64`. Resume needs every input of
+  the book hash (cost, cash, funding, threshold, band, hold, blocks, statistic, mask, split table, rows); the conflict message lists the flags and those given now (an sd-unit checkpoint written
   before the one-pass sd of #945 does not resume). `--pnl-blocks K` (1 to 64, default 1 = off) cuts the training
   timestamps into `K` blocks, scores each as its own long/flat book and ranks by a statistic of
   the block regrets, so a formula that earns in one regime only scores worse. `--pnl-stat`
