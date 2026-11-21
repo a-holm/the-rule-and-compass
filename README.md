@@ -212,6 +212,7 @@ A `.rcsb` walk-forward reads only the columns the run uses (the variables a cand
 `--threshold-fit fitness` fits the cut of every window on its validation slice (training rows without one) by one sort and one sweep of the block fitness (`--cut-min-entries`, default 30 distinct entry timestamps; `--cut-blocks`, default 4; `--cut-lambda`, default 1) and freezes it on the test block. `--threshold-fixed` or the `--from-run` threshold is the reference cut and the fallback. Each window reports a `cut` object with the source-row fitness, the reference cut, the plateau and a 32-cut profile; the trial count is unchanged and the cut rule is part of the sealed candidate (`docs/walkforward.md`).
 
 `rcsr panel spread` prints the market-neutral bucket spread of a feature (for example `clv1` against `lbl_h1_fwd`) in bp with a block-bootstrap interval, on a `--range` that must not reach the declared locked test (`docs/time-series.md`).
+`rcsr panel permute-labels --label NAME --block ROWS --seed N` writes the search-capacity null store: the label family `lbl_NAME_*` moves per symbol by one seeded circular-block order over the rows with a finite `y`, while time, symbol, `t1`, `weight` and every feature keep their bytes; its walk-forward reports carry `null_store`, and `rcsr trials --table` reads them only with `--null-wf` (`docs/panel.md`).
 `--policy band` adds a long-only no-trade band (`--band`, `--min-hold`) whose
 associative `Carry2`/`CooldownCarry` is chunk-invariant, and `--policy dp`
 adds the exact `O(2n)` hindsight DP as a labelled bound, never as the

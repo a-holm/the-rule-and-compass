@@ -338,7 +338,7 @@ fn gaussian(rng: &mut Mt) -> f64 {
     (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
 }
 
-fn mix_seed(parts: &[u64]) -> u32 {
+pub(crate) fn mix_seed(parts: &[u64]) -> u32 {
     let mut h = 0x9E37_79B9_7F4A_7C15u64;
     for p in parts {
         h ^= p.wrapping_add(0x9E37_79B9_7F4A_7C15).wrapping_add(h << 6).wrapping_add(h >> 2);
