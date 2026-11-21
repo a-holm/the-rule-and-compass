@@ -28,7 +28,11 @@ use crate::expr::{node, Node, Op};
 use crate::genome::{postfix_hash, Philox, OP_HALT};
 use crate::gpu;
 use crate::pareto::Sol;
+use crate::search::{MigrationPolicy, MIGRANT_TOURNAMENT};
 use std::collections::HashSet;
+
+/// #1029: the counter slot of the migrant draw, past every population slot.
+const MIGRATION_SLOT: u32 = u32::MAX;
 
 /// One parsed node inside a postfix program: its word span and arity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -249,19 +253,60 @@ impl Arena {
         Ok(())
     }
 
-    /// Ring migration: the best program of island `i` replaces the worst of
-    /// island `i+1`. Slot order and the source fitness are preserved, so the
-    /// next generation sees the same program the archive saw.
-    pub fn migrate(&mut self) {
-        if self.islands < 2 {
-            return;
-        }
-        let bests: Vec<usize> = (0..self.islands).map(|i| self.best(i)).collect();
+    /// Migration: for each `(from, to)`, the best program of island `from`
+    /// replaces the worst of island `to`. Every best and worst is chosen before
+    /// the first copy, so a move reads the arena as it was before migration.
+    /// Slot order and the source fitness are preserved, so the next generation
+    /// sees the same program the archive saw. The island policy (#1081) chooses
+    /// the moves.
+    pub fn migrate(&mut self, moves: &[(usize, usize)]) {
+        self.migrate_with(moves, MigrationPolicy::Ring, 0, 0);
+    }
+
+    /// Migration under `policy` (#1029) at generation `gen`: returns the
+    /// migrants copied and skipped. Under `ring-tournament` the migrant of a
+    /// move is the winner of `MIGRANT_TOURNAMENT` draws over island `from`,
+    /// drawn from the stream at `(seed, to, gen, MIGRATION_SLOT)`; a source
+    /// without a finite error sends nothing, and a destination that holds a
+    /// member with the migrant's error bits is skipped.
+    pub fn migrate_with(
+        &mut self,
+        moves: &[(usize, usize)],
+        policy: MigrationPolicy,
+        seed: u32,
+        gen: u32,
+    ) -> (usize, usize) {
         let worsts: Vec<usize> = (0..self.islands).map(|i| self.worst(i)).collect();
-        for i in 0..self.islands {
-            let src = bests[(i + 1) % self.islands];
-            self.copy_slot(worsts[i], src);
+        let picks: Vec<Option<(usize, bool)>> = moves
+            .iter()
+            .map(|&(from, to)| match policy {
+                MigrationPolicy::Ring => Some((self.best(from), false)),
+                MigrationPolicy::RingTournament => {
+                    let base = from * self.pop;
+                    if !(base..base + self.pop).any(|i| self.err[i].is_finite()) {
+                        return None;
+                    }
+                    let mut rng = Philox::at(seed, to as u32, gen, MIGRATION_SLOT);
+                    let winner = self.tournament(from, &mut rng, MIGRANT_TOURNAMENT);
+                    let bits = self.err[winner].to_bits();
+                    let dest = to * self.pop;
+                    let held = self.err[winner].is_finite() && (dest..dest + self.pop).any(|i| self.err[i].to_bits() == bits);
+                    Some((winner, held))
+                }
+            })
+            .collect();
+        let (mut sent, mut skipped) = (0, 0);
+        for (&(_, to), pick) in moves.iter().zip(&picks) {
+            match *pick {
+                None => {}
+                Some((_, true)) => skipped += 1,
+                Some((src, false)) => {
+                    self.copy_slot(worsts[to], src);
+                    sent += 1;
+                }
+            }
         }
+        (sent, skipped)
     }
 }
 
@@ -509,20 +554,40 @@ impl Variation {
     /// the next attempt at that slot is used, and parent order is fixed, so
     /// the result never depends on thread or island scheduling.
     pub fn next_generation(&self, parents: &Arena, gen: u32, restart: &[bool]) -> Arena {
-        self.next_generation_with_front(parents, gen, restart, &FrontParents::empty(), 0.0)
+        self.next_generation_with_front(
+            parents,
+            gen,
+            restart,
+            &FrontParents::empty(),
+            &vec![0.0; parents.islands],
+        )
     }
 
     /// Generate the next generation with the archive-guided parent draw
     /// (#76 parity). `front_p` is the fraction of parent draws taken uniformly
-    /// from `front`; the search passes 0.15 when `--front-parents` is on and
-    /// 0.0 (with an empty pool and no RNG advance) when it is off.
+    /// from `front`, one value per island; the search passes 0.15 when
+    /// `--front-parents` is on and 0.0 (with an empty pool and no RNG advance)
+    /// when it is off or the island is isolated after a restart (#1022).
     pub fn next_generation_with_front(
         &self,
         parents: &Arena,
         gen: u32,
         restart: &[bool],
         front: &FrontParents,
-        front_p: f64,
+        front_p: &[f64],
+    ) -> Arena {
+        self.next_generation_with_fronts(parents, gen, restart, &vec![front; parents.islands], front_p)
+    }
+
+    /// #1070: [`Variation::next_generation_with_front`] with one front per
+    /// island: island `i` draws its front parents from `fronts[i]`.
+    pub fn next_generation_with_fronts(
+        &self,
+        parents: &Arena,
+        gen: u32,
+        restart: &[bool],
+        fronts: &[&FrontParents],
+        front_p: &[f64],
     ) -> Arena {
         let mut attempts = 0usize;
         let mut scratch = Scratch::new(self.width);
@@ -555,8 +620,8 @@ impl Variation {
                     gen,
                     &mut attempts,
                     &mut scratch,
-                    front,
-                    front_p,
+                    fronts[i],
+                    front_p.get(i).copied().unwrap_or(0.0),
                 );
             }
         }
@@ -1150,15 +1215,15 @@ mod tests {
             64,
             30,
         );
-        let a = v.next_generation_with_front(&parents, 5, &[false; 2], &front, 0.15);
-        let b = v.next_generation_with_front(&parents, 5, &[false; 2], &front, 0.15);
+        let a = v.next_generation_with_front(&parents, 5, &[false; 2], &front, &[0.15; 2]);
+        let b = v.next_generation_with_front(&parents, 5, &[false; 2], &front, &[0.15; 2]);
         assert_eq!(a.words, b.words);
         assert_eq!(a.hash, b.hash);
 
         // `--no-front-parents` must be bit-identical to the pre-#76 path.
         let off = v.next_generation(&parents, 5, &[false; 2]);
         let off_explicit =
-            v.next_generation_with_front(&parents, 5, &[false; 2], &FrontParents::empty(), 0.0);
+            v.next_generation_with_front(&parents, 5, &[false; 2], &FrontParents::empty(), &[0.0; 2]);
         assert_eq!(off.words, off_explicit.words);
         assert_eq!(off.hash, off_explicit.hash);
         assert_ne!(a.words, off.words, "the feedback must change some children");
@@ -1194,16 +1259,145 @@ mod tests {
         assert_eq!(unique_slots(&a), vec![0, 2]);
     }
 
+    fn tagged_arena(errors: &[f64], pop: usize) -> Arena {
+        let mut a = Arena::new(errors.len() / pop, pop, 8);
+        for (i, &e) in errors.iter().enumerate() {
+            a.set_slot(i, &[crate::gpu::OP_VAR, i as u32, OP_HALT]);
+            a.err[i] = e;
+        }
+        a
+    }
+
     #[test]
-    fn migration_moves_the_best_into_the_next_island() {
+    fn ring_tournament_draws_the_flat_migrant_from_the_destination_stream() {
+        let errors: Vec<f64> = (0..24).map(|i| 1.0 + i as f64).collect();
+        let before = tagged_arena(&errors, 8);
+        let draw = |g: u32| before.tournament(1, &mut Philox::at(9, 0, g, MIGRATION_SLOT), MIGRANT_TOURNAMENT);
+        let gen = (0..200).find(|&g| draw(g) != before.best(1)).expect("a generation whose winner is not the best");
+        let mut a = tagged_arena(&errors, 8);
+        let got = a.migrate_with(&[(1, 0)], MigrationPolicy::RingTournament, 9, gen);
+        assert_eq!(got, (1, 0));
+        let mut rng = Philox::at(9, 0, gen, MIGRATION_SLOT);
+        let winner = before.tournament(1, &mut rng, MIGRANT_TOURNAMENT);
+        assert_eq!(a.slot(7), before.slot(winner), "the migrant replaces the worst of island 0");
+        assert_eq!(a.err[7], before.err[winner]);
+        assert!((8..24).all(|i| a.slot(i) == before.slot(i)), "no other island changes");
+        let mut again = tagged_arena(&errors, 8);
+        again.migrate_with(&[(1, 0)], MigrationPolicy::RingTournament, 9, gen);
+        assert_eq!(again.words, a.words, "a pure function of the position");
+    }
+
+    #[test]
+    fn a_flat_migrant_whose_error_the_destination_holds_is_skipped() {
+        let mut errors: Vec<f64> = (0..16).map(|i| if i < 8 { 100.0 + i as f64 } else { 5.0 }).collect();
+        errors[3] = 5.0;
+        let before = tagged_arena(&errors, 8);
+        let mut a = tagged_arena(&errors, 8);
+        assert_eq!(a.migrate_with(&[(1, 0)], MigrationPolicy::RingTournament, 1, 0), (0, 1));
+        assert_eq!(a.words, before.words, "the destination is unchanged");
+        errors[3] = 99.0;
+        let mut free = tagged_arena(&errors, 8);
+        assert_eq!(free.migrate_with(&[(1, 0)], MigrationPolicy::RingTournament, 1, 0), (1, 0));
+    }
+
+    #[test]
+    fn a_flat_source_without_a_finite_error_sends_nothing() {
+        let errors: Vec<f64> = (0..16).map(|i| if i < 8 { 1.0 + i as f64 } else { f64::INFINITY }).collect();
+        let before = tagged_arena(&errors, 8);
+        let mut a = tagged_arena(&errors, 8);
+        assert_eq!(a.migrate_with(&[(1, 0)], MigrationPolicy::RingTournament, 1, 0), (0, 0));
+        assert_eq!(a.words, before.words);
+    }
+
+    #[test]
+    fn migration_moves_the_best_of_the_source_over_the_worst_of_the_destination() {
         let mut a = Arena::new(2, 3, 8);
         for i in 0..6 {
             a.set_slot(i, &[crate::gpu::OP_VAR, i as u32, OP_HALT]);
             a.err[i] = i as f64;
         }
+        let before: Vec<Vec<u32>> = (0..6).map(|i| a.slot(i).to_vec()).collect();
         // Best of island 0 is slot 0; worst of island 1 is slot 5.
-        a.migrate();
+        a.migrate(&[(0, 1)]);
         assert_eq!(a.slot(5), a.slot(0));
         assert_eq!(a.err[5], 0.0);
+        assert!((0..3).all(|i| a.slot(i) == &before[i][..]), "the source island is unchanged");
+    }
+
+    #[test]
+    fn migration_reads_every_source_before_the_first_copy() {
+        let mut a = Arena::new(3, 2, 8);
+        for (i, e) in [5.0, 6.0, 3.0, 4.0, 0.0, 1.0].into_iter().enumerate() {
+            a.set_slot(i, &[crate::gpu::OP_VAR, i as u32, OP_HALT]);
+            a.err[i] = e;
+        }
+        let before: Vec<Vec<u32>> = (0..6).map(|i| a.slot(i).to_vec()).collect();
+        // The first move puts island 2's best (slot 4) over island 1's worst
+        // (slot 3); the second still sends island 1's best before migration
+        // (slot 2), not the migrant.
+        a.migrate(&[(2, 1), (1, 0)]);
+        assert_eq!(a.slot(3), &before[4][..]);
+        assert_eq!(a.slot(1), &before[2][..]);
+        assert_eq!(a.err[1], 3.0);
+        assert_eq!(a.slot(5), &before[5][..], "island 2 receives nothing");
+    }
+
+    #[test]
+    fn an_isolated_island_draws_no_front_parent_in_the_flat_path() {
+        let v = Variation::new(64, 2, 30, 1, &Op::default_set(), 3, true).unwrap();
+        let mut parents = Arena::new(2, 24, 64);
+        let mut rng = Philox::at(9, 0, 0, 0);
+        for i in 0..parents.islands * parents.pop {
+            let mut p = v.random_program(&mut rng, 3);
+            while spans(&p).is_none() {
+                p = v.random_program(&mut rng, 3);
+            }
+            parents.set_slot(i, &p);
+            parents.err[i] = ((i * 37) % 101) as f64 / 101.0;
+        }
+        let front = FrontParents::from_front(
+            &[solution(node(Op::Add, vec![input(0), constant(7.0)]), 0.25, 3.0)],
+            64,
+            30,
+        );
+        let off = v.next_generation_with_front(&parents, 5, &[false; 2], &front, &[0.0; 2]);
+        let mixed = v.next_generation_with_front(&parents, 5, &[false; 2], &front, &[0.0, 0.5]);
+        let island0 = |a: &Arena| (0..24).map(|j| a.slot(a.slot_index(0, j)).to_vec()).collect::<Vec<_>>();
+        let island1 = |a: &Arena| (0..24).map(|j| a.slot(a.slot_index(1, j)).to_vec()).collect::<Vec<_>>();
+        assert_eq!(island0(&mixed), island0(&off), "the isolated island is the off path");
+        assert_ne!(island1(&mixed), island1(&off), "the open island takes front parents");
+    }
+
+    #[test]
+    fn per_island_fronts_reproduce_the_shared_front_and_stay_local() {
+        let v = Variation::new(64, 2, 30, 1, &Op::default_set(), 3, true).unwrap();
+        let mut parents = Arena::new(2, 24, 64);
+        let mut rng = Philox::at(9, 0, 0, 0);
+        for i in 0..parents.islands * parents.pop {
+            let mut p = v.random_program(&mut rng, 3);
+            while spans(&p).is_none() {
+                p = v.random_program(&mut rng, 3);
+            }
+            parents.set_slot(i, &p);
+            parents.err[i] = ((i * 37) % 101) as f64 / 101.0;
+        }
+        let front = FrontParents::from_front(
+            &[solution(node(Op::Add, vec![input(0), constant(7.0)]), 0.25, 3.0)],
+            64,
+            30,
+        );
+        let other = FrontParents::from_front(
+            &[solution(node(Op::Mul, vec![input(1), constant(3.0)]), 0.3, 3.0)],
+            64,
+            30,
+        );
+        let shared = v.next_generation_with_front(&parents, 5, &[false; 2], &front, &[0.5; 2]);
+        let same = v.next_generation_with_fronts(&parents, 5, &[false; 2], &[&front, &front], &[0.5; 2]);
+        assert_eq!(shared.words, same.words, "one front per island equals the shared front");
+        assert_eq!(shared.hash, same.hash);
+        let split = v.next_generation_with_fronts(&parents, 5, &[false; 2], &[&front, &other], &[0.5; 2]);
+        let island = |a: &Arena, i: usize| (0..24).map(|j| a.slot(a.slot_index(i, j)).to_vec()).collect::<Vec<_>>();
+        assert_eq!(island(&split, 0), island(&shared, 0), "island 0 keeps its own front");
+        assert_ne!(island(&split, 1), island(&shared, 1), "island 1 draws from its own front");
     }
 }

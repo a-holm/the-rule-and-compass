@@ -416,6 +416,53 @@ pub fn compute(base: &[Bar], bar_seconds: i64, requested: &[String]) -> Result<B
     Ok(out)
 }
 
+
+/// Days of the average and of the high window of the equal-weight index gates (#1270).
+pub const GATE_MA_DAYS: usize = 100;
+pub const GATE_HIGH_DAYS: usize = 90;
+
+/// Lookback rule `rcsr-lookback/1` of a gate column on a daily series, in
+/// seconds. The index needs one return day before its first level, and a
+/// base row reads the closed day before its own.
+pub fn gate_lookback_seconds(name: &str) -> Option<i64> {
+    match name {
+        "btc_trend_ma100_ratio" => lookback_seconds("trend_ma100_ratio"),
+        "mkt_trend_ma100_ratio" => Some((GATE_MA_DAYS as i64 + 2) * DAY),
+        "mkt_trend_hi90_dist" => Some((GATE_HIGH_DAYS as i64 + 2) * DAY),
+        _ => None,
+    }
+}
+
+/// `I/SMA100(I) - 1` and `I/max(I over 90 days) - 1` of a calendar-complete
+/// daily index `idx` (one entry per UTC day, `NaN` for a day without a level).
+/// A window holding a `NaN` is `NaN`, as in [`daily_leaves`].
+pub fn index_gate_leaves(idx: &[f64]) -> (Vec<f64>, Vec<f64>) {
+    let n = idx.len();
+    let times: Vec<i64> = (0..n as i64).map(|d| d * DAY).collect();
+    let ws = WinStats::new(idx, &times, DAY);
+    let mut ratio = vec![f64::NAN; n];
+    let mut high = vec![f64::NAN; n];
+    for j in 0..n {
+        if !idx[j].is_finite() {
+            continue;
+        }
+        if j + 1 >= GATE_MA_DAYS {
+            if let Some(m) = ws.mean_strict(j, GATE_MA_DAYS) {
+                if m > 0.0 {
+                    ratio[j] = idx[j] / m - 1.0;
+                }
+            }
+        }
+        if j + 1 >= GATE_HIGH_DAYS && idx[j + 1 - GATE_HIGH_DAYS..=j].iter().all(|v| v.is_finite()) {
+            let mx = idx[j + 1 - GATE_HIGH_DAYS..=j].iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            if mx > 0.0 {
+                high[j] = idx[j] / mx - 1.0;
+            }
+        }
+    }
+    (ratio, high)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

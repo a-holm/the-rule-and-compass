@@ -1005,7 +1005,7 @@ __global__ void k_rank_scatter(const unsigned long long *__restrict__ keys,
                                const int *__restrict__ off,
                                const unsigned int *__restrict__ counts,
                                const unsigned int *__restrict__ gid,
-                               int n, double *__restrict__ out)
+                               int n, int min_members, double *__restrict__ out)
 {
     int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= n) return;
@@ -1013,7 +1013,7 @@ __global__ void k_rank_scatter(const unsigned long long *__restrict__ keys,
     unsigned int finite = counts[g];
     unsigned int pos = (unsigned int)p - (unsigned int)off[g];
     double v = NAN;
-    if (pos < finite && finite >= 20 &&
+    if (pos < finite && finite >= (unsigned int)min_members &&
         keys[p] != RC_RANK_INVALID) {
         v = 2.0 * (double)pos / (double)(finite - 1) - 1.0;
     }
@@ -2065,10 +2065,10 @@ int rc_enrich_xs_prepare(void *v, const unsigned int *sym_key,
 /* Rank one source column across the cached permutation. The stable segmented
    sort uses (value, symbol, row) via the cached order, and only finite PIT
    members enter the count; every other row is NaN. */
-int rc_enrich_xs_rank(void *v, const double *src, double *out)
+int rc_enrich_xs_rank(void *v, const double *src, int min_members, double *out)
 {
     RcEnrich *c = (RcEnrich *)v;
-    if (!c) return -1;
+    if (!c || min_members < 5 || min_members > 200) return -1;
     stats_begin(c);
     if (c->xs_ready && (RC_LAUNCH_FAULT(RC_FAULT_XS_RANK) || !c->d_xs_src || !c->d_xs_order ||
                         !c->d_xs_member || !c->d_xs_keys || !c->d_xs_keys_out ||
@@ -2117,7 +2117,7 @@ int rc_enrich_xs_rank(void *v, const double *src, double *out)
                                          c->xs_groups, c->d_xs_counts);
     rc_launch("k_rank_scatter", k_rank_scatter, blocks, threads, 0, 0, c->d_xs_keys_out, c->d_xs_rows_out,
                                         c->d_xs_off, c->d_xs_counts,
-                                        c->d_xs_gid, c->n, c->d_xs_src);
+                                        c->d_xs_gid, c->n, min_members, c->d_xs_src);
     cudaEventRecord(ev1, 0);
     cudaEventSynchronize(ev1);
     float ms = 0.0f;

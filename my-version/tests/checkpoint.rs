@@ -811,6 +811,375 @@ fn help_and_schema_document_checkpoints() {
     }
 }
 
+fn island_config(seed: u32, generations: usize) -> Config {
+    Config {
+        generations,
+        islands: 3,
+        pop: 24,
+        max_complexity: 10,
+        fit_iters: 2,
+        migration_interval: 3,
+        restart_interval: 4,
+        restart_policy: search::RestartPolicy::Island,
+        restart_isolation: 7,
+        patience: 0,
+        seed,
+        ..Default::default()
+    }
+}
+
+/// The exit checkpoint text and the restart count of one run.
+fn island_run(
+    cfg: &Config,
+    resume: Option<Checkpoint>,
+    train: &Sample,
+    test: &Sample,
+) -> (Outcome, String, u64) {
+    let restarts = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let sink = restarts.clone();
+    let cfg = Config {
+        dev_log: Some(std::sync::Arc::new(move |r: &rcsr::devlog::GenRecord| {
+            sink.store(r.restarts_total, std::sync::atomic::Ordering::SeqCst);
+        })),
+        ..cfg.clone()
+    };
+    let mut text: Option<String> = None;
+    let out = search::run_resumable(&cfg, train, test, resume, 0, |cp| text = Some(cp.to_text()))
+        .expect("island run");
+    (out, text.expect("exit checkpoint"), restarts.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+#[test]
+fn an_island_policy_run_and_its_resume_match_exactly() {
+    let train = sample(240);
+    let test = sample(80);
+    let (uninterrupted, full_text, restarts) = island_run(&island_config(11, 40), None, &train, &test);
+    assert!(restarts > 0, "the fixture restarts an island, else the resume proves nothing");
+    assert!(full_text.contains("config restart_policy island\n"));
+    assert!(full_text.contains("config restart_isolation 7\n"));
+    assert_eq!(full_text.matches("\nisland_stall ").count(), 3, "one record per island");
+
+    let (_, saved_text, _) = island_run(&island_config(11, 20), None, &train, &test);
+    let saved = Checkpoint::from_text(&saved_text).expect("parse saved checkpoint");
+    let (resumed, resumed_text, _) =
+        island_run(&island_config(11, 40), Some(saved), &train, &test);
+
+    assert_eq!(describe(&uninterrupted), describe(&resumed), "the archive");
+    assert_eq!(
+        full_text, resumed_text,
+        "archive, populations, rng state and island_stall counters of the exit checkpoint"
+    );
+}
+
+#[test]
+fn an_archive_policy_checkpoint_keeps_its_bytes() {
+    let text = checkpoint_text(&config(3), &sample(60), &sample(20));
+    assert!(!text.contains("island_stall"));
+    assert!(!text.contains("restart_policy"));
+    assert!(!text.contains("restart_isolation"));
+}
+
+#[test]
+fn an_island_checkpoint_resumes_only_under_its_own_policy() {
+    let train = sample(100);
+    let test = sample(30);
+    let (_, text, _) = island_run(&island_config(5, 8), None, &train, &test);
+
+    let archive_cfg = Config { restart_policy: search::RestartPolicy::Archive, ..island_config(5, 8) };
+    let saved = Checkpoint::from_text(&text).expect("parse");
+    let err = expect_err(
+        search::run_resumable(&archive_cfg, &train, &test, Some(saved), 0, |_| {}),
+        "resume under archive",
+    );
+    assert!(err.contains("restart_policy"), "{err}");
+
+    let isolation_cfg = Config { restart_isolation: 9, ..island_config(5, 8) };
+    let saved = Checkpoint::from_text(&text).expect("parse");
+    let err = expect_err(
+        search::run_resumable(&isolation_cfg, &train, &test, Some(saved), 0, |_| {}),
+        "resume under another isolation",
+    );
+    assert!(err.contains("restart_isolation"), "{err}");
+
+    let stripped: String = text
+        .lines()
+        .filter(|l| !l.starts_with("island_stall "))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let err = expect_err(Checkpoint::from_text(&stripped), "island checkpoint without records");
+    assert!(err.contains("island_stall"), "{err}");
+}
+
+#[test]
+fn cli_resume_of_an_island_checkpoint_exits_2_naming_restart_policy() {
+    let csv = TempPath::new("island.csv");
+    std::fs::write(&csv.0, line_csv(40)).expect("write csv");
+    let checkpoint = TempPath::new("island.rcsr");
+    let base = ["--data", csv.as_str(), "--target", "y", "--vars", "x", "--seed", "2", "--pop", "25"];
+
+    let mut made_args = base.to_vec();
+    made_args.extend(["--generations", "5", "--restart-policy", "island", "--restart-isolation", "7", "--save", checkpoint.as_str()]);
+    let made = rcsr(&made_args);
+    assert!(made.status.success(), "save run failed: {:?}", made);
+    let saved = std::fs::read_to_string(&checkpoint.0).expect("read checkpoint");
+    assert!(saved.contains("config restart_policy island\n") && saved.contains("island_stall 0 "));
+
+    let mut conflict_args = base.to_vec();
+    conflict_args.extend(["--resume", checkpoint.as_str(), "--restart-policy", "archive"]);
+    let conflict = rcsr(&conflict_args);
+    assert_eq!(conflict.status.code(), Some(2), "a contradictory policy is a usage error");
+    let err = String::from_utf8_lossy(&conflict.stderr);
+    assert!(err.contains("restart_policy"), "the error must name restart_policy: {}", err);
+
+    let mut isolation_args = base.to_vec();
+    isolation_args.extend(["--resume", checkpoint.as_str(), "--restart-isolation", "9"]);
+    let isolation = rcsr(&isolation_args);
+    assert_eq!(isolation.status.code(), Some(2), "a contradictory isolation is a usage error");
+    assert!(String::from_utf8_lossy(&isolation.stderr).contains("restart_isolation"));
+
+    let mut resume_args = base.to_vec();
+    resume_args.extend(["--resume", checkpoint.as_str()]);
+    let resumed = rcsr(&resume_args);
+    assert!(resumed.status.success(), "a resume that omits the flags keeps the saved policy: {:?}", resumed);
+}
+
+/// #1100: the explore tier is a saved search setting, and it needs an exploit
+/// island.
+#[test]
+fn cli_resume_of_an_explore_checkpoint_exits_2_naming_explore_islands() {
+    let csv = TempPath::new("explore.csv");
+    std::fs::write(&csv.0, line_csv(40)).expect("write csv");
+    let checkpoint = TempPath::new("explore.rcsr");
+    let base = ["--data", csv.as_str(), "--target", "y", "--vars", "x", "--seed", "2", "--pop", "25", "--islands", "4"];
+
+    let mut too_many = base.to_vec();
+    too_many.extend(["--generations", "2", "--explore-islands", "4"]);
+    let refused = rcsr(&too_many);
+    assert_eq!(refused.status.code(), Some(2), "no exploit island is a usage error");
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("--explore-islands"), "{:?}", refused);
+
+    let mut made_args = base.to_vec();
+    made_args.extend(["--generations", "5", "--explore-islands", "2", "--save", checkpoint.as_str()]);
+    let made = rcsr(&made_args);
+    assert!(made.status.success(), "save run failed: {:?}", made);
+    let saved = std::fs::read_to_string(&checkpoint.0).expect("read checkpoint");
+    assert!(saved.contains("config explore_islands 2\n"), "{saved}");
+
+    let mut conflict_args = base.to_vec();
+    conflict_args.extend(["--resume", checkpoint.as_str(), "--explore-islands", "1"]);
+    let conflict = rcsr(&conflict_args);
+    assert_eq!(conflict.status.code(), Some(2), "a different tier is a usage error");
+    let err = String::from_utf8_lossy(&conflict.stderr);
+    assert!(err.contains("explore_islands"), "the error must name explore_islands: {}", err);
+
+    let mut resume_args = base.to_vec();
+    resume_args.extend(["--resume", checkpoint.as_str(), "--generations", "8"]);
+    let resumed = rcsr(&resume_args);
+    assert!(resumed.status.success(), "a resume that omits the flag keeps the saved tier: {:?}", resumed);
+}
+
+/// #1109: the restart interval is a saved search setting set from the command
+/// line.
+#[test]
+fn cli_resume_refuses_a_different_restart_interval() {
+    let csv = TempPath::new("interval.csv");
+    std::fs::write(&csv.0, line_csv(40)).expect("write csv");
+    let checkpoint = TempPath::new("interval.rcsr");
+    let resaved = TempPath::new("interval-resaved.rcsr");
+    let base = ["--data", csv.as_str(), "--target", "y", "--vars", "x", "--seed", "2", "--pop", "25", "--islands", "4"];
+
+    let mut made_args = base.to_vec();
+    made_args.extend(["--generations", "5", "--restart-interval", "30", "--save", checkpoint.as_str()]);
+    let made = rcsr(&made_args);
+    assert!(made.status.success(), "save run failed: {:?}", made);
+    let saved = std::fs::read_to_string(&checkpoint.0).expect("read checkpoint");
+    assert!(saved.contains("config restart_interval 30\n"), "{saved}");
+
+    let mut conflict_args = base.to_vec();
+    conflict_args.extend(["--resume", checkpoint.as_str(), "--restart-interval", "60"]);
+    let conflict = rcsr(&conflict_args);
+    assert_eq!(conflict.status.code(), Some(2), "a different interval is a usage error");
+    let err = String::from_utf8_lossy(&conflict.stderr);
+    assert!(err.contains("--restart-interval 60 (saved restart_interval is 30)"), "{err}");
+
+    let mut same_args = base.to_vec();
+    same_args.extend(["--resume", checkpoint.as_str(), "--restart-interval", "30", "--generations", "6"]);
+    let same = rcsr(&same_args);
+    assert!(same.status.success(), "the saved value is no conflict: {:?}", same);
+
+    let mut resume_args = base.to_vec();
+    resume_args.extend(["--resume", checkpoint.as_str(), "--generations", "8", "--save", resaved.as_str()]);
+    let resumed = rcsr(&resume_args);
+    assert!(resumed.status.success(), "a resume that omits the flag keeps the saved interval: {:?}", resumed);
+    let again = std::fs::read_to_string(&resaved.0).expect("read resaved checkpoint");
+    assert!(again.contains("config restart_interval 30\n"), "{again}");
+}
+
+/// #1116: the migration interval is a saved search setting set from the command
+/// line.
+#[test]
+fn cli_resume_refuses_a_different_migration_interval() {
+    let csv = TempPath::new("migration-interval.csv");
+    std::fs::write(&csv.0, line_csv(40)).expect("write csv");
+    let checkpoint = TempPath::new("migration-interval.rcsr");
+    let resaved = TempPath::new("migration-interval-resaved.rcsr");
+    let base = ["--data", csv.as_str(), "--target", "y", "--vars", "x", "--seed", "2", "--pop", "25", "--islands", "4"];
+
+    let mut made_args = base.to_vec();
+    made_args.extend(["--generations", "5", "--migration-interval", "5", "--save", checkpoint.as_str()]);
+    let made = rcsr(&made_args);
+    assert!(made.status.success(), "save run failed: {:?}", made);
+    let saved = std::fs::read_to_string(&checkpoint.0).expect("read checkpoint");
+    assert!(saved.contains("config migration_interval 5\n"), "{saved}");
+
+    let mut conflict_args = base.to_vec();
+    conflict_args.extend(["--resume", checkpoint.as_str(), "--migration-interval", "25"]);
+    let conflict = rcsr(&conflict_args);
+    assert_eq!(conflict.status.code(), Some(2), "a different interval is a usage error");
+    let err = String::from_utf8_lossy(&conflict.stderr);
+    assert!(err.contains("--migration-interval 25 (saved migration_interval is 5)"), "{err}");
+
+    let mut same_args = base.to_vec();
+    same_args.extend(["--resume", checkpoint.as_str(), "--migration-interval", "5", "--generations", "6"]);
+    let same = rcsr(&same_args);
+    assert!(same.status.success(), "the saved value is no conflict: {:?}", same);
+
+    let mut resume_args = base.to_vec();
+    resume_args.extend(["--resume", checkpoint.as_str(), "--generations", "8", "--save", resaved.as_str()]);
+    let resumed = rcsr(&resume_args);
+    assert!(resumed.status.success(), "a resume that omits the flag keeps the saved interval: {:?}", resumed);
+    let again = std::fs::read_to_string(&resaved.0).expect("read resaved checkpoint");
+    assert!(again.contains("config migration_interval 5\n"), "{again}");
+}
+
+/// #1070: the front scope is a saved search setting, and it refuses the shared
+/// QD archive.
+#[test]
+fn cli_resume_of_an_island_front_checkpoint_exits_2_naming_front_scope() {
+    let csv = TempPath::new("front.csv");
+    std::fs::write(&csv.0, line_csv(40)).expect("write csv");
+    let checkpoint = TempPath::new("front.rcsr");
+    let base = ["--data", csv.as_str(), "--target", "y", "--vars", "x", "--seed", "2", "--pop", "25", "--islands", "3"];
+
+    let mut qd = base.to_vec();
+    qd.extend(["--generations", "2", "--front-scope", "island", "--qd-policy"]);
+    let refused = rcsr(&qd);
+    assert_eq!(refused.status.code(), Some(2), "island fronts with the shared QD archive is a usage error");
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("QD archive"), "{:?}", refused);
+
+    let mut made_args = base.to_vec();
+    made_args.extend(["--generations", "5", "--front-scope", "island", "--save", checkpoint.as_str()]);
+    let made = rcsr(&made_args);
+    assert!(made.status.success(), "save run failed: {:?}", made);
+    let saved = std::fs::read_to_string(&checkpoint.0).expect("read checkpoint");
+    assert!(saved.contains("config front_scope island\n") && saved.contains("\nisland_front 0 "), "{saved}");
+
+    let mut conflict_args = base.to_vec();
+    conflict_args.extend(["--resume", checkpoint.as_str(), "--front-scope", "global"]);
+    let conflict = rcsr(&conflict_args);
+    assert_eq!(conflict.status.code(), Some(2), "a different front scope is a usage error");
+    let err = String::from_utf8_lossy(&conflict.stderr);
+    assert!(err.contains("front_scope"), "the error must name front_scope: {}", err);
+
+    let mut resume_args = base.to_vec();
+    resume_args.extend(["--resume", checkpoint.as_str(), "--generations", "8"]);
+    let resumed = rcsr(&resume_args);
+    assert!(resumed.status.success(), "a resume that omits the flag keeps the saved scope: {:?}", resumed);
+}
+
+/// #1029: the migration policy is a saved search setting.
+#[test]
+fn cli_resume_of_a_ring_tournament_checkpoint_exits_2_naming_migration_policy() {
+    let csv = TempPath::new("migrant.csv");
+    std::fs::write(&csv.0, line_csv(40)).expect("write csv");
+    let checkpoint = TempPath::new("migrant.rcsr");
+    let base = ["--data", csv.as_str(), "--target", "y", "--vars", "x", "--seed", "2", "--pop", "25", "--islands", "3"];
+
+    let mut bad = base.to_vec();
+    bad.extend(["--generations", "2", "--migration-policy", "tournament"]);
+    let refused = rcsr(&bad);
+    assert_eq!(refused.status.code(), Some(2), "an unknown policy is a usage error: {:?}", refused);
+
+    let mut made_args = base.to_vec();
+    made_args.extend(["--generations", "30", "--migration-policy", "ring-tournament", "--save", checkpoint.as_str()]);
+    let made = rcsr(&made_args);
+    assert!(made.status.success(), "save run failed: {:?}", made);
+    let saved = std::fs::read_to_string(&checkpoint.0).expect("read checkpoint");
+    assert!(saved.contains("config migration_policy ring-tournament\n"), "{saved}");
+
+    let mut conflict_args = base.to_vec();
+    conflict_args.extend(["--resume", checkpoint.as_str(), "--migration-policy", "ring"]);
+    let conflict = rcsr(&conflict_args);
+    assert_eq!(conflict.status.code(), Some(2), "a different migration policy is a usage error");
+    let err = String::from_utf8_lossy(&conflict.stderr);
+    assert!(err.contains("migration_policy"), "the error must name migration_policy: {}", err);
+
+    let mut resume_args = base.to_vec();
+    resume_args.extend(["--resume", checkpoint.as_str(), "--generations", "35"]);
+    let resumed = rcsr(&resume_args);
+    assert!(resumed.status.success(), "a resume that omits the flag keeps the saved policy: {:?}", resumed);
+}
+
+/// #1090: an `rcsr` run with the `island_panic` test fault (every island thread
+/// panics at the start of its generation). The fault hook exists in a `cuda`
+/// build only; the run itself stays on the CPU.
+#[cfg(feature = "cuda")]
+fn panicking_rcsr(args: &[&str]) -> Output {
+    rcsr_cmd::rcsr()
+        .args(args)
+        .env("RCSR_FAULT", "island_panic")
+        .output()
+        .expect("run rcsr")
+}
+
+/// #1090: a panic in an island thread fails the run with the search-error exit
+/// code, names every island that panicked, and writes no checkpoint for that
+/// generation: the last good checkpoint stays on disk.
+#[cfg(feature = "cuda")]
+#[test]
+fn an_island_panic_exits_non_zero_and_keeps_the_last_good_checkpoint() {
+    let csv = TempPath::new("panic.csv");
+    // No short formula fits these rows, so the run cannot stop early as solved.
+    let rows: String = (0..60)
+        .map(|i| {
+            let x = -2.0 + 4.0 * i as f64 / 59.0;
+            format!("{x:.6},{:.6}\n", (3.0 * x).sin() + 0.1 * ((i * 7919) % 13) as f64)
+        })
+        .collect();
+    std::fs::write(&csv.0, format!("x,y\n{rows}")).expect("write csv");
+    for (islands, named) in [("1", vec![0usize]), ("3", vec![0, 1, 2])] {
+        let checkpoint = TempPath::new(&format!("panic-{islands}.rcsr"));
+        let base = [
+            "--data", csv.as_str(), "--target", "y", "--vars", "x", "--seed", "2", "--pop", "20", "--islands", islands,
+            "--cpu", "--save", checkpoint.as_str(), "--save-every", "1",
+        ];
+        let mut first = base.to_vec();
+        first.extend(["--generations", "3"]);
+        let made = rcsr(&first);
+        assert!(made.status.success(), "save run failed: {:?}", made);
+        let good = std::fs::read_to_string(&checkpoint.0).expect("read checkpoint");
+        assert_eq!(Checkpoint::from_text(&good).expect("parse").generations, 3);
+
+        let mut resumed = base.to_vec();
+        resumed.extend(["--generations", "6", "--resume", checkpoint.as_str()]);
+        let failed = panicking_rcsr(&resumed);
+        let err = String::from_utf8_lossy(&failed.stderr);
+        assert_eq!(failed.status.code(), Some(3), "a search error exits 3: {err}");
+        for i in &named {
+            assert!(
+                err.contains(&format!("island {i} panicked in generation 3: injected island panic")),
+                "islands {islands}: the error names island {i}: {err}"
+            );
+        }
+        assert!(!err.contains(&format!("island {islands} panicked")), "only real islands are named: {err}");
+        assert_eq!(
+            std::fs::read_to_string(&checkpoint.0).expect("read checkpoint"),
+            good,
+            "islands {islands}: the failing generation wrote no checkpoint"
+        );
+    }
+}
+
 #[test]
 fn cli_resume_errors_use_the_documented_exit_codes() {
     let csv = TempPath::new("cli.csv");
@@ -986,6 +1355,84 @@ fn a_long_pnl_run_resumes_with_the_same_book_and_refuses_another() {
     let saved = Checkpoint::from_text(&text).expect("parse");
     let err = expect_err(search::run_resumable(&other, &train, &test, Some(saved), 0, |_| {}), "other cost");
     assert!(err.contains("fitness"), "{err}");
+}
+
+/// #1023: a saved-then-resumed `--selection lexicase` run equals the
+/// uninterrupted run: the metric cases are drawn from the seed and the
+/// generation, and a member's case errors are recomputed from its saved tree.
+#[test]
+fn a_lexicase_run_and_its_resume_match_exactly() {
+    let train = sample(240);
+    let test = sample(80);
+    let lex = |generations| Config {
+        generations,
+        selection: search::Selection::Lexicase,
+        lexicase_cases: 48,
+        gpu: false,
+        ..config(11)
+    };
+    let uninterrupted = search::run(&lex(30), &train, &test);
+    let text = checkpoint_text(&lex(15), &train, &test);
+    assert!(text.contains("config selection lexicase\n") && text.contains("config lexicase_cases 48\n"));
+    let saved = Checkpoint::from_text(&text).expect("parse");
+    let resumed = search::run_resumable(&lex(30), &train, &test, Some(saved), 0, |_| {}).expect("resume");
+    assert_eq!(describe(&uninterrupted), describe(&resumed));
+    assert_eq!(uninterrupted.candidates_evaluated, resumed.candidates_evaluated);
+    assert_eq!(uninterrupted.archive.hash(), resumed.archive.hash());
+    let mut end_a = None;
+    search::run_resumable(&lex(30), &train, &test, None, 0, |cp| end_a = Some(cp.to_text())).expect("full");
+    let mut end_b = None;
+    let saved = Checkpoint::from_text(&text).expect("parse");
+    search::run_resumable(&lex(30), &train, &test, Some(saved), 0, |cp| end_b = Some(cp.to_text())).expect("resume");
+    assert_eq!(end_a, end_b, "the final population and generators must match");
+}
+
+/// #1023: the same under `--fitness pnl` with 2 groups and 2 time blocks
+/// (4 sub-book cases): the resumed members get their sub-book regrets from one
+/// pass over their saved trees, the bits the scoring pass kept.
+#[test]
+fn a_lexicase_long_pnl_run_resumes_exactly() {
+    let train = sample(240);
+    let test = sample(80);
+    let slice = rcsr::data::TradingSlice {
+        rows: rcsr::trading::TradingRows {
+            time: (0..train.len()).map(|i| 900.0 * (i % 120) as f64).collect(),
+            group: (0..train.len()).map(|i| (i / 120) as u64).collect(),
+            funding: Vec::new(),
+        },
+        ret: train.x.iter().map(|r| 0.002 * (r[1] - 0.5)).collect(),
+    };
+    let spec = rcsr::trading::TradingSpec { cost_bps: 2.0, min_trades: 0, ..Default::default() };
+    let book = rcsr::trading::FitnessBook::with_blocks(&slice, &spec, 900.0, 2, 1.0).expect("book");
+    assert_eq!(book.cases().kept.len(), 4);
+    let fitness = search::Fitness::LongPnl(std::sync::Arc::new(book));
+    let lex = |generations| Config {
+        generations,
+        selection: search::Selection::Lexicase,
+        fitness: fitness.clone(),
+        gpu: false,
+        ..config(11)
+    };
+    // The state at the last generation (populations, generators, the search
+    // archive), taken before the resumed run rebuilds its reported front.
+    let last_generation = |resume: Option<Checkpoint>| {
+        let mut texts = Vec::new();
+        let out = search::run_resumable(&lex(24), &train, &test, resume, 1, |cp| texts.push(cp.to_text())).expect("run");
+        assert!(texts.len() >= 2);
+        (out, texts[texts.len() - 2].clone())
+    };
+    let (uninterrupted, full_state) = last_generation(None);
+    let text = checkpoint_text(&lex(12), &train, &test);
+    let (resumed, resumed_state) = last_generation(Some(Checkpoint::from_text(&text).expect("parse")));
+    assert_eq!(full_state, resumed_state, "populations, generators and the search archive must match");
+    // A resumed run reports the front rebuilt on every row, which takes the
+    // canonical member among trees with the same regret bits; an uninterrupted
+    // CPU run reports the search archive. Compare the reported errors and costs.
+    let bits = |o: &Outcome| o.archive.items.iter().map(|s| (s.error.to_bits(), s.cost.to_bits())).collect::<Vec<_>>();
+    assert_eq!(bits(&uninterrupted), bits(&resumed));
+    assert_eq!(uninterrupted.candidates_evaluated, resumed.candidates_evaluated);
+    let lexicographic = search::run(&Config { selection: search::Selection::Lexicographic, ..lex(24) }, &train, &test);
+    assert_ne!(uninterrupted.archive.hash(), lexicographic.archive.hash(), "lexicase must change the trajectory");
 }
 
 /// #598: the pipeline depth is an execution setting. A resume takes the one it
@@ -1838,4 +2285,507 @@ fn resume_ignores_sidecar_from_other_generation() {
     let run = json_file(dir.join("run.json"));
     let cumulative = run.get("search").and_then(|s| s.get("cumulative")).expect("search.cumulative");
     assert!(matches!(cumulative.get("complete"), Some(rcsr::devlog::Json::Bool(false))), "{cumulative:?}");
+}
+
+/// #1087: a saved run, then a resume with explicit flags. `extra` goes on the
+/// save run, `resume` on the resume.
+fn resume_with(tag: &str, extra: &[&str], resume: &[&str]) -> Output {
+    let csv = TempPath::new("flags.csv");
+    std::fs::write(&csv.0, line_csv(40)).expect("write csv");
+    let checkpoint = TempPath::new(&format!("{tag}.rcsr"));
+    let base = ["--data", csv.as_str(), "--target", "y", "--vars", "x", "--seed", "2", "--pop", "25"];
+    let mut made_args = base.to_vec();
+    made_args.extend(["--generations", "2", "--save", checkpoint.as_str()]);
+    made_args.extend(extra);
+    let made = rcsr(&made_args);
+    assert!(made.status.success(), "save run failed: {}", String::from_utf8_lossy(&made.stderr));
+    let mut resume_args = base.to_vec();
+    resume_args.extend(["--generations", "3", "--resume", checkpoint.as_str()]);
+    resume_args.extend(resume);
+    rcsr(&resume_args)
+}
+
+fn assert_conflict(out: &Output, line: &str) {
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(err.contains("conflicts with the saved search settings:"), "{err}");
+    assert!(err.lines().any(|l| l == format!("  - {line}")), "missing '{line}' in:\n{err}");
+}
+
+fn assert_resumed(out: &Output) {
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn run_resumable_refuses_another_variation_mode() {
+    let (train, test) = (sample(60), sample(20));
+    let saved_cfg = Config { variation: search::VariationMode::Node, ..config(3) };
+    let text = checkpoint_text(&saved_cfg, &train, &test);
+    assert!(text.contains("config variation node\n"));
+    let other = Config { variation: search::VariationMode::Auto, ..config(3) };
+    let saved = Checkpoint::from_text(&text).expect("parse");
+    let err = expect_err(search::run_resumable(&other, &train, &test, Some(saved), 0, |_| {}), "resume under auto");
+    assert!(err.contains("variation"), "{err}");
+    let saved = Checkpoint::from_text(&text).expect("parse");
+    search::run_resumable(&saved_cfg, &train, &test, Some(saved), 0, |_| {}).expect("same mode resumes");
+}
+
+#[test]
+fn cli_resume_with_an_explicit_variation_conflicts_or_matches() {
+    assert_conflict(
+        &resume_with("var-node", &["--variation", "node"], &["--variation", "auto"]),
+        "--variation auto (saved variation is node)",
+    );
+    assert_conflict(
+        &resume_with("var-auto", &[], &["--variation", "node"]),
+        "--variation node (saved variation is auto)",
+    );
+    assert_resumed(&resume_with("var-same", &["--variation", "node"], &["--variation", "node"]));
+    assert_resumed(&resume_with("var-same-auto", &[], &["--variation", "auto"]));
+    assert_resumed(&resume_with("var-none", &["--variation", "node"], &[]));
+}
+
+#[test]
+fn cli_resume_with_an_explicit_qd_flag_conflicts_or_matches() {
+    let saved = ["--qd-cells", "8", "--qd-cell-cap", "2"];
+    assert_conflict(&resume_with("qd-cells", &saved, &["--qd-cells", "32"]), "--qd-cells 32 (saved qd_bins is 8)");
+    assert_conflict(&resume_with("qd-cap", &saved, &["--qd-cell-cap", "5"]), "--qd-cell-cap 5 (saved qd_cell_cap is 2)");
+    assert_conflict(&resume_with("qd-cvt", &saved, &["--qd-cvt"]), "--qd-cvt (saved qd_cvt is false)");
+    assert_conflict(
+        &resume_with("qd-policy", &saved, &["--qd-policy"]),
+        "--qd-policy (saved qd_policy is false, qd_cvt is false)",
+    );
+    assert_conflict(
+        &resume_with("qd-uniform", &saved, &["--qd-uniform"]),
+        "--qd-uniform (saved qd_policy is false, qd_control is 0, qd_cvt is false)",
+    );
+    assert_conflict(
+        &resume_with("qd-random", &saved, &["--qd-random"]),
+        "--qd-random (saved qd_policy is false, qd_control is 0)",
+    );
+    assert_conflict(&resume_with("qd-off", &[], &["--qd"]), "--qd (saved qd_bins is 0)");
+    assert_resumed(&resume_with("qd-same", &saved, &["--qd-cells", "8", "--qd-cell-cap", "2", "--qd"]));
+    assert_resumed(&resume_with("qd-none", &saved, &[]));
+    assert_resumed(&resume_with("qd-policy-same", &["--qd-policy"], &["--qd-policy", "--qd-cvt", "--qd-cells", "512"]));
+}
+
+#[test]
+fn cli_resume_with_explicit_units_flags_conflicts_or_matches() {
+    let units = ["--units", "x=m,y=m"];
+    assert_conflict(
+        &resume_with("units-other", &units, &["--units", "x=s,y=m"]),
+        "--units x=s,y=m (saved units is m, units.target is m)",
+    );
+    assert_conflict(&resume_with("units-new", &[], &["--units", "x=m,y=m"]), "--units x=m,y=m (saved units is none)");
+    assert_resumed(&resume_with("units-same", &units, &["--units", "x=m,y=m"]));
+    assert_resumed(&resume_with("units-none", &units, &[]));
+    let required = ["--units", "x=m,y=m", "--require-dimensions"];
+    assert_conflict(
+        &resume_with("req-new", &units, &["--require-dimensions"]),
+        "--require-dimensions (saved require_dimensions is false)",
+    );
+    assert_resumed(&resume_with("req-same", &required, &["--require-dimensions"]));
+    assert_resumed(&resume_with("req-none", &required, &[]));
+}
+
+fn accept_config(generations: usize, accept: search::FitAccept) -> Config {
+    Config { fit_iters: 3, fit_accept: accept, ..island_config(9, generations) }
+}
+
+#[test]
+fn a_fit_accept_fitness_run_and_its_resume_match_exactly() {
+    let train = sample(240);
+    let test = sample(80);
+    let (uninterrupted, full_text, _) = island_run(&accept_config(30, search::FitAccept::Fitness), None, &train, &test);
+    assert!(full_text.contains("config fit_accept fitness\n"));
+
+    let (_, saved_text, _) = island_run(&accept_config(15, search::FitAccept::Fitness), None, &train, &test);
+    let saved = Checkpoint::from_text(&saved_text).expect("parse saved checkpoint");
+    let (resumed, resumed_text, _) =
+        island_run(&accept_config(30, search::FitAccept::Fitness), Some(saved), &train, &test);
+    assert_eq!(describe(&uninterrupted), describe(&resumed), "the archive");
+    assert_eq!(full_text, resumed_text, "archive, populations and rng state of the exit checkpoint");
+}
+
+#[test]
+fn a_default_checkpoint_has_no_fit_accept_key_and_a_fitness_one_resumes_only_under_fitness() {
+    let (_, always_text, _) = island_run(&accept_config(6, search::FitAccept::Always), None, &sample(100), &sample(30));
+    assert!(!always_text.contains("fit_accept"));
+    let (_, text, _) = island_run(&accept_config(6, search::FitAccept::Fitness), None, &sample(100), &sample(30));
+    let saved = Checkpoint::from_text(&text).expect("parse");
+    let err = expect_err(
+        search::run_resumable(
+            &accept_config(6, search::FitAccept::Always),
+            &sample(100),
+            &sample(30),
+            Some(saved),
+            0,
+            |_| {},
+        ),
+        "resume under always",
+    );
+    assert!(err.contains("fit_accept"), "{err}");
+}
+
+/// #1060: chunk 0 of a chain that stops right after its second periodic save
+/// (`RCSR_TEST_EXIT_AFTER_SAVES`), like a crashed process: it never reaches the exit write.
+fn crashed_chunk(dir: &std::path::Path, csv: &str) {
+    let args = chunk_args(csv, &["--save-every", "1"]);
+    let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let out = rcsr_cmd::rcsr()
+        .current_dir(dir)
+        .args(&refs)
+        .env("RCSR_TEST_EXIT_AFTER_SAVES", "2")
+        .output()
+        .expect("run rcsr");
+    assert_eq!(out.status.code(), Some(137), "{:?}", out);
+    let cp = rcsr::checkpoint::Checkpoint::load(dir.join("ck.rcsr").to_str().expect("utf-8")).expect("checkpoint");
+    assert_eq!(cp.generations, 2);
+}
+
+fn sidecar_text(dir: &std::path::Path) -> String {
+    std::fs::read_to_string(dir.join("ck.rcsr.cost")).expect("sidecar")
+}
+
+/// #1060: a chunk that stops after a periodic save (through the real save callback) leaves a sidecar with its own
+/// backend, so the resumed search reports it instead of `unknown`.
+#[test]
+fn a_killed_chunk_does_not_poison_the_search_backend() {
+    let (_scratch, dir, csv) = cost_scratch("killed-chunk-backend");
+    crashed_chunk(&dir, &csv);
+    assert!(sidecar_text(&dir).contains("\"backend\":\"cpu\""), "{}", sidecar_text(&dir));
+    cost_chunk(&dir, &csv, 1, true);
+    let run = json_file(dir.join("run.json"));
+    assert_eq!(run.get("search_backend").and_then(|v| v.as_str()), Some("cpu"));
+    let cumulative = run.get("search").and_then(|s| s.get("cumulative")).expect("search.cumulative");
+    assert_eq!(cumulative.get("backend").and_then(|v| v.as_str()), Some("cpu"));
+}
+
+/// #1127: rewrite the saved checkpoint with the identity a fit-only device run writes (the device
+/// defers the fit, the host scores): the one value both snapshot sites take.
+fn stamp_fit_only_device_identity(dir: &std::path::Path) {
+    let path = dir.join("ck.rcsr");
+    let mut cp = Checkpoint::load(path.to_str().expect("utf-8")).expect("checkpoint");
+    cp.backend = search::checkpoint_backend(true, true, false);
+    cp.error_kind = rcsr::checkpoint::ErrorKind::for_backend(cp.backend);
+    cp.save(&path).expect("save checkpoint");
+}
+
+/// #1127: a fit-only device run scores on the host, and a resume computes the backend it will use
+/// from the configuration alone (`cpu` for a metric the device does not score natively). Both
+/// stopping points of the previous chunk, a periodic save (killed chunk) and the exit save, leave a
+/// checkpoint that resumes without `--allow-backend-change`.
+#[test]
+fn a_fit_only_device_run_resumes_from_its_periodic_and_its_exit_checkpoint() {
+    let (_scratch, dir, csv) = cost_scratch("fit-only-identity-periodic");
+    crashed_chunk(&dir, &csv);
+    stamp_fit_only_device_identity(&dir);
+    cost_chunk(&dir, &csv, 1, true);
+
+    let (_scratch, dir, csv) = cost_scratch("fit-only-identity-exit");
+    cost_chunk(&dir, &csv, 0, false);
+    stamp_fit_only_device_identity(&dir);
+    cost_chunk(&dir, &csv, 1, true);
+}
+
+/// #1060: a sidecar already poisoned by an older binary (real example from
+/// campaign #268, generation rewritten to the checkpoint's) is not repaired:
+/// nothing in it says which chunks ran on which backend, so the total stays
+/// `unknown`.
+#[test]
+fn a_poisoned_sidecar_stays_unknown_on_resume() {
+    let (_scratch, dir, csv) = cost_scratch("poisoned-sidecar");
+    cost_chunk(&dir, &csv, 0, false);
+    let cp = rcsr::checkpoint::Checkpoint::load(dir.join("ck.rcsr").to_str().expect("utf-8")).expect("checkpoint");
+    std::fs::write(
+        dir.join("ck.rcsr.cost"),
+        format!("{{\"v\":2,\"generation\":{},\"chunks\":1,\"search_seconds\":268.351034924,\"ledger_wall_s\":null,\"device_seconds_incl_fit\":null,\"backend\":\"unknown\"}}", cp.generations),
+    )
+    .unwrap();
+    cost_chunk(&dir, &csv, 1, true);
+    let run = json_file(dir.join("run.json"));
+    assert_eq!(run.get("search_backend").and_then(|v| v.as_str()), Some("unknown"));
+    let cumulative = run.get("search").and_then(|s| s.get("cumulative")).expect("search.cumulative");
+    assert_eq!(cumulative.get("backend").and_then(|v| v.as_str()), Some("unknown"));
+    assert!(sidecar_text(&dir).contains("\"backend\":\"unknown\""));
+}
+
+/// #1060: an uninterrupted chunk still ends with the exit write: the sidecar
+/// of the final checkpoint carries the outcome backend and the full ledger
+/// fields, and the periodic callback does not touch the checkpoint bytes.
+#[test]
+fn an_uninterrupted_chunk_keeps_its_exit_sidecar() {
+    let (_scratch, dir, csv) = cost_scratch("uninterrupted-sidecar");
+    cost_chunk(&dir, &csv, 0, true);
+    let cp = rcsr::checkpoint::Checkpoint::load(dir.join("ck.rcsr").to_str().expect("utf-8")).expect("checkpoint");
+    let text = sidecar_text(&dir);
+    assert!(text.starts_with(&format!("{{\"v\":2,\"generation\":{},\"chunks\":1,\"search_seconds\":", cp.generations)), "{text}");
+    assert!(text.ends_with("\"ledger_wall_s\":null,\"device_seconds_incl_fit\":null,\"backend\":\"cpu\"}"), "{text}");
+}
+
+// ---- #1166: under --qd-policy the QD archive is trajectory state ----
+
+/// A small `--qd-policy` search that migrates and restarts every few
+/// generations, so the archive drives parent draws, migration victims and
+/// restart aims inside the run.
+fn qd_policy_config(generations: usize) -> Config {
+    Config {
+        generations,
+        islands: 3,
+        pop: 24,
+        max_complexity: 10,
+        fit_iters: 2,
+        migration_interval: 2,
+        restart_interval: 3,
+        restart_policy: search::RestartPolicy::Island,
+        restart_isolation: 2,
+        patience: 0,
+        seed: 7,
+        qd_bins: 16,
+        qd_cell_cap: 2,
+        qd_cvt: true,
+        qd_policy: true,
+        ..Default::default()
+    }
+}
+
+/// Every checkpoint of one run in generation order, the exit checkpoint last,
+/// and the migrants and restarts the run made.
+fn every_qd_checkpoint(cfg: &Config, train: &Sample, test: &Sample) -> (Outcome, Vec<String>, usize, u64) {
+    let seen = std::sync::Arc::new(std::sync::Mutex::new((0usize, 0u64)));
+    let sink = seen.clone();
+    let cfg = Config {
+        dev_log: Some(std::sync::Arc::new(move |r: &rcsr::devlog::GenRecord| {
+            let mut s = sink.lock().unwrap();
+            s.0 += r.migrants;
+            s.1 = r.restarts_total;
+        })),
+        ..cfg.clone()
+    };
+    let mut texts = Vec::new();
+    let out = search::run_resumable(&cfg, train, test, None, 1, |cp| texts.push(cp.to_text())).expect("qd policy run");
+    let (migrants, restarts) = *seen.lock().unwrap();
+    (out, texts, migrants, restarts)
+}
+
+fn qd_centroid_lines(text: &str) -> Vec<&str> {
+    text.lines().filter(|l| l.starts_with("qd_centroid ")).collect()
+}
+
+/// A `--qd-policy` run resumed from the checkpoint of any generation gives the
+/// same front, QD report and exit checkpoint as the uninterrupted run, for the
+/// CVT, grid and random archives, and for the uniform control on screened
+/// rows (every member then reaches the archive through its descriptor cache).
+#[test]
+fn a_qd_policy_run_resumed_at_every_generation_matches_exactly() {
+    let train = sample(240);
+    let test = sample(80);
+    let arms = [
+        ("cvt", qd_policy_config(12)),
+        ("grid", Config { qd_cvt: false, qd_bins: 4, ..qd_policy_config(12) }),
+        ("random", Config { qd_cvt: false, qd_control: 2, ..qd_policy_config(12) }),
+        ("uniform, screened", Config { qd_control: 1, fit_samples: 120, ..qd_policy_config(12) }),
+    ];
+    let mut cvt_texts = Vec::new();
+    for (what, cfg) in &arms {
+        let (full, texts, migrants, restarts) = every_qd_checkpoint(cfg, &train, &test);
+        assert!(migrants > 0, "{what}: the fixture migrates, so the archive picks migration victims");
+        if *what == "cvt" {
+            assert!(restarts > 0, "{what}: the fixture restarts an island, so the archive aims a restart");
+        }
+        assert_eq!(texts.len(), cfg.generations + 1, "{what}: one save per generation and the exit save");
+        let exit = texts.last().expect("exit checkpoint");
+        // Generation 0 saves an empty archive.
+        let mut zero: Option<String> = None;
+        search::run_resumable(&Config { generations: 0, ..cfg.clone() }, &train, &test, None, 0, |cp| zero = Some(cp.to_text()))
+            .expect("generation 0 run");
+        let zero = zero.expect("generation 0 checkpoint");
+        for text in std::iter::once(&zero).chain(&texts[..cfg.generations - 1]) {
+            let saved = Checkpoint::from_text(text).expect("parse saved checkpoint");
+            let at = saved.generations;
+            let mut resumed_exit: Option<String> = None;
+            let resumed = search::run_resumable(cfg, &train, &test, Some(saved), 0, |cp| resumed_exit = Some(cp.to_text()))
+                .expect("resume");
+            assert_eq!(describe(&full), describe(&resumed), "{what}: front after a resume at generation {at}");
+            assert_eq!(full.qd, resumed.qd, "{what}: QD report after a resume at generation {at}");
+            assert_eq!(exit, &resumed_exit.expect("exit checkpoint"), "{what}: exit checkpoint after a resume at generation {at}");
+        }
+        if *what == "cvt" {
+            cvt_texts = texts;
+        }
+    }
+    // A Lloyd step moves the CVT centroids in generation 4 on this fixture, so
+    // the resume at generation 3 runs it as its first generation.
+    assert_ne!(qd_centroid_lines(&cvt_texts[2]), qd_centroid_lines(&cvt_texts[3]), "centroids at generations 3 and 4");
+}
+
+/// The `qd_*` records save and load every field of the archive state (cells,
+/// descriptors, centroids, visits, Lloyd sample, counters, descriptor cache)
+/// bit for bit, the text is a fixed point, and a malformed block is refused.
+#[test]
+fn the_qd_archive_records_round_trip_exactly() {
+    let train = sample(240);
+    let test = sample(80);
+    let arms = [
+        ("cvt", qd_policy_config(5)),
+        ("grid", Config { qd_cvt: false, qd_bins: 4, ..qd_policy_config(5) }),
+        ("random", Config { qd_cvt: false, qd_control: 2, ..qd_policy_config(5) }),
+        ("uniform, screened", Config { qd_control: 1, fit_samples: 120, ..qd_policy_config(5) }),
+    ];
+    let mut cvt_text = String::new();
+    for (what, cfg) in &arms {
+        let mut live: Option<(rcsr::qd::QdState, String)> = None;
+        search::run_resumable(cfg, &train, &test, None, 0, |cp| live = Some((cp.qd.clone().expect("qd state"), cp.to_text())))
+            .expect("qd policy run");
+        let (state, text) = live.expect("exit checkpoint");
+        assert!(state.cells.iter().any(|c| c.len() == 2), "{what}: a cell at its cap");
+        assert!(!state.known.is_empty() && !state.observed.is_empty(), "{what}");
+        if *what == "uniform, screened" {
+            assert!(state.fallbacks > 0, "{what}: screened members reach the archive without a descriptor");
+        }
+        assert_eq!(state.centroids.len(), if cfg.qd_cvt && cfg.qd_control != 2 { 16 } else { 0 }, "{what}");
+        let loaded = Checkpoint::from_text(&text).expect("parse");
+        assert_eq!(format!("{:?}", loaded.qd.expect("loaded qd")), format!("{state:?}"), "{what}");
+        assert_eq!(Checkpoint::from_text(&text).expect("parse").to_text(), text, "{what}: fixed point");
+        if *what == "cvt" {
+            cvt_text = text;
+        }
+    }
+    let refused = |text: String, needle: &str| {
+        let err = expect_err(Checkpoint::from_text(&text), needle);
+        assert!(err.contains(needle), "{needle}: {err}");
+    };
+    refused(cvt_text.replace("\nqd_archive 1 ", "\nqd_archive 2 "), "qd_archive version 2 is not supported");
+    let last_known = cvt_text.rfind("\nqd_known ").expect("qd_known record");
+    let truncated = format!("{}{}", &cvt_text[..last_known + 1], &cvt_text[last_known + 1..].split_once('\n').expect("line").1);
+    refused(truncated, "qd_known record(s)");
+    let header = cvt_text.lines().find(|l| l.starts_with("qd_archive ")).expect("header");
+    refused(cvt_text.replace(&format!("{header}\n"), ""), "record before the qd_archive header");
+    refused(cvt_text.replace("config qd_policy true\n", "config qd_policy false\n"), "written only under --qd-policy");
+}
+
+/// The archive records do not depend on the thread count, and a resume under
+/// another count continues the same trajectory.
+#[test]
+fn a_qd_policy_search_does_not_depend_on_the_thread_count() {
+    let train = sample(2600);
+    let test = sample(300);
+    assert_thread_free(&qd_policy_config(6), "qd policy", &train, &test);
+}
+
+const CLEAN_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/clean.csv");
+
+/// One CPU run on `tests/fixtures/clean.csv` with `--seed 3 --islands 2 --pop 40`.
+fn clean_run(extra: &[&str]) -> Output {
+    let mut args = vec![
+        "--data", CLEAN_CSV, "--target", "y", "--vars", "x", "--seed", "3", "--islands", "2", "--pop", "40", "--cpu",
+        "--no-dev-log", "--quiet", "--json",
+    ];
+    args.extend_from_slice(extra);
+    rcsr(&args)
+}
+
+fn clean_json(extra: &[&str]) -> String {
+    let out = clean_run(extra);
+    assert!(out.status.success(), "rcsr {extra:?}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8(out.stdout).expect("utf-8 json")
+}
+
+fn from_pareto(json: &str) -> &str {
+    &json[json.find("\"pareto\":").expect("pareto field")..]
+}
+
+fn qd_object(json: &str) -> &str {
+    let rest = &json[json.find("\"qd\":").expect("qd field")..];
+    &rest[..rest.find(",\"seeds\"").expect("seeds after qd")]
+}
+
+fn without_build_lines(text: &str) -> String {
+    text.lines().filter(|l| !l.starts_with("build ")).map(|l| format!("{l}\n")).collect()
+}
+
+/// 8 generations straight against 4 generations saved and resumed to 8: the
+/// JSON from `"pareto":`, the `qd` object and the exit checkpoints apart from
+/// the `build` lines are equal.
+fn assert_clean_qd_resume_matches(tag: &str, flags: &[&str]) {
+    let scratch = Scratch::new(tag);
+    let path = |name: &str| scratch.join(name).to_str().expect("utf-8 path").to_string();
+    let (straight_cp, half_cp, resumed_cp) = (path("straight.rcsr"), path("half.rcsr"), path("resumed.rcsr"));
+    let mut straight = flags.to_vec();
+    straight.extend(["--generations", "8", "--save", &straight_cp]);
+    let a = clean_json(&straight);
+    let mut half = flags.to_vec();
+    half.extend(["--generations", "4", "--save", &half_cp]);
+    clean_json(&half);
+    let b = clean_json(&["--generations", "8", "--resume", &half_cp, "--save", &resumed_cp]);
+    assert!(!qd_object(&a).contains("null"), "{tag}: {}", qd_object(&a));
+    assert_eq!(from_pareto(&a), from_pareto(&b), "{tag}: front");
+    assert_eq!(qd_object(&a), qd_object(&b), "{tag}: qd report");
+    let read = |p: &str| without_build_lines(&std::fs::read_to_string(p).expect("checkpoint"));
+    assert_eq!(read(&straight_cp), read(&resumed_cp), "{tag}: exit checkpoint");
+}
+
+#[test]
+fn a_qd_policy_run_and_its_resume_match_exactly() {
+    assert_clean_qd_resume_matches("qd-policy", &["--qd-policy"]);
+}
+
+#[test]
+fn a_qd_uniform_run_and_its_resume_match_exactly() {
+    assert_clean_qd_resume_matches("qd-uniform", &["--qd-policy", "--qd-uniform"]);
+}
+
+#[test]
+fn a_qd_random_run_and_its_resume_match_exactly() {
+    assert_clean_qd_resume_matches("qd-random", &["--qd-policy", "--qd-random"]);
+}
+
+/// A resume at the final generation runs no generation and still reports the
+/// saved archive.
+#[test]
+fn a_qd_policy_resume_at_the_final_generation_reports_the_saved_archive() {
+    let scratch = Scratch::new("qd-final");
+    let cp = scratch.join("final.rcsr").to_str().expect("utf-8 path").to_string();
+    let a = clean_json(&["--qd-policy", "--generations", "6", "--save", &cp]);
+    let b = clean_json(&["--resume", &cp]);
+    assert_eq!(from_pareto(&a), from_pareto(&b), "front");
+    assert_eq!(qd_object(&a), qd_object(&b), "qd report");
+}
+
+/// The archive records are written only under `--qd-policy`: a QD-off and a
+/// passive `--qd` checkpoint keep their bytes.
+#[test]
+fn the_qd_archive_is_saved_only_under_qd_policy() {
+    let scratch = Scratch::new("qd-records");
+    let saved = |name: &str, flags: &[&str]| {
+        let cp = scratch.join(name).to_str().expect("utf-8 path").to_string();
+        let mut args = flags.to_vec();
+        args.extend(["--generations", "3", "--save", &cp]);
+        clean_json(&args);
+        std::fs::read_to_string(&cp).expect("checkpoint")
+    };
+    for (name, flags) in [("off.rcsr", &[][..]), ("passive.rcsr", &["--qd"][..])] {
+        let text = saved(name, flags);
+        assert!(!text.lines().any(|l| l.starts_with("qd_")), "{name} has QD archive records");
+    }
+    let policy = saved("policy.rcsr", &["--qd-policy"]);
+    assert_eq!(policy.lines().filter(|l| l.starts_with("qd_archive 1 cvt ")).count(), 1, "{policy}");
+}
+
+/// A `--qd-policy` checkpoint without the archive records (written before
+/// #1166) is refused on resume with exit 2 and a message naming the archive.
+#[test]
+fn a_qd_policy_checkpoint_without_the_archive_is_refused() {
+    let scratch = Scratch::new("qd-old");
+    let cp = scratch.join("new.rcsr").to_str().expect("utf-8 path").to_string();
+    let old = scratch.join("old.rcsr").to_str().expect("utf-8 path").to_string();
+    clean_json(&["--qd-policy", "--generations", "4", "--save", &cp]);
+    let text = std::fs::read_to_string(&cp).expect("checkpoint");
+    let stripped: String = text.lines().filter(|l| !l.starts_with("qd_")).map(|l| format!("{l}\n")).collect();
+    assert_ne!(stripped, text, "the checkpoint carries archive records");
+    std::fs::write(&old, stripped).expect("write old checkpoint");
+    let refused = clean_run(&["--generations", "8", "--resume", &old]);
+    let err = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(refused.status.code(), Some(2), "{err}");
+    assert!(err.contains("has no QD archive"), "{err}");
 }

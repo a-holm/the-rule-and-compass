@@ -1,0 +1,136 @@
+@@ --fit-irls --fit-accept
+  --fit-thresholds          after the LM, fit each constant that is an operand of a
+                             comparison or sits in the condition of if by an exact
+                             1-D search (default off). The LM never moves such a
+                             constant because its gradient is zero. Candidates are
+                             the midpoints between sorted operand values on the
+                             fit rows (levels of at most 64, narrowing around the best),
+                             scored on the fitted loss (squared error for the
+                             squared family and --fitness pnl); at most 2
+                             constants per tree. Trees with such a constant take
+                             the CPU fit arm, never the device. A saved search
+                             setting: a resume refuses a different value. No
+                             effect with --fit-iters 0
+@@ --no-dedup --no-front-parents
+  --migration-interval <N>   generations between island migrations,
+                             default 25. 0 turns migration off. No effect
+                             with --islands 1. Saved search setting (#1116)
+  --restart-interval <N>     generations between island restart checks,
+                             default 60. Also the stall length of
+                             --restart-policy island and the lifetime unit of
+                             --explore-islands. 0 turns every restart off,
+                             explore restarts included. Saved search setting
+                             (#1109)
+  --selection lexicographic|afp|lexicase
+                             survivor and parent selection inside an island.
+                             lexicographic (default) replaces the island with
+                             its offspring and picks parents by error, then
+                             size. afp keeps the Pareto-best of parents and
+                             offspring on (error, complexity, age), adds a few
+                             random immigrants per generation and picks
+                             parents by Pareto rank and crowding distance.
+                             lexicase replaces the island like lexicographic
+                             and picks parents by epsilon-lexicase on cases
+                             drawn per generation (--lexicase-cases): row
+                             losses under the metric fitness, (group, time
+                             block) sub-book regrets under --fitness pnl.
+                             lexicase runs on the CPU and needs a per-row
+                             loss metric. Node path only; refuses --variation
+                             postfix
+  --lexicase-cases <K>       cases one --selection lexicase generation selects
+                             on, default 256, 2 to 4096: rows under the metric
+                             fitness, sub-books under --fitness pnl, drawn per
+                             generation from the seed. Saved search setting
+                             (#1023)
+  --restart-policy archive|island
+                             which stall rule restarts an island every
+                             restart interval (--restart-interval, default
+                             60 generations). archive (default) restarts an
+                             island after two checks in which its best error
+                             is worse than the archive best. island restarts
+                             an island whose own best error has not improved
+                             for one restart interval, except the lowest
+                             island that holds the archive best (the keeper),
+                             and isolates it from front parents, --qd-policy
+                             parents and migrants for --restart-isolation
+                             generations. With one island nothing restarts.
+                             Saved search setting (#1022)
+  --restart-isolation <N>    generations a restarted island takes no front
+                             parent, no --qd-policy parent and no migrant,
+                             default 25 (the migration interval). Read only
+                             with --restart-policy island; 0 turns the
+                             isolation off. Saved search setting (#1022)
+  --explore-islands <K>      the highest K islands form an explore tier,
+                             default 0 (none). An explore island takes no
+                             front parent, no --qd-policy parent and no
+                             migrant, sends no migrant, and restarts at the
+                             end of each lifetime of a Luby schedule in
+                             units of --restart-interval (default 60
+                             generations; 0 turns restarts off, explore
+                             islands included). The other islands keep
+                             --restart-policy and a ring of their own;
+                             explore results reach them through the
+                             archive only. K must be below --islands.
+                             Saved search setting (#1100)
+  --front-scope global|island
+                             where front parents come from. global
+                             (default) draws them from the Pareto front of
+                             every island. island gives each island its own
+                             error/complexity front; a front moves only
+                             with a migrant (the destination front becomes
+                             the front of both) and a restart empties it.
+                             The reported archive stays global. Not with
+                             --qd-policy. Saved search setting (#1070)
+  --migration-policy ring|ring-tournament
+                             which member an island sends at a migration.
+                             ring (default) sends the best member of the next
+                             island. ring-tournament sends the winner of a
+                             tournament of 8 draws over it, drawn with the
+                             destination's generator, and skips a destination
+                             that holds a member with the same error. Saved
+                             search setting (#1029)
+  --mutation-mix <M>         node-path edit weights: classic (point .25, terminal
+                             .35, subtree .40; default) or extended (adds insert,
+                             delete, swap and rotate). Not with --variation
+                             postfix (#471)
+  --crossover-internal <P>   probability that a crossover cut point is an
+                             internal node (default 0 = uniform cut). Not with
+                             --variation postfix (#471)
+  --adaptive-mix             per-island edit weights learned from the success
+                             rate of the last 10 generations (uses all seven edit
+                             kinds; learns on the CPU and the device).
+                             Off by default; not with --variation postfix (#471)
+@@ --no-front-parents --prune
+  --reject-constant-offspring
+                             reject offspring and random trees with no input
+                             outside an aggregate before the constant fit; the
+                             first constant of an island is kept (#477). Saved
+                             search setting, off by default
+                             and restores the pre-#76 trajectory exactly
+  --reject-fixed-position    under --fitness pnl, reject trees whose long/flat
+                             position cannot depend on the inputs (the exact
+                             output range does not cross --threshold, for
+                             example gauss(c * x) at threshold 0) before the
+                             constant fit, and keep them off the front. Before
+                             the fit every constant counts as free, so c + abs(x)
+                             goes to the fit (#848). With --objective it also
+                             makes such a member unusable as finalist, under
+                             --fitness metric too; so is a member whose
+                             validation book was long on every row or on none
+                             (#849). Saved search setting, off by default
+@@ --fit-samples --time-budget
+  --patience <N>             stop after N generations without improvement (default 40)
+@@ --pipeline-depth --save
+  --variation auto|node|postfix
+                             variation engine. auto (default) uses the flat
+                             postfix arena for --no-fit GPU runs with a
+                             population >= 4096; node keeps the owned-tree loop;
+                             postfix requires the flat path and refuses a run
+                             that does not qualify
+
+CHECKPOINTS:
+@@ --no-fit --migration-interval
+  --no-dedup                 disable structural de-duplication
+@@ --adaptive-mix --reject-constant-offspring
+  --no-front-parents         draw every parent from the island tournament;
+                             turns off the 15% Pareto-front feedback (#76)

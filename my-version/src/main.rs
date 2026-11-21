@@ -20,6 +20,7 @@ use rcsr::fit;
 use rcsr::metrics::{self, Metric};
 use rcsr::rng::Mt;
 use rcsr::schema;
+use rcsr::settings::{self, Group};
 use rcsr::units::{Unit, Units};
 use rcsr::{
     backend, data, diagnostics, leakage, multi, qd, registry, search, stability, store, target,
@@ -35,6 +36,7 @@ const EXIT_INPUT: i32 = 3;
 const EXIT_NO_SOLUTION: i32 = 4;
 /// #604: an explicit `--gpu` search lost the device after the start-up probe.
 const EXIT_DEVICE: i32 = 6;
+const EXIT_KILLED: i32 = 137;
 /// #129: a leakage audit failed. Stable so CI can distinguish a real leak from
 /// a usage (2) or input (3) error.
 const EXIT_LEAKAGE: i32 = leakage::AUDIT_EXIT_CODE;
@@ -109,7 +111,112 @@ fn parse_unit_assignments(src: &str) -> Result<Vec<(String, Unit)>, String> {
     Ok(out)
 }
 
+/// #120: apply one `--qd*` flag to `cfg`. The error is the whole message after `error: `.
+fn apply_qd_flag(cfg: &mut rcsr::search::Config, flag: &str, value: Option<&str>) -> Result<(), String> {
+    let range = |lo: usize, hi: usize| -> Result<usize, String> {
+        let v = value.unwrap_or_default();
+        match v.parse::<usize>() {
+            Ok(n) if (lo..=hi).contains(&n) => Ok(n),
+            _ => Err(format!("{} needs an integer in {}..={}, got '{}'", flag, lo, hi, v)),
+        }
+    };
+    match flag {
+        "--qd" => {
+            if cfg.qd_bins == 0 {
+                cfg.qd_bins = if cfg.qd_cvt { 512 } else { 16 };
+            }
+            return Ok(());
+        }
+        "--qd-cells" => {
+            cfg.qd_bins = range(2, 512)?;
+            return Ok(());
+        }
+        "--qd-cell-cap" => {
+            cfg.qd_cell_cap = range(1, 64)?;
+            return Ok(());
+        }
+        "--qd-cvt" => cfg.qd_cvt = true,
+        "--qd-policy" => {
+            cfg.qd_policy = true;
+            cfg.qd_cvt = true;
+        }
+        "--qd-uniform" => {
+            cfg.qd_policy = true;
+            cfg.qd_control = 1;
+            cfg.qd_cvt = true;
+        }
+        "--qd-random" => {
+            cfg.qd_policy = true;
+            cfg.qd_control = 2;
+        }
+        other => return Err(format!("{} is not a quality-diversity flag", other)),
+    }
+    if cfg.qd_bins == 0 {
+        cfg.qd_bins = 512;
+    }
+    Ok(())
+}
+
+/// #1087: a resume line for every `--qd*` flag that would change the saved
+/// quality-diversity settings. A flag that leaves the saved settings as they are
+/// matches, so `--qd` or `--qd-cvt` on a run that already has them resumes.
+fn qd_conflicts(flags: &[(String, Option<String>)], saved: &rcsr::search::Config, out: &mut Vec<String>) {
+    for (flag, value) in flags {
+        let mut trial = saved.clone();
+        if apply_qd_flag(&mut trial, flag, value.as_deref()).is_err() {
+            continue;
+        }
+        let mut changed = Vec::new();
+        if trial.qd_bins != saved.qd_bins {
+            changed.push(format!("qd_bins is {}", saved.qd_bins));
+        }
+        if trial.qd_cell_cap != saved.qd_cell_cap {
+            changed.push(format!("qd_cell_cap is {}", saved.qd_cell_cap));
+        }
+        if trial.qd_policy != saved.qd_policy {
+            changed.push(format!("qd_policy is {}", saved.qd_policy));
+        }
+        if trial.qd_control != saved.qd_control {
+            changed.push(format!("qd_control is {}", saved.qd_control));
+        }
+        if trial.qd_cvt != saved.qd_cvt {
+            changed.push(format!("qd_cvt is {}", saved.qd_cvt));
+        }
+        if changed.is_empty() {
+            continue;
+        }
+        let shown = value.as_ref().map_or(flag.clone(), |v| format!("{} {}", flag, v));
+        let line = format!("{} (saved {})", shown, changed.join(", "));
+        if !out.contains(&line) {
+            out.push(line);
+        }
+    }
+}
+
+/// Exit 2 with the resume conflict block when `conflicts` is not empty.
+fn exit_on_resume_conflicts(path: &str, conflicts: &[String]) {
+    if conflicts.is_empty() {
+        return;
+    }
+    eprintln!("error: --resume '{}' conflicts with the saved search settings:", path);
+    for c in conflicts {
+        eprintln!("  - {}", c);
+    }
+    eprintln!("  the saved run wins; omit the flag or pass the saved value");
+    std::process::exit(EXIT_USAGE);
+}
+
 fn usage() -> String {
+    let help_stop = settings::help(Group::Stop);
+    let help_schedule = settings::help(Group::Schedule);
+    let help_island = settings::help(Group::Island);
+    let help_variation = settings::help(Group::Variation);
+    let help_filter = settings::help(Group::Filter);
+    let help_fit = settings::help(Group::Fit);
+    let help_engine = settings::help(Group::Engine);
+    let help_dedup = settings::help(Group::Dedup);
+    let help_front_parents = settings::help(Group::FrontParents);
+    let help_qd = settings::help(Group::Qd);
     format!(
         "rcsr {VERSION} — symbolic regression (rule-and-compass)
 
@@ -120,6 +227,23 @@ USAGE:
   rcsr enrich --data <store.rcsb|CSV> --out <store.rcsb> --features <list> [options]
   rcsr walkforward --data <store.rcsb> --target <col> --expr <formula> ...
   rcsr trials --wf <report.json>... [--baseline <ladder.json>] | --compare <A> <B> [options]
+  rcsr trials --cpcv-assemble <report.json>... --splits <csv> --out-dir <dir>
+  rcsr protocol cpcv --start <date> --end <date> --groups N --test-groups K ...
+  rcsr lock check --record <record.json> <path>...
+  rcsr switch <--fitness pnl run flags> --a <expr|flat> --b <expr|flat> --gate <expr>...
+                              the exact gate-cut profile of if(greater(g, c), A, B)
+                              and the k-switch bound on the training rows
+  rcsr compose <--fitness pnl run flags> --gates <menu.json> --bull <run.json>...
+               --bear <run.json>... [--all-weather <run.json>...] [--out <run.json>]
+                              regime-switching composites of the pools from a
+                              pre-registered gate menu, chosen on validation rows
+  rcsr enumerate <--fitness pnl run flags> --vars <v,...> --ops <op,...> [--max-size N]
+                 [--null-shifts R] [--compare-run <run.json>] [--emit-seeds <file>] [--gpu]
+                              every expression up to N nodes scored exactly on the
+                              training book: class optimum, gap, family null
+  rcsr <--fitness pnl run flags> --gate-search --branch-on <run.json|expr|cash>
+       --branch-off <run.json|expr|cash> [--gate-band h] [--gate-dwell D]
+                              search the gate of a switch between frozen branches
   rcsr audit --data <file> --target <col> [--time <col>] [--horizon N] [--json]
              [--lockbox <START,END|none>]
              [--target-spec <file>]
@@ -166,6 +290,10 @@ INPUT:
                              block, manifest and dev log. Mutually exclusive
                              with --force; n >= the row count is a full load
                              and must still fit the budget
+                             Exit 2 with --pnl-mask, rcsr compose, rcsr
+                             switch and --gate-search (gate states need
+                             every row)
+                             and with rcsr enumerate (every training row)
   --target <col>[,<col>..]   target column; a comma-separated list enables
                              multi-output regression (one shared shape, one
                              fitted constant vector per output). See
@@ -227,16 +355,106 @@ INPUT:
                              the band book of walkforward --policy band (the
                              device holds at most 32 rows; above that --gpu
                              exits 2 and auto falls back to the CPU scorer).
-                             Resume needs the same cost, threshold, band,
-                             band units, minimum hold and rows
-  --pnl-blocks K          1 to 8 time blocks for --fitness pnl (default 1 =
+                             Resume needs every input of the book hash: the
+                             message lists the flags (cost, cash, funding,
+                             threshold, band, hold, blocks, statistic, mask,
+                             split table, rows)
+  --pnl-blocks K          1 to 64 time blocks for --fitness pnl (default 1 =
                              off, the plain regret). The training timestamps
                              are cut into K equal runs, each block is its own
-                             long/flat book, and the fitness is the mean block
-                             regret plus --pnl-block-lambda times their
-                             standard deviation. Needs --fitness pnl
+                             long/flat book, and the fitness is the --pnl-stat
+                             statistic of the block regrets (default the mean
+                             plus --pnl-block-lambda times their standard
+                             deviation). Needs --fitness pnl
   --pnl-block-lambda L      weight of the block spread (default 1.0, finite,
-                             >= 0; 0 is the plain mean). Needs --fitness pnl
+                             >= 0; 0 is the plain mean). With many blocks use
+                             about t / sqrt(K) for a fixed test level t (for
+                             example 2 / sqrt(K)). Needs --fitness pnl; exit 2
+                             under --pnl-stat cvar
+  --pnl-stat S              statistic of the block regrets r_k = 1 - c_k
+                             (c_k = net_k / B_k, the capture of block k):
+                             mean-sd (default) mean(r) + L sd(r); mean-semi
+                             mean(r) + L sqrt(mean(max(r_k - 1, 0)^2)), only
+                             blocks that lose against cash cost; cvar the mean
+                             of the ceil(q K) largest r_k (the worst captures,
+                             ties to the lower block). Needs --fitness pnl.
+                             --json search_fitness gains stat (and cvar_q)
+                             unless mean-sd with K <= 8; the book hash covers
+                             it, so a resume needs the same statistic
+  --pnl-cvar-q q            share of worst blocks under --pnl-stat cvar
+                             (default 0.25, in (0, 1]; 1 is the mean). Needs
+                             --pnl-stat cvar
+  --pnl-mask <expr>         price only the rows inside a causal regime gate
+                             (a bull or bear specialist). The expression reads
+                             columns of the row; aggregates exit 2 and a
+                             label, target, return or construction column
+                             exits 5 (D13). The gate is on when the value is
+                             > 0. Rows outside are flat; every run of on rows
+                             of a group starts flat and pays its exit, and a
+                             row without a return (an unlabelled row of a
+                             strided label) neither starts nor ends a run, in
+                             walk-forward too; the hindsight bound is taken on
+                             those runs. The
+                             training, validation and test books read one gate
+                             state, rcsr-gate-state/1: the kernel over every
+                             row of the data file from each group's first row
+                             (never a label or a row filter); the training and
+                             validation rows never read a test interval.
+                             --gpu scores it on the device, except with
+                             --band-units sd (exit 2). Needs --fitness pnl;
+                             the book hash covers it, so a resume needs the
+                             same mask
+  --pnl-mask-band h         hysteresis of --pnl-mask (default 0, finite, >= 0):
+                             on above +h, off below -h, else the previous
+                             state. Needs --pnl-mask
+  --pnl-mask-dwell D        minimum rows per gate state, per group (default 1,
+                             integer >= 1), in rows of the data file in every
+                             slice: unlabelled and dropped rows count, so 168
+                             is a week on hourly rows. Needs --pnl-mask
+  --gate-search             search a regime gate g over --vars (required)
+                             between two frozen branches (#1182). A candidate
+                             is scored at its best cut c of the 16-quantile
+                             grid of its training values by the --fitness pnl
+                             book of the composite that holds --branch-on where
+                             the gate state (the --pnl-mask kernel over g - c
+                             under rcsr-gate-state/1, read on the training
+                             rows, #1279) is on and --branch-off elsewhere; a constant gate
+                             holds the better branch. The front goes to the
+                             choice and pricing of rcsr compose (robust rule,
+                             alpha >= 0 in each gate state on the validation
+                             rows, rcsr-gate-state/1 on the validation and test
+                             rows); --json prints the composed run.json with
+                             the switch of every searched gate, gate_search and
+                             pareto[].gate_search; every candidate counts in
+                             search.candidates_evaluated and every composite
+                             pays its full bits. Implies --fitness pnl,
+                             --select-rule robust and --cpu; --gpu, the pricing
+                             flags compose refuses, --save, --resume and
+                             --reselect exit 2; a label, target, return or
+                             construction column exits 5. See docs/compose.md
+  --branch-on <run.json|expr|cash>
+                             the branch held where the gate is on: a run's
+                             finalist with its threshold subtracted (the run
+                             shares target, target spec, cost and split, else
+                             exit 2), an expression long above 0, or cash
+  --branch-off <run.json|expr|cash>
+                             the branch held where the gate is off
+  --gate-band h             hysteresis of the searched gate (default 0): on
+                             above c + h, off below c - h. Needs --gate-search
+  --gate-dwell D            minimum rows per searched gate state, per group
+                             (default 1). Needs --gate-search
+  --pnl-excess none|xs-mean the benchmark of the --fitness pnl excess (default
+                             none: return - funding - cash return). xs-mean
+                             subtracts the equal-weight mean return of the
+                             training rows at each timestamp (the rows the
+                             book can trade), so the fitness pays for timing
+                             and selection, not for market beta. Validation,
+                             test, robust selection and walk-forward stay
+                             absolute; objective.validation and
+                             objective.test gain xs_excess_net. Needs
+                             --fitness pnl and --cash-return 0 (exit 2); the
+                             book hash covers it, so a resume needs the same
+                             value
   --book-target COL         price the long/flat book on another label of the
                              same --target-spec file: its return_column,
                              horizon, entry offset and cost give the fitness,
@@ -252,7 +470,10 @@ INPUT:
                              a NaN fit label and a finite book return stays in
                              the book; the constant fit and --fit-rows read the
                              labelled rows only (on the GPU as well: the device
-                             fits the labelled rows and scores every book row)
+                             fits the labelled rows and scores every book row).
+                             --json records the book label's spec as
+                             objective.book_target_spec, so walkforward
+                             --from-run and --front price the same rows
   --position long_only|top_tercile
                              long_only (default): 1[pred > --threshold]. top_tercile: per
                              timestamp the top floor(n/3) finite predictions are long (p=1),
@@ -270,7 +491,17 @@ INPUT:
   --cost-override <f>        per-side cost that differs from the target spec cost on
                              purpose; the objective block says cost.source = flag
   --slippage-bps <f>         extra cost per side in basis points (default 0)
-  --cash-return <f>          return per row earned while flat (default 0)
+  --cash-return <f|train-mean>
+                             return per row earned while flat (default 0).
+                             train-mean (needs --fitness pnl) credits the
+                             fitness book with the mean return of its
+                             training rows (the drift of the assets' own
+                             returns, not an interest rate; the rows the
+                             book can trade under --pnl-mask). Validation,
+                             test, reports and walk-forward keep cash at 0.
+                             search_fitness gains cash_return and
+                             cash_return_source; the book hash covers the
+                             mode. Exit 2 with --pnl-excess xs-mean
   --funding <col>            per-row funding rate paid while long
   --max-position <f>         position cap in (0, 1] (default 1)
   --min-trades <n>           fewer trades on validation make a candidate
@@ -287,7 +518,8 @@ INPUT:
   --quorum <Q>              fraction of the K members that must vote long, with --policy vote
   --band-units score|sd      how --band is read (default score). sd: b = B x the
                              sample sd of the candidate's finite scores on the
-                             training rows only; the validation and test books
+                             training rows only (with --pnl-mask, the gate-on
+                             training rows); the validation and test books
                              take that b and never compute an sd; a degenerate
                              sd gives b = 0. Needs --band (exit 2 otherwise)
   --require-validation       refuse (exit 2) when there is no validation slice
@@ -405,13 +637,42 @@ DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
 
 HOW ROWS ARE SPLIT (important for time series and panel data):
   See docs/time-series.md for the full purge/embargo/look-ahead checklist.
-  --split random|temporal|group|temporal-group|auto   (default random)
+  --split random|temporal|group|temporal-group|temporal-intervals|auto   (default random)
                              random          shuffled i.i.d. holdout
                              temporal        train on the past, test on the future
                              group           hold out whole groups (unseen stocks,
                                              subjects, sensors), never both sides
                              temporal-group  a temporal split inside every group
+                             temporal-intervals  the roles of a --split-table
                              auto            infer from the columns and report
+  --split-table <csv>        interval-list split (mode temporal-intervals): rows
+                             split_id,role,start,end with role train, validation
+                             or test, UTC half-open intervals (ISO 8601 or epoch
+                             seconds). Needs --split-id, --time with epoch seconds
+                             and a --target-spec (the label purge). A training or
+                             validation row whose label window [t, t + purge)
+                             reaches a test interval, or that lies within the
+                             embargo after one, is left out; a training row within
+                             the purge on either side of a validation interval too.
+                             Overlapping intervals, an interval with no row left
+                             and --validation-frac, --test-frac, --train-select,
+                             --test-select or --cv with it exit 2; an interval that
+                             reaches a declared locked range exits 3. A split with
+                             no test interval is a final all-data run. Under
+                             --fitness pnl every maximal contiguous training
+                             interval is its own book segment per group; so is
+                             every validation and test interval in the validation
+                             and test books. run.json split records split_id,
+                             split_table_sha256, intervals, effective_intervals,
+                             interval_purge_seconds, embargo_seconds,
+                             embargo_source, embargo_column and book_segments
+  --split-id <id>            the split of --split-table to use
+  --embargo <seconds|auto>   embargo after every test interval of --split-table
+                             (default auto: the larger of the label purge and the
+                             longest lookback of the --vars columns, rule
+                             rcsr-lookback/1 at the modal bar of the data; a column
+                             without a rule counts as 10972800). A smaller value
+                             exits 2. embargo_source is flag, lookback or purge
   --time <col>               time/ordering column; implies temporal. Accepts
                              epoch numbers or ISO 8601 with a Z / +-HH:MM offset
   --date-only <policy>       date-only time values: error (default, refuses an
@@ -751,11 +1012,20 @@ SEARCH:
   --fit-fallback-max <N>     hard per-generation bound on exact CPU fallback
                              refits for --fit-strategy gpu (default 4096,
                              0 = unbounded). Fallbacks beyond the bound keep
-                             their finite device constants and are counted.
+                             their device constants, also after a routed tail
+                             status; only one with no finite device answer keeps
+                             its starting constants. All are counted.
+                             A bound that binds takes fallbacks by group (plan
+                             rejects first), then by island from a start
+                             island that moves every generation (a function of
+                             --seed and the generation), so each island gets
+                             refits in proportion over a run.
                              The refits run on the CPU fallback pool beside
                              the device work (same trees as after it);
                              RCSR_FIT_TAIL_SERIAL=1 runs them after the
-                             device batch
+                             device batch; RCSR_FIT_RELEASE_WAVES=K runs the
+                             device fit as K ordered calls, so they start
+                             under the later calls (same trees)
   --fit-polish <f64|f32|off>  arithmetic of the device fit kernel's polish, the
                              undamped Gauss-Newton steps after the damped LM
                              (default f64). f64 re-baselines and steps on the
@@ -787,6 +1057,7 @@ SEARCH:
                              search setting: a resume refuses a different
                              value. No effect for other metrics or with
                              --fit-iters 0
+{help_fit}
   --refit-band <F>           after a device-fit search, refit exactly (CPU f64)
                              only the trees whose full-data error is within
                              this relative band of the lowest error at no
@@ -794,46 +1065,12 @@ SEARCH:
                              still unrefit. inf (default) refits every
                              unique tree
   --no-fit                   disable constant fitting entirely (= --fit-iters 0)
-  --no-dedup                 disable structural de-duplication
-  --selection lexicographic|afp
-                             survivor and parent selection inside an island.
-                             lexicographic (default) replaces the island with
-                             its offspring and picks parents by error, then
-                             size. afp keeps the Pareto-best of parents and
-                             offspring on (error, complexity, age), adds a few
-                             random immigrants per generation and picks
-                             parents by Pareto rank and crowding distance.
-                             Node path only; refuses --variation postfix
-  --mutation-mix <M>         node-path edit weights: classic (point .25, terminal
-                             .35, subtree .40; default) or extended (adds insert,
-                             delete, swap and rotate). Not with --variation
-                             postfix (#471)
-  --crossover-internal <P>   probability that a crossover cut point is an
-                             internal node (default 0 = uniform cut). Not with
-                             --variation postfix (#471)
-  --adaptive-mix             per-island edit weights learned from the success
-                             rate of the last 10 generations (uses all seven edit
-                             kinds; learns from CPU-scored generations only).
-                             Off by default; not with --variation postfix (#471)
-  --no-front-parents         draw every parent from the island tournament;
-                             turns off the 15% Pareto-front feedback (#76)
-  --reject-constant-offspring
-                             reject offspring and random trees with no input
-                             outside an aggregate before the constant fit; the
-                             first constant of an island is kept (#477). Saved
-                             search setting, off by default
-                             and restores the pre-#76 trajectory exactly
-  --reject-fixed-position    under --fitness pnl, reject trees whose long/flat
-                             position cannot depend on the inputs (the exact
-                             output range does not cross --threshold, for
-                             example gauss(c * x) at threshold 0) before the
-                             constant fit, and keep them off the front. Before
-                             the fit every constant counts as free, so c + abs(x)
-                             goes to the fit (#848). With --objective it also
-                             makes such a member unusable as finalist, under
-                             --fitness metric too; so is a member whose
-                             validation book was long on every row or on none
-                             (#849). Saved search setting, off by default
+{help_dedup}
+{help_schedule}
+{help_island}
+{help_variation}
+{help_front_parents}
+{help_filter}
   --prune                    remove neutral code from the final front (off by
                              default): replace subtrees with a child or a
                              constant when the training error stays within
@@ -862,7 +1099,7 @@ SEARCH:
                              refit and scored on all training rows before
                              selection and archiving. Independent of
                              --predictor-samples
-  --patience <N>             stop after N generations without improvement (default 40)
+{help_stop}
   --time-budget <seconds>    wall-clock limit of this process (default: none).
                              The generation in progress finishes, its progress
                              event and checkpoint are written, and the result
@@ -1010,11 +1247,14 @@ SEARCH:
                              instead of the rectangular grid
   --qd-policy                feed the archive back into parent selection (UCB1
                              60/25/10/5), stratified migration and least-
-                             occupied restarts; implies --qd --qd-cvt
+                             occupied restarts; implies --qd --qd-cvt. The
+                             archive is then search state: --save writes it
+                             and --resume restores it (#1166)
   --qd-uniform               control: the policy selects occupied cells
                              uniformly instead of the UCB1 mix
   --qd-random                control: hash descriptors to random cells, so the
                              partition carries no behaviour information
+{help_qd}
   --threads <N>              worker threads for constant fitting and scoring of
                              offspring, inside each island (default: the CPU
                              cores available to the process; 1 = serial). The
@@ -1036,12 +1276,7 @@ SEARCH:
                              size (default min(cores, 8)). --json reports each
                              generation's native/unsupported counts and
                              fallback seconds
-  --variation auto|node|postfix
-                             variation engine. auto (default) uses the flat
-                             postfix arena for --no-fit GPU runs with a
-                             population >= 4096; node keeps the owned-tree loop;
-                             postfix requires the flat path and refuses a run
-                             that does not qualify
+{help_engine}
 
 CHECKPOINTS:
   --save <file>              write a checkpoint on exit and every --save-every
@@ -1083,7 +1318,7 @@ CHECKPOINTS:
                              refused: stderr names it (#860). A time-budget stop is not
                              terminal: --resume continues it and
                              --time-budget may be set again
-  --select-rule validation_objective|robust
+  --select-rule validation_objective|robust|occam
                              post-loop finalist rule (#928, like --prune: not
                              saved search state, outside the config hash).
                              robust needs --objective pnl|sharpe|log_growth:
@@ -1095,9 +1330,31 @@ CHECKPOINTS:
                              pooled alpha wins. No eligible member: verdict
                              no_signal, validation_objective finalist. Reads
                              training and validation rows only
-  --select-blocks <K>        validation blocks of robust, 1 to 8 (default 4)
+                             occam (#1184, report-only for the broad pilot):
+                             every member is priced in bits under the
+                             prefix code of docs/occam-code-v1.json and
+                             scored p_occam = min(1, p x 2^bits), with p the
+                             one-sided Student-t tail of the block-mean alpha
+                             t statistic on training and validation rows
+                             (at least 20 blocks, else exit 2); the lowest
+                             p_occam wins and verdict certified needs
+                             p_occam <= --select-delta, else no_signal.
+                             Needs --objective pnl|sharpe|log_growth
+  --select-blocks <K|intervals>
+                             validation blocks of robust, 1 to 8 (default 4);
+                             intervals takes one block per validation interval of
+                             --split-table (2 to 8 intervals, exit 2 otherwise)
   --select-se <Z>            one-standard-error multiple (default 1.0)
-  --select-block-len <L>     bootstrap block length in periods (default 21)
+  --select-delta <D>         occam: certification level, inside (0, 1) (default
+                             0.05; exit 2 otherwise or without occam)
+  --select-min-entries <E>   occam: fewest entries of an eligible member
+                             (default 30; exit 2 without occam)
+  --select-block-len <L>     bootstrap block length in periods, at most half the
+                             validation periods (exit 2 above). Default per
+                             member: max(ceil(cbrt(T)), mean long hold) for T
+                             validation periods, capped at T/4. A period is one
+                             timestamp, or one floor(t / horizon) bucket under
+                             a label stride
   --select-require-edge      post-loop gate (#1026, not saved search state,
                              outside the config hash): a member whose training
                              fitness is not below 1 (no better than flat on
@@ -1115,7 +1372,13 @@ CHECKPOINTS:
                              other data, target spec or backend. Another
                              build is accepted and recorded
   --reselect-run <run.json>  the same from a run.json front (expression_exact);
-                             split and train rows must match the data
+                             with --select-rule occam it reads pareto[].occam_tree
+                             (exit 2 if absent);
+                             split and train rows must match the data. A run.json
+                             with a compose block (rcsr compose) reruns compose's
+                             choice over its composites on these rows (pass the
+                             compose flags without --gates and the pools; see
+                             docs/compose.md)
 
 RUN INTEGRITY (#140):
   --run-manifest <file>      atomically write a JSON manifest with the build
@@ -1234,6 +1497,12 @@ fn expand_block_aliases(spec: &str, blocks: &[expr::Block]) -> String {
         .join(",")
 }
 
+/// #1117: `,"fit_accept":{...}` for the run JSON `search` object, empty unless
+/// `--fit-accept fitness`.
+fn fit_accept_json(report: Option<&search::FitAcceptReport>) -> String {
+    report.map_or(String::new(), |r| format!(",\"fit_accept\":{}", r.json()))
+}
+
 fn jstr(s: &str) -> String {
     let mut o = String::with_capacity(s.len() + 2);
     o.push('"');
@@ -1301,6 +1570,15 @@ fn trading_book(
     rcsr::trading::evaluate(&pred, &ret, &rows, tspec)
 }
 
+/// #1180: the share of rows on and the on-runs of the validation and test
+/// slices under `--pnl-mask`, and the raw slices for the unmasked reference.
+struct MaskContext {
+    validation: Option<(f64, usize)>,
+    test: (f64, usize),
+    raw_validation: Option<data::TradingSlice>,
+    raw_test: data::TradingSlice,
+}
+
 fn trading_usage(msg: &str) -> ! {
     eprintln!("error: {}", msg);
     std::process::exit(EXIT_USAGE);
@@ -1308,27 +1586,31 @@ fn trading_usage(msg: &str) -> ! {
 
 /// #925: the spec of one member's books: an sd-unit band resolved from its
 /// predictions on the training rows, never from the rows the book prices.
+/// #1246: under a regime mask the sd reads the gate-on training rows only,
+/// as the training fitness does.
 fn member_spec(
     tspec: &rcsr::trading::TradingSpec,
     train_pred: &[f64],
     train: Option<&data::TradingSlice>,
+    train_book: Option<&rcsr::trading::FitnessBook>,
 ) -> rcsr::trading::TradingSpec {
     if tspec.band.units != rcsr::trading::BandUnits::Sd {
         return tspec.clone();
     }
     let time = train.map_or(&[][..], |t| t.rows.time.as_slice());
-    rcsr::trading::TradingSpec {
-        band: rcsr::trading::BandSpec::from_training(tspec.band.units, tspec.band.multiple, train_pred, time),
-        ..tspec.clone()
-    }
+    let band = match train_book.filter(|b| b.is_masked()) {
+        Some(b) => rcsr::trading::BandSpec::from_training_masked(tspec.band.units, tspec.band.multiple, train_pred, time, b.flags()),
+        None => rcsr::trading::BandSpec::from_training(tspec.band.units, tspec.band.multiple, train_pred, time),
+    };
+    rcsr::trading::TradingSpec { band, ..tspec.clone() }
 }
 
 /// #480: the `"fitness"` member of a Pareto entry, in exact CPU `f64` on the
 /// training rows. `train_net` is the excess net over cash.
 fn fitness_member_json(book: &rcsr::trading::FitnessBook, pred: &[f64], regret: f64) -> String {
-    if book.blocks() > 1 {
-        // #484: `train_regret` is the search fitness (mean + lambda * sd of the
-        // block regrets); net, flips and exits sum the blocks.
+    if book.blocks() > 1 || book.stat() != rcsr::trading::BlockStat::MeanSd {
+        // #484: `train_regret` is the search fitness (#1178: the block statistic
+        // of the block regrets); net, flips and exits sum the blocks.
         let blocks = book.block_totals(pred);
         let mut net = 0.0;
         let (mut flips, mut exits, mut longs) = (0u64, 0u64, 0u64);
@@ -1709,7 +1991,7 @@ fn gpu_json(
     // #169: the run-level fit-arm ledger. Emitted for every GPU run, so the
     // strategy and its attempt/fallback/refit counts are always auditable.
     let fit = format!(
-        "\"fit\":{{\"strategy\":{},\"admission\":{},\"screened\":{},\"admitted_wide\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"status_by_label\":{{{}}},\"refits\":{},\"refit_candidates\":{},\"refit_s\":{},\"rescore_s\":{},\"carried_kept\":{},\"seconds\":{},\"kernel_lm_s\":{},\"kernel_polish_s\":{},\"polish\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"tail_overlap_s\":{},\"tail_join_wait_s\":{},\"gate_s\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{},\"fit_rows\":{},\"score_rows\":{},\"fit_twin_bytes\":{},\"subsample_hash\":{},\"calls\":{},\"candidates\":{},\"call_s_max\":{},\"fold_count\":{},\"folded\":{},\"fallback_skipped_by_cause\":{{{}}},\"fallback_device_kept_by_cause\":{{{}}},\"max_iters\":{}}}",
+        "\"fit\":{{\"strategy\":{},\"admission\":{},\"screened\":{},\"admitted_wide\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"status_by_label\":{{{}}},\"refits\":{},\"refit_candidates\":{},\"refit_s\":{},\"rescore_s\":{},\"carried_kept\":{},\"seconds\":{},\"kernel_lm_s\":{},\"kernel_polish_s\":{},\"polish\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"tail_overlap_s\":{},\"tail_join_wait_s\":{},\"gate_s\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{},\"fit_rows\":{},\"score_rows\":{},\"fit_twin_bytes\":{},\"subsample_hash\":{},\"calls\":{},\"candidates\":{},\"call_s_max\":{},\"release_waves\":{},\"tail_early_fits\":{},\"fold_count\":{},\"folded\":{},\"fallback_skipped_by_cause\":{{{}}},\"fallback_device_kept_by_cause\":{{{}}},\"max_iters\":{}}}",
         jstr(fit_strategy),
         jstr(g.fit_admission.name()),
         g.fit_screened,
@@ -1748,6 +2030,8 @@ fn gpu_json(
         g.fit_calls,
         g.fit_call_candidates,
         jnum(g.fit_call_ms_max / 1000.0),
+        g.fit_release_waves,
+        g.fit_tail_early,
         g.fit_fold_count,
         g.fit_folded,
         ops_json(&g.fit_fallback_skipped_by_cause),
@@ -2023,13 +2307,24 @@ fn eprint_run_summary(
     }
 }
 
+/// #1084: `note` under the book descriptor, nothing under the moments pair, so
+/// a moments run keeps its report bytes.
+fn qd_descriptor_note(q: &qd::QdReport, note: &'static str) -> &'static str {
+    if q.descriptor == rcsr::qd::DescriptorKind::Book.as_str() {
+        note
+    } else {
+        ""
+    }
+}
+
 /// #120: QD coverage in the human-readable log.
 fn qd_text(q: Option<&qd::QdReport>) {
     if let Some(q) = q {
         eprintln!(
-            "# qd ({}): {}/{} reachable cells occupied ({:.1}%), {} entries, best error {}, \
+            "# qd ({}{}): {}/{} reachable cells occupied ({:.1}%), {} entries, best error {}, \
              entropy {:.3}/{:.3} bits, qd-score {:.4}, descriptor fallbacks {}, hypervolume {:.4} (self-normalised diagnostic)",
             q.mode,
+            qd_descriptor_note(q, ", book descriptor"),
             q.occupied_reachable,
             q.reachable,
             100.0 * q.reachable_coverage,
@@ -2049,8 +2344,9 @@ fn qd_json(q: Option<&qd::QdReport>) -> String {
     match q {
         None => "null".to_string(),
         Some(q) => format!(
-            "{{\"mode\":\"{}\",\"bins\":{},\"cells\":{},\"reachable\":{},\"occupied\":{},\"occupied_reachable\":{},\"coverage\":{},\"reachable_coverage\":{},\"entries\":{},\"best_error\":{},\"cell_cap\":{},\"occupancy_entropy\":{},\"occupancy_entropy_normalized\":{},\"qd_score\":{},\"descriptor_fallbacks\":{},\"hypervolume\":{},\"evaluations\":{}}}",
+            "{{\"mode\":\"{}\"{},\"bins\":{},\"cells\":{},\"reachable\":{},\"occupied\":{},\"occupied_reachable\":{},\"coverage\":{},\"reachable_coverage\":{},\"entries\":{},\"best_error\":{},\"cell_cap\":{},\"occupancy_entropy\":{},\"occupancy_entropy_normalized\":{},\"qd_score\":{},\"descriptor_fallbacks\":{},\"hypervolume\":{},\"evaluations\":{}}}",
             q.mode,
+            qd_descriptor_note(q, ",\"descriptor\":\"book\""),
             q.bins,
             q.cells,
             q.reachable,
@@ -2526,6 +2822,9 @@ struct Row {
     /// #645: the `"validation_book"` member of the pareto JSON (leading comma);
     /// empty without a trading objective.
     validation_book_json: String,
+    /// #1184: the `"occam"` member of the pareto JSON (leading comma); empty
+    /// without `--select-rule occam`.
+    occam_json: String,
 }
 
 /// Cross-validation summary (issue #19).
@@ -2611,6 +2910,19 @@ fn main() {
     if args.first().map(|s| s.as_str()) == Some("trials") {
         rcsr::trials::run(&args[1..]);
     }
+    // #1185: `rcsr switch` builds the training book of a --fitness pnl run and stops before the search.
+    let args: Vec<String> = if args.first().map(|s| s.as_str()) == Some("switch") { rcsr::switch::claim(&args[1..]) } else { args };
+    // #1181: `rcsr compose` builds the rows of a --fitness pnl run and stops before the search.
+    let args: Vec<String> = if args.first().map(|s| s.as_str()) == Some("compose") { rcsr::compose::claim(&args[1..]) } else { args };
+    // #1214: `--reselect-run` of a composed run reruns compose's choice over the run's composites.
+    let args: Vec<String> = match rcsr::compose::reselect_target(&args).filter(|_| rcsr::compose::request().is_none() && args.first().is_some_and(|a| a.starts_with("--"))) {
+        Some(path) => rcsr::compose::claim_reselect(&args, &path),
+        None => args,
+    };
+    // #1182: `--gate-search` scores gate trees by the composite of two frozen branches.
+    let args: Vec<String> = if args.first().is_some_and(|a| a.starts_with("--")) { rcsr::gate_search::claim(args) } else { args };
+    // #1183: `rcsr enumerate` builds the training book of a --fitness pnl run and stops before the search.
+    let args: Vec<String> = if args.first().map(|s| s.as_str()) == Some("enumerate") { rcsr::enumerate::claim(&args[1..]) } else { args };
     // #124: a reusable Rust walk-forward evaluator over the column store.
     if matches!(
         args.first().map(|s| s.as_str()),
@@ -2625,6 +2937,10 @@ fn main() {
     // #140: verify a run manifest without starting a search.
     if args.first().map(|s| s.as_str()) == Some("verify-manifest") {
         run_verify_manifest(&args[1..]);
+    }
+    // #1130: the campaign lock record check.
+    if args.first().map(|s| s.as_str()) == Some("lock") {
+        rcsr::lockrec::run(&args[1..]);
     }
     // #129: differential leakage audit. Exit 5 when any detector fires.
     if args.first().map(|s| s.as_str()) == Some("audit") {
@@ -2677,6 +2993,13 @@ fn main() {
     let mut pnl_blocks_arg: Option<String> = None;
     let mut book_target_arg: Option<String> = None;
     let mut pnl_lambda_arg: Option<String> = None;
+    // #1178: the statistic of the block regrets.
+    let mut pnl_stat_arg: Option<String> = None;
+    let mut pnl_cvar_q_arg: Option<String> = None;
+    let mut pnl_mask_arg: Option<String> = None;
+    let mut pnl_mask_band_arg: Option<String> = None;
+    let mut pnl_mask_dwell_arg: Option<String> = None;
+    let mut pnl_excess_arg: Option<String> = None;
     let mut trading_flags: Vec<&'static str> = Vec::new();
     let mut position_arg: Option<String> = None;
     let mut allow_short = false;
@@ -2685,6 +3008,7 @@ fn main() {
     let mut trade_cost_override: Option<f64> = None;
     let mut trade_slippage_bps = 0.0f64;
     let mut trade_cash_return = 0.0f64;
+    let mut cash_train_mean = false;
     let mut trade_funding: Option<String> = None;
     let mut trade_max_position = 1.0f64;
     let mut trade_min_trades = 1usize;
@@ -2776,8 +3100,16 @@ fn main() {
     let mut select_rule_arg: Option<String> = None;
     let mut select_require_edge = false;
     let mut select_blocks_arg: Option<usize> = None;
+    // #1173: interval-list split.
+    let mut select_blocks_intervals = false;
+    let mut split_table_path: Option<String> = None;
+    let mut split_id_arg: Option<String> = None;
+    let mut embargo_arg: Option<String> = None;
+    let mut test_frac_given = false;
     let mut select_se_arg: Option<f64> = None;
     let mut select_block_len_arg: Option<usize> = None;
+    let mut select_delta_arg: Option<f64> = None;
+    let mut select_min_entries_arg: Option<usize> = None;
     let mut reselect_path: Option<String> = None;
     let mut reselect_run_path: Option<String> = None;
     // #140: run integrity flags.
@@ -2810,8 +3142,6 @@ fn main() {
     // #116: remember an explicit --fit-strategy so a resume can refuse a
     // contradiction with the saved configuration.
     let mut fit_strategy_set = false;
-    let mut dedup_set = false;
-    let mut patience_set = false;
     let mut time_budget_set = false;
     let mut predictor_samples_set = false;
     // #85: remember an explicit --fit-samples so a resume can refuse a
@@ -2826,20 +3156,14 @@ fn main() {
     let mut fit_polish_set = false;
     let mut fit_max_iters_set = false; // #1042
     let mut fit_irls_set = false;
-    // #76: remember an explicit --no-front-parents so a resume can refuse a
-    // contradiction with the saved configuration.
-    let mut front_parents_set = false;
-    let mut reject_constant_set = false;
-    let mut reject_fixed_set = false; // #848
-    // #465: explicit --selection for the resume settings check.
-    let mut selection_set = false;
-    let mut mutation_mix_set = false; // #471
-    let mut crossover_internal_set = false;
-    let mut adaptive_mix_set = false;
+    // #1083: the table rows named on the command line.
+    let mut explicit = settings::Explicit::default();
     // #25: `--units` is resolved against the prepared input list later; the
     // expressions themselves are parsed here so a typo is a usage error.
     let mut unit_assignments: Vec<(String, Unit)> = Vec::new();
     let mut require_dimensions = false;
+    let mut units_specs: Vec<String> = Vec::new();
+    let mut qd_flags: Vec<(String, Option<String>)> = Vec::new();
     let mut op_complexity_spec: Option<String> = None;
     let mut complexity_weights_spec: Option<String> = None;
     let mut depth_weight_spec: Option<f64> = None;
@@ -2981,13 +3305,22 @@ fn main() {
                 cfg.seed = parse_flag("--seed", &val!(), "an integer from 0 to 4294967295", |_| true);
                 seed_set = true;
             }
-            "--test-frac" => test_frac = parse_nonneg("--test-frac", &val!()),
+            "--test-frac" => {
+                test_frac = parse_nonneg("--test-frac", &val!());
+                test_frac_given = true;
+            }
             "--validation-frac" => validation_frac = parse_nonneg("--validation-frac", &val!()),
             "--select-by" => select_by_arg = Some(val!()),
             "--objective" => objective_arg = Some(val!()),
             "--fitness" => fitness_arg = Some(val!()),
             "--pnl-blocks" => pnl_blocks_arg = Some(val!()),
             "--pnl-block-lambda" => pnl_lambda_arg = Some(val!()),
+            "--pnl-stat" => pnl_stat_arg = Some(val!()),
+            "--pnl-cvar-q" => pnl_cvar_q_arg = Some(val!()),
+            "--pnl-mask" => pnl_mask_arg = Some(val!()),
+            "--pnl-mask-band" => pnl_mask_band_arg = Some(val!()),
+            "--pnl-mask-dwell" => pnl_mask_dwell_arg = Some(val!()),
+            "--pnl-excess" => pnl_excess_arg = Some(val!()),
             "--book-target" => {
                 trading_flags.push("--book-target");
                 book_target_arg = Some(val!());
@@ -3018,7 +3351,9 @@ fn main() {
             }
             "--cash-return" => {
                 trading_flags.push("--cash-return");
-                trade_cash_return = parse_trade_number("--cash-return", &val!());
+                let v = val!();
+                cash_train_mean = v.trim() == "train-mean";
+                trade_cash_return = if cash_train_mean { 0.0 } else { parse_trade_number("--cash-return", &v) };
             }
             "--funding" => {
                 trading_flags.push("--funding");
@@ -3135,6 +3470,9 @@ fn main() {
             "--train-select" => train_select_src = Some(val!()),
             "--test-select" => test_select_src = Some(val!()),
             "--split" => split_arg = Some(val!()),
+            "--split-table" => split_table_path = Some(val!()),
+            "--split-id" => split_id_arg = Some(val!()),
+            "--embargo" => embargo_arg = Some(val!()),
             "--time" => time_name = Some(val!()),
             "--group-by" => group_name = Some(val!()),
             "--gap" => gap_src = Some(val!()),
@@ -3328,69 +3666,15 @@ fn main() {
                     }
                 }
             }
-            "--no-dedup" => {
-                cfg.dedup = false;
-                dedup_set = true;
-            }
             // #120: opt-in quality-diversity coverage archive.
-            "--qd" => {
-                if cfg.qd_bins == 0 {
-                    cfg.qd_bins = if cfg.qd_cvt { 512 } else { 16 };
+            "--qd" | "--qd-cells" | "--qd-cell-cap" | "--qd-cvt" | "--qd-policy" | "--qd-uniform" | "--qd-random" => {
+                let flag = args[i].clone();
+                let value = if flag == "--qd-cells" || flag == "--qd-cell-cap" { Some(val!()) } else { None };
+                if let Err(e) = apply_qd_flag(&mut cfg, &flag, value.as_deref()) {
+                    eprintln!("error: {}", e);
+                    std::process::exit(EXIT_USAGE);
                 }
-            }
-            "--qd-cells" => {
-                let v = val!();
-                match v.parse::<usize>() {
-                    Ok(n) if (2..=512).contains(&n) => cfg.qd_bins = n,
-                    _ => {
-                        eprintln!(
-                            "error: --qd-cells needs an integer in 2..=512, got '{}'",
-                            v
-                        );
-                        std::process::exit(EXIT_USAGE);
-                    }
-                }
-            }
-            "--qd-cell-cap" => {
-                let v = val!();
-                match v.parse::<usize>() {
-                    Ok(n) if (1..=64).contains(&n) => cfg.qd_cell_cap = n,
-                    _ => {
-                        eprintln!(
-                            "error: --qd-cell-cap needs an integer in 1..=64, got '{}'",
-                            v
-                        );
-                        std::process::exit(EXIT_USAGE);
-                    }
-                }
-            }
-            "--qd-cvt" => {
-                cfg.qd_cvt = true;
-                if cfg.qd_bins == 0 {
-                    cfg.qd_bins = 512;
-                }
-            }
-            "--qd-policy" => {
-                cfg.qd_policy = true;
-                cfg.qd_cvt = true;
-                if cfg.qd_bins == 0 {
-                    cfg.qd_bins = 512;
-                }
-            }
-            "--qd-uniform" => {
-                cfg.qd_policy = true;
-                cfg.qd_control = 1;
-                cfg.qd_cvt = true;
-                if cfg.qd_bins == 0 {
-                    cfg.qd_bins = 512;
-                }
-            }
-            "--qd-random" => {
-                cfg.qd_policy = true;
-                cfg.qd_control = 2;
-                if cfg.qd_bins == 0 {
-                    cfg.qd_bins = 512;
-                }
+                qd_flags.push((flag, value));
             }
             "--linear-scaling" => {
                 eprintln!(
@@ -3398,65 +3682,21 @@ fn main() {
                 );
                 std::process::exit(EXIT_USAGE);
             }
-            // #471: node-path variation settings, each off by default.
-            "--mutation-mix" => {
-                let v = val!();
-                match rcsr::search::MutationMix::parse(&v) {
-                    Ok(m) => cfg.mutation_mix = m,
-                    Err(e) => {
-                        eprintln!("error: --mutation-mix: {}", e);
-                        std::process::exit(EXIT_USAGE);
-                    }
+            // #1083: settings from the search setting table.
+            flag if settings::find(flag).is_some() => {
+                let row = settings::find(flag).expect("matched by the guard");
+                let value = if row.takes_value() { Some(val!()) } else { None };
+                if let Err(e) = row.apply_cli(&mut cfg, value.as_deref()) {
+                    eprintln!("error: {}", e);
+                    std::process::exit(EXIT_USAGE);
                 }
-                mutation_mix_set = true;
+                explicit.mark(row);
             }
             "--tree-arity" => {
                 eprintln!(
                     "error: --tree-arity was removed (#471): its only non-default value, balanced, lowered oracle_recovered in the default-decision A/B"
                 );
                 std::process::exit(EXIT_USAGE);
-            }
-            "--crossover-internal" => {
-                let v = val!();
-                match v.parse::<f64>() {
-                    Ok(p) if (0.0..=1.0).contains(&p) => cfg.crossover_internal = p,
-                    _ => {
-                        eprintln!("error: --crossover-internal needs a probability in [0, 1], got '{}'", v);
-                        std::process::exit(EXIT_USAGE);
-                    }
-                }
-                crossover_internal_set = true;
-            }
-            "--adaptive-mix" => {
-                cfg.adaptive_mix = true;
-                adaptive_mix_set = true;
-            }
-            // #76: exactness escape hatch; the default is on.
-            // #465: survivor and parent selection inside an island.
-            "--selection" => {
-                let v = val!();
-                match crate::search::Selection::parse(&v) {
-                    Ok(s) => {
-                        cfg.selection = s;
-                        selection_set = true;
-                    }
-                    Err(e) => {
-                        eprintln!("error: {}", e);
-                        std::process::exit(EXIT_USAGE);
-                    }
-                }
-            }
-            "--no-front-parents" => {
-                cfg.front_parents = false;
-                front_parents_set = true;
-            }
-            "--reject-constant-offspring" => {
-                cfg.reject_constant_offspring = true;
-                reject_constant_set = true;
-            }
-            "--reject-fixed-position" => {
-                cfg.reject_fixed_position = true;
-                reject_fixed_set = true;
             }
             // #27: evaluator path only; deliberately not a saved search
             // setting, because both paths produce identical errors.
@@ -3527,17 +3767,6 @@ fn main() {
                     }
                 }
             }
-            // #122: variation engine selection.
-            "--variation" => {
-                let v = val!();
-                match crate::search::VariationMode::parse(&v) {
-                    Ok(mode) => cfg.variation = mode,
-                    Err(e) => {
-                        eprintln!("error: {}", e);
-                        std::process::exit(EXIT_USAGE);
-                    }
-                }
-            }
             "--predictor-samples" => {
                 let v = val!();
                 match v.parse::<usize>() {
@@ -3577,8 +3806,12 @@ fn main() {
                 }
             }
             "--units" => {
-                match parse_unit_assignments(&val!()) {
-                    Ok(mut entries) => unit_assignments.append(&mut entries),
+                let spec = val!();
+                match parse_unit_assignments(&spec) {
+                    Ok(mut entries) => {
+                        unit_assignments.append(&mut entries);
+                        units_specs.push(spec);
+                    }
                     Err(e) => {
                         eprintln!("error: --units: {}", e);
                         std::process::exit(EXIT_USAGE);
@@ -3586,10 +3819,6 @@ fn main() {
                 }
             }
             "--require-dimensions" => require_dimensions = true,
-            "--patience" => {
-                cfg.patience = parse_uint("--patience", &val!());
-                patience_set = true;
-            }
             "--patience-tol" => {
                 eprintln!("error: --patience-tol was removed (#464): it saved under 10 % of the noisy CPU in the default-decision A/B");
                 std::process::exit(EXIT_USAGE);
@@ -3620,9 +3849,18 @@ fn main() {
             "--resume" => resume_path = Some(val!()),
             "--select-rule" => select_rule_arg = Some(val!()),
             "--select-require-edge" => select_require_edge = true,
-            "--select-blocks" => select_blocks_arg = Some(parse_uint("--select-blocks", &val!())),
+            "--select-blocks" => {
+                let v = val!();
+                if v == "intervals" {
+                    select_blocks_intervals = true;
+                } else {
+                    select_blocks_arg = Some(parse_uint("--select-blocks", &v));
+                }
+            }
             "--select-se" => select_se_arg = Some(parse_nonneg("--select-se", &val!())),
             "--select-block-len" => select_block_len_arg = Some(parse_uint("--select-block-len", &val!())),
+            "--select-delta" => select_delta_arg = Some(parse_nonneg("--select-delta", &val!())),
+            "--select-min-entries" => select_min_entries_arg = Some(parse_uint("--select-min-entries", &val!())),
             "--reselect" => reselect_path = Some(val!()),
             "--reselect-run" => reselect_run_path = Some(val!()),
             "--allow-backend-change" => allow_backend_change = true,
@@ -3814,6 +4052,25 @@ fn main() {
         );
         std::process::exit(EXIT_USAGE);
     }
+    if cfg.selection == crate::search::Selection::Lexicase && cfg.variation == crate::search::VariationMode::Postfix {
+        eprintln!("error: --selection lexicase runs on the node path only; use --variation auto or node");
+        std::process::exit(EXIT_USAGE); // #1023
+    }
+    // #1100: a resume is checked against its saved island count by the search.
+    if resume_path.is_none() && cfg.explore_islands > 0 && cfg.explore_islands >= cfg.islands.max(1) {
+        eprintln!(
+            "error: --explore-islands {} needs at least one exploit island (--islands {})",
+            cfg.explore_islands,
+            cfg.islands.max(1)
+        );
+        std::process::exit(EXIT_USAGE);
+    }
+    if cfg.front_scope == crate::search::FrontScope::Island && cfg.qd_policy {
+        eprintln!(
+            "error: --front-scope island with --qd-policy: the QD archive is one parent pool shared by every island"
+        );
+        std::process::exit(EXIT_USAGE); // #1070
+    }
     // #928: a re-selection is a resume that runs nothing.
     if reselect_path.is_some() || reselect_run_path.is_some() {
         let conflicts = [
@@ -3996,6 +4253,11 @@ fn main() {
             }
         }
         let saved = cp.config.clone();
+        // #1166: a --reselect reads only the final archive, so it needs no QD archive.
+        if saved.qd_policy && cp.qd.is_none() && reselect_path.is_none() {
+            eprintln!("error: --resume '{}': {}", path, rcsr::checkpoint::QD_ARCHIVE_MISSING);
+            std::process::exit(EXIT_USAGE);
+        }
         if cp.refit_band_unknown && !refit_band_set {
             eprintln!(
                 "error: --resume '{}' has no saved --refit-band (written by an older binary), so its band is unknown",
@@ -4053,15 +4315,8 @@ fn main() {
                 saved.fit_strategy.name()
             ));
         }
-        if dedup_set && cfg.dedup != saved.dedup {
-            conflicts.push(format!("--no-dedup (saved dedup is {})", saved.dedup));
-        }
-        if patience_set && cfg.patience != saved.patience {
-            conflicts.push(format!(
-                "--patience {} (saved {})",
-                cfg.patience, saved.patience
-            ));
-        }
+        settings::conflicts(Group::Dedup, &cfg, &saved, &explicit, &mut conflicts);
+        settings::conflicts(Group::Stop, &cfg, &saved, &explicit, &mut conflicts); // #1083
         if predictor_samples_set && cfg.predictor_samples != saved.predictor_samples {
             conflicts.push(format!(
                 "--predictor-samples {:?} (saved {:?})",
@@ -4119,14 +4374,8 @@ fn main() {
                 cfg.fit_fallback_max, saved.fit_fallback_max
             ));
         }
-        // #465: the selection scheme is saved search state.
-        if selection_set && cfg.selection != saved.selection {
-            conflicts.push(format!(
-                "--selection {} (saved {})",
-                cfg.selection.as_str(),
-                saved.selection.as_str()
-            ));
-        }
+        settings::conflicts(Group::Schedule, &cfg, &saved, &explicit, &mut conflicts); // #1109
+        settings::conflicts(Group::Island, &cfg, &saved, &explicit, &mut conflicts); // #1083
         // #495: the band decides which finalists get the exact refit.
         if refit_band_set && !cp.refit_band_unknown && cfg.refit_band != saved.refit_band {
             conflicts.push(format!(
@@ -4134,42 +4383,17 @@ fn main() {
                 cfg.refit_band, saved.refit_band
             ));
         }
-        // #471: the node-path variation settings are saved search state.
-        {
-            if mutation_mix_set && cfg.mutation_mix != saved.mutation_mix {
-                conflicts.push(format!(
-                    "--mutation-mix {} (saved {})",
-                    cfg.mutation_mix.as_str(),
-                    saved.mutation_mix.as_str()
-                ));
-            }
-            if crossover_internal_set && cfg.crossover_internal != saved.crossover_internal {
-                conflicts.push(format!(
-                    "--crossover-internal {} (saved {})",
-                    cfg.crossover_internal, saved.crossover_internal
-                ));
-            }
-            if adaptive_mix_set && cfg.adaptive_mix != saved.adaptive_mix {
-                conflicts.push(format!("--adaptive-mix (saved adaptive_mix is {})", saved.adaptive_mix));
-            }
-        }
-        // #76: front feedback is saved search state.
-        if front_parents_set && cfg.front_parents != saved.front_parents {
+        settings::conflicts(Group::Variation, &cfg, &saved, &explicit, &mut conflicts); // #1083
+        settings::conflicts(Group::FrontParents, &cfg, &saved, &explicit, &mut conflicts);
+        settings::conflicts(Group::Filter, &cfg, &saved, &explicit, &mut conflicts); // #1083
+        settings::conflicts(Group::Fit, &cfg, &saved, &explicit, &mut conflicts);
+        settings::conflicts(Group::Engine, &cfg, &saved, &explicit, &mut conflicts); // #1087
+        qd_conflicts(&qd_flags, &saved, &mut conflicts);
+        settings::conflicts(Group::Qd, &cfg, &saved, &explicit, &mut conflicts); // #1084
+        if require_dimensions && !saved.require_dimensions {
             conflicts.push(format!(
-                "--no-front-parents (saved front_parents is {})",
-                saved.front_parents
-            ));
-        }
-        if reject_constant_set && cfg.reject_constant_offspring != saved.reject_constant_offspring {
-            conflicts.push(format!(
-                "--reject-constant-offspring (saved reject_constant_offspring is {})",
-                saved.reject_constant_offspring
-            ));
-        }
-        if reject_fixed_set && cfg.reject_fixed_position != saved.reject_fixed_position {
-            conflicts.push(format!(
-                "--reject-fixed-position (saved reject_fixed_position is {})",
-                saved.reject_fixed_position
+                "--require-dimensions (saved require_dimensions is {})",
+                saved.require_dimensions
             ));
         }
         if let Some(spec) = &op_complexity_spec {
@@ -4203,17 +4427,7 @@ fn main() {
             }
         }
 
-        if !conflicts.is_empty() {
-            eprintln!(
-                "error: --resume '{}' conflicts with the saved search settings:",
-                path
-            );
-            for c in &conflicts {
-                eprintln!("  - {}", c);
-            }
-            eprintln!("  the saved run wins; omit the flag or pass the saved value");
-            std::process::exit(EXIT_USAGE);
-        }
+        exit_on_resume_conflicts(path, &conflicts);
 
         // The generation budget is the one setting that may be *raised* on
         // resume: all earlier generations are unaffected and a longer run is
@@ -4263,6 +4477,15 @@ fn main() {
         std::process::exit(EXIT_USAGE);
     }
     cfg.fit_max_iters = cfg.fit_max_iters_effective();
+    // #1023: lexicase reads per-case errors on the host only.
+    if cfg.selection == crate::search::Selection::Lexicase && gpu_explicit == Some(true) {
+        if fitness_arg.as_deref() == Some("pnl") || !cfg.fitness.is_metric() {
+            eprintln!("error: --selection lexicase --fitness pnl --gpu: the device long_pnl fitness returns no sub-book cases yet (#1031); omit --gpu to run on the CPU");
+        } else {
+            eprintln!("error: --selection lexicase with --gpu: the device scorer returns no per-row case errors yet (#1169); omit --gpu to run on the CPU");
+        }
+        std::process::exit(EXIT_USAGE);
+    }
 
     // #141: probe the device once, before the dataset is loaded. The probe
     // allocates nothing; the search opens its own resident context later. This
@@ -4273,6 +4496,9 @@ fn main() {
     }
     cfg.dispatch = dispatch_mode;
 
+    if pnl_mask_arg.is_some() && gpu_explicit == Some(true) && trade_band_units.as_deref().map(str::trim) == Some("sd") {
+        trading_usage("--pnl-mask with --band-units sd and --gpu: the device sd reads every row, not the rows inside the mask; use --band-units score or omit --gpu to run on the CPU");
+    }
     let gpu_probe = if gpu_explicit == Some(false) {
         backend::Probe::not_probed("--cpu/--no-gpu (device not probed)")
     } else {
@@ -4552,6 +4778,96 @@ fn main() {
     if let (Some(r), false) = (&target_resolved, vars.is_empty()) {
         target_check = Some(enforce_target_check(&r.spec, &vars, allow_target_structure, require_clean_inputs));
     }
+    // #1180: the regime gate of --pnl-mask, parsed and checked before any row is read.
+    let gate_spec: Option<rcsr::regime_gate::GateSpec> = match pnl_mask_arg.as_deref() {
+        None => {
+            for (flag, given) in [("--pnl-mask-band", pnl_mask_band_arg.is_some()), ("--pnl-mask-dwell", pnl_mask_dwell_arg.is_some())] {
+                if given {
+                    trading_usage(&format!("{} needs --pnl-mask", flag));
+                }
+            }
+            None
+        }
+        Some(src) => {
+            if fitness_arg.as_deref() != Some("pnl") {
+                trading_usage("--pnl-mask needs --fitness pnl");
+            }
+            let band = match pnl_mask_band_arg.as_deref() {
+                None => 0.0,
+                Some(t) => match t.trim().parse::<f64>() {
+                    Ok(b) if b.is_finite() && b >= 0.0 => b,
+                    _ => trading_usage(&format!("--pnl-mask-band must be a finite number >= 0, got '{}'", t)),
+                },
+            };
+            let dwell = match pnl_mask_dwell_arg.as_deref() {
+                None => 1,
+                Some(t) => match t.trim().parse::<usize>() {
+                    Ok(d) if d >= 1 => d,
+                    _ => trading_usage(&format!("--pnl-mask-dwell must be an integer >= 1, got '{}'", t)),
+                },
+            };
+            let spec = match rcsr::regime_gate::GateSpec::parse(src, band, dwell) {
+                Ok(g) => g,
+                Err(e) => trading_usage(&format!("--pnl-mask: {}", e)),
+            };
+            let specs: Vec<&target::TargetSpec> = target_resolved.iter().chain(book_resolved.iter()).map(|r| &r.spec).collect();
+            enforce_gate_columns("--pnl-mask", &spec.columns, &specs, &target_names, allow_target_structure);
+            Some(spec)
+        }
+    };
+    // #1247: gate state is a row-to-row recursion over every row of the data file; a hash sample breaks it.
+    if sample_rows.is_some() {
+        let gated = if gate_spec.is_some() {
+            Some("--pnl-mask")
+        } else if rcsr::switch::request().is_some() {
+            Some("rcsr switch")
+        } else if rcsr::compose::request().is_some() {
+            Some("rcsr compose")
+        } else if rcsr::gate_search::request().is_some() {
+            Some("--gate-search")
+        } else {
+            None
+        };
+        if let Some(what) = gated {
+            trading_usage(&format!(
+                "--sample-rows with {}: the gate states are computed over the sampled rows, not over the data file; drop --sample-rows or load the full store",
+                what
+            ));
+        }
+    }
+    // #1185: every column `rcsr switch` reads passes the --pnl-mask checks before any row is read.
+    if let Some(sw) = rcsr::switch::request() {
+        if lags > 0 || lag_set_src.is_some() || fill != data::FillMethod::None || outlier_iqr.is_some() || smooth > 0 {
+            trading_usage("rcsr switch reads the raw columns of the training rows: --lags, --lag-set, --fill, --outlier-iqr and --smooth would change them");
+        }
+        let specs: Vec<&target::TargetSpec> = target_resolved.iter().chain(book_resolved.iter()).map(|r| &r.spec).collect();
+        for (flag, columns) in sw.column_sets() {
+            enforce_gate_columns(flag, columns, &specs, &target_names, allow_target_structure);
+        }
+    }
+    // #1181: the gate and branch columns of `rcsr compose` pass the same checks.
+    if let Some(cp) = rcsr::compose::request() {
+        if lags > 0 || lag_set_src.is_some() || !matches!(fill, data::FillMethod::None | data::FillMethod::Drop) || outlier_iqr.is_some() || smooth > 0 {
+            trading_usage("rcsr compose reads the raw columns of the rows: --lags, --lag-set, --fill other than drop, --outlier-iqr and --smooth would change them");
+        }
+        let specs: Vec<&target::TargetSpec> = target_resolved.iter().chain(book_resolved.iter()).map(|r| &r.spec).collect();
+        for (flag, columns) in cp.column_sets() {
+            enforce_gate_columns(flag, &columns, &specs, &target_names, allow_target_structure);
+        }
+    }
+    // #1182: the gate variables and the branch columns of `--gate-search` pass the same checks.
+    if let Some(gs) = rcsr::gate_search::request() {
+        if vars.is_empty() {
+            trading_usage("--gate-search needs --vars: it lists the gate's variables");
+        }
+        if lags > 0 || lag_set_src.is_some() || !matches!(fill, data::FillMethod::None | data::FillMethod::Drop) || outlier_iqr.is_some() || smooth > 0 {
+            trading_usage("--gate-search reads the raw columns of the rows: --lags, --lag-set, --fill other than drop, --outlier-iqr and --smooth would change them");
+        }
+        let specs: Vec<&target::TargetSpec> = target_resolved.iter().chain(book_resolved.iter()).map(|r| &r.spec).collect();
+        for (flag, columns) in gs.column_sets(&vars) {
+            enforce_gate_columns(flag, columns, &specs, &target_names, allow_target_structure);
+        }
+    }
 
     // #71/#112: the guard and the backing choice happen before any resident
     // Table or search sample is built. A CSV estimate uses the table's shape
@@ -4814,6 +5130,18 @@ fn main() {
                         }
                         if let Some(f) = trade_funding.as_deref() {
                             pnames.push(f.to_string());
+                        }
+                        if let Some(g) = &gate_spec {
+                            pnames.extend(g.columns.iter().cloned());
+                        }
+                        if let Some(sw) = rcsr::switch::request() {
+                            pnames.extend(sw.columns());
+                        }
+                        if let Some(cp) = rcsr::compose::request() {
+                            pnames.extend(cp.columns());
+                        }
+                        if let Some(gs) = rcsr::gate_search::request() {
+                            pnames.extend(gs.columns(&vars));
                         }
                     }
                     pnames.sort();
@@ -5156,6 +5484,13 @@ fn main() {
             }
         },
     };
+    // #1173: a splits table sets the interval mode.
+    let requested = match (split_table_path.is_some(), requested) {
+        (true, None) | (true, Some(data::SplitMode::TemporalIntervals)) => Some(data::SplitMode::TemporalIntervals),
+        (true, Some(m)) => trading_usage(&format!("--split-table sets --split temporal-intervals; drop --split {}", m.name())),
+        (false, Some(data::SplitMode::TemporalIntervals)) => trading_usage("--split temporal-intervals needs --split-table <csv> --split-id <id>"),
+        (false, m) => m,
+    };
     let mode = if let Some(m) = requested {
         m
     } else if split_arg.as_deref() == Some("auto") {
@@ -5180,7 +5515,7 @@ fn main() {
                 let (guess, tc, gc, nt) = data::suggest_split(&table, target_idx, &known_vars);
                 if guess != data::SplitMode::Random {
                     let hint = match guess {
-                        data::SplitMode::Temporal | data::SplitMode::TemporalGroup => {
+                        data::SplitMode::Temporal | data::SplitMode::TemporalGroup | data::SplitMode::TemporalIntervals => {
                             let mut h = match tc {
                                 Some(j) => format!("--time {}", table.names[j]),
                                 None => "--time <col>".to_string(),
@@ -5212,7 +5547,7 @@ fn main() {
     };
 
     // Fill in a column the mode requires but the user did not name.
-    if matches!(mode, data::SplitMode::Temporal | data::SplitMode::TemporalGroup)
+    if matches!(mode, data::SplitMode::Temporal | data::SplitMode::TemporalGroup | data::SplitMode::TemporalIntervals)
         && time_col.is_none()
     {
         match data::find_time_col(&table, &exclusion(None, group_col)) {
@@ -5381,10 +5716,10 @@ fn main() {
     let pnl_blocks: usize = match pnl_blocks_arg.as_deref() {
         None => 1,
         Some(t) => match t.trim().parse::<usize>() {
-            Ok(k) if (1..=rcsr::trading::FITNESS_MAX_BLOCKS).contains(&k) => k,
+            Ok(k) if (1..=rcsr::trading::FITNESS_BOOK_MAX_BLOCKS).contains(&k) => k,
             _ => trading_usage(&format!(
                 "--pnl-blocks must be an integer from 1 to {}, got '{}'",
-                rcsr::trading::FITNESS_MAX_BLOCKS, t
+                rcsr::trading::FITNESS_BOOK_MAX_BLOCKS, t
             )),
         },
     };
@@ -5396,11 +5731,37 @@ fn main() {
         },
     };
     if !fitness_pnl {
-        for (flag, given) in [("--pnl-blocks", pnl_blocks_arg.is_some()), ("--pnl-block-lambda", pnl_lambda_arg.is_some())] {
+        for (flag, given) in [
+            ("--pnl-blocks", pnl_blocks_arg.is_some()),
+            ("--pnl-block-lambda", pnl_lambda_arg.is_some()),
+            ("--pnl-excess", pnl_excess_arg.is_some()),
+            ("--pnl-stat", pnl_stat_arg.is_some()),
+            ("--pnl-cvar-q", pnl_cvar_q_arg.is_some()),
+        ] {
             if given {
                 trading_usage(&format!("{} needs --fitness pnl", flag));
             }
         }
+    }
+    // #1179: the fitness benchmark; every reported net stays absolute.
+    let pnl_excess = pnl_excess_arg.as_deref().map_or(Ok(rcsr::trading::PnlExcess::None), rcsr::trading::PnlExcess::parse).unwrap_or_else(|e| trading_usage(&e));
+    // #1178: the block statistic; `--pnl-cvar-q` is read under cvar only.
+    let pnl_cvar_q: f64 = match pnl_cvar_q_arg.as_deref() {
+        None => rcsr::trading::DEFAULT_CVAR_Q,
+        Some(t) => match t.trim().parse::<f64>() {
+            Ok(q) if q > 0.0 && q <= 1.0 => q,
+            _ => trading_usage(&format!("--pnl-cvar-q must be a number in (0, 1], got '{}'", t)),
+        },
+    };
+    let pnl_stat = match rcsr::trading::BlockStat::parse(pnl_stat_arg.as_deref().unwrap_or("mean-sd"), pnl_cvar_q) {
+        Ok(s) => s,
+        Err(e) => trading_usage(&e),
+    };
+    if pnl_cvar_q_arg.is_some() && !matches!(pnl_stat, rcsr::trading::BlockStat::Cvar(_)) {
+        trading_usage("--pnl-cvar-q needs --pnl-stat cvar");
+    }
+    if pnl_lambda_arg.is_some() && matches!(pnl_stat, rcsr::trading::BlockStat::Cvar(_)) {
+        trading_usage("--pnl-block-lambda has no effect under --pnl-stat cvar");
     }
     let mut trading_spec: Option<rcsr::trading::TradingSpec> = None;
     let mut trading_cols: Option<data::TradingColumns> = None;
@@ -5439,7 +5800,7 @@ fn main() {
                 trading_usage("--position top_tercile has no threshold: remove --threshold");
             }
         }
-        if !matches!(mode, data::SplitMode::Temporal | data::SplitMode::TemporalGroup)
+        if !matches!(mode, data::SplitMode::Temporal | data::SplitMode::TemporalGroup | data::SplitMode::TemporalIntervals)
             || time_col.is_none()
         {
             trading_usage(&format!(
@@ -5455,13 +5816,8 @@ fn main() {
             )),
         };
         if let (Some(b), Some(f)) = (&book_resolved, &target_resolved) {
-            for s in [&b.spec, &f.spec] {
-                if s.kind != "forward_return" {
-                    trading_usage(&format!(
-                        "--book-target needs forward_return labels on both sides, '{}' declares '{}'",
-                        s.column, s.kind
-                    ));
-                }
+            if let Some(e) = target::book_pair_refusal(&f.spec, &b.spec) {
+                trading_usage(&e);
             }
         }
         if ts.kind != "forward_return" && ts.kind != target::KIND_XS_RANK {
@@ -5507,22 +5863,26 @@ fn main() {
                  target spec so the P&L uses realised returns",
             );
         }
-        if let Some(b) = &book_resolved {
-            if b.spec.return_column.is_none() {
-                trading_usage(&format!(
-                    "--book-target: book target '{}' declares no return_column, so the book would be priced on the fit label: declare a return_column in the target spec",
-                    b.spec.column
-                ));
-            }
-        }
         trading_cols = Some(data::TradingColumns {
             return_column: ts.return_column.clone(),
             log_returns: ts.return_units == "log",
             funding_column: trade_funding.clone(),
-            train: fitness_pnl || trade_band_units.as_deref() == Some("sd"), // #480, #925
+            train: fitness_pnl || trade_band_units.as_deref() == Some("sd") || select_rule_arg.as_deref().is_some_and(|s| rcsr::selection::SelectRule::parse(s) == Ok(rcsr::selection::SelectRule::Occam)), // #480, #925, #1184
             cross_section: top_tercile,
             book_rows: book_resolved.is_some(),
+            mask: gate_spec.clone(),
+            train_values: rcsr::switch::request()
+                .map(|sw| sw.columns())
+                .or_else(|| rcsr::compose::request().map(|cp| cp.columns()))
+                .or_else(|| rcsr::gate_search::request().map(|gs| gs.columns(&vars)))
+                .unwrap_or_default(),
+            slice_values: rcsr::compose::request().is_some() || rcsr::gate_search::request().is_some(), // #1181, #1182
+            state_gates: rcsr::compose::request().map_or_else(Vec::new, |cp| cp.state_gates()), // #1214
+            gate_rows: if rcsr::gate_search::request().is_some() { vars.clone() } else { Vec::new() }, // #1182
         });
+        if gate_spec.is_some() && top_tercile {
+            trading_usage("--pnl-mask prices the long/flat threshold book: it cannot combine with --position top_tercile");
+        }
         // #925: an sd-unit band is resolved per candidate from its training rows.
         let band_units = match trade_band_units.as_deref().map(rcsr::trading::BandUnits::parse) {
             None => rcsr::trading::BandUnits::Score,
@@ -5541,16 +5901,21 @@ fn main() {
             slippage_bps: trade_slippage_bps,
             funding_col: trade_funding.clone(),
             cash_return: trade_cash_return,
+            cash_mode: if cash_train_mean { rcsr::trading::CashMode::TrainMean } else { rcsr::trading::CashMode::Constant },
             min_trades: trade_min_trades,
             min_holding: trade_min_holding,
             band,
             threshold: trade_threshold,
             max_position: trade_max_position,
             position: position_map,
+            pnl_excess,
             ..Default::default()
         };
         if let Err(e) = tspec.validate() {
             trading_usage(&e);
+        }
+        if cash_train_mean && !fitness_pnl {
+            trading_usage("--cash-return train-mean needs --fitness pnl");
         }
         trading_spec = Some(tspec);
     }
@@ -5593,6 +5958,22 @@ fn main() {
             trading_usage("--fitness pnl is not supported with --null-runs/--null-block: the null shuffles the target, but the regret reads the book's returns, so every null run is the real run");
         }
     }
+    // #1023: a metric-fitness lexicase case is one row's loss.
+    if cfg.selection == crate::search::Selection::Lexicase && !fitness_pnl {
+        if let Some(reason) = search::lexicase_metric_refusal(cfg.metric, implicit_mode, multi_output, weight_name.is_some()) {
+            eprintln!("error: {}", reason);
+            std::process::exit(EXIT_USAGE);
+        }
+    }
+    // #1084: the book descriptor reads the long/flat book of the search fitness.
+    if cfg.qd_descriptor == rcsr::qd::DescriptorKind::Book {
+        if !fitness_pnl {
+            trading_usage("--qd-descriptor book needs --fitness pnl: the book descriptor reads the long/flat fitness book");
+        }
+        if cfg.qd_bins == 0 {
+            trading_usage("--qd-descriptor book needs a QD archive: add --qd, --qd-cells or --qd-policy");
+        }
+    }
 
     let resolved_lockbox = rcsr::lockbox::resolve_retired(lockbox_arg.as_deref(), lockbox_embargo_arg.as_deref(), &data_path, retired_arg.as_deref()).unwrap_or_else(|e| {
         eprintln!("error: {}", e.message);
@@ -5621,6 +6002,84 @@ fn main() {
     } else {
         None
     };
+    // #1173: the splits table, its label purge and the embargo after every test interval.
+    let mut split_table_sha = String::new();
+    let interval_split: Option<rcsr::intervals::IntervalSplit> = match split_table_path.as_deref() {
+        None => {
+            for (flag, given) in [
+                ("--split-id", split_id_arg.is_some()),
+                ("--embargo", embargo_arg.is_some()),
+                ("--select-blocks intervals", select_blocks_intervals),
+            ] {
+                if given {
+                    trading_usage(&format!("{} needs --split-table <csv>", flag));
+                }
+            }
+            None
+        }
+        Some(path) => {
+            for (flag, given) in [
+                ("--validation-frac", validation_frac > 0.0),
+                ("--test-frac", test_frac_given),
+                ("--train-select/--test-select", train_select.is_some() || test_select.is_some()),
+                ("--cv", cv_mode.is_some()),
+            ] {
+                if given {
+                    trading_usage(&format!("--split-table sets the training, validation and test intervals; drop {}", flag));
+                }
+            }
+            let Some(id) = split_id_arg.as_deref() else {
+                trading_usage("--split-table needs --split-id <id>");
+            };
+            let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
+                eprintln!("error: --split-table {}: {}", path, e);
+                std::process::exit(EXIT_INPUT);
+            });
+            split_table_sha = rcsr::manifest::sha256_hex(text.as_bytes());
+            let declared = rcsr::intervals::parse_table(&text, id).unwrap_or_else(|e| trading_usage(&e));
+            let purge = match target_resolved.as_ref() {
+                Some(r) => Some(book_resolved.as_ref().map_or(0.0, |b| b.spec.required_purge_seconds()).max(r.spec.required_purge_seconds())),
+                None => multi_boundary_purge,
+            };
+            let Some(purge) = purge else {
+                trading_usage("--split-table needs the label purge of a declared target: add --target-spec");
+            };
+            let purge = purge.ceil() as i64;
+            let tc = time_col.expect("the interval mode resolved a time column");
+            let keys = data::time_keys_with(&table, tc, &data::TimeSpec { date_only, unit: time_unit, tz })
+                .map(|(k, _)| k)
+                .unwrap_or_else(|e| {
+                    eprintln!("error: --split-table: time column: {}", e);
+                    std::process::exit(EXIT_INPUT);
+                });
+            let groups = group_col.map(|gc| data::group_ids(&table, gc).0);
+            let bar = rcsr::intervals::modal_step(&keys, groups.as_deref()).unwrap_or(0);
+            let flag = match embargo_arg.as_deref() {
+                None | Some("auto") => None,
+                Some(s) => match s.trim().parse::<i64>() {
+                    Ok(v) if v >= 0 => Some(v),
+                    _ => trading_usage(&format!("--embargo must be whole seconds >= 0 or auto, got '{}'", s)),
+                },
+            };
+            // #1180: the gate columns of `--pnl-mask` carry a lookback too.
+            let mut embargo_columns: Vec<String> = vars.clone();
+            if let Some(g) = &gate_spec {
+                embargo_columns.extend(g.columns.iter().cloned());
+            }
+            if let Some(sw) = rcsr::switch::request() {
+                embargo_columns.extend(sw.columns());
+            }
+            if let Some(cp) = rcsr::compose::request() {
+                embargo_columns.extend(cp.columns());
+            }
+            if let Some(gs) = rcsr::gate_search::request() {
+                embargo_columns.extend(gs.columns(&vars));
+            }
+            let (embargo, source, column) = rcsr::intervals::resolve_embargo(flag, purge, &embargo_columns, bar).unwrap_or_else(|e| trading_usage(&e));
+            Some(rcsr::intervals::IntervalSplit::new(declared, purge, embargo, source, column))
+        }
+    };
+    let split_fingerprint: Option<String> = interval_split.as_ref().map(|s| s.fingerprint());
     let spec = data::SplitSpec {
         mode,
         time_col,
@@ -5645,6 +6104,7 @@ fn main() {
         boundary_purge_seconds: multi_boundary_purge,
         trading: trading_cols.clone(),
         canonical_train_order: fitness_pnl, // #480
+        intervals: interval_split.clone(),
         scale_column: target_resolved
             .as_ref()
             .and_then(|r| r.spec.scale_column())
@@ -5707,7 +6167,7 @@ fn main() {
         Ok(p) => p,
         Err(e) => {
             eprintln!("error: {}", e);
-            std::process::exit(if e.starts_with("target spec") {
+            std::process::exit(if e.starts_with("target spec") || e.starts_with("--split-table") {
                 EXIT_USAGE
             } else {
                 EXIT_INPUT
@@ -5754,6 +6214,10 @@ fn main() {
     // #468: the long/flat book earns the full per-row return, so rows of one
     // group must not be closer than the label horizon.
     let target_horizon = book_resolved.as_ref().or(target_resolved.as_ref()).map_or(0.0, |r| r.spec.horizon_seconds);
+    let period_width = book_resolved.as_ref().or(target_resolved.as_ref()).map_or(0.0, |r| r.spec.period_width_seconds());
+    if let Some(s) = trading_spec.as_mut() {
+        s.period_seconds = (period_width > 0.0).then_some(period_width);
+    }
     let mut min_group_step: Option<f64> = None;
     if let (Some(_), Some(split), Some(r)) = (&trading_spec, prepared.trading.as_ref(), book_resolved.as_ref().or(target_resolved.as_ref())) {
         let horizon = r.spec.horizon_seconds;
@@ -5768,6 +6232,9 @@ fn main() {
                 Err(e) => trading_usage(&e),
             }
         }
+        if let Err(e) = rcsr::target::check_period_width(horizon, r.spec.stride_seconds, min_group_step) {
+            trading_usage(&e);
+        }
     }
     // #480: the exact long/flat fitness book on the canonical training rows.
     let fitness_book: Option<std::sync::Arc<rcsr::trading::FitnessBook>> = if fitness_pnl {
@@ -5775,7 +6242,16 @@ fn main() {
         let (Some(tspec), Some(slice)) = (trading_spec.as_ref(), slice) else {
             trading_usage("--fitness pnl found no training trading rows");
         };
-        match rcsr::trading::FitnessBook::with_blocks(slice, tspec, target_horizon, pnl_blocks, pnl_lambda) {
+        let train_mask = prepared.trading.as_ref().and_then(|t| t.masks.as_ref()).and_then(|m| m.train.as_deref());
+        let mask_identity = gate_spec.as_ref().map(|g| g.identity());
+        let book_mask = match (train_mask, mask_identity.as_deref()) {
+            (Some(on), Some(identity)) => Some(rcsr::trading::BookMask { on, identity }),
+            _ => None,
+        };
+        let segments = interval_split.as_ref().map_or_else(Vec::new, |s| s.segment_starts());
+        match rcsr::trading::FitnessBook::with_segments(slice, tspec, target_horizon, pnl_blocks, pnl_lambda, &segments, book_mask)
+            .and_then(|b| b.with_stat(pnl_stat))
+        {
             Ok(book) if book.len() == prepared.book.as_ref().map_or(prepared.train.len(), |b| b.train.len()) => Some(std::sync::Arc::new(book)),
             Ok(book) => trading_usage(&format!(
                 "--fitness pnl: {} training trading rows for {} training rows",
@@ -5787,6 +6263,40 @@ fn main() {
     } else {
         None
     };
+    // #1185: `rcsr switch` reports on the training book and exits before the search.
+    if let Some(sw) = rcsr::switch::request() {
+        let (Some(book), Some(slice), Some(split)) = (&fitness_book, prepared.trading.as_ref().and_then(|t| t.train.as_ref()), prepared.trading.as_ref()) else {
+            trading_usage("rcsr switch found no training book");
+        };
+        let ctx = rcsr::switch::Context {
+            target: &target_names[0],
+            per_side_bps: trading_spec.as_ref().map_or(0.0, |s| s.per_side_bps()),
+            segments: interval_split.as_ref().map_or(1, |s| s.segment_starts().len().max(1)),
+            budget,
+            force,
+        };
+        rcsr::switch::run(sw, book, slice, &split.train_values, &ctx);
+    }
+    // #1180: the validation and test books price the same regime mask: every
+    // on-run is its own book and the rows outside the mask are dropped. The raw
+    // slices stay for the unmasked reference nets.
+    let mut mask_context: Option<MaskContext> = None;
+    if let (Some(_), Some(split)) = (&gate_spec, prepared.trading.as_mut()) {
+        if let Some(masks) = split.masks.clone() {
+            let share = |slice: &data::TradingSlice, on: &[bool]| {
+                let priced = rcsr::regime_gate::priced_rows(slice);
+                let (rows_on, runs) = rcsr::regime_gate::run_count(&slice.rows.group, on, &priced);
+                (rows_on as f64 / priced.iter().filter(|&&p| p).count().max(1) as f64, runs)
+            };
+            let validation = split.validation.as_ref().zip(masks.validation.as_ref()).map(|(s, on)| share(s, on));
+            let test = share(&split.test, &masks.test);
+            mask_context = Some(MaskContext { validation, test, raw_validation: split.validation.clone(), raw_test: split.test.clone() });
+            if let (Some(v), Some(on)) = (split.validation.as_mut(), masks.validation.as_ref()) {
+                *v = rcsr::regime_gate::masked_slice(v, on);
+            }
+            split.test = rcsr::regime_gate::masked_slice(&split.test, &masks.test);
+        }
+    }
     if let Some(book) = &fitness_book {
         cfg.fitness = search::Fitness::LongPnl(book.clone());
         if weight_name.is_some() && !quiet {
@@ -5799,10 +6309,19 @@ fn main() {
     }
     if let Some(cp) = &resume_checkpoint {
         if cp.config.fitness.key() != cfg.fitness.key() {
+            let mask = gate_spec.as_ref().map_or(String::new(), |g| {
+                format!(
+                    "; under --pnl-mask '{}' it also holds the training gate states of {} (the kernel over every row of the data file), which a checkpoint of the per-segment training rule does not have",
+                    g.source,
+                    rcsr::regime_gate::STATE_RULE
+                )
+            });
             trading_usage(&format!(
-                "--resume conflicts with the saved search settings: fitness {} (saved {}); the book depends on the cost, threshold, band, band units, minimum hold, min-trades and training rows",
+                "--resume conflicts with the saved search settings: fitness {} (saved {}); {}{}",
                 cfg.fitness.key(),
-                cp.config.fitness.key()
+                cp.config.fitness.key(),
+                rcsr::trading::book_conflict_text(&args),
+                mask
             ));
         }
     }
@@ -6014,12 +6533,24 @@ fn main() {
         Some(src) => rcsr::selection::SelectRule::parse(src).unwrap_or_else(|e| trading_usage(&e)),
         None => rcsr::selection::SelectRule::ValidationObjective,
     };
-    let robust_params = rcsr::selection::RobustParams {
-        blocks: select_blocks_arg.unwrap_or(rcsr::selection::RobustParams::default().blocks),
-        se_z: select_se_arg.unwrap_or(rcsr::selection::RobustParams::default().se_z),
-        block_len: select_block_len_arg.unwrap_or(rcsr::selection::ROBUST_BLOCK_LEN),
+    // #1173: `--select-blocks intervals` takes one block per validation interval.
+    let interval_cuts: Option<Vec<f64>> = if select_blocks_intervals {
+        let cuts = interval_split.as_ref().map_or_else(Vec::new, |s| s.validation_starts());
+        if cuts.len() < 2 {
+            trading_usage(&format!("--select-blocks intervals needs at least 2 validation intervals in the split, found {}", cuts.len()));
+        }
+        Some(cuts)
+    } else {
+        None
     };
-    if select_blocks_arg.is_some() || select_se_arg.is_some() || select_block_len_arg.is_some() {
+    let robust_params = rcsr::selection::RobustParams {
+        blocks: interval_cuts
+            .as_ref()
+            .map_or_else(|| select_blocks_arg.unwrap_or(rcsr::selection::RobustParams::default().blocks), Vec::len),
+        se_z: select_se_arg.unwrap_or(rcsr::selection::RobustParams::default().se_z),
+        block_len: select_block_len_arg,
+    };
+    if select_blocks_arg.is_some() || select_blocks_intervals || select_se_arg.is_some() || select_block_len_arg.is_some() {
         if select_rule != rcsr::selection::SelectRule::Robust {
             trading_usage("--select-blocks, --select-se and --select-block-len need --select-rule robust");
         }
@@ -6029,6 +6560,20 @@ fn main() {
             trading_usage("--select-rule robust ranks the validation P&L book: add --objective pnl|sharpe|log_growth");
         }
         if let Err(e) = robust_params.validate() {
+            trading_usage(&e);
+        }
+    }
+    let occam_params = rcsr::occam::OccamParams {
+        delta: select_delta_arg.unwrap_or(rcsr::occam::OccamParams::default().delta),
+        min_entries: select_min_entries_arg.unwrap_or(rcsr::occam::OccamParams::default().min_entries),
+    };
+    if select_delta_arg.is_some() || select_min_entries_arg.is_some() {
+        if select_rule != rcsr::selection::SelectRule::Occam {
+            trading_usage("--select-delta and --select-min-entries need --select-rule occam");
+        }
+    }
+    if select_rule == rcsr::selection::SelectRule::Occam {
+        if let Err(e) = occam_params.validate() {
             trading_usage(&e);
         }
     }
@@ -6048,6 +6593,105 @@ fn main() {
             "error: --select-by validation needs a validation slice;              add --validation-frac <f>"
         );
         std::process::exit(EXIT_USAGE);
+    }
+    // #1181, #1182: the `split` object of a composed run.
+    let composed_split_json = if rcsr::compose::request().is_some() || rcsr::gate_search::request().is_some() {
+        format!(
+            "{{\"mode\":{},\"train_rows\":{}{},\"test_rows\":{}{}{}{}}}",
+            jstr(prepared.report.mode),
+            prepared.train.len(),
+            if prepared.report.validation_rows > 0 { format!(",\"validation_rows\":{}", prepared.report.validation_rows) } else { String::new() },
+            prepared.test.len(),
+            target::split_purge_json(&prepared.report),
+            split_time_json(prepared.keys.as_ref()),
+            interval_split.as_ref().map_or_else(String::new, |s| s.json_fields(&split_table_sha))
+        )
+    } else {
+        String::new()
+    };
+    // #1181: `rcsr compose` composes the pools on these rows and exits before the search.
+    if let Some(cp) = rcsr::compose::request() {
+        rcsr::compose::start(cp, &command, &prepared, fitness_book.as_deref(), trading_spec.as_ref(), &rcsr::compose::Inputs {
+            target: &target_names[0],
+            target_sha: target_sha.as_deref(),
+            target_spec_json: &target_spec_json,
+            split_json: &composed_split_json,
+            objective,
+            cost: trading_cost.clone(),
+            min_group_step,
+            horizon_seconds: target_horizon,
+            robust: robust_params,
+            cuts: interval_cuts.as_deref(),
+            interval_split: interval_split.as_ref(),
+            ops: &cfg.ops,
+            vars: &vars,
+            book_target: book_resolved.is_some(),
+        });
+    }
+    // #1183: `rcsr enumerate` scores its class on the book's training rows and exits before the search.
+    if let Some(en) = rcsr::enumerate::request() {
+        let segments = |f: fn(&rcsr::intervals::IntervalSplit) -> Vec<f64>| interval_split.as_ref().map_or_else(Vec::new, f);
+        rcsr::enumerate::start(en, &rcsr::enumerate::Inputs {
+            target: &target_names[0],
+            vars: &vars,
+            ops: &cfg.ops,
+            train: prepared.book.as_ref().map_or(&prepared.train, |b| &b.train),
+            validation: prepared.book.as_ref().map_or(prepared.validation.as_ref(), |b| b.validation.as_ref()),
+            trading: prepared.trading.as_ref(),
+            means: &prepared.means,
+            stds: &prepared.stds,
+            book: fitness_book.as_deref(),
+            spec: trading_spec.as_ref(),
+            objective,
+            horizon_seconds: target_horizon,
+            blocks: pnl_blocks,
+            lambda: pnl_lambda,
+            stat: pnl_stat,
+            train_segments: segments(|s| s.segment_starts()),
+            validation_segments: segments(|s| s.validation_segment_starts()),
+            split_json: format!(
+                "{{\"mode\":{},\"train_rows\":{}{},\"test_rows\":{}{}{}{}}}",
+                jstr(prepared.report.mode),
+                prepared.train.len(),
+                if prepared.report.validation_rows > 0 { format!(",\"validation_rows\":{}", prepared.report.validation_rows) } else { String::new() },
+                prepared.test.len(),
+                target::split_purge_json(&prepared.report),
+                split_time_json(prepared.keys.as_ref()),
+                interval_split.as_ref().map_or_else(String::new, |s| s.json_fields(&split_table_sha))
+            ),
+            seed: cfg.seed,
+            threads,
+        });
+    }
+    // #1182: the gate search scores a gate by the composite book of the frozen branches.
+    if let Some(gs) = rcsr::gate_search::request() {
+        let (Some(book), Some(split)) = (&fitness_book, prepared.trading.as_ref()) else {
+            trading_usage("--gate-search found no training book");
+        };
+        let Some(train) = split.train.as_ref() else {
+            trading_usage("--gate-search found no training trading rows");
+        };
+        let Some(gate_rows) = split.gate_rows.as_ref() else {
+            trading_usage("--gate-search found no gate rows");
+        };
+        let layered = rcsr::gate_search::setup(gs, book, &rcsr::gate_search::Setup {
+            train,
+            train_values: &split.train_values,
+            train_x: &prepared.train.x,
+            gate_rows,
+            means: &prepared.means,
+            stds: &prepared.stds,
+            vars: &vars,
+            ops: &cfg.ops,
+            target: &target_names[0],
+            target_sha: target_sha.as_deref(),
+            per_side_bps: trading_spec.as_ref().map_or(0.0, |s| s.per_side_bps()),
+            split_json: &composed_split_json,
+            trading_objective: objective.is_trading(),
+            validation: split.validation.is_some(),
+        });
+        cfg.fitness = search::Fitness::LongPnl(layered);
+        cfg.reject_fixed_position = false;
     }
 
     // #14: implicit relations. The target becomes one more input (normalised
@@ -6091,6 +6735,11 @@ fn main() {
     let search_train: &data::Sample = if fitness_pnl { book_train } else { &prepared.train };
     if fitness_pnl && prepared.book.is_some() {
         cfg.fit_view = Some(std::sync::Arc::new(prepared.train.clone()));
+    }
+    // #1023: the lexicase cost limits read the flags and the data shape only.
+    if let Some(reason) = search::lexicase_limit_refusal(&cfg, search_train) {
+        eprintln!("error: {}", reason);
+        std::process::exit(EXIT_USAGE);
     }
 
     // #25: resolve --units names against the prepared input list. A lagged
@@ -6147,6 +6796,16 @@ fn main() {
             }
         ));
     }
+    // #1087: explicit units must match the saved declaration.
+    if let (Some(cp), Some(path), false) = (&resume_checkpoint, &resume_path, unit_assignments.is_empty()) {
+        if cfg.units != cp.config.units {
+            let saved = match &cp.config.units {
+                Some(u) => format!("units is {}, units.target is {}", u.encode_vars(), u.target),
+                None => "units is none".to_string(),
+            };
+            exit_on_resume_conflicts(path, &[format!("--units {} (saved {})", units_specs.join(","), saved)]);
+        }
+    }
     if require_dimensions {
         cfg.require_dimensions = true;
     }
@@ -6160,6 +6819,10 @@ fn main() {
     let mut backend_change: Option<(String, String)> = None;
     if let Some(cp) = &resume_checkpoint {
         if let Err(e) = cp.check_target_spec(target_sha.as_deref()) {
+            eprintln!("error: {}", e);
+            std::process::exit(EXIT_USAGE);
+        }
+        if let Err(e) = cp.check_split_intervals(split_fingerprint.as_deref()) {
             eprintln!("error: {}", e);
             std::process::exit(EXIT_USAGE);
         }
@@ -6781,9 +7444,20 @@ fn main() {
         }
         let mut front = rcsr::pareto::Archive::new(run.members.len());
         for m in &run.members {
-            let tree = expr::parse(&m.expression_exact, &vars)
-                .unwrap_or_else(|e| usage(format!("--reselect-run '{}': archive_rank {}: {}", path, m.archive_rank, e)));
-            let tree = normalise_inputs(&tree, &prepared.means, &prepared.stds);
+            // #1184: the Occam rule prices the stored normalised search tree, never the printed expression.
+            let tree = if select_rule_arg.as_deref().is_some_and(|s| rcsr::selection::SelectRule::parse(s) == Ok(rcsr::selection::SelectRule::Occam)) {
+                let text = m.occam_tree.as_deref().unwrap_or_else(|| {
+                    usage(format!(
+                        "--reselect-run '{}': archive_rank {} has no occam_tree: --select-rule occam needs a run.json written by a run with --select-rule occam",
+                        path, m.archive_rank
+                    ))
+                });
+                rcsr::checkpoint::decode_tree(text).unwrap_or_else(|e| usage(format!("--reselect-run '{}': archive_rank {}: occam_tree: {}", path, m.archive_rank, e)))
+            } else {
+                let tree = expr::parse(&m.expression_exact, &vars)
+                    .unwrap_or_else(|e| usage(format!("--reselect-run '{}': archive_rank {}: {}", path, m.archive_rank, e)));
+                normalise_inputs(&tree, &prepared.means, &prepared.stds)
+            };
             front.items.push(rcsr::pareto::Sol {
                 complexity: m.complexity as usize,
                 cost: m.complexity,
@@ -6802,6 +7476,9 @@ fn main() {
         (Some(p), Some(cp)) => rcsr::resume_cost::load(p, cp.generations),
         _ => None,
     };
+    // Tests stop the process right after a save, as a crash would, without a kill race.
+    let exit_after_saves = std::env::var("RCSR_TEST_EXIT_AFTER_SAVES").ok().and_then(|v| v.parse::<usize>().ok());
+    let mut saves_done = 0usize;
     let outcome_result = if let Some(done) = reselect_outcome {
         Ok(done)
     } else if let Some(path) = save_path.clone() {
@@ -6814,22 +7491,24 @@ fn main() {
             save_every,
             &seeds,
             |cp| {
-                if let Err(e) = cp.save_for(&path, target_sha.as_deref()) {
+                if let Err(e) = cp.save_with_split(&path, target_sha.as_deref(), split_fingerprint.as_deref()) {
                     eprintln!("error: {}", e);
                     std::process::exit(EXIT_INPUT);
                 }
                 let generation = cp.generations;
                 last_saved = Some((generation, path.clone()));
-                let so_far = rcsr::resume_cost::Cost::process(
+                let so_far = rcsr::resume_cost::Cost::periodic(
                     search_start.elapsed().as_secs_f64(),
-                    None,
-                    None,
-                    rcsr::resume_cost::Search::Unknown,
+                    cp.process_backend.map_or(rcsr::resume_cost::Search::Unknown, rcsr::resume_cost::Search::of),
                 );
                 if let Some(t) = rcsr::resume_cost::total(cost_resumed, cost_base.as_ref(), &so_far) {
                     if let Err(e) = rcsr::resume_cost::write(&path, generation, &t) {
                         eprintln!("warning: {}", e);
                     }
+                }
+                saves_done += 1;
+                if exit_after_saves == Some(saves_done) {
+                    std::process::exit(EXIT_KILLED);
                 }
                 // #211: the checkpoint file is saved; record its size and hash.
                 if let Some(sink) = &dev_sink {
@@ -6872,6 +7551,35 @@ fn main() {
             std::process::exit(gpu_required_exit(&e).unwrap_or(EXIT_INPUT));
         }
     };
+    // #1182: the front of a gate search goes to compose's choice and pricing; the process exits there.
+    if let (Some(gs), Some(tspec)) = (rcsr::gate_search::request(), trading_spec.as_ref()) {
+        let finish = rcsr::gate_search::Finish {
+            front: &outcome.archive.items,
+            candidates_evaluated: outcome.candidates_evaluated,
+            generations: outcome.generations,
+            vars: &vars,
+            ops: &cfg.ops,
+            means: &prepared.means,
+            stds: &prepared.stds,
+        };
+        let inputs = rcsr::compose::Inputs {
+            target: &target_names[0],
+            target_sha: target_sha.as_deref(),
+            target_spec_json: &target_spec_json,
+            split_json: &composed_split_json,
+            objective,
+            cost: trading_cost.clone(),
+            min_group_step,
+            horizon_seconds: target_horizon,
+            robust: robust_params,
+            cuts: interval_cuts.as_deref(),
+            interval_split: interval_split.as_ref(),
+            ops: &cfg.ops,
+            vars: &vars,
+            book_target: book_resolved.is_some(),
+        };
+        rcsr::gate_search::finish(gs, &finish, prepared.trading.as_ref(), tspec, &command, &inputs);
+    }
     if let Some(g) = outcome.gpu.as_mut() {
         g.ledger.record_outside(rcsr::gpu_stats::Stage::Io, table_loaded_s);
         g.ledger
@@ -6994,7 +7702,7 @@ fn main() {
         match format {
             Format::Json => {
                 let doc = format!(
-                    "{{\"tool\":\"rcsr\",\"version\":{},\"interim\":true,\"backend\":\"{}\",\"search_backend\":\"{}\",\"process_backend\":\"{}\",\"backend_reason\":{},\"device\":{},\"threads\":{},\"seed\":{},\"stop_reason\":{},\"generations_run\":{},\"elapsed_seconds\":{},\"search\":{{\"cumulative\":{}}},\"timing\":{},\"gpu\":{},\"checkpoint\":{}}}",
+                    "{{\"tool\":\"rcsr\",\"version\":{},\"interim\":true,\"backend\":\"{}\",\"search_backend\":\"{}\",\"process_backend\":\"{}\",\"backend_reason\":{},\"device\":{},\"threads\":{},\"seed\":{},\"stop_reason\":{},\"generations_run\":{},\"elapsed_seconds\":{},\"search\":{{\"cumulative\":{}{}}},\"timing\":{},\"gpu\":{},\"checkpoint\":{}}}",
                     jstr(VERSION),
                     backend_name,
                     search_backend,
@@ -7007,6 +7715,7 @@ fn main() {
                     outcome.generations,
                     jnum(elapsed),
                     cumulative_json,
+                    fit_accept_json(outcome.fit_accept.as_ref()),
                     timing.json(),
                     gpu,
                     checkpoint_json
@@ -7100,7 +7809,7 @@ fn main() {
                 .collect::<Vec<_>>()
                 .join(" ");
             eprintln!(
-                "# fit: gpu-fit screened={} admitted_wide={} admitted={} gpu={} fallback={} [{}] labels=[{}] refit_candidates={} refits={} refit_s={:.3} rescore_s={:.3} fallback_s={:.3} tail_overlap_s={:.3} tail_join_wait_s={:.3} bounded={}/{} workers={}",
+                "# fit: gpu-fit screened={} admitted_wide={} admitted={} gpu={} fallback={} [{}] labels=[{}] refit_candidates={} refits={} refit_s={:.3} rescore_s={:.3} fallback_s={:.3} tail_overlap_s={:.3} tail_join_wait_s={:.3} bounded={}/{} workers={} release_waves={} early={}",
                 g.fit_screened,
                 g.fit_admitted_wide,
                 g.fit_attempts,
@@ -7117,7 +7826,9 @@ fn main() {
                 g.ledger.fit_tail_join_wait_s(),
                 g.fit_fallback_bounded,
                 g.fit_fallback_max,
-                g.fit_fallback_workers
+                g.fit_fallback_workers,
+                g.fit_release_waves,
+                g.fit_tail_early
             );
         }
     }
@@ -7188,6 +7899,9 @@ fn main() {
         None
     };
     let train_slice = prepared.trading.as_ref().and_then(|t| t.train.as_ref());
+    let validation_segments = interval_split.as_ref().map_or_else(Vec::new, |s| s.validation_segment_starts());
+    let occam_train_segments = interval_split.as_ref().map_or_else(Vec::new, |s| s.segment_starts());
+    let test_segments = interval_split.as_ref().map_or_else(Vec::new, |s| s.test_segment_starts());
     let mut rows: Vec<Row> = sorted
         .iter()
         .enumerate()
@@ -7221,12 +7935,12 @@ fn main() {
             } else {
                 std::borrow::Cow::Borrowed(&pred)
             };
-            let train_fitness = fitness_book.as_ref().map(|b| b.regret(&pred)).unwrap_or(f64::NAN);
+            let train_fitness = fitness_book.as_ref().map(|b| b.regret(&book_pred)).unwrap_or(f64::NAN);
             let edge_rejected = rcsr::selection::edge_rejected(select_require_edge, train_fitness);
             let (objective_value, validation_book_json) = match (&trading_spec, book_validation, prepared.trading.as_ref().and_then(|t| t.validation.as_ref())) {
                 (Some(tspec), Some(v), Some(slice)) => {
                     let ctx = prepared.trading.as_ref().and_then(|t| t.validation_context.as_ref());
-                    let mspec = member_spec(tspec, &book_pred, train_slice);
+                    let mspec = rcsr::trading::TradingSpec { segment_starts: validation_segments.clone(), ..member_spec(tspec, &book_pred, train_slice, fitness_book.as_deref()) };
                     match trading_book(&s.tree, &v.x, slice, ctx, &mspec) {
                         Ok(stats) => {
                             // #849: a fixed-position member is unusable as a finalist with the flag.
@@ -7349,9 +8063,10 @@ fn main() {
                 gate_json: String::new(),
                 fitness_json: fitness_book
                     .as_ref()
-                    .map(|b| fitness_member_json(b, &pred, train_fitness))
+                    .map(|b| fitness_member_json(b, &book_pred, train_fitness))
                     .unwrap_or_default(),
                 validation_book_json,
+                occam_json: String::new(),
             }
         })
         .collect();
@@ -7430,9 +8145,9 @@ fn main() {
             let mut spec_of = |i: usize| {
                 let tree = &sorted[rows[i].archive_rank - 1].tree;
                 let train_pred: Vec<f64> = book_train.x.iter().map(|row| expr::eval(tree, row)).collect();
-                member_spec(tspec, &train_pred, train_slice)
+                rcsr::trading::TradingSpec { segment_starts: validation_segments.clone(), ..member_spec(tspec, &train_pred, train_slice, fitness_book.as_deref()) }
             };
-            let picked = rcsr::selection::select_robust_specs(&metas, robust_params, &mut spec_of, &ret, &book_rows, &mut |i| {
+            let picked = rcsr::selection::select_robust_specs_cuts(&metas, robust_params, interval_cuts.as_deref(), &mut spec_of, &ret, &book_rows, &mut |i| {
                 trading_pred(&sorted[rows[i].archive_rank - 1].tree, &v.x, ctx)
             })
             .unwrap_or_else(|e| trading_usage(&e));
@@ -7441,6 +8156,65 @@ fn main() {
                 order.insert(0, c);
             }
             selection_rule_fields = if select_require_edge { picked.fields_json_edge(no_edge) } else { picked.fields_json() };
+            if interval_cuts.is_some() {
+                selection_rule_fields.push_str(",\"blocks_source\":\"intervals\"");
+            }
+        } else if select_rule == rcsr::selection::SelectRule::Occam {
+            let (Some(tspec), Some(v), Some(vslice), Some(tslice)) = (
+                &trading_spec,
+                book_validation,
+                prepared.trading.as_ref().and_then(|t| t.validation.as_ref()),
+                train_slice,
+            ) else {
+                trading_usage("--select-rule occam needs training and validation rows: add --validation-frac <f>");
+            };
+            let vctx = prepared.trading.as_ref().and_then(|t| t.validation_context.as_ref());
+            let (vret, vrows) = trading_inputs(vslice, vctx);
+            let (tret, trows) = trading_inputs(tslice, None);
+            let metas: Vec<rcsr::selection::RobustMeta> = rows
+                .iter()
+                .map(|r| rcsr::selection::RobustMeta {
+                    archive_rank: r.archive_rank,
+                    complexity: r.complexity,
+                    usable: r.objective_value.is_finite(),
+                    objective: r.objective_value,
+                })
+                .collect();
+            let code = rcsr::occam::CodeSpec::v1(&cfg.ops, vars.len());
+            let dev_books = rcsr::occam::DevBooks { train_ret: &tret, train_rows: &trows, train_segments: &occam_train_segments, val_ret: &vret, val_rows: &vrows, val_segments: &validation_segments };
+            let picked = rcsr::occam::select_occam(&metas, occam_params, &code, &mut |i| {
+                let tree = &sorted[rows[i].archive_rank - 1].tree;
+                let mut words = Vec::new();
+                for c in code.candidates(tree) {
+                    let train_pred: Vec<f64> = book_train.x.iter().map(|row| expr::eval(&c.tree, row)).collect();
+                    let base = member_spec(tspec, &train_pred, train_slice, fitness_book.as_deref());
+                    let val_pred = trading_pred(&c.tree, &v.x, vctx);
+                    let Some((series, entries, hold)) = dev_books.alpha(&train_pred, &val_pred, &base) else {
+                        continue;
+                    };
+                    let den = expr::simplify_display(&expr::denormalize(&expr::simplify_display(&c.tree), &prepared.means, &prepared.stds));
+                    words.push(rcsr::occam::Scored {
+                        tier: c.tier,
+                        expression_exact: expr::to_string_exact(&den, &vars),
+                        bits: c.bits,
+                        series,
+                        entries,
+                        hold,
+                    });
+                }
+                Ok(words)
+            })
+            .unwrap_or_else(|e| trading_usage(&e));
+            for (k, r) in rows.iter_mut().enumerate() {
+                let tree = &sorted[r.archive_rank - 1].tree;
+                let stored = if tree_has_custom(tree) { "null".to_string() } else { jstr(&rcsr::checkpoint::encode_tree(tree)) };
+                r.occam_json = format!("{},\"occam_tree\":{}", picked.member_json(k), stored);
+            }
+            if let Some(c) = picked.chosen {
+                order.retain(|&i| i != c);
+                order.insert(0, c);
+            }
+            selection_rule_fields = picked.fields_json(select_require_edge.then_some(no_edge));
         } else if select_require_edge {
             selection_rule_fields.push_str(",\"require_edge\":true");
             if no_edge {
@@ -7464,9 +8238,9 @@ fn main() {
             let tree = &sorted[top.archive_rank - 1].tree;
             // #925: the validation and test books take the band resolved on the training rows.
             let train_pred: Vec<f64> = book_train.x.iter().map(|row| expr::eval(tree, row)).collect();
-            let fspec = member_spec(tspec, &train_pred, train_slice);
-            let book = |sample: &data::Sample, slice: Option<&data::TradingSlice>, ctx: Option<&data::TradingContext>| match slice {
-                Some(slice) => trading_book(tree, &sample.x, slice, ctx, &fspec),
+            let fspec = member_spec(tspec, &train_pred, train_slice, fitness_book.as_deref());
+            let book = |sample: &data::Sample, slice: Option<&data::TradingSlice>, ctx: Option<&data::TradingContext>, segments: &[f64]| match slice {
+                Some(slice) => trading_book(tree, &sample.x, slice, ctx, &rcsr::trading::TradingSpec { segment_starts: segments.to_vec(), ..fspec.clone() }),
                 None => Err("no trading rows".to_string()),
             };
             let split = prepared.trading.as_ref();
@@ -7475,7 +8249,7 @@ fn main() {
                 eprintln!("# warning: no candidate has a usable P&L book on the validation slice");
             }
             let validation_book = match book_validation {
-                Some(v) => book(v, split.and_then(|t| t.validation.as_ref()), split.and_then(|t| t.validation_context.as_ref())),
+                Some(v) => book(v, split.and_then(|t| t.validation.as_ref()), split.and_then(|t| t.validation_context.as_ref()), &validation_segments),
                 None => Err("no validation slice".to_string()),
             };
             let realised = validation_book.as_ref().ok().and_then(|s| rcsr::trading::realised_position(s.exposure, tspec));
@@ -7500,12 +8274,31 @@ fn main() {
                 test_error: top.test_error,
                 validation_value: top.objective_value,
                 search_fitness: fitness_book.as_ref().map(|_| "long_pnl_regret"),
-                book_target: book_resolved.as_ref().map(|b| b.spec.column.clone()),
+                book_target: book_resolved.as_ref().map(|b| b.spec.clone()),
                 selection: select_rule.name(),
                 selection_rule: selection_rule_fields.clone(),
                 reselected_from: reselected_from.clone(),
                 validation: validation_book,
-                test: book(book_test, split.map(|t| &t.test), split.and_then(|t| t.test_context.as_ref())),
+                test: book(book_test, split.map(|t| &t.test), split.and_then(|t| t.test_context.as_ref()), &test_segments),
+                mask: match (&gate_spec, &mask_context) {
+                    (Some(g), Some(m)) => {
+                        let raw_net = |sample: &data::Sample, slice: Option<&data::TradingSlice>| {
+                            slice.and_then(|s| trading_book(tree, &sample.x, s, None, &fspec).ok()).map(|s| s.net_pnl)
+                        };
+                        Some(rcsr::trading::MaskReport {
+                            expr: g.source.clone(),
+                            band: g.band,
+                            dwell: g.dwell,
+                            validation: m.validation.map(|(on_share, runs)| rcsr::trading::MaskedBlock {
+                                on_share,
+                                runs,
+                                unmasked_net_pnl: book_validation.and_then(|v| raw_net(v, m.raw_validation.as_ref())),
+                            }),
+                            test: rcsr::trading::MaskedBlock { on_share: m.test.0, runs: m.test.1, unmasked_net_pnl: raw_net(book_test, Some(&m.raw_test)) },
+                        })
+                    }
+                    _ => None,
+                },
             })
         }
         _ => None,
@@ -8173,7 +8966,7 @@ fn main() {
                 String::new()
             };
             let split_json = format!(
-                "{{\"mode\":{},\"rows\":{},\"train_rows\":{}{},\"test_rows\":{},\"folds\":[{}],\"gap\":{},\"excluded\":{},\"overlap\":{},\"unassigned\":{},\"groups_total\":{},\"groups_train\":{},\"groups_test\":{},\"lags\":{},\"lag_menu\":[{}],\"nvars_before\":{},\"nvars_after\":{},\"series\":{},\"history_rows\":{},\"notes\":[{}]{}{}}}",
+                "{{\"mode\":{},\"rows\":{},\"train_rows\":{}{},\"test_rows\":{},\"folds\":[{}],\"gap\":{},\"excluded\":{},\"overlap\":{},\"unassigned\":{},\"groups_total\":{},\"groups_train\":{},\"groups_test\":{},\"lags\":{},\"lag_menu\":[{}],\"nvars_before\":{},\"nvars_after\":{},\"series\":{},\"history_rows\":{},\"notes\":[{}]{}{}{}}}",
                 jstr(prepared.report.mode),
                 prepared.report.rows_total,
                 prepared.train.len(),
@@ -8200,7 +8993,13 @@ fn main() {
                 lag_report.history_rows,
                 notes.iter().map(|n| jstr(n)).collect::<Vec<_>>().join(","),
                 target::split_purge_json(&prepared.report),
-                split_time_json(prepared.keys.as_ref())
+                split_time_json(prepared.keys.as_ref()),
+                interval_split.as_ref().map_or_else(String::new, |s| format!(
+                    "{},\"interval_rows\":{{\"dropped\":{},\"outside\":{}}}",
+                    s.json_fields(&split_table_sha),
+                    prepared.report.interval_dropped_rows,
+                    prepared.report.interval_outside_rows
+                ))
             );
             // #264: lockbox facts of the loaded table (rows, date range, read count).
             let lockbox_json = {
@@ -8229,12 +9028,14 @@ fn main() {
             };
             let seeds_json: Vec<String> = seed_rows
                 .iter()
-                .map(|(expression, complexity, error)| {
+                .zip(&outcome.seeds)
+                .map(|((expression, complexity, error), seed)| {
                     format!(
-                        "{{\"expression\":{},\"complexity\":{},\"train_error\":{}}}",
+                        "{{\"expression\":{},\"complexity\":{},\"train_error\":{}{}}}",
                         jstr(expression),
                         jnum(*complexity),
-                        jnum(*error)
+                        jnum(*error),
+                        seed.fit_kept.map_or(String::new(), |k| format!(",\"fit_kept\":{}", k))
                     )
                 })
                 .collect();
@@ -8250,7 +9051,7 @@ fn main() {
                     } else {
                         String::new()
                     };
-                    let dimensions = format!("{}{}{}{}", dimensions, r.gate_json, r.fitness_json, r.validation_book_json);
+                    let dimensions = format!("{}{}{}{}{}", dimensions, r.gate_json, r.fitness_json, r.validation_book_json, r.occam_json);
                     // Only a run that actually has a selection criterion gains
                     // the new fields; an ordinary run stays byte-identical.
                     let selection_json = if select_by.is_some() {
@@ -8542,7 +9343,7 @@ fn main() {
                 backend_json,
                 match &fitness_book {
                     Some(b) => format!(
-                        "\"search_fitness\":{{\"kind\":\"long_pnl_regret\",\"rows\":{},\"groups\":{},\"cost_per_side\":{},\"threshold\":{},\"bound\":{},\"min_trades\":{},\"band\":{},\"band_units\":\"{}\",\"min_holding\":{},\"backend\":\"cpu_f64\",\"book_hash\":\"{:016x}\",{}{}{}}},",
+                        "\"search_fitness\":{{\"kind\":\"long_pnl_regret\",\"rows\":{},\"groups\":{},\"cost_per_side\":{},\"threshold\":{},\"bound\":{},\"min_trades\":{},\"band\":{},\"band_units\":\"{}\",\"min_holding\":{},\"backend\":\"cpu_f64\",\"book_hash\":\"{:016x}\",{}{}{}{}{}{}}},",
                         b.len(),
                         b.groups(),
                         jnum(b.side()),
@@ -8555,15 +9356,47 @@ fn main() {
                         b.hash(),
                         book_resolved.as_ref().map(|r| format!("\"book_target\":{},", jstr(&r.spec.column))).unwrap_or_default(),
                         // #484: omitted for one block, so the default report is unchanged.
-                        if b.blocks() > 1 {
+                        // #1178: `stat` and `cvar_q` only for another statistic or more
+                        // than 8 blocks, so a run without the new flags is unchanged.
+                        if b.blocks() > 1 || b.stat() != rcsr::trading::BlockStat::MeanSd {
+                            let stat = b.stat();
                             format!(
-                                "\"blocks\":{},\"lambda\":{},\"block_bounds\":[{}],",
+                                "\"blocks\":{},\"lambda\":{},\"block_bounds\":[{}],{}",
                                 b.blocks(),
                                 jnum(b.lambda()),
-                                b.block_bounds().iter().map(|v| jnum(*v)).collect::<Vec<_>>().join(",")
+                                b.block_bounds().iter().map(|v| jnum(*v)).collect::<Vec<_>>().join(","),
+                                if stat != rcsr::trading::BlockStat::MeanSd || b.blocks() > rcsr::trading::FITNESS_MAX_BLOCKS {
+                                    match stat {
+                                        rcsr::trading::BlockStat::Cvar(q) => format!("\"stat\":\"cvar\",\"cvar_q\":{},", jnum(q)),
+                                        s => format!("\"stat\":{},", jstr(s.name())),
+                                    }
+                                } else {
+                                    String::new()
+                                }
                             )
                         } else {
                             String::new()
+                        },
+                        // #1180: omitted without a mask, so the default report is unchanged.
+                        match (&gate_spec, b.is_masked()) {
+                            (Some(g), true) => format!(
+                                "\"mask\":{{\"expr\":{},\"band\":{},\"dwell\":{},\"off_rows\":{}}},",
+                                jstr(&g.source),
+                                jnum(g.band),
+                                g.dwell,
+                                b.masked_rows()
+                            ),
+                            _ => String::new(),
+                        },
+                        // #1179: omitted under `none`, so the default report is unchanged.
+                        match b.excess_mode() {
+                            rcsr::trading::PnlExcess::None => String::new(),
+                            m => format!("\"excess\":\"{}\",", m.name()),
+                        },
+                        // #1273: omitted for a constant, so the default report is unchanged.
+                        match b.cash_mode() {
+                            rcsr::trading::CashMode::Constant => String::new(),
+                            rcsr::trading::CashMode::TrainMean => format!("\"cash_return\":{},\"cash_return_source\":\"train_mean\",", jnum(b.cash_return())),
                         },
                         // #481: what ranked the generations; `backend` above is
                         // the reported values, always exact CPU f64.
@@ -8618,7 +9451,7 @@ fn main() {
                 outcome.generations,
                 outcome.candidates_evaluated,
                 format!(
-                    "{}{}{}",
+                    "{}{}{}{}",
                     if cfg.fit_irls_active() {
                         format!(",\"fit_irls\":{}", jstr(cfg.fit_irls.name()))
                     } else {
@@ -8629,6 +9462,7 @@ fn main() {
                     } else {
                         String::new()
                     },
+                    fit_accept_json(outcome.fit_accept.as_ref()),
                     format!(",\"cumulative\":{}", cumulative_json)
                 ),
                 outcome.converged_early,
@@ -8712,7 +9546,7 @@ fn main() {
                 } else {
                     String::new()
                 };
-                let dimensions = format!("{}{}{}{}", dimensions, r.gate_json, r.fitness_json, r.validation_book_json);
+                let dimensions = format!("{}{}{}{}{}", dimensions, r.gate_json, r.fitness_json, r.validation_book_json, r.occam_json);
                 let selection_json = if select_by.is_some() {
                     format!(
                         "\"archive_rank\":{},\"validation_error\":{},",
@@ -9348,6 +10182,17 @@ fn normalise_inputs(n: &expr::Node, means: &[f64], stds: &[f64]) -> expr::Node {
             // A block body is in parameter space and must not be rewritten.
             block: n.block.clone(),
         },
+    }
+}
+
+
+/// #1180: the columns of a regime gate are inputs of the decision: a label,
+/// the target, its return column or a construction column would leak the future
+/// into the mask (D13, exit 5).
+fn enforce_gate_columns(flag: &str, columns: &[String], specs: &[&target::TargetSpec], target_names: &[String], allow_structure: bool) {
+    if let Some(why) = rcsr::regime_gate::gate_column_leak(columns, specs, target_names, allow_structure) {
+        eprintln!("error: {}: {}", flag, why);
+        std::process::exit(EXIT_LEAKAGE);
     }
 }
 
@@ -11029,6 +11874,29 @@ USAGE:
   The threshold comes from training/validation rows only. With a target spec
   whose column has a report in <data>.labels.json, the JSON split records
   fit_label (name, stride, average_uniqueness, effective_n, effective_n_hours).
+  Labelled rows (#1291): a row is priced, spacing-checked and read by the
+  threshold when its return is finite and, with a target spec (--target-spec,
+  --from-run, --front), its fit label (the spec's label column) is finite too:
+  the rows of the search's books. A run searched with --book-target prices
+  every row with a finite return of its book label, from the spec the run
+  records (objective.book_target_spec; a run without it exits 2); its
+  --target is the book label or its return column, so the fit label exits 2.
+  A top-tercile book and a run whose --fill filled missing labels (mean,
+  median, zero, previous or interpolate; drop and none fill nothing) price
+  every finite return, as the search did. Data without the fit label column exits
+  2 under --from-run and --front; with --target-spec the return alone labels
+  a row and stderr says so. The JSON split records labelled_rows {{rule:
+  fit_label|book_target|return, column}}. The candidate id binds the rule and
+  every input of it (#1312): procedure_spec holds one rows= line with the
+  rule, the fit label column, the return column, the run's preparation.fill,
+  top-tercile and the book label, so a sealed candidate read under another
+  fit label, fill or run target_spec.column is not in the sealed list (exit 3).
+  Book label (#1212): --book-target, or the book label of a --from-run or
+  --front run, prices the book on another label than the fit label: its
+  return column, horizon, stride and cost set the rows, the period grid, the
+  bootstrap block and the annualisation; the purge is the larger of the two
+  labels' entry offset + horizon + delay. The JSON book block adds target,
+  fit_target and source (flag|run), and the candidate id binds both labels.
   See docs/walkforward.md.
 
 OPTIONS:
@@ -11039,15 +11907,21 @@ OPTIONS:
                              repeat to select among candidates on the validation slice
   --front <run.json>         candidates from the Pareto front of a run (one per
                              member, labelled front_rank_<k>), instead of --expr.
-                             --vars, --target (the run's return column) and
-                             --trials (search.candidates_evaluated) default to
-                             the run. The run's position rule is carried: the
+                             --vars and --target (the run's return column) default
+                             to the run; --trials defaults to the front size (the
+                             search trials when a window is in sample and the run has
+                             them). The run's
+                             position rule is carried: the
                              objective threshold as a fixed threshold and its
                              per-side cost; --threshold-fixed,
                              --threshold-quantile and --cost-bps override.
                              A window whose test_start is below the last train
                              or validation time of the run plus its required
                              purge exits 2
+                             (a run of --split-table: a window that a kept
+                             training or validation row reaches with its label
+                             window or reads within the run's embargo after the
+                             window exits 2; an earlier window can be out of sample)
                              Members are read from expression_exact (the lossless
                              form) when the run has it; the report says
                              selection.expression_source exact or rounded
@@ -11072,6 +11946,12 @@ OPTIONS:
   --window <spec>            LABEL,TRAIN_START,TRAIN_END,TEST_START,TEST_END
                              (repeatable; the four-bound form is also accepted)
   --windows <file>           CSV file of window rows with the same columns
+                             or a splits table (split_id,role,start,end) with
+                             --split-id: one window per test interval, labelled
+                             <id>-test<k>, with no training range of its own (one
+                             second before the purge gap); use it with --from-run
+                             or --threshold-fixed
+  --split-id <id>            the split of a --windows splits table
   --horizon <seconds>        forward-label horizon; minimum purge/embargo. Test rows of one
                              group closer than the horizon overlap and are refused (exit 2)
                              (default 0)
@@ -11086,6 +11966,20 @@ OPTIONS:
                              --delay, the return column, return units (log is
                              converted with exp_m1) and the cost come from the entry
                              matching --target; a flag that disagrees is refused
+  --book-target <col>        #1212: price the book on another label of the
+                             --target-spec file than --target (the fit label): its
+                             return column, horizon, stride and cost price the book on
+                             every row with a finite book return; the purge is the
+                             larger of the two labels' entry offset + horizon + delay
+                             (a shorter gap exits 2 naming the label that binds). Both
+                             labels forward_return and a book return_column, a data
+                             file with that column, else exit 2; the fit label itself
+                             changes nothing. With --from-run or --front it names the
+                             run's book label (objective.book_target, else the fit
+                             label), priced without the flag too; another label exits 2.
+                             --device-pnl and --batch-pnl exit 2. JSON: book.target,
+                             book.fit_target, book.source (flag|run); split.fit_label is
+                             the fit label's; procedure_spec binds both labels
   --from-run <run.json>      the book a search with --objective selected: expression,
                              variables, fixed threshold, per-side cost and target spec
                              of the run. A run that priced a band or a minimum hold
@@ -11097,15 +11991,52 @@ OPTIONS:
                              --band-units or --min-hold that differs from the run exits 2.
                              Refuses --expr, --threshold-quantile,
                              --threshold-fixed and --target-spec, and a run without an
-                             objective block
+                             objective block; --threshold-fit fitness keeps the run
+                             threshold as the reference cut
                              The expression is objective.finalist.expression_exact,
                              else the 4-decimal expression (expression_source
-                             rounded); --locked-test refuses a rounded source (exit 3)
+                             rounded); --locked-test refuses a rounded source (exit 3).
+                             A composed run (rcsr compose) is priced as its switch
+                             (objective.finalist.switch; --front: pareto[].switch):
+                             the held branch's score under the gate state of
+                             rcsr-gate-state/1 (one pass over every row of the data
+                             before the last window end; windows[].gate.start and
+                             .regime). --device-pnl, --batch-pnl, --threshold-fit,
+                             --select-band, a --policy other than threshold and a
+                             band exit 2; a label, target, return or construction
+                             gate column exits 5. Such a run writes
+                             selection.composite: source, type, form and gate of its
+                             compose.chosen (#1237); other reports carry no marker.
+                             The selection block carries run and run_sha256 (the
+                             SHA-256 of the file, inside the report hash; #1238)
   --threshold-quantile <q>   exact type-7 training/validation score quantile
                              (default {DEFAULT_QUANTILE}); selected by order-preserving
                              radix count, so theta is bit-identical to numpy
   --threshold-fixed <theta>  pre-registered fixed threshold instead of a quantile;
                              reported with threshold_source = fixed
+  --threshold-fit fitness    fit the cut of each window on its validation slice
+                             (training rows without one): the cut with the lowest
+                             block fitness (mean + lambda x sd of the block regrets)
+                             among cuts with at least --cut-min-entries distinct entry
+                             timestamps, from one sort and one sweep, frozen on the
+                             test block. Needs --threshold-fixed or --from-run (the
+                             reference cut and the fallback); --threshold-quantile,
+                             --policy band, vote, dp and top-tercile, --select-band,
+                             --device-pnl and --batch-pnl exit 2. threshold_source is
+                             validation_fitness or train_fitness, or fixed on a
+                             fallback (no_rows, book_error, no_valid_cut, floor);
+                             windows[].cut holds the source-row fitness, the reference
+                             cut, the plateau and a 32-cut profile. The cut rule is part
+                             of the candidate id and the read binding; the DSR trials
+                             are unchanged (the cut never reads the test block)
+  --cut-min-entries <E>      fewest distinct entry timestamps of a fitted cut
+                             (default 30, at least 1)
+  --cut-blocks <K>           time blocks of the fitted-cut fitness (default 4, 1 to 8)
+  --cut-lambda <L>           weight of the block regret sd in the fitted-cut fitness
+                             (default 1, finite and >= 0)
+  --unmasked                 price the raw formula of a run that searched with
+                             --pnl-mask instead of its masked book (diagnostic;
+                             needs --from-run or --front of a masked run)
   --policy <p>               threshold | band | dp | top-tercile | vote (default threshold). top-tercile
                              holds the top floor(n/3) finite scores of each timestamp long and
                              the rest flat (no threshold; --threshold-quantile, --threshold-fixed,
@@ -11120,7 +12051,9 @@ OPTIONS:
                              (0, 1], required). A member with a non-finite score drops the row.
                              --band B (whole number) keeps a long book long while votes >=
                              ceil(Q x K) - B; --min-hold applies after voting. K=1, Q=1 equals the
-                             threshold book. --locked-test reads the whole book once:
+                             threshold book. Q x K up to 0.05 above a whole number (0.67 of 3) rounds the
+                             votes up: a stderr warning names the count. --locked-test reads the whole
+                             book once:
                              the sealed entry binds members, order, quorum, band, min-hold
                              and threshold. --device-pnl, --batch-pnl, --select-band and
                              --band-units are refused
@@ -11148,9 +12081,47 @@ OPTIONS:
                              (default 0: use all training rows)
   --pool-reset-flat          reset every group to flat at a window seam (the
                              historical pooled P&L); default carries the boundary
-                             position, so total variation includes |p_end-q_start|
-  --periods-per-year <f>     annualisation override (default: infer from the
-                             median test time step; 365 for daily crypto bars)
+                             position, so total variation includes |p_end-q_start|.
+                             Windows from a --windows splits table always reset
+                             at a gap between test intervals
+  --period-grid score|target the periods of the pooled series (default score:
+                             a period where some row has a finite score and
+                             target). target: a period where some test row has
+                             a finite target before the gate, the same for every
+                             formula and gate on one store; a period where the
+                             book prices no row (no finite score, gate off)
+                             books net 0. The book does not change: cost,
+                             turnover, trades and the sum of period_net equal
+                             the score report. Adds pooled.grid (rule, periods,
+                             empty_periods) and pooled.period_rows; rcsr trials
+                             and --cpcv-assemble guard pooled.grid.rule. Use it
+                             for CPCV splits and for comparing formulas with
+                             different NaN coverage or gates
+  --missing-score flat|hold  what the book does on a row with a finite target
+                             and no finite score (default flat). flat: the row
+                             ends the group's run; the run pays its exit at its
+                             last priced row and the next priced row starts
+                             flat (the band and cooldown state restarts), so a
+                             gap costs a round trip. hold: the row keeps the
+                             position before it and earns its return, with no
+                             cost; the band and cooldown state carries across
+                             it. A row with a finite score and no finite target
+                             is never priced. The report adds book
+                             (missing_score, missing_score_exits,
+                             unpriced_target_rows); rcsr trials and
+                             --cpcv-assemble guard book.missing_score
+  --periods-per-year <f>     annualisation override. Default: 31536000 / S, S the
+                             label horizon, or the label stride when the
+                             spec has a wider stride_seconds (target spec, else
+                             --horizon), else the median step of labelled test
+                             times. A spec with no stride_seconds whose labelled
+                             rows of one group are 2 horizons or more apart,
+                             and a stride_seconds wider than the smallest
+                             per-group step, exit 2. A period is
+                             the bucket floor(t / S); without a declared
+                             horizon a period is one timestamp. With a target
+                             spec a different value exits 2; with --horizon
+                             alone it overrides
   --device-pnl               recompute each test block through the fused
                              long-only reduction (f64 canonical segments; the
                              CUDA kernel when built with --features cuda) and
@@ -11188,19 +12159,74 @@ OPTIONS:
                              bootstrap, effective n, DSR at N_eff and 10 N_eff,
                              PBO (CSCV), SPA against the best long/flat baseline
                              and BH-FDR over the candidates
+  --regimes <calendar.csv>   #1175: per-stratum report of the pooled periods by a regime
+                             calendar (rows label,start,end, UTC half-open, no overlap,
+                             any label set; `rcsr protocol regimes` writes one). A period
+                             belongs to the row that contains its bucket start; periods
+                             outside every row are `undated`. Adds `regimes` to the report
+                             (JSON and --markdown): periods, years, net mean and annualised
+                             at the report cost and at twice it, Sharpe, Sortino, max
+                             drawdown of the stratum periods concatenated, exposure,
+                             entries, buy-and-hold and alpha over exposure-matched
+                             buy-and-hold, and a block-bootstrap interval of the mean
+                             with --bootstrap. A reporting input only: no search reads it.
+                             Without any regime flag the report is unchanged
+  --regime-expr <expr>       causal regime expression of columns of the row (repeatable);
+                             a row is on when the value is > 0 (non-finite is off and
+                             counted), a period is on when more than half of its rows
+                             are on. Reports the on and off strata and the switches,
+                             switches per year and mean state duration. Aggregates exit
+                             2; a label, target, return or construction column exits 5
+                             (D13). Needs the data to hold the columns. The state
+                             of a row comes from one gate pass over the data
+                             (rcsr-gate-state/1), never from the window rows alone
+  --regime-name <name>       name of the preceding --regime-expr (default r1, r2, ...)
+  --regime-band <h>          hysteresis of every --regime-expr (default 0, >= 0)
+  --regime-dwell <D>         minimum rows per state of every --regime-expr (default 1)
+  --period-series            also write pooled.period_gross, period_exposure,
+                             period_entries and period_bh, so `rcsr trials --regimes`
+                             reports exposure and alpha per stratum (implied by the
+                             regime flags above)
+  --emit-series              #1176: --period-series plus pooled.period_cost (gross - net,
+                             so gross - m x cost is the net at m times the cost),
+                             period_entry_stamp (1 when a row enters a long run),
+                             period_bh_net (the buy-and-hold control of the same rows
+                             at the report cost) and entry_times (distinct entry stamps),
+                             and windows[].entry_times (#1236: the window's share of
+                             entry_times; the windows sum to it)
+  --all-members              #1176, with --front: also price every front member alone
+                             with its own carried threshold and band, as --expr <member>
+                             would, into members[] (archive_rank, complexity, expression,
+                             constant, dropped_rows, per-window metrics, pooled metrics
+                             with entry_times and cost_ladder, and the --emit-series
+                             series); selection.source front_all_members, diagnostic true.
+                             The selection of the report is unchanged and no member feeds
+                             it; implies --emit-series. --select-band, --threshold-fit,
+                             --policy vote and --locked-test exit 2
   --block-len <L>            block length in periods (default
                              max(h, hold, n^(1/3))); must be >= max(h, hold)
   --null-draws <B>           draws of the hour-block permutation null and the
-                             matched-exposure random long/flat null (default 0
-                             = off); p = (1+count)/(B+1)
+                             matched-exposure shifted long/flat null (one
+                             circular shift per draw and window, shared by all
+                             symbols; p is null under 20 distinct shifts; with
+                             D <= B distinct shifts all D are evaluated once and
+                             p = (1+count)/(D+1))
+                             (default 0 = off); p = (1+count)/(B+1)
   --trials <N>               total trials behind the candidates, the N of the
-                             DSR (default: the candidate count)
+                             DSR. Default: the run's candidates_evaluated when a
+                             window is in sample (the front size when the run has no
+                             count); else --from-run 1 (out-of-sample book), --front
+                             the front size, --expr the candidate count; the report
+                             names it in multiple_testing.n_trials_source
   --protocol-seed <n>        seed of every bootstrap, null and SPA draw
   --pbo-blocks <S>           even CSCV block count (default 16)
   --fdr-q <q>                Benjamini-Hochberg rate (default 0.10)
   --ledger <file>            append-only JSONL candidate ledger. A development
                              run appends a candidate (test_read:false) and
-                             refuses windows that reach the declared lockbox
+                             refuses windows that reach the declared lockbox.
+                             A null store (rcsr panel permute-labels) exits 2
+                             before any ledger read or write, also with
+                             --locked-test (#1304)
   --lockbox-embargo <SECONDS>
                              widen the lookback embargo after the end of every locked range
                              (default: lockbox_embargo declared with the data, else 10972800);
@@ -11225,7 +12251,12 @@ OPTIONS:
   --locked-test              read the locked test once for a sealed candidate.
                              Needs --ledger and --sealed. A second read, an
                              unsealed candidate or a code/data hash that differs
-                             from the sealed entry is refused. After `protocol seal
+                             from the sealed entry is refused. The candidate id
+                             binds procedure_spec (with its rows= line), the data
+                             hash and the build commit, so a list sealed by another
+                             build is not readable by this one; the refusal names
+                             the cause (another build, other data or another
+                             procedure). After `protocol seal
                              --final`: at most the sealed number of reads, a read
                              through another ledger of the same store is refused
                              (<data>.locked_reads.jsonl), --batch-pnl is refused
@@ -11234,13 +12265,17 @@ OPTIONS:
   --sealed <file>            locked_candidates.json from `rcsr protocol seal`
   --verify-read              with --locked-test (exit 2 without it): recompute a recorded
                              read, compare its report hash, write --out and --markdown,
-                             record nothing; the route after a failed report write
+                             record nothing; a candidate with no recorded read, a window set or
+                             setting that differs from the recorded read, and a read stored without a
+                             binding digest are refused (exit 3) before any locked row is scored;
+                             the verify needs the same build line that recorded the read
   --allow-unbound-ledger     with --locked-test: read a candidate whose ledger
                              recorded no locked test range (old ledger); the read
                              is reported as unbound. Without it that read is
                              refused (exit 3), as is a range that differs from
                              the one the candidate was developed against
-  --expect-report-sha256 <h> exit 3 unless the report JSON hashes to h
+  --expect-report-sha256 <h> exit 3 unless the report JSON hashes to h; with --locked-test
+                             it needs --verify-read (exit 2 without it)
   --json                     print the full JSON report to stdout
                              (it ends with a ledger object: the phase ledger of the
                              command, io and pnl seconds on the run wall, outside the
@@ -11268,6 +12303,18 @@ struct BandFlags {
     band: bool,
     units: Option<String>,
     min_hold: bool,
+}
+
+/// #1027: the N of the deflated Sharpe is what selected on the scored rows. An
+/// out-of-sample `--from-run` book is one trial and `--front` compares its
+/// front members; a window the search selected on brings the search trials.
+fn default_trials(run: &rcsr::run_json::RunFile, front: bool, in_sample: bool) -> (usize, &'static str) {
+    let front_size = run.front.len().max(1);
+    match (front, in_sample, run.candidates_evaluated) {
+        (_, true, Some(n)) if n > 0 => (n as usize, "run.candidates_evaluated"),
+        (_, true, _) | (true, false, _) => (front_size, "front_size"),
+        (false, false, _) => (1, "out_of_sample_book"),
+    }
 }
 
 /// #946: `--from-run` and `--front` price the book the search selected. When
@@ -11339,6 +12386,7 @@ fn run_walkforward(args: &[String]) -> ! {
     let mut windows: Vec<walkforward::Window> = Vec::new();
     let mut windows_file: Option<String> = None;
     let mut horizon: Option<f64> = None;
+    let mut windows_split_id: Option<String> = None;
     let mut embargo: Option<f64> = None;
     let mut cost_flag: Option<f64> = None;
     let mut cost_override: Option<f64> = None;
@@ -11349,6 +12397,10 @@ fn run_walkforward(args: &[String]) -> ! {
     let mut quantile = walkforward::DEFAULT_QUANTILE;
     let mut quantile_set = false;
     let mut threshold_fixed: Option<f64> = None;
+    let mut threshold_fit = false;
+    let mut cut_min_entries: Option<u32> = None;
+    let mut cut_blocks: Option<usize> = None;
+    let mut cut_lambda: Option<f64> = None;
     let mut policy = walkforward::Policy::Threshold;
     let mut band_width = 0.0f64;
     let mut min_hold = 1usize;
@@ -11366,6 +12418,7 @@ fn run_walkforward(args: &[String]) -> ! {
     let mut quiet = false;
     let mut allow_lockbox = false;
     let mut popts = walkforward::ProtocolOptions::default();
+    let mut unmasked = false;
     let mut band_units_arg: Option<String> = None;
     let mut windows_scheme: Option<String> = None;
     let mut ledger_path: Option<String> = None;
@@ -11379,6 +12432,14 @@ fn run_walkforward(args: &[String]) -> ! {
     let mut expect_hash: Option<String> = None;
     let mut front_path: Option<String> = None;
     let mut allow_in_sample = false;
+    let mut regimes_path: Option<String> = None;
+    let mut regime_exprs_src: Vec<(String, Option<String>)> = Vec::new();
+    let mut regime_band_arg: Option<String> = None;
+    let mut regime_dwell_arg: Option<String> = None;
+    let mut period_series = false;
+    let mut emit_series = false;
+    let mut all_members = false;
+    let mut book_target_arg: Option<String> = None;
 
     let need = |args: &[String], i: usize, flag: &str| -> String {
         match args.get(i) {
@@ -11440,6 +12501,10 @@ fn run_walkforward(args: &[String]) -> ! {
                 windows_file = Some(need(args, i + 1, "--windows"));
                 i += 1;
             }
+            "--split-id" => {
+                windows_split_id = Some(need(args, i + 1, "--split-id"));
+                i += 1;
+            }
             "--horizon" => {
                 horizon = Some(number(need(args, i + 1, "--horizon"), "--horizon"));
                 i += 1;
@@ -11464,11 +12529,45 @@ fn run_walkforward(args: &[String]) -> ! {
                 from_run_path = Some(need(args, i + 1, "--from-run"));
                 i += 1;
             }
+            "--book-target" => {
+                book_target_arg = Some(need(args, i + 1, "--book-target"));
+                i += 1;
+            }
             "--front" => {
                 front_path = Some(need(args, i + 1, "--front"));
                 i += 1;
             }
             "--allow-in-sample-windows" => allow_in_sample = true,
+            "--regimes" => {
+                regimes_path = Some(need(args, i + 1, "--regimes"));
+                i += 1;
+            }
+            "--regime-expr" => {
+                regime_exprs_src.push((need(args, i + 1, "--regime-expr"), None));
+                i += 1;
+            }
+            "--regime-name" => {
+                let name = need(args, i + 1, "--regime-name");
+                match regime_exprs_src.last_mut() {
+                    Some(last) if last.1.is_none() => last.1 = Some(name),
+                    _ => {
+                        eprintln!("error: --regime-name follows a --regime-expr and names it once");
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+                i += 1;
+            }
+            "--regime-band" => {
+                regime_band_arg = Some(need(args, i + 1, "--regime-band"));
+                i += 1;
+            }
+            "--regime-dwell" => {
+                regime_dwell_arg = Some(need(args, i + 1, "--regime-dwell"));
+                i += 1;
+            }
+            "--period-series" => period_series = true,
+            "--emit-series" => emit_series = true,
+            "--all-members" => all_members = true,
             "--threshold-quantile" => {
                 quantile = number(
                     need(args, i + 1, "--threshold-quantile"),
@@ -11482,6 +12581,33 @@ fn run_walkforward(args: &[String]) -> ! {
                     need(args, i + 1, "--threshold-fixed"),
                     "--threshold-fixed",
                 ));
+                i += 1;
+            }
+            "--threshold-fit" => {
+                let src = need(args, i + 1, "--threshold-fit");
+                if src != "fitness" {
+                    eprintln!("error: --threshold-fit takes fitness, got '{}'", src);
+                    std::process::exit(EXIT_USAGE);
+                }
+                threshold_fit = true;
+                i += 1;
+            }
+            "--cut-min-entries" | "--cut-blocks" => {
+                let flag = args[i].clone();
+                let src = need(args, i + 1, &flag);
+                let v = src.parse::<u32>().unwrap_or_else(|_| {
+                    eprintln!("error: {} needs a non-negative integer, got '{}'", flag, src);
+                    std::process::exit(EXIT_USAGE);
+                });
+                if flag == "--cut-min-entries" {
+                    cut_min_entries = Some(v);
+                } else {
+                    cut_blocks = Some(v as usize);
+                }
+                i += 1;
+            }
+            "--cut-lambda" => {
+                cut_lambda = Some(number(need(args, i + 1, "--cut-lambda"), "--cut-lambda"));
                 i += 1;
             }
             "--policy" => {
@@ -11536,6 +12662,20 @@ fn run_walkforward(args: &[String]) -> ! {
                 i += 1;
             }
             "--pool-reset-flat" => pool_reset_flat = true,
+            "--missing-score" => {
+                popts.missing_score = rcsr::trading::MissingScore::parse(&need(args, i + 1, "--missing-score")).unwrap_or_else(|e| {
+                    eprintln!("error: {}\n\n{}", e, walkforward_usage());
+                    std::process::exit(EXIT_USAGE);
+                });
+                i += 1;
+            }
+            "--period-grid" => {
+                popts.period_grid = walkforward::PeriodGrid::parse(&need(args, i + 1, "--period-grid")).unwrap_or_else(|e| {
+                    eprintln!("error: {}\n\n{}", e, walkforward_usage());
+                    std::process::exit(EXIT_USAGE);
+                });
+                i += 1;
+            }
             "--device-pnl" => device_pnl = true,
             "--batch-pnl" => popts.batch_pnl = true,
             "--gpu" => gpu = true,
@@ -11625,6 +12765,7 @@ fn run_walkforward(args: &[String]) -> ! {
             "--verify-read" => verify_read = true,
             "--allow-unbound-ledger" => allow_unbound = true,
             "--allow-lockbox" => allow_lockbox = true,
+            "--unmasked" => unmasked = true,
             other if other.starts_with("--policy=") => {
                 let src = &other["--policy=".len()..];
                 policy = match walkforward::Policy::parse(src) {
@@ -11685,6 +12826,12 @@ fn run_walkforward(args: &[String]) -> ! {
         eprintln!("error: {}", msg);
         std::process::exit(EXIT_INPUT);
     };
+    if all_members {
+        let vote = policy == walkforward::Policy::Vote;
+        if let Some(msg) = walkforward::all_members_conflict(front_path.is_some(), band_select, threshold_fit, vote, locked_test) {
+            usage_fail(&msg);
+        }
+    }
     // #487: one declaration of the label window, the return units and the
     // cost, read from a target spec or from the run that selected the book.
     let given = |names: &[&str]| args.iter().any(|a| names.iter().any(|n| a == n || a.starts_with(&format!("{}=", n))));
@@ -11694,6 +12841,26 @@ fn run_walkforward(args: &[String]) -> ! {
         units: band_units_arg.clone(),
         min_hold: given(&["--min-hold"]),
     };
+    if !threshold_fit && (cut_min_entries.is_some() || cut_blocks.is_some() || cut_lambda.is_some()) {
+        usage_fail("--cut-min-entries, --cut-blocks and --cut-lambda need --threshold-fit fitness");
+    }
+    if threshold_fit {
+        if quantile_set {
+            usage_fail(
+                "--threshold-fit fitness and --threshold-quantile are alternatives: the fitted cut replaces the \
+                 quantile; pass the reference cut with --threshold-fixed or --from-run",
+            );
+        }
+        if let Some(msg) = walkforward::threshold_fit_conflict(policy, band_select, device_pnl, popts.batch_pnl) {
+            usage_fail(&msg);
+        }
+        let d = walkforward::CutFit::default();
+        popts.threshold_fit = Some(walkforward::CutFit {
+            min_entry_times: cut_min_entries.unwrap_or(d.min_entry_times),
+            blocks: cut_blocks.unwrap_or(d.blocks),
+            lambda: cut_lambda.unwrap_or(d.lambda),
+        });
+    }
     if from_run_path.is_some() && (target_spec_path.is_some() || front_path.is_some()) {
         usage_fail("--from-run, --front and --target-spec are alternatives: a run carries its own target spec");
     }
@@ -11715,6 +12882,31 @@ fn run_walkforward(args: &[String]) -> ! {
     let mut cost_spec: Option<rcsr::target::TargetSpec> = None;
     let mut run_cost: Option<(f64, rcsr::target::CostSource)> = None;
     let mut front_run: Option<rcsr::run_json::RunFile> = None;
+    // #1291, #1212: the book label of a run searched with --book-target prices its books on every finite
+    // book return, and its fit label keeps its purge. --book-target names the run's book label.
+    let mut book_label: Option<walkforward::BookLabel> = None;
+    let run_book_label = |run: &rcsr::run_json::RunFile, path: &str, fit: Option<rcsr::target::TargetSpec>| -> Option<walkforward::BookLabel> {
+        let book = walkforward::BookLabel::of_run(run, path, fit.as_ref()).unwrap_or_else(|e| usage_fail(&e));
+        let Some(fit) = fit else {
+            if book_target_arg.is_some() {
+                usage_fail(&walkforward::BookLabel::no_fit_label(path));
+            }
+            return None;
+        };
+        if let Some(arg) = &book_target_arg {
+            let label = book.as_ref().map_or(&fit, |b| &b.book);
+            if rcsr::target::entry_for(std::slice::from_ref(label), arg).is_none() {
+                usage_fail(&format!(
+                    "--book-target {} differs from the book label of {}: the run priced its books on '{}'{}",
+                    arg,
+                    path,
+                    label.column,
+                    if book.is_none() { ", its fit label (no objective.book_target); search with --book-target to trade another label" } else { "" }
+                ));
+            }
+        }
+        book
+    };
     if let Some(path) = &from_run_path {
         if !expressions.is_empty() {
             usage_fail("--from-run takes the expression from the run; do not pass --expr");
@@ -11732,6 +12924,12 @@ fn run_walkforward(args: &[String]) -> ! {
             input_fail(&e)
         });
         let book = run.band_book().unwrap_or_else(|e| input_fail(&format!("{}: {}", path, e)));
+        if unmasked && book.mask.is_none() {
+            usage_fail("--unmasked: the run priced no regime mask");
+        }
+        popts.mask = if unmasked { None } else { book.mask.clone() };
+        // #1214: a composed C1 or C2 finalist is priced as its switch.
+        popts.switches = book.switch.iter().map(|s| Some(walkforward::SwitchCandidate { switch: s.clone(), source: "objective.finalist.switch".to_string() })).collect();
         expressions.push(book.expression.clone());
         popts.expression_source = Some(book.expression_source);
         if locked_test && book.expression_source == rcsr::run_json::ExpressionSource::Rounded {
@@ -11760,7 +12958,9 @@ fn run_walkforward(args: &[String]) -> ! {
             band_units_arg = None;
         }
         run_cost = Some((book.per_side_bps, book.source));
-        cost_spec = Some(book.spec);
+        book_label = run_book_label(&run, path, Some(book.spec.clone()));
+        cost_spec = Some(book_label.as_ref().map_or(book.spec, |b| b.book.clone()));
+        popts.composite = run.composite.clone();
         front_run = Some(run);
     } else if let Some(path) = &front_path {
         if !expressions.is_empty() {
@@ -11787,6 +12987,13 @@ fn run_walkforward(args: &[String]) -> ! {
             std::process::exit(EXIT_INPUT);
         }
         expressions = run.front.iter().map(|m| m.expression.clone()).collect();
+        if unmasked && run.mask.is_none() {
+            usage_fail("--unmasked: the run priced no regime mask");
+        }
+        popts.mask = if unmasked { None } else { run.mask.clone() };
+        if run.front.iter().any(|m| m.switch.is_some()) {
+            popts.switches = run.front.iter().enumerate().map(|(k, m)| m.switch.clone().map(|s| walkforward::SwitchCandidate { switch: s, source: format!("pareto[{}].switch", k) })).collect();
+        }
         popts.expression_source = Some(run.front_source);
         if locked_test && run.front_source == rcsr::run_json::ExpressionSource::Rounded {
             input_fail(&rcsr::run_json::rounded_refusal(path));
@@ -11795,24 +13002,14 @@ fn run_walkforward(args: &[String]) -> ! {
             run: path.clone(),
             run_sha256: run.sha256.clone(),
             labels: run.front.iter().map(|m| format!("front_rank_{}", m.rank)).collect(),
+            ranks: run.front.iter().map(|m| m.rank).collect(),
         });
         if vars_src.is_none() && !run.variables.is_empty() {
             vars_src = Some(run.variables.join(","));
         }
+        book_label = run_book_label(&run, path, run.target_spec());
         if target.is_none() {
-            target = run.return_column.clone();
-        }
-        if popts.trials.is_none() {
-            popts.trials = Some(match run.candidates_evaluated {
-                Some(n) if n > 0 => n as usize,
-                _ => {
-                    eprintln!(
-                        "error: --front {}: the run has no search.candidates_evaluated; pass --trials",
-                        path
-                    );
-                    std::process::exit(EXIT_USAGE);
-                }
-            });
+            target = book_label.as_ref().map_or_else(|| run.return_column.clone(), |b| b.book.return_column.clone());
         }
         // The front is priced as the books the search compared: the run's
         // fixed threshold, cost and target spec.
@@ -11855,16 +13052,70 @@ fn run_walkforward(args: &[String]) -> ! {
         }
         if let Some(bps) = run.per_side_bps {
             run_cost = Some((bps, run.cost_source()));
-            cost_spec = run.target_spec();
+            cost_spec = book_label.as_ref().map(|b| b.book.clone()).or_else(|| run.target_spec());
         }
+        popts.composite = run.composite.clone();
         front_run = Some(run);
     } else if let Some(path) = &target_spec_path {
         let text = std::fs::read_to_string(path).unwrap_or_else(|e| input_fail(&format!("{}: {}", path, e)));
         let specs = rcsr::target::parse_file(&text).unwrap_or_else(|e| input_fail(&format!("{}: {}", path, e)));
         let want = target.clone().unwrap_or_else(|| usage_fail("--target-spec needs --target to pick the spec entry"));
         match rcsr::target::entry_for(&specs, &want) {
-            Some(s) => cost_spec = Some(s.clone()),
+            Some(s) => {
+                // #1212: --target picks the fit label and --book-target the label that prices the book.
+                if let Some(arg) = &book_target_arg {
+                    let book = rcsr::target::entry_for(&specs, arg).unwrap_or_else(|| {
+                        usage_fail(&format!("--book-target {}: {} has no entry whose column, name or return_column is '{}'", arg, path, arg))
+                    });
+                    book_label = walkforward::BookLabel::pair(s, book, walkforward::BookSource::Flag).unwrap_or_else(|e| usage_fail(&e));
+                }
+                cost_spec = Some(book_label.as_ref().map_or(s, |b| &b.book).clone());
+                if book_label.is_some() {
+                    target = None;
+                }
+            }
             None => input_fail(&format!("{}: no entry for target '{}'", path, want)),
+        }
+    }
+    if book_target_arg.is_some() && target_spec_path.is_none() && from_run_path.is_none() && front_path.is_none() {
+        usage_fail("--book-target needs --target-spec (the spec file that declares the fit label and the book label), --from-run or --front");
+    }
+    if let Some(b) = &book_label {
+        for (on, flag) in [(device_pnl, "--device-pnl"), (popts.batch_pnl, "--batch-pnl")] {
+            if on {
+                usage_fail(&format!(
+                    "{} conflicts with the book label '{}' (--book-target or the run's objective.book_target): a book on another label than the fit label '{}' is priced on the CPU",
+                    flag, b.book.column, b.fit.column
+                ));
+            }
+        }
+    }
+    if unmasked && from_run_path.is_none() && front_path.is_none() {
+        usage_fail("--unmasked needs --from-run or --front of a run that priced a regime mask");
+    }
+    if popts.switches.iter().any(Option::is_some) {
+        let refused = [
+            (device_pnl, "--device-pnl"),
+            (popts.batch_pnl, "--batch-pnl"),
+            (threshold_fit, "--threshold-fit"),
+            (band_select, "--select-band"),
+            (policy != walkforward::Policy::Threshold, "--policy, --band and --min-hold"),
+        ];
+        if let Some((_, flag)) = refused.iter().find(|(on, _)| *on) {
+            usage_fail(&format!("{} conflicts with the run's switch (rcsr compose): the composite is the long/flat book at threshold 0 under its gate states, priced on the CPU test rows", flag));
+        }
+    }
+    if popts.mask.is_some() {
+        let refused = [
+            (device_pnl, "--device-pnl"),
+            (popts.batch_pnl, "--batch-pnl"),
+            (threshold_fit, "--threshold-fit"),
+            (policy == walkforward::Policy::TopTercile, "--policy top-tercile"),
+            (policy == walkforward::Policy::Vote, "--policy vote"),
+            (policy == walkforward::Policy::Dp, "--policy dp"),
+        ];
+        if let Some((_, flag)) = refused.iter().find(|(on, _)| *on) {
+            usage_fail(&format!("{} conflicts with the run's regime mask (--pnl-mask): the masked book is priced on the CPU test rows; pass --unmasked to price the raw formula", flag));
         }
     }
     let mut cost_bps = walkforward::DEFAULT_COST_BPS;
@@ -11896,13 +13147,22 @@ fn run_walkforward(args: &[String]) -> ! {
             }
         };
         horizon = Some(agree("--horizon", horizon, s.horizon_seconds));
+        popts.horizon_from_spec = s.horizon_seconds > 0.0;
+        popts.stride_seconds = s.stride_seconds;
         popts.entry_offset = agree("--entry-offset", entry_offset_flag, s.entry_offset_seconds);
-        popts.fit_label = target::label_report_for(&data_path, &s.column).and_then(|r| rcsr::labels::fit_label_json(&r));
+        let fit_spec = book_label.as_ref().map_or(s, |b| &b.fit);
+        popts.fit_label = target::label_report_for(&data_path, &fit_spec.column).and_then(|r| rcsr::labels::fit_label_json(&r));
+        popts.fit_label_required = front_run.is_some();
+        let top_tercile = policy == walkforward::Policy::TopTercile;
+        let book_column = book_label.as_ref().map(|b| b.book.column.clone());
+        popts.row_rule = walkforward::RowRule::of_search(Some(fit_spec), s.return_column.as_deref().unwrap_or(&s.column), top_tercile, front_run.as_ref(), book_column);
         popts.delay = agree("--delay", delay_flag, s.delay_seconds);
     } else {
         popts.entry_offset = entry_offset_flag.unwrap_or(0.0);
         popts.delay = delay_flag.unwrap_or(0.0);
+        popts.row_rule = walkforward::RowRule::of_search(None, target.as_deref().unwrap_or(""), policy == walkforward::Policy::TopTercile, front_run.as_ref(), None);
     }
+    popts.book_label = book_label;
     let resolved = match run_cost {
         Some((per_side, source)) => match (cost_flag, cost_override) {
             (Some(_), Some(_)) => Err("--cost-bps and --cost-override are alternatives; pass one of them".to_string()),
@@ -11923,6 +13183,57 @@ fn run_walkforward(args: &[String]) -> ! {
     } else if cost_source == rcsr::target::CostSource::Flag {
         popts.cost = Some(rcsr::target::CostDecl::new(None, cost_bps, cost_source));
     }
+    if let Some(path) = &regimes_path {
+        popts.regimes = Some(rcsr::regimes::Calendar::load(path).unwrap_or_else(|e| usage_fail(&format!("--regimes {}", e))));
+    }
+    if regime_exprs_src.is_empty() {
+        for (flag, given) in [("--regime-band", regime_band_arg.is_some()), ("--regime-dwell", regime_dwell_arg.is_some())] {
+            if given {
+                usage_fail(&format!("{} needs --regime-expr", flag));
+            }
+        }
+    }
+    let regime_band = match regime_band_arg.as_deref() {
+        None => 0.0,
+        Some(t) => match t.trim().parse::<f64>() {
+            Ok(b) if b.is_finite() && b >= 0.0 => b,
+            _ => usage_fail(&format!("--regime-band must be a finite number >= 0, got '{}'", t)),
+        },
+    };
+    let regime_dwell = match regime_dwell_arg.as_deref() {
+        None => 1,
+        Some(t) => match t.trim().parse::<usize>() {
+            Ok(d) if d >= 1 => d,
+            _ => usage_fail(&format!("--regime-dwell must be an integer >= 1, got '{}'", t)),
+        },
+    };
+    for (k, (src, name)) in regime_exprs_src.iter().enumerate() {
+        let gate = rcsr::regime_gate::GateSpec::parse(src, regime_band, regime_dwell).unwrap_or_else(|e| usage_fail(&format!("--regime-expr: {}", e)));
+        let name = name.clone().unwrap_or_else(|| format!("r{}", k + 1));
+        if popts.regime_exprs.iter().any(|e| e.name == name) {
+            usage_fail(&format!("--regime-name '{}' is used twice", name));
+        }
+        let specs: Vec<&target::TargetSpec> = cost_spec.iter().chain(popts.book_label.iter().map(|b| &b.fit)).collect();
+        let mut names: Vec<String> = target.iter().cloned().collect();
+        names.extend(specs.iter().map(|s| s.column.clone()));
+        enforce_gate_columns("--regime-expr", &gate.columns, &specs, &names, false);
+        popts.regime_exprs.push(rcsr::regimes::ExprSpec { name, gate });
+    }
+    // #1214: a switch or mask gate column of the label family, the target, its return column or a construction column exits 5.
+    {
+        let specs: Vec<&target::TargetSpec> = cost_spec.iter().chain(popts.book_label.iter().map(|b| &b.fit)).collect();
+        let mut names: Vec<String> = target.iter().cloned().collect();
+        names.extend(specs.iter().map(|s| s.column.clone()));
+        for c in popts.switches.iter().flatten() {
+            enforce_gate_columns(&c.source, &c.switch.gate.columns, &specs, &names, false);
+        }
+        if let Some(g) = &popts.mask {
+            enforce_gate_columns("objective.spec.pnl_mask", &g.columns, &specs, &names, false);
+        }
+    }
+    popts.emit_series = emit_series || all_members;
+    popts.all_members = all_members;
+    popts.period_series = period_series || popts.emit_series;
     let horizon = horizon.unwrap_or(0.0);
     let target = target.unwrap_or_else(|| {
         eprintln!("error: walkforward needs --target\n\n{}", walkforward_usage());
@@ -11958,8 +13269,37 @@ fn run_walkforward(args: &[String]) -> ! {
         eprintln!("error: walkforward needs --time\n\n{}", walkforward_usage());
         std::process::exit(EXIT_USAGE);
     });
+    let mut split_windows = false;
     if let Some(file) = windows_file {
         match std::fs::read_to_string(&file) {
+            Ok(text) if rcsr::intervals::is_table(&text) => {
+                // #1173: one window per test interval of the split; the window has no
+                // training range of its own (one second before the purge gap).
+                let Some(id) = windows_split_id.as_deref() else {
+                    eprintln!("error: --windows {} is a splits table: add --split-id <id>\n\n{}", file, walkforward_usage());
+                    std::process::exit(EXIT_USAGE);
+                };
+                let d = rcsr::intervals::parse_table(&text, id).unwrap_or_else(|e| {
+                    eprintln!("error: {}: {}", file, e);
+                    std::process::exit(EXIT_USAGE);
+                });
+                if d.test.is_empty() {
+                    eprintln!("error: {}: split '{}' has no test interval", file, id);
+                    std::process::exit(EXIT_USAGE);
+                }
+                split_windows = true;
+                let gap = embargo.unwrap_or(horizon).max(horizon).max(popts.required_purge_seconds(horizon));
+                for (k, &(s, e)) in d.test.iter().enumerate() {
+                    let train_end = s as f64 - gap;
+                    windows.push(walkforward::Window {
+                        label: format!("{}-test{}", id, k + 1),
+                        train_start: train_end - 1.0,
+                        train_end,
+                        test_start: s as f64,
+                        test_end: e as f64,
+                    });
+                }
+            }
             Ok(text) if rcsr::protocol::is_windows_table(&text) => {
                 match rcsr::protocol::parse_windows_csv(&text, windows_scheme.as_deref()) {
                     Ok(rows) => {
@@ -12009,6 +13349,24 @@ fn run_walkforward(args: &[String]) -> ! {
             }
         }
     }
+    if split_windows {
+        // #1189: test intervals of a split are separate books; adjacent ones keep the carry.
+        let seams = windows.len().saturating_sub(1);
+        let touching = windows.windows(2).filter(|p| p[0].test_end == p[1].test_start).count();
+        if touching == 0 {
+            pool_reset_flat = true;
+        } else if touching < seams && !pool_reset_flat {
+            if popts.batch_pnl {
+                eprintln!("error: --batch-pnl cannot price a splits table whose test intervals both touch and leave gaps (touching seams carry, gaps start flat); add --pool-reset-flat or drop --batch-pnl\n\n{}", walkforward_usage());
+                std::process::exit(EXIT_USAGE);
+            }
+            popts.flat_gaps = true;
+        }
+    }
+    if windows_split_id.is_some() && !split_windows {
+        eprintln!("error: --split-id needs --windows <splits table> (header {})\n\n{}", rcsr::intervals::TABLE_HEADER, walkforward_usage());
+        std::process::exit(EXIT_USAGE);
+    }
     if band_select && validation_frac <= 0.0 && popts.validation_starts.is_empty() {
         eprintln!(
             "error: --select-band needs --validation-frac > 0 or a windows table with validation_start; \
@@ -12026,10 +13384,14 @@ fn run_walkforward(args: &[String]) -> ! {
     }
     if let Some(run) = front_run.as_ref() {
         for w in &windows {
-            if run.in_sample(w.test_start) {
+            if run.in_sample_window(w.test_start, w.test_end) {
                 if allow_in_sample {
                     popts.in_sample_windows.push(w.label.clone());
                     continue;
+                }
+                if run.intervals.is_some() {
+                    eprintln!("error: window '{}' tests rows the run trained or selected on ({})", w.label, run.interval_reason());
+                    std::process::exit(EXIT_USAGE);
                 }
                 match run.earliest_test_start() {
                     Some((_, seen, purge)) => eprintln!(
@@ -12046,6 +13408,11 @@ fn run_walkforward(args: &[String]) -> ! {
                 std::process::exit(EXIT_USAGE);
             }
         }
+    }
+    if let (None, Some(run)) = (popts.trials, front_run.as_ref()) {
+        let (n, source) = default_trials(run, front_path.is_some(), !popts.in_sample_windows.is_empty());
+        popts.trials = Some(n);
+        popts.trials_source = source;
     }
     let vars: Vec<String> = vars_src
         .map(|s| {
@@ -12097,6 +13464,12 @@ fn run_walkforward(args: &[String]) -> ! {
         if let Some(msg) = walkforward::vote_refusal(&spec, &popts) {
             usage_fail(&msg);
         }
+        if let Some(msg) = walkforward::vote_quorum_warning(popts.quorum.unwrap_or(1.0), spec.candidates.len()) {
+            eprintln!("{}", msg);
+        }
+    }
+    if let Some(msg) = walkforward::threshold_fit_refusal(&spec, &popts) {
+        usage_fail(&msg);
     }
     let resolved = rcsr::lockbox::resolve_retired(lockbox_arg.as_deref(), lockbox_embargo_arg.as_deref(), &data_path, retired_arg.as_deref()).unwrap_or_else(|e| {
         eprintln!("error: {}", e.message);
@@ -12119,6 +13492,15 @@ fn run_walkforward(args: &[String]) -> ! {
     if locked_test && (ledger_path.is_none() || sealed_path.is_none()) {
         eprintln!("error: --locked-test needs --ledger and --sealed");
         std::process::exit(EXIT_USAGE);
+    }
+    if locked_test && !verify_read && expect_hash.is_some() {
+        eprintln!("error: --expect-report-sha256 with --locked-test needs --verify-read");
+        std::process::exit(EXIT_USAGE);
+    }
+    // #1272: a report priced on a null store carries its marker. #1304: the ledger refuses it.
+    let null_store = rcsr::permute_labels::marker(&data_path);
+    if let (Some(m), true) = (&null_store, ledger_path.is_some()) {
+        usage_fail(&rcsr::permute_labels::ledger_refusal(&data_path, m, locked_test));
     }
     for (ri, rg) in resolved.ranges().into_iter().enumerate() {
         let sealed_read = locked_test && ri == 0;
@@ -12205,13 +13587,16 @@ fn run_walkforward(args: &[String]) -> ! {
             usage_fail(&msg);
         }
     }
+    let read_binding = rcsr::protocol::walkforward_binding(&spec, &popts);
     if let Some(l) = &ledger {
         let r = (|| -> Result<u64, String> {
             l.verify_chain()?;
             if locked_test {
                 let sealed = std::path::Path::new(sealed_path.as_deref().unwrap_or(""));
                 let entry = if verify_read {
-                    l.authorize_sealed(sealed, &candidate_id, &data_sha, &build_id, binding)?
+                    let entry = l.authorize_verify(sealed, &candidate_id, &data_sha, &build_id, binding)?;
+                    l.check_verify_binding(Some(&candidate_id), &read_binding)?;
+                    entry
                 } else {
                     l.authorize_read(sealed, &candidate_id, &data_sha, &build_id, binding)?
                 };
@@ -12232,13 +13617,19 @@ fn run_walkforward(args: &[String]) -> ! {
             }
         }
     }
-    let report = match walkforward::run_path_with(&data_path, &spec, &popts) {
+    let mut report = match walkforward::run_path_with(&data_path, &spec, &popts) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("error: {}", e);
-            std::process::exit(if e.contains("overlapping returns") || e.contains("purge gap") { EXIT_USAGE } else { EXIT_INPUT });
+            std::process::exit(if e.contains("overlapping returns") || e.contains("purge gap") || e.contains("are not in time order") || e.starts_with("--periods-per-year") || e.starts_with("missing stride_seconds") || e.starts_with("stride_seconds") || e.starts_with(walkforward::FIT_LABEL_REFUSAL) || e.starts_with(walkforward::BOOK_LABEL_REFUSAL) { EXIT_USAGE } else { EXIT_INPUT });
         }
     };
+    if let (Some(c), walkforward::LabelledRows::Return) = (popts.row_rule.rows().fit_label(), &report.labelled_rows) {
+        eprintln!("note: the data has no column '{}' (the target spec's label column): a row is labelled by its finite return alone (split.labelled_rows)", c);
+    }
+    if let (Some(path), Some(run)) = (&from_run_path, &front_run) {
+        report.from_run = Some(walkforward::RunRef { run: path.clone(), run_sha256: run.sha256.clone() });
+    }
     if spec.threshold_fixed.is_none() {
         for c in &report.candidates {
             let constant = expr::parse(c, &report.variables)
@@ -12337,7 +13728,7 @@ fn run_walkforward(args: &[String]) -> ! {
             windows_scheme.as_ref().map_or("null".to_string(), |s| format!("{:?}", s)),
         ));
     }
-    let report_json = || report.json_with_ledger(protocol_json.as_deref());
+    let report_json = || rcsr::permute_labels::mark_report(report.json_with_ledger(protocol_json.as_deref()), null_store.as_deref());
     for w in &report.windows {
         let reasons = [
             w.band.as_ref().and_then(|b| b.fallback_reason.as_deref()),
@@ -12370,7 +13761,7 @@ fn run_walkforward(args: &[String]) -> ! {
                         return Ok(());
                     }
                     l.write_read_marker(&data_path, "test_read", &report_sha)?;
-                    let count = l.record_read(&candidate_id, &report_sha, current_range.as_ref())?;
+                    let count = l.record_read_bound(&candidate_id, &report_sha, current_range.as_ref(), Some(&read_binding))?;
                     if count == read_count {
                         Ok(())
                     } else {
@@ -13321,6 +14712,9 @@ mod tests {
         g.fit_fallback_bounded = 0;
         g.fit_fallback_workers = 8;
         g.fit_fallback_max = 4096;
+        // #1075: the release schedule and the fits that started from it.
+        g.fit_release_waves = 3;
+        g.fit_tail_early = 5;
         g.fit_polish = rcsr::fit::FitPolish::F32;
         g.ledger.record_fit(0.5, 0.75, 0.125);
         g.ledger.record_fit_polish_split(0.25);
@@ -13336,7 +14730,7 @@ mod tests {
         for key in [
             "\"calls\":0",
             "\"candidates\":0",
-            "\"call_s_max\":0,\"fold_count\":7,\"folded\":6",
+            "\"call_s_max\":0,\"release_waves\":3,\"tail_early_fits\":5,\"fold_count\":7,\"folded\":6",
         ] {
             assert!(json.contains(key), "{key} in {json}");
         }
@@ -13791,4 +15185,10 @@ mod tests {
         assert!(t.text().contains("total=0.67s"));
         assert!(t.text().contains("gpu=0.12s"), "GPU wall is a subset, not a phase");
     }
+}
+
+/// #1184: a custom block carries fitted constants in its own copy, which the
+/// checkpoint tree encoding does not hold; such a tree stores no `occam_tree`.
+fn tree_has_custom(n: &expr::Node) -> bool {
+    n.op.is_custom() || n.kids.iter().any(tree_has_custom)
 }

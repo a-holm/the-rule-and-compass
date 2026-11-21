@@ -44,7 +44,7 @@ const STYLE_CSS: &str = include_str!("../gui/style.css");
 const EXAMPLE_CSV: &str = "x,y\n0,1\n1,3\n2,5\n3,7\n4,9\n5,11\n6,13\n7,15\n8,17\n9,19\n10,21\n11,23\n12,25\n13,27\n14,29\n15,31\n16,33\n17,35\n18,37\n19,39\n";
 
 /// `rcsr schema` as a JSON document. The option table lives in
-/// [`crate::schema::OPTIONS`]; this endpoint serves exactly that document, so
+/// [`crate::schema::options`]; this endpoint serves exactly that document, so
 /// there is no second copy to drift.
 pub fn schema_json() -> String {
     // Single source of truth: the same document `rcsr schema` prints.
@@ -818,8 +818,13 @@ const UNSUPPORTED: &[(&str, &str)] = &[
     ("--resume", "checkpoints depend on a process lifecycle the stream does not have"),
     ("--select-rule", "post-loop selection is a CLI option"),
     ("--select-blocks", "post-loop selection is a CLI option"),
+    ("--split-table", "interval-list splits read a splits table the server does not open"),
+    ("--split-id", "interval-list splits read a splits table the server does not open"),
+    ("--embargo", "interval-list splits read a splits table the server does not open"),
     ("--select-se", "post-loop selection is a CLI option"),
     ("--select-block-len", "post-loop selection is a CLI option"),
+    ("--select-delta", "post-loop selection is a CLI option"),
+    ("--select-min-entries", "post-loop selection is a CLI option"),
     ("--select-require-edge", "post-loop selection is a CLI option"),
     ("--reselect", "checkpoints depend on a process lifecycle the stream does not have"),
     ("--reselect-run", "re-selection reads files the server does not open"),
@@ -950,10 +955,12 @@ fn parse_args(args: &[String]) -> Result<(RawOptions, search::Config), String> {
                     .ok_or_else(|| format!("unknown --fit-strategy '{}'", v))?;
             }
             "--no-fit" => cfg.fit_iters = 0,
-            "--no-dedup" => cfg.dedup = false,
-            "--no-front-parents" => cfg.front_parents = false,
-            "--reject-constant-offspring" => cfg.reject_constant_offspring = true,
-            "--reject-fixed-position" => cfg.reject_fixed_position = true,
+            // #1083: settings from the search setting table that the browser implements.
+            flag if crate::settings::find(flag).is_some_and(|r| r.gui()) => {
+                let row = crate::settings::find(flag).expect("matched by the guard");
+                let value = if row.takes_value() { Some(take(&mut i)?) } else { None };
+                row.apply_cli(&mut cfg, value.as_deref())?;
+            }
             "--no-simd" => cfg.simd = false,
             "--qd" => {
                 if cfg.qd_bins == 0 {
@@ -981,7 +988,6 @@ fn parse_args(args: &[String]) -> Result<(RawOptions, search::Config), String> {
             "--predictor-samples" => {
                 cfg.predictor_samples = Some(int(&take(&mut i)?, "--predictor-samples", 2)?)
             }
-            "--patience" => cfg.patience = int(&take(&mut i)?, "--patience", 0)?,
             "--time-budget" => cfg.time_budget = Some(float(&take(&mut i)?, "--time-budget")?),
             "--top" => raw.top = int(&take(&mut i)?, "--top", 0)?,
             // Presentation-only CLI flags: the HTTP response is always NDJSON.
@@ -1360,6 +1366,7 @@ impl RunPlan {
             scale_column: None,
             trading: None,
             canonical_train_order: false,
+            intervals: None,
         };
         let cv_dtypes = dtypes.clone();
         let prep = data::PrepSpec {

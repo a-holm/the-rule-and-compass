@@ -1,11 +1,10 @@
 //! #928: the robust finalist rule on planted books.
 
-use rcsr::selection::{
-    choose_robust, circular_block_se, select_robust, RobustMember, RobustMeta, RobustParams, ROBUST_BLOCK_LEN,
-};
+use rcsr::selection::{choose_robust, circular_block_se, select_robust, RobustMember, RobustMeta, RobustParams};
 use rcsr::trading::{blocked_alpha, evaluate, TradingRows, TradingSpec};
 
 const PERIODS: usize = 160;
+const BLOCK_LEN: usize = 21;
 
 /// One group, 4 blocks of 40 periods. Rows of class `t % 4`:
 /// class 0 earns steadily; class 1 earns only in block 0 (class 2 pays it back
@@ -51,7 +50,7 @@ fn planted() -> Planted {
 }
 
 fn params(blocks: usize, se_z: f64) -> RobustParams {
-    RobustParams { blocks, se_z, block_len: ROBUST_BLOCK_LEN }
+    RobustParams { blocks, se_z, block_len: Some(BLOCK_LEN) }
 }
 
 fn select(p: &Planted, params: RobustParams) -> rcsr::selection::RobustSelection {
@@ -158,7 +157,7 @@ fn circular_block_se_grows_with_block_length_for_a_trending_series() {
 }
 
 fn member(archive_rank: usize, complexity: f64, trades: usize, pooled: f64, se: f64, eligible: bool) -> RobustMember {
-    RobustMember { archive_rank, complexity, trades, block_alpha: vec![pooled], pooled_alpha: pooled, se, eligible }
+    RobustMember { archive_rank, complexity, trades, block_alpha: vec![pooled], pooled_alpha: pooled, se, eligible, block_len: 1 }
 }
 
 #[test]
@@ -183,7 +182,7 @@ fn params_are_validated() {
     assert!(params(0, 1.0).validate().is_err());
     assert!(params(9, 1.0).validate().is_err());
     assert!(params(4, -1.0).validate().is_err());
-    assert!(RobustParams { blocks: 4, se_z: 1.0, block_len: 0 }.validate().is_err());
+    assert!(RobustParams { blocks: 4, se_z: 1.0, block_len: Some(0) }.validate().is_err());
     assert!(params(1, 0.0).validate().is_ok());
 }
 
@@ -214,5 +213,163 @@ fn edge_gate_rejects_every_fitness_not_below_one() {
     for (fitness, rejected) in [(0.99, false), (1.0, true), (1.01, true), (f64::NAN, true), (f64::INFINITY, true)] {
         assert_eq!(edge_rejected(true, fitness), rejected, "fitness {fitness}");
         assert!(!edge_rejected(false, fitness), "no gate without the flag: fitness {fitness}");
+    }
+}
+
+fn meta(archive_rank: usize, complexity: f64) -> RobustMeta {
+    RobustMeta { archive_rank, complexity, usable: true, objective: 0.0 }
+}
+
+fn one_group(periods: usize) -> TradingRows {
+    TradingRows { time: (0..periods).map(|t| t as f64).collect(), group: vec![0; periods], funding: Vec::new() }
+}
+
+fn default_params() -> RobustParams {
+    RobustParams { blocks: 4, se_z: 1.0, block_len: None }
+}
+
+/// Mixed-sign returns with no period structure.
+fn noisy_returns(periods: usize) -> Vec<f64> {
+    (0..periods).map(|t| (((t * 7919) % 13) as f64 / 13.0 - 0.4) * 0.01).collect()
+}
+
+fn run_default(periods: usize, pred: Vec<f64>) -> rcsr::selection::RobustSelection {
+    let ret = noisy_returns(periods);
+    select_robust(&[meta(1, 1.0)], default_params(), &TradingSpec::default(), &ret, &one_group(periods), &mut |_| pred.clone())
+        .unwrap()
+}
+
+#[test]
+fn circular_block_se_caps_the_block_at_half_the_series() {
+    let series: Vec<f64> = (0..12).map(|t| ((t * 5) % 7) as f64 - 3.0).collect();
+    let se = circular_block_se(&series, 12, 500, 9);
+    assert!(se > 0.0, "{se}");
+    assert_eq!(se, circular_block_se(&series, 6, 500, 9));
+    assert_eq!(se, circular_block_se(&series, 100, 500, 9));
+}
+
+/// 12 periods in 4 blocks of 3. Per block the first period earns `g`, the second
+/// `k g`, the third nothing. Member B (complexity 2) is long on the first
+/// period, member A (complexity 9) on the first two; `k` makes A's pooled alpha
+/// 1.05 times B's.
+fn h336() -> (Vec<f64>, Vec<Vec<f64>>) {
+    let g = [0.02, 0.03, 0.025, 0.04];
+    let k = 1.1 / 2.05;
+    let ret: Vec<f64> = (0..12).map(|t| match t % 3 { 0 => g[t / 3], 1 => k * g[t / 3], _ => 0.0 }).collect();
+    let long = |upto: usize| -> Vec<f64> { (0..12).map(|t| if t % 3 < upto { 1.0 } else { -1.0 }).collect() };
+    (ret, vec![long(2), long(1)])
+}
+
+#[test]
+fn robust_h336_fixture_prefers_the_simpler_member_within_one_se() {
+    let (ret, preds) = h336();
+    let metas = [meta(1, 9.0), meta(2, 2.0)];
+    let sel = select_robust(&metas, default_params(), &TradingSpec::default(), &ret, &one_group(12), &mut |i| preds[i].clone()).unwrap();
+    let (a, b) = (&sel.members[0], &sel.members[1]);
+    assert!((a.pooled_alpha / b.pooled_alpha - 1.05).abs() < 1e-9, "{a:?} {b:?}");
+    assert!(b.eligible && b.block_alpha.iter().all(|&v| v > 0.0), "{b:?}");
+    assert!(a.se > 0.0 && b.se > 0.0, "{a:?} {b:?}");
+    assert_eq!((a.block_len, b.block_len), (3, 3));
+    assert_eq!(sel.chosen, Some(1), "{:?}", sel.members);
+    assert!(sel.fields_json().contains("\"block_len\":null"));
+}
+
+#[test]
+fn robust_default_block_len_follows_the_period_count() {
+    for (periods, want) in [(12, 3), (25, 3), (59, 4), (4287, 17)] {
+        let pred: Vec<f64> = (0..periods).map(|t| if t % 3 == 0 { 1.0 } else { -1.0 }).collect();
+        let sel = run_default(periods, pred);
+        assert_eq!(sel.members[0].block_len, want, "{periods} periods");
+    }
+}
+
+#[test]
+fn robust_default_block_len_covers_the_hold_up_to_a_quarter() {
+    let runs = |periods: usize, on: usize, off: usize| -> Vec<f64> {
+        (0..periods).map(|t| if t % (on + off) < on { 1.0 } else { -1.0 }).collect()
+    };
+    assert_eq!(run_default(4287, runs(4287, 60, 60)).members[0].block_len, 60);
+    // Hold 10 on 25 periods wants 10; the cap is 25 / 4 = 6.
+    let pred: Vec<f64> = (0..25).map(|t| if t < 10 || t >= 15 { 1.0 } else { -1.0 }).collect();
+    assert_eq!(run_default(25, pred).members[0].block_len, 6);
+}
+
+#[test]
+fn explicit_block_len_is_used_for_every_member_and_capped_at_half() {
+    let (ret, preds) = h336();
+    let metas = [meta(1, 9.0), meta(2, 2.0)];
+    let run = |len: usize| {
+        select_robust(&metas, RobustParams { blocks: 4, se_z: 1.0, block_len: Some(len) }, &TradingSpec::default(), &ret, &one_group(12), &mut |i| {
+            preds[i].clone()
+        })
+    };
+    let sel = run(6).unwrap();
+    assert!(sel.members.iter().all(|m| m.block_len == 6));
+    assert!(sel.fields_json().contains("\"block_len\":6,\"verdict\""));
+    let e = run(7).unwrap_err();
+    assert!(e.contains("--select-block-len 7") && e.contains("12 validation periods (6)"), "{e}");
+}
+
+/// Reference series: the mean of `net - exposure x bh` per key, blocks cut over
+/// the distinct keys.
+fn reference_series(keys: &[f64], pos: &[f64], ret: &[f64], blocks: usize) -> Vec<f64> {
+    let mut distinct: Vec<f64> = keys.to_vec();
+    distinct.sort_by(|a, b| a.total_cmp(b));
+    distinct.dedup();
+    let per = distinct.len() / blocks;
+    let mean_at = |k: f64, f: &dyn Fn(usize) -> f64| {
+        let idx: Vec<usize> = (0..keys.len()).filter(|&i| keys[i] == k).collect();
+        idx.iter().map(|&i| f(i)).sum::<f64>() / idx.len() as f64
+    };
+    let block_of = |p: usize| (p / per).min(blocks - 1);
+    let exposure: Vec<f64> = (0..blocks)
+        .map(|b| {
+            let ks: Vec<f64> = (0..distinct.len()).filter(|&p| block_of(p) == b).map(|p| mean_at(distinct[p], &|i| pos[i])).collect();
+            ks.iter().sum::<f64>() / ks.len() as f64
+        })
+        .collect();
+    (0..distinct.len())
+        .map(|p| {
+            let e = exposure[block_of(p)];
+            let net = mean_at(distinct[p], &|i| pos[i] * ret[i]);
+            let bh = mean_at(distinct[p], &|i| ret[i]);
+            net - e * bh
+        })
+        .collect()
+}
+
+#[test]
+fn blocked_alpha_series_is_one_entry_per_period_bucket() {
+    const DAY: f64 = 86_400.0;
+    let days = 40usize;
+    let mut time = Vec::new();
+    let mut group = Vec::new();
+    let mut ret = Vec::new();
+    let mut pred = Vec::new();
+    for d in 0..days {
+        for g in 0..2usize {
+            time.push(d as f64 * DAY + g as f64 * 12.0 * 3600.0);
+            group.push(g as u64);
+            ret.push((((d * 7 + g * 5) % 11) as f64 - 4.0) * 0.002);
+            pred.push(if (d + g) % 2 == 0 { 1.0 } else { -1.0 });
+        }
+    }
+    let rows = TradingRows { time: time.clone(), group, funding: Vec::new() };
+    let pos: Vec<f64> = pred.iter().map(|&p| if p > 0.0 { 1.0 } else { 0.0 }).collect();
+    let bucketed = TradingSpec { period_seconds: Some(DAY), ..TradingSpec::default() };
+    let a = blocked_alpha(&pred, &ret, &rows, &bucketed, 4).unwrap();
+    assert_eq!(a.series.len(), 40);
+    let day_keys: Vec<f64> = time.iter().map(|t| (t / DAY).floor()).collect();
+    let want = reference_series(&day_keys, &pos, &ret, 4);
+    let mean = want.iter().sum::<f64>() / want.len() as f64;
+    assert!((a.pooled_alpha - mean).abs() < 1e-15, "{} {}", a.pooled_alpha, mean);
+    for (g, w) in a.series.iter().zip(&want) {
+        assert!((g - w).abs() < 1e-15, "{g} {w}");
+    }
+    let plain = blocked_alpha(&pred, &ret, &rows, &TradingSpec::default(), 4).unwrap();
+    assert_eq!(plain.series.len(), 80);
+    let want = reference_series(&time, &pos, &ret, 4);
+    for (g, w) in plain.series.iter().zip(&want) {
+        assert!((g - w).abs() < 1e-15, "{g} {w}");
     }
 }

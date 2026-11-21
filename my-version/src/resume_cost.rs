@@ -86,6 +86,12 @@ impl Cost {
         Cost { chunks: 1, search_s, ledger_wall_s, device_s, backend }
     }
 
+    /// The cost recorded by a periodic checkpoint save inside a running process.
+    /// `backend` is the one the exit write would record for the same process.
+    pub fn periodic(search_s: f64, backend: Search) -> Cost {
+        Cost::process(search_s, None, None, backend)
+    }
+
     /// `self` is the cost before this process, `process` the cost so far in it.
     pub fn plus(&self, process: &Cost) -> Cost {
         let both = |a: Option<f64>, b: Option<f64>| a.zip(b).map(|(a, b)| a + b);
@@ -197,6 +203,29 @@ mod tests {
         .unwrap();
         let c = load(&path, 5).expect("v1 sidecar loads");
         assert_eq!((c.chunks, c.search_s, c.backend), (2, 3.5, Search::Unknown));
+    }
+
+    #[test]
+    fn periodic_sidecar_records_the_process_backend() {
+        for (kind, name) in [(Search::Cpu, "cpu"), (Search::Gpu, "gpu"), (Search::Mixed, "mixed")] {
+            let path = dir(&format!("periodic-{name}"));
+            write(&path, 9, &Cost::periodic(2.0, kind)).unwrap();
+            let text = std::fs::read_to_string(sidecar_path(&path)).unwrap();
+            assert!(text.contains(&format!("\"backend\":\"{name}\"")), "{text}");
+            assert!(text.contains("\"ledger_wall_s\":null") && text.contains("\"device_seconds_incl_fit\":null"), "{text}");
+            assert_eq!(load(&path, 9).unwrap().backend.name(), name);
+        }
+    }
+
+    #[test]
+    fn a_killed_chunk_does_not_poison_the_cumulative_backend() {
+        let chunk1 = total(false, None, &Cost::periodic(3.0, Search::Cpu)).unwrap();
+        let chunk2 = total(true, Some(&chunk1), &Cost::periodic(1.0, Search::Cpu)).unwrap();
+        let end = total(true, Some(&chunk2), &Cost::process(2.0, None, None, Search::Cpu)).unwrap();
+        assert_eq!((end.chunks, end.backend), (3, Search::Cpu));
+        let gpu = total(false, None, &Cost::periodic(3.0, Search::Gpu)).unwrap();
+        assert_eq!(total(true, Some(&gpu), &Cost::process(1.0, None, None, Search::Gpu)).unwrap().backend, Search::Gpu);
+        assert_eq!(total(true, Some(&gpu), &Cost::process(1.0, None, None, Search::Cpu)).unwrap().backend, Search::Mixed);
     }
 
     #[test]

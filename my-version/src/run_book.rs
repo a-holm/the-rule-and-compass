@@ -27,8 +27,33 @@ pub struct RunBook {
     pub band: crate::trading::BandSpec,
     /// `objective.spec.min_holding`.
     pub min_holding: usize,
+    /// #1180: the regime gate of `objective.spec.pnl_mask`, when the run priced a masked book.
+    pub mask: Option<crate::regime_gate::GateSpec>,
+    /// #1214: `objective.finalist.switch`: the composite's book; `expression` is its display form.
+    pub switch: Option<crate::regime_gate::Switch>,
     /// The finalist reads no variable.
     pub constant: bool,
+}
+
+/// #1291: the book label of a run searched with `--book-target`
+/// (`objective.book_target`): its return column, horizon and cost priced the
+/// books, on every row with a finite book return.
+#[derive(Clone, Debug)]
+pub struct BookTarget {
+    pub column: String,
+    /// `objective.book_target_spec`; absent in a run written before #1291.
+    pub spec: Option<TargetSpec>,
+}
+
+/// #1291: `objective.book_target` and `objective.book_target_spec`; `None` for a run without `--book-target`.
+pub(crate) fn book_target_of(j: &Json) -> Result<Option<BookTarget>, String> {
+    let Some(obj) = j.get("objective") else { return Ok(None) };
+    let Some(column) = obj.get("book_target").and_then(Json::as_str) else { return Ok(None) };
+    let spec = match obj.get("book_target_spec") {
+        None | Some(Json::Null) => None,
+        Some(s) => Some(target::parse_object(s).map_err(|e| format!("run.json objective.book_target_spec: {}", e))?),
+    };
+    Ok(Some(BookTarget { column: column.to_string(), spec }))
 }
 
 /// `objective.cost.source`; a run without the block counts as a flag cost.
@@ -92,6 +117,15 @@ pub(crate) fn band_of(spec: Option<&Json>) -> Result<(crate::trading::BandSpec, 
     Ok((BandSpec { units, multiple, sd, sd_rows, sd_max_time, resolved }, min_holding))
 }
 
+/// #1180: the regime gate of an `objective.spec` (`pnl_mask`); `None` without one.
+pub(crate) fn mask_of(spec: Option<&Json>) -> Result<Option<crate::regime_gate::GateSpec>, String> {
+    let Some(m) = spec.and_then(|s| s.get("pnl_mask")).filter(|m| !matches!(m, Json::Null)) else { return Ok(None) };
+    let expr = m.get("expr").and_then(Json::as_str).ok_or_else(|| "run.json objective.spec.pnl_mask has no expr".to_string())?;
+    let band = m.get("band").and_then(Json::as_f64).ok_or_else(|| "run.json objective.spec.pnl_mask has no band".to_string())?;
+    let dwell = m.get("dwell").and_then(Json::as_f64).filter(|d| *d >= 1.0 && d.fract() == 0.0).ok_or_else(|| "run.json objective.spec.pnl_mask has no integer dwell >= 1".to_string())?;
+    crate::regime_gate::GateSpec::parse(expr, band, dwell as usize).map(Some).map_err(|e| format!("run.json objective.spec.pnl_mask: {}", e))
+}
+
 impl RunBook {
     /// The run priced a no-trade band or a minimum hold.
     pub fn has_band(&self) -> bool {
@@ -147,6 +181,10 @@ impl RunBook {
             .ok_or_else(|| "run.json has no target_spec".to_string())?;
         let spec = target::parse_object(target_spec).map_err(|e| format!("run.json target_spec: {}", e))?;
         let source = cost_source_of(j);
+        let switch = match finalist.get("switch") {
+            None | Some(Json::Null) => None,
+            Some(s) => Some(crate::regime_gate::Switch::parse(s).map_err(|e| format!("run.json objective.finalist.{}", e))?),
+        };
         let constant = finalist
             .get("constant")
             .map(|c| matches!(c, Json::Bool(true)))
@@ -162,6 +200,8 @@ impl RunBook {
             spec,
             band,
             min_holding,
+            mask: mask_of(Some(spec_json))?,
+            switch,
             constant,
         })
     }

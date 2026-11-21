@@ -1093,6 +1093,12 @@ mod tests {
             percent_converged: if gen >= 2 { 0.8 } else { 0.1 },
             island_best: vec![1.0 / gen as f64],
             rng_key: 7,
+            restarts: 0,
+            restarts_total: 0,
+            isolated: 0,
+            migrants: 0,
+            migrants_skipped: 0,
+            lexicase_cases: None,
         }
         .json()
     }

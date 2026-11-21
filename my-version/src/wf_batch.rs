@@ -99,6 +99,9 @@ pub struct BatchSpec<'a> {
     pub threads: usize,
     /// Seed of the matched-exposure random control; `None` skips it.
     pub random_seed: Option<u64>,
+    /// #1203: the missing-score rule of the scalar evaluator that prices a
+    /// candidate with a non-finite score on a laid-out row.
+    pub missing_score: crate::trading::MissingScore,
 }
 
 impl<'a> BatchSpec<'a> {
@@ -119,6 +122,7 @@ impl<'a> BatchSpec<'a> {
             tile_bytes: DEFAULT_TILE_BYTES,
             threads: DEFAULT_THREADS,
             random_seed: None,
+            missing_score: crate::trading::MissingScore::Flat,
         }
     }
 }
@@ -715,6 +719,7 @@ pub fn run(spec: &BatchSpec, scores: &mut dyn FnMut(usize, usize) -> Vec<f64>) -
                         spec.thresholds[c][w],
                         spec.cost_side,
                         &mut previous,
+                        spec.missing_score,
                     );
                     cells.push(Cell {
                         candidate: c,
@@ -986,6 +991,7 @@ pub fn summarize(
     cost_side: f64,
     pooled: bool,
     random_seed: u64,
+    missing_score: crate::trading::MissingScore,
 ) -> Result<BatchSummary, String> {
     let first = input.first().ok_or("batch needs at least one window")?;
     let candidates = first.scores.len();
@@ -996,6 +1002,7 @@ pub fn summarize(
     let run_seam = |seam: Seam| -> Result<BatchResult, String> {
         let mut spec = BatchSpec::new(&windows, candidates, &thresholds, cost_side, seam);
         spec.random_seed = Some(random_seed);
+        spec.missing_score = missing_score;
         let mut fetch = |c: usize, w: usize| input[w].scores[c].clone();
         run(&spec, &mut fetch)
     };

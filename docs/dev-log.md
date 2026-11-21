@@ -217,6 +217,8 @@ Emitted at the same boundary as `--progress`, once per completed generation
 | `fit.gpu` | both | candidates the GPU fit returned usable constants for |
 | `fit.fallback` | both | candidates refit by the exact CPU arm |
 | `fit.refits` | full | exact CPU refits recorded for this generation |
+| `fit.threshold_moves` | full | #1024: thresholds moved by the exact 1-D fit since process start; present only with `--fit-thresholds` |
+| `fit.accepted`, `fit.rejected` | full | #1117: `--fit-accept fitness` decisions of this generation: fitted candidates kept and refused, summed over the offspring, restart, carried, device, lost-batch and survivor paths (a decision between two scored trees; a fit that moved nothing is not counted). Not since process start, so a reader sums them. Present only with `--fit-accept fitness`; the finalist, prune and seed paths, the generation-0 batch and the QD refit after the generation loop (`--qd-policy`, survivor path) are in the run JSON `search.fit_accept` only. `finalist` counts per distinct finalist: when the #848 fixed-position fallback rebuilds the archive a second time, only the reported rebuild is counted |
 | `fit.host_seconds`, `fit.fallback_seconds`, `fit.fallback_workers` | full | #256: wall of the whole fit stage in this generation, the exact CPU fit-fallback inside it, and the width of the **fit** fallback pool |
 | `fit.gate_seconds` | full | #498: wall of the exact host gate of device proposals inside `fit.host_seconds` (log_loss, correlation, correlation_signed, signed; 0 otherwise) |
 | `fit.fallback_by_cause` | full | CPU fallback counts labelled by cause (`unsupported_plan`, `too_few_rows`, `too_many_constants`, `ill_conditioned`, `non_finite`, `launch`, …) |
@@ -238,6 +240,12 @@ Emitted at the same boundary as `--progress`, once per completed generation
 | `convergence.confidence/stability/maturity` | full | its three components |
 | `islands` | full | best error of each island's population, in island order |
 | `rng` | full | hash of the island and main MT19937 states at this boundary |
+| `restarts` | both | #1022: islands restarted at this generation's restart step (0 on every other generation; the record is reported after the step); explore islands (#1100) count too |
+| `restarts_total` | both | #1022: islands restarted since the run, or the resume, began |
+| `isolated` | full | #1022: islands inside their isolation window after this generation (`--restart-policy island`; 0 under `archive`); an explore island (#1100) is isolated by its tier and is not counted |
+| `migrants` | full | #1029: migrants copied at this generation's migration step (0 on every other generation; the record is reported after the step) |
+| `migrants_skipped` | full | #1029: migrants not copied because the destination already held a member with the migrant's error bits (`--migration-policy ring-tournament`; 0 under `ring`) |
+| `selection.mode`, `selection.cases` | both | #1023: present only under `--selection lexicase`: `"lexicase"` and the number of cases the generation selected on (rows under the metric fitness, sub-books under `--fitness pnl`); every other selection writes no `selection` key, so its lines keep their bytes |
 
 The six `phases` (excluding the two summed CPU times) are disjoint windows on
 the search's main thread and add up to `wall`. `fit_cpu` and `eval_cpu` overlap

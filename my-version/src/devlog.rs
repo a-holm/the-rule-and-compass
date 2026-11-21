@@ -398,6 +398,12 @@ pub struct FitGen {
     /// #256: workers the fit-fallback batch used. This is the fit pool; the
     /// top-level `fallback.workers` is the evaluator's pool.
     pub fallback_workers: usize,
+    /// #1024: thresholds moved by the exact 1-D fit since process start; present
+    /// only with `--fit-thresholds`.
+    pub threshold_moves: Option<u64>,
+    /// #1117: `--fit-accept fitness` decisions of this generation, `(accepted,
+    /// rejected)`, summed over the paths; present only under `fitness`.
+    pub accept: Option<(u64, u64)>,
 }
 
 impl FitGen {
@@ -415,7 +421,7 @@ impl FitGen {
         let improved_total: usize = self.fallback_improved_by_cause.iter().map(|(_, v)| *v).sum();
         format!(
             "{{\"attempts\":{},\"gpu\":{},\"fallback\":{},\"refits\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\
-             \"host_seconds\":{},\"fallback_seconds\":{},\"gate_seconds\":{},\"fallback_workers\":{}}}",
+             \"host_seconds\":{},\"fallback_seconds\":{},\"gate_seconds\":{},\"fallback_workers\":{}{}{}}}",
             self.attempts,
             self.gpu,
             self.fallback,
@@ -426,7 +432,11 @@ impl FitGen {
             num(self.host_seconds),
             num(self.fallback_seconds),
             num(self.gate_seconds),
-            self.fallback_workers
+            self.fallback_workers,
+            self.threshold_moves
+                .map_or(String::new(), |m| format!(",\"threshold_moves\":{}", m)),
+            self.accept
+                .map_or(String::new(), |(a, r)| format!(",\"accepted\":{},\"rejected\":{}", a, r)),
         )
     }
 }
@@ -538,6 +548,19 @@ pub struct GenRecord {
     /// Hash of the island RNG states at this boundary: two logs with the same
     /// key at the same generation saw the same stream.
     pub rng_key: u64,
+    /// #1022: islands restarted at this generation's boundary.
+    pub restarts: usize,
+    /// #1022: islands restarted since the run (or resume) began.
+    pub restarts_total: u64,
+    /// #1022: islands inside their isolation window after this boundary.
+    pub isolated: usize,
+    /// #1029: migrants copied at this generation's migration step.
+    pub migrants: usize,
+    /// #1029: migrants skipped because the destination held their error.
+    pub migrants_skipped: usize,
+    /// #1023: cases this generation selected on under `--selection lexicase`;
+    /// `None` under every other selection, and the line carries no `selection`.
+    pub lexicase_cases: Option<usize>,
 }
 
 impl GenRecord {
@@ -564,7 +587,7 @@ impl GenRecord {
     /// archive hash/hypervolume, the variation counters, the per-island best
     /// list and the RNG key — those exist only in a `full` log.
     pub fn json_summary(&self) -> String {
-        format!(
+        self.with_selection(format!(
             "{{\"schema\":\"{}\",\"v\":{},\"event\":\"generation\",\"level\":\"summary\",\
              \"generation\":{},\"total\":{},\"t\":{},\"wall\":{},\
              \"phases\":{{\"prep\":{},\"search\":{},\"eval\":{},\"select\":{},\"archive\":{},\"fit\":{},\
@@ -573,7 +596,7 @@ impl GenRecord {
              \"archive\":{{\"size\":{}}},\
              \"fit\":{{\"attempts\":{},\"gpu\":{},\"fallback\":{}}},\
              \"gpu\":{},\"fallback\":{{\"scope\":\"evaluator_pool\",\"seconds\":{},\"workers\":{}}},\
-             \"convergence\":{{\"percent_converged\":{}}}}}",
+             \"convergence\":{{\"percent_converged\":{}}},\"restarts\":{},\"restarts_total\":{}}}",
             SCHEMA,
             VERSION,
             self.generation,
@@ -598,14 +621,16 @@ impl GenRecord {
             self.gpu.as_ref().map(|g| g.json()).unwrap_or_else(|| "null".to_string()),
             num(self.fallback_s),
             self.fallback_workers,
-            num(self.percent_converged)
-        )
+            num(self.percent_converged),
+            self.restarts,
+            self.restarts_total
+        ))
     }
 
     /// The complete NDJSON line (without the trailing newline).
     pub fn json(&self) -> String {
         let islands: Vec<String> = self.island_best.iter().map(|v| num(*v)).collect();
-        format!(
+        self.with_selection(format!(
             "{{\"schema\":\"{}\",\"v\":{},\"event\":\"generation\",\"level\":\"full\",\
              \"generation\":{},\"total\":{},\
              \"t\":{},\"wall\":{},\
@@ -620,7 +645,7 @@ impl GenRecord {
              \"qd\":{},\
              \"convergence\":{{\"confidence\":{},\"stability\":{},\"maturity\":{},\
              \"percent_converged\":{}}},\
-             \"islands\":[{}],\"rng\":{}}}",
+             \"islands\":[{}],\"rng\":{},\"restarts\":{},\"restarts_total\":{},\"isolated\":{},\"migrants\":{},\"migrants_skipped\":{}}}",
             SCHEMA,
             VERSION,
             self.generation,
@@ -668,8 +693,23 @@ impl GenRecord {
             num(self.maturity),
             num(self.percent_converged),
             islands.join(","),
-            hex(self.rng_key)
-        )
+            hex(self.rng_key),
+            self.restarts,
+            self.restarts_total,
+            self.isolated,
+            self.migrants,
+            self.migrants_skipped
+        ))
+    }
+
+    /// #1023: `line` with `"selection":{"mode":"lexicase","cases":N}` before its
+    /// closing brace under lexicase; unchanged otherwise.
+    fn with_selection(&self, mut line: String) -> String {
+        if let Some(cases) = self.lexicase_cases {
+            line.pop();
+            line.push_str(&format!(",\"selection\":{{\"mode\":\"lexicase\",\"cases\":{}}}}}", cases));
+        }
+        line
     }
 }
 
@@ -1256,6 +1296,8 @@ mod tests {
                 fallback_seconds: 0.03,
                 gate_seconds: 0.02,
                 fallback_workers: 4,
+                threshold_moves: None,
+                accept: None,
             },
             fallback_s: 0.001,
             fallback_workers: 1,
@@ -1271,6 +1313,12 @@ mod tests {
             percent_converged: 0.85,
             island_best: vec![0.5, 0.55],
             rng_key: 0x1234,
+            restarts: 1,
+            restarts_total: 3,
+            isolated: 2,
+            migrants: 4,
+            migrants_skipped: 1,
+            lexicase_cases: None,
         }
     }
 
@@ -1351,6 +1399,9 @@ mod tests {
         for key in ["generation", "t", "wall", "phases", "error", "archive", "fit", "gpu", "fallback", "convergence"] {
             assert!(j.get(key).is_some(), "summary has no '{}'", key);
         }
+        assert_eq!(j.get("restarts").and_then(|v| v.as_usize()), Some(1));
+        assert_eq!(j.get("restarts_total").and_then(|v| v.as_usize()), Some(3));
+        assert!(j.get("isolated").is_none(), "isolated is a full-level field");
         assert_eq!(j.get("error").and_then(|e| e.get("best")).and_then(|v| v.as_f64()), Some(0.5));
         assert_eq!(j.get("error").and_then(|e| e.get("median")).and_then(|v| v.as_f64()), Some(0.8));
         assert_eq!(j.get("archive").and_then(|a| a.get("size")).and_then(|v| v.as_usize()), Some(4));
@@ -1365,7 +1416,26 @@ mod tests {
         let full = Json::parse(&r.json()).unwrap();
         assert_eq!(full.get("level").and_then(|v| v.as_str()), Some("full"));
         assert!(full.get("variation").is_some() && full.get("islands").is_some());
+        assert_eq!(full.get("restarts").and_then(|v| v.as_usize()), Some(1));
+        assert_eq!(full.get("restarts_total").and_then(|v| v.as_usize()), Some(3));
+        assert_eq!(full.get("isolated").and_then(|v| v.as_usize()), Some(2));
+        assert_eq!(full.get("migrants").and_then(|v| v.as_usize()), Some(4));
+        assert_eq!(full.get("migrants_skipped").and_then(|v| v.as_usize()), Some(1));
         assert!(line.len() < r.json().len(), "summary must be smaller than full");
+    }
+
+    /// #1023: only a lexicase generation carries `selection`, on both levels.
+    #[test]
+    fn only_a_lexicase_generation_carries_selection() {
+        let r = rec();
+        assert!(!r.json().contains("selection") && !r.json_summary().contains("selection"));
+        let lex = GenRecord { lexicase_cases: Some(8), ..rec() };
+        for line in [lex.json(), lex.json_summary()] {
+            let j = Json::parse(&line).expect("the line parses");
+            let s = j.get("selection").expect("selection");
+            assert_eq!(s.get("mode").and_then(|v| v.as_str()), Some("lexicase"));
+            assert_eq!(s.get("cases").and_then(|v| v.as_usize()), Some(8));
+        }
     }
 
     /// The default cadence keeps a long run to a bounded number of events.
@@ -1422,19 +1492,21 @@ mod tests {
         let dir = crate::test_scratch::Scratch::new("devlog-cap");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("cap.ndjson");
-        // Room for the start event plus one full generation event (a
-        // generation line is ~1.2 KiB with every optional section present).
-        let cap = run_start_json(&RunStart::default()).len() as u64 + 1500;
-        let mut log = Log::create(&path, cap).unwrap();
-        assert!(log.append(&run_start_json(&RunStart::default()), true));
+        let start = run_start_json(&RunStart::default());
         let line = rec().json();
+        // Room for the start event plus exactly one generation event, whatever
+        // the schema size.
+        let (start_bytes, line_bytes) = (start.len() as u64 + 1, line.len() as u64 + 1);
+        let cap = start_bytes + line_bytes + line_bytes / 2;
+        let mut log = Log::create(&path, cap).unwrap();
+        assert!(log.append(&start, true));
         let mut written = 0;
         for _ in 0..50 {
             if log.append(&line, false) {
                 written += 1;
             }
         }
-        assert!(written >= 1, "at least one event fits under the cap");
+        assert_eq!(written, 1, "exactly one event fits under the cap");
         assert!(log.dropped() > 0, "the cap must drop events");
         assert!(log.bytes() <= cap, "generation events never exceed the cap");
         assert!(log.append(&run_end_json(&RunEnd::default()), true));

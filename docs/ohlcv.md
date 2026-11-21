@@ -335,7 +335,7 @@ so a multi-gigabyte store is not read a second time just to checksum it.
 | `donchian` | `don20 don96` | close position in the trailing high/low channel; `don96` is centred on 0 |
 | `calendar` | `dow_* hour_* month_* dom_*` (sin/cos) | UTC calendar cycles |
 | `lags` | `lag_r1_1` .. `lag_r1_10` | causal copies of `r1`, refused across a gap |
-| `xs` | `xs_rank_r1 xs_rank_r20 xs_rank_vol20` | per-timestamp PIT rank in `[-1,1]`, `N>=20` |
+| `xs` | `xs_rank_r1 xs_rank_r20 xs_rank_vol20` | per-timestamp PIT rank in `[-1,1]`, `N>=20` by default (`--min-cross-members-rank`) |
 | `btc` | `btc_r1 btc_r20 btc_vol20 rel_btc_r1 rel_btc_r20 beta_btc_60` | benchmark joins by exact timestamp |
 | `cross` | 45 columns | the complete #273 cross-asset, ETH, market-state, breadth, dispersion, average-correlation and rank family |
 | `py15m` | 35 columns | the legacy 15 m enrichment set, kept for parity |
@@ -349,7 +349,7 @@ so a multi-gigabyte store is not read a second time just to checksum it.
 The five `py15m` names `mkt_r16`, `mkt_r96`, `mkt_vol96`, `rel_r16` and
 `rel_r96` predate #273. `mkt_*` are now the canonical equal-weight market
 columns below; on a single-symbol slice they are `NaN` because the market
-requires 20 PIT members. `rel_r16`/`rel_r96` remain the legacy BTC-relative
+requires the member floor (20 by default). `rel_r16`/`rel_r96` remain the legacy BTC-relative
 py15m columns. This is a deliberate correction of the old six BTC joins, not a
 second implementation.
 
@@ -532,14 +532,45 @@ Whole-panel market state, breadth and dispersion:
 | `mkt_ew_ret1`, `mkt_ew_ret16`, `mkt_breadth`, `mkt_dispersion` | legacy #269 aliases | one implementation, no duplicate formula |
 | `btc_volume_share` | `BTC volume / total PIT member volume` | needs the raw `volume` column |
 
-Every cross-sectional column requires at least **20** valid point-in-time
-members at the timestamp. With `N < 20` the whole timestamp is `NaN`; a
-member with a non-finite source is excluded from the count but does not make a
-different member's market state `NaN`.
+Gate-menu columns (#1270), the inputs of the pre-registered regime gates
+(`docs/compose.md`). They are in `--features cross` and have no device kernel:
+`--gpu auto` prices them on the CPU.
+
+| column | definition | lookback (`rcsr-lookback/1`) |
+|---|---|---|
+| `btc_r168` | `ln(C_BTC,t / C_BTC,t-168)` at the same timestamp | 168 bars |
+| `mkt_r672` | equal-weight mean of PIT member `r672` at `t`, same member rule as `mkt_r96` | 672 bars |
+| `btc_trend_ma100_ratio` | the BTC series' `trend_ma100_ratio` at the same timestamp | that of `trend_ma100_ratio`, 101 days |
+| `mkt_trend_ma100_ratio` | `I / SMA100(I) - 1` on the closed daily equal-weight index `I` | 102 days |
+| `btc_vol_ratio_168_2160` | population sd of BTC one-bar log returns over 168 bars divided by the same over 2160 bars | 2160 bars |
+| `mkt_trend_hi90_dist` | `I / max(I over the last 90 closed days) - 1` | 92 days |
+
+The daily index is `I_d = I_(d-1) exp(m_d)`, `m_d` the equal-weight mean of the
+PIT members' log returns of closed UTC day `d` (last base bar of the day over the
+last base bar of the day before). A symbol counts on a day when it is a PIT
+member at its last bar of that day. A day with fewer returns than the member floor (`--min-cross-members`, 20 by default), or a day
+with no bar, has no level; the index restarts at 1 after it, and every window
+that holds such a day is `NaN`. A base row reads the closed day before its own
+day, never the running one. The warm-up of the three daily columns is counted in
+days. `--embargo auto` over a gate column gives the lookback in the table.
+
+Every cross-sectional column requires a minimum number of valid point-in-time
+members at the timestamp; with fewer the whole timestamp is `NaN`. A member with a
+non-finite source is excluded from the count but does not make a different
+member's market state `NaN`.
+
+### Member floor (#1274)
+
+The floor is a parameter of `rcsr enrich`, default **20** for both classes, an integer in `5..=200` (`0`, `4`, `201` or a non-number exits 2). Below 5 members the sd, the rank grid and the correlation proxy carry no information. `--min-cross-members <n>` sets the floor of the mean, share, sd and sum-ratio columns (class M): `mkt_r16`, `mkt_ew_ret16`, `breadth`, `mkt_breadth`, `dispersion`, `mkt_dispersion`, `rel_mkt16`, `mkt_r96`, `rel_mkt96`, `mkt_vol96`, `mkt_ew_ret1`, `btc_volume_share`, `mkt_r672`, `mkt_trend_ma100_ratio` and `mkt_trend_hi90_dist` (the daily index counts the member returns of a day). `--min-cross-members-rank <m>` sets the floor of the rank columns `xs_rank_*`, `cs_rank_r60` and of `avg_corr` (class R); it defaults to `n`. A rank over 5 members takes 5 values and `avg_corr` includes each member in the market mean it is correlated with, so the pilot can keep class R stricter than class M. The formulas, the warm-up and `lookback_seconds` do not change; only the comparison `count < floor` reads the parameter. `btc_*` and `eth_*` columns have no member floor. A floor of `n` finite members is finite, `n - 1` is `NaN`.
+
+With the default floors every output column is byte-identical to the engine before the parameter existed. `<out>.enrich.json` records `cross_floor` (`{"members":n,"rank_members":m}`) and `min_members` on each class M and class R column it built; a column outside the two classes has no `min_members`. The sidecar also lists the floors of the cross columns the run keeps from its input as `cross_columns`. The top-level `cross_floor` is written when the output holds at least one cross column and every cross column of a class has one floor; a class with no column takes this run's value when the run builds a class M or class R column, else the input's `cross_floor`, else 20. With mixed floors inside one class, or no cross column, it is omitted and the per-column records speak. `rcsr enrich` moves an existing `<out>.schema.json` to `<out>.schema.json.prev` when it writes the store, as `<out>.enrich.json` keeps its previous generation, so a rebuilt store never keeps the schema of the old one; `rcsr panel schema` writes the schema of the new store. `rcsr panel append` copies `min_members` into the column entry of `<panel>.schema.json`, and the `transform` and `pit_rule` text of that entry states `N>=<k>` with the recorded value.
+
+Floors are never mixed silently. The floor of a cross column is its record in `<store>.schema.json`, else in `<store>.enrich.json` (the per-column `min_members`, or `cross_columns` for the columns a run kept from its input), else the top-level `cross_floor`, else 20; a schema record counts only while its `sha256` equals the hash of the column's current data; `enrich` and `panel append` read it through one resolver, and the top-level `cross_floor` is written only when every cross column of the output agrees. `rcsr enrich` with a class M or class R column onto a store whose cross columns were built with other floors exits 2 and names the column and both values (a store without the record counts as 20, `--replace` of a column lifts the check for it; a run that builds no class M or class R column is not checked). `rcsr panel append` of a column whose `min_members` differs from a column of the same class already in the panel exits 3 and names both values; a family store without the record counts as 20. The device kernels take the floor as an argument, so `--gpu` and the CPU produce identical bytes at every floor (`min_cross_members_device_parity`).
+
 
 Ranks (`xs_rank_r1 r16 r20 vol20 amihud96`, plus the legacy `cs_rank_r60`) are
 `2*(rank-1)/(n-1)-1` in `[-1,1]`. They use finite PIT members only, require
-`N>=20`, and break ties by symbol name then row order. `-0.0` and `+0.0` are one
+`N>=20` by default (`--min-cross-members-rank`), and break ties by symbol name then row order. `-0.0` and `+0.0` are one
 value for that tie order. `xs_rank_amihud96` inherits the #270 Amihud input
 requirement (`quote_volume`); a missing raw field fails closed naming both the
 rank and the field.
@@ -659,7 +690,7 @@ that truncating the store never changes an earlier value.
 
 `xs_rank_*` ranks each timestamp across PIT symbols, ignores non-finite source
 values and non-members, breaks ties by symbol name then row order, maps the rank
-to `[-1,1]`, and returns `NaN` when fewer than 20 finite members are present.
+to `[-1,1]`, and returns `NaN` when fewer than the floor (`--min-cross-members-rank`, 20 by default) finite members are present.
 `-0.0` and `+0.0` are one tie. The pass holds one source column, the time column,
 a row permutation and the rank column (about 32 B/row), never the whole panel.
 `rcsr enrich` refuses the pass when that exceeds the detected hard memory limit.
@@ -817,6 +848,8 @@ The trend-join row repeats the mtf-join anchors (and the mtf-join device through
 
 The two pass classes mark a family with a column that only a shared CPU reference pass computes (the py15m pass for names such as `ema8`, `rsi6`, `bb50`; the compact pass for names such as `r16`, `ma96`, `vol16`, `don96`). That pass costs the same for one column or all of them and a run computes it once, however many families need it. `plan_groups_rated` therefore costs each pass once per run: the device skips it only when every family that needs it goes to the device and every column of those families has a kernel. Among the families that could leave, it sorts them by device cost minus per-column CPU cost and takes the prefix (none, some or all) with the lowest run estimate, ties to the CPU. A family with a column left on the CPU keeps the pass for the whole run. The device context (host read, resident upload, setup) is paid once per run: once one family is on the device, another family is compared by its cost without the context, repeated until the decisions stop changing. A family joins the device only after a seed family does, and the fused families keep their own context term. `gpu_ms` stays the estimate of the family on its own. Each `plan[]` entry carries `pass_shared` (another family needs the same pass) and `pass_cpu_ms` (the share of the pass this family adds to the planned run; the CPU families of a class split it equally, a family on the device adds none). `cpu_ms` is the family's CPU estimate with the whole run on the CPU: the pass split equally among all families of its class, so the `cpu_ms` of the families sum to the run estimate. The segmented-rank row is the cross-section stage (`timing.xs_s`) only: a three-point fit over 1, 4 and 5 columns is linear to a few milliseconds, so the rank class needs no separate pass class. The mtf-join and trend-join families are also kept on the CPU below 32 symbol segments (the kernels run one thread per segment); `--gpu on` forces them. `rcsr calibrate` fits the same table on the machine at hand and `rcsr enrich --calibration` reads it (`docs/dispatch.md`, "Enrich planner rates"). Re-measure the table when the CPU producers or the kernels change; `tests/enrich.rs::measured_rates_set_the_gpu_crossover_per_op_class` pins the column counts at which the plan flips.
 
+A family is priced by the classes of its columns, not by its family class. `plan_groups_mixed` takes, per family, a list of `ClassCount` (`op`, `cols`, `supported`, `exact`) built by `enrich::class_mix`: the CPU per-column term is the sum of each class's anchor over its columns (a compact column adds 0, a py15m column 45 ms per Mrow, a join column 2,777.8 ms per Mrow), the device kernel term is the sum over the supported columns of each class at its own rate, and the family class (`plan[].op`) stays the member class with the highest pass rank. A join column filed in a compact family therefore costs its join rate on the CPU. `exact` counts the supported columns whose declared parity tier is `bitwise`. A family whose supported columns are not all exact (for example `btc`, whose `rel_*` and `beta_*` columns are `1e-12`) keeps the one-class price of its family class and one worker in the decision, so no column changes bytes by changing backend; its `cpu_ms` is still the mixed estimate. The `plan[].classes` sidecar value (`op`, `columns`, `gpu_supported`, `bit_identical`) lets a plan be recomputed. The feature pass runs on `--threads` workers: `cpu_ms` and the shared pass term are divided by `min(threads, symbol segments)`, and the decision uses that divisor only for a family whose supported columns are all exact (the pass: all its families exact). The commit is serial, so the divisor is an upper bound on the speed-up. `rcsr calibrate` fits the rates with one worker. `tests/enrich.rs::{compact_family_with_join_columns_is_priced_at_its_per_column_cost, mixed_family_is_priced_by_its_name_classes, join_columns_that_are_not_bit_identical_keep_their_backend, cpu_estimate_divides_by_the_worker_count, c2_names_price_the_btc_family_by_its_join_columns}` pin this.
+
 `--gpu auto` (the default) applies the cost model. `--gpu on` *forces* every
 registered kernel above the row floor, which is how the parity fixture exercises
 all kernels; it does not make the cost model claim a win. `--no-gpu`/`--cpu`
@@ -964,6 +997,19 @@ On the 16.1M-row cell the CPU arm went from 1408.5 s to 900.7 s (23:30 -> 15:01)
 with the **same output SHA-256** (`a4c99c95...`): the 27.26 GB second read
 disappeared and the bytes did not change.
 
+### Append memory budget (#1158)
+
+The append pass stages several groups of every temp column per read. One batch holds `groups x temp columns x group rows x 8` bytes.
+
+| variable | default | rule |
+|---|---|---|
+| `RCSR_APPEND_BUDGET_MIB` | 1024 | memory the staged batch may use; clamped to `64..=65536`; unparsable values fall back to 1024 |
+| `RCSR_APPEND_BATCH_GROUPS` | as many groups as fit the budget | groups per read; clamped to `1..=groups`, to 16 and to the budget; unparsable values fall back to the default |
+
+When the clamp lowers the override, `rcsr enrich` prints one line, for example `RCSR_APPEND_BATCH_GROUPS=16 clamped to 4 by the 1024 MiB append budget`. Batch 1 is the floor: when one group alone exceeds the budget, the pass stages 1 group and prints `one group (N MiB) exceeds the append budget (M MiB); staging 1 group`. The output bytes are identical for any batch size and budget. Both variables are listed under `enrich` in `rcsr schema`.
+
+A failed append (read error, write error, hash thread panic) returns the error, joins the hash thread, and leaves neither the output file nor its `.tmp-<pid>` file (`store::tests::append_mid_stream_*_leaves_no_output`, `append_hash_thread_panic_leaves_no_output`).
+
 ### Batched output arc and pinned chunked D2H (#300)
 
 The GPU output path no longer allocates one host `Vec` and issues one download
@@ -993,6 +1039,10 @@ partitioned into disjoint intervals on that thread:
 | `gpu.write_s` | host staging writes of GPU output blocks |
 | `timing.feature_cpu_s` | the CPU fallback pass |
 | `timing.feature_other_s` | `feature_s` minus the five above; never negative beyond clock rounding |
+| `timing.write_s` | the append pass that copies the source store and the temp columns into the output |
+| `timing.write_read_s` | block reads inside `write_s` (temp columns in batches, source blocks) |
+| `timing.write_write_s` | file writes inside `write_s` |
+| `timing.write_hash_wait_s` | time inside `write_s` the writer waits for the SHA-256 thread |
 
 `gpu.kernel_s`, `gpu.h2d_s` and `gpu.d2h_s` are device-busy measures. They
 overlap the host timeline and are not summed into the partition. The text
@@ -1044,7 +1094,7 @@ itself gets `1.0` once its window is complete, as on the CPU.
 mkt_dispersion rel_mkt16 mkt_r96 rel_mkt96 mkt_vol96 mkt_ew_ret1 avg_corr
 btc_volume_share`. One thread per timestamp group walks the group in the CPU's
 `(time, symbol, row)` order (the permutation #295 builds), so the sums use the
-CPU addition order and the same `member_asof <= t` mask and 20-member floor. For
+CPU addition order and the same `member_asof <= t` mask and member floor (`--min-cross-members`, `--min-cross-members-rank`; passed to the kernels as an argument). For
 an identical source column the kernels are bit-for-bit equal to the CPU
 (`tests/bench_gpu.rs` asserts `to_bits` equality). The sources (`r1 r16 r96
 vol96`) are themselves `1e-12` columns when the device produced them, so those

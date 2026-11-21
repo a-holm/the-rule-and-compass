@@ -4,9 +4,11 @@
 //! `rcsr enrich` needs one contiguous run per symbol, so a family is computed on
 //! a symbol-major store (the hourly base store) and carried into the time-major
 //! panel by `(symbol, ts)` key. The panel's existing value and code blocks are
-//! copied unchanged ([`store::write_store_appending_hashed`]), the input file is
-//! never opened for writing, and the output schema records every column hash.
+//! copied unchanged ([`store::write_store_appending_hashed_stats_marked`]), the input file is
+//! never opened for writing, and the output schema records every column hash. The output
+//! header carries the null-store marker of either input ([`output_marker`], #1313).
 
+use crate::devlog::Json;
 use crate::manifest;
 use crate::registry;
 use crate::store::{self, AppendColumn, DType, FileStore};
@@ -43,6 +45,8 @@ pub struct AppendReport {
     /// Panel rows with no row in the family store; their values are NaN.
     pub unmatched_rows: usize,
     pub schema: String,
+    /// The `null_store` member of the output header ([`output_marker`]).
+    pub null_store: Option<String>,
 }
 
 struct Keys {
@@ -170,18 +174,85 @@ pub fn resolve_all(panel: &FileStore, family: &FileStore) -> Vec<String> {
         .collect()
 }
 
+/// The member floor of every cross-section column of the output (#1274). A column the panel already holds keeps
+/// the floor recorded next to the panel, an appended one takes the floor recorded next to the family store; a store
+/// without the record counts as 20. Appended and existing columns of one class must agree.
+fn merged_floors(
+    target_path: &str,
+    family_path: &str,
+    target: &FileStore,
+    columns: &[String],
+) -> Result<std::collections::BTreeMap<String, usize>, String> {
+    use crate::cross_floor as cf;
+    let panel_rec = cf::resolved_columns(target_path, &target.header().names());
+    let family_rec = cf::resolved_columns(family_path, columns);
+    let mut floors = std::collections::BTreeMap::new();
+    for n in target.header().names().iter().filter(|n| cf::is_floored(n)) {
+        floors.insert(n.clone(), panel_rec.get(n).copied().unwrap_or(cf::DEFAULT));
+    }
+    let class_of = |n: &str| cf::MARKET_COLUMNS.contains(&n);
+    for n in columns.iter().filter(|n| cf::is_floored(n)) {
+        if floors.contains_key(n) {
+            continue;
+        }
+        let k = family_rec.get(n).copied().unwrap_or(cf::DEFAULT);
+        if let Some((other, have)) = floors.iter().find(|(o, h)| class_of(o) == class_of(n) && **h != k) {
+            return Err(format!(
+                "member floors differ: column '{}' of {} was built with min_members {}; the panel {} holds '{}' with min_members {}",
+                n, family_path, k, target_path, other, have
+            ));
+        }
+        floors.insert(n.clone(), k);
+    }
+    Ok(floors)
+}
+
+/// #1313: the `null_store` member of the output. The output takes columns from the target and
+/// from the family store, so the marker of either (`permute_labels::marker`: the store header,
+/// else the manifest of a null store written before #1304) marks it. Two different markers are
+/// refused: one store cannot hold two null draws.
+pub fn output_marker(target: &str, family: &str) -> Result<Option<String>, String> {
+    use crate::permute_labels::marker;
+    match (marker(target), marker(family)) {
+        (Some(t), Some(f)) if !same_marker(&t, &f) => Err(format!(
+            "the target {} ({}) and the family store {} ({}) are different null stores; an output carries one null_store marker",
+            target,
+            describe_marker(&t),
+            family,
+            describe_marker(&f)
+        )),
+        (t, f) => Ok(t.or(f)),
+    }
+}
+
+fn same_marker(a: &str, b: &str) -> bool {
+    a == b || matches!((Json::parse(a), Json::parse(b)), (Some(x), Some(y)) if x == y)
+}
+
+/// `null_store label L, seed S` of the marker text `m`.
+fn describe_marker(m: &str) -> String {
+    Json::parse(m).map_or_else(|| "null_store".to_string(), |j| crate::permute_labels::describe(&j))
+}
+
 fn bits_equal(a: f64, b: f64) -> bool {
     a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan())
 }
 
 /// Append `opts.columns` from the family store to the panel.
 pub fn append_family(opts: &AppendOptions) -> Result<AppendReport, String> {
+    append_family_locked(opts, None)
+}
+
+/// [`append_family`] whose schema sidecar summarises only the rows outside the range of a lock record.
+pub fn append_family_locked(opts: &AppendOptions, record: Option<&crate::lockrec::LockRecord>) -> Result<AppendReport, String> {
+    let null_store = output_marker(&opts.target, &opts.family)?;
     let declared = crate::lockbox::output_declaration(&opts.out, Some(&opts.target), opts.locked_test).map_err(|e| e.message)?;
     let also = crate::lockbox::inherited_also(&opts.target, declared.as_ref())?;
     let retired = crate::retire::writer_retirement(opts.retired.as_deref(), declared.as_ref(), &[&opts.target, &opts.family]).map_err(|e| e.message)?;
     // The target's declaration wins and is kept. A family store with no declaration is accepted.
     if let Some(s) = crate::lockbox::stored_all(&opts.family).map_err(|e| e.message)? {
-        if declared != Some(s.range) || also != s.also {
+        let record_also = record.is_some_and(|r| also.is_none() && s.also == Some(r.range));
+        if declared != Some(s.range) || (also != s.also && !record_also) {
             return Err(format!(
                 "family store {} declares the locked test {} ({}), the target {} declares {}",
                 opts.family,
@@ -195,6 +266,7 @@ pub fn append_family(opts: &AppendOptions) -> Result<AppendReport, String> {
     let target = FileStore::open(&opts.target)?;
     let family = FileStore::open(&opts.family)?;
     check_columns(&target, &family, &opts.columns, opts.skip_existing)?;
+    let floors = merged_floors(&opts.target, &opts.family, &target, &opts.columns)?;
     let before = manifest::sha256_file(&opts.target)?;
     let tk = read_keys(&target)?;
     let fk = read_keys(&family)?;
@@ -272,7 +344,7 @@ pub fn append_family(opts: &AppendOptions) -> Result<AppendReport, String> {
                 replace: false,
             });
         }
-        store::write_store_appending_hashed(&opts.out, &target, &extras)
+        store::write_store_appending_hashed_stats_marked(&opts.out, &target, &extras, null_store.as_deref()).map(|(sha, _)| sha)
     })();
     for f in &files {
         let _ = std::fs::remove_file(f);
@@ -287,7 +359,7 @@ pub fn append_family(opts: &AppendOptions) -> Result<AppendReport, String> {
             .flatten()
             .map(|(_, s)| s)
             .max();
-        let schema = registry::write_schema_retired(&opts.out, &opts.panel_version, declared.as_ref(), also.as_ref(), floor, retired.as_ref())?;
+        let schema = registry::write_schema_floors(&opts.out, &opts.panel_version, declared.as_ref(), also.as_ref(), floor, retired.as_ref(), record, &floors)?;
         crate::lockbox::finish_output(&opts.out, declared.as_ref(), &["schema.json"]).map_err(|e| e.message)?;
         Ok(schema)
     };
@@ -303,12 +375,15 @@ pub fn append_family(opts: &AppendOptions) -> Result<AppendReport, String> {
         skipped_existing,
         unmatched_rows,
         schema,
+        null_store,
     })
 }
 
 fn usage_text() -> &'static str {
-    "rcsr panel schema --data panel.rcsb [--panel-version V] [--verify]
-rcsr panel append --data panel.rcsb --family symbol_major.rcsb --columns a,b|@all --out out.rcsb [--skip-existing] [--panel-version V] [--scratch dir] [--locked-test START,END|none] [--retired retired.json]
+    "rcsr panel schema --data panel.rcsb [--panel-version V] [--verify] [--lock-record record.json]
+rcsr panel append --data panel.rcsb --family symbol_major.rcsb --columns a,b|@all --out out.rcsb [--skip-existing] [--panel-version V] [--scratch dir] [--locked-test START,END|none] [--retired retired.json] [--lock-record record.json]
+  The output header carries the null_store marker of a null store among --data and --family (its store header, or the
+  rcsr-null-store/1 manifest of a null store written before #1304); two stores with different markers exit 2 before any write.
 "
 }
 
@@ -327,6 +402,7 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
     let mut scratch: Option<String> = None;
     let mut verify = false;
     let mut skip_existing = false;
+    let mut lock_record: Option<String> = None;
     let mut retired: Option<String> = None;
     let mut locked_test = crate::lockbox::Keep::Unset;
     let mut i = 0usize;
@@ -349,6 +425,7 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
                     .unwrap_or_else(|e| fail(&format!("--locked-test: {}", e), 2))
             }
             "--retired" => retired = Some(value(args, &mut i)),
+            "--lock-record" => lock_record = Some(value(args, &mut i)),
             "--verify" => verify = true,
             "--skip-existing" => skip_existing = true,
             "-h" | "--help" => {
@@ -360,16 +437,20 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
         i += 1;
     }
     let data = data.unwrap_or_else(|| fail(&format!("`rcsr panel {}` needs --data", cmd), 2));
+    let record = lock_record.as_deref().map(crate::lockrec::LockRecord::load).transpose().unwrap_or_else(|e| fail(&e.message, e.exit));
     match cmd {
         "schema" => {
             if verify {
+                if let Some(note) = registry::registry_age_note(&registry::schema_path(&data)) {
+                    eprintln!("{}", note);
+                }
                 match registry::verify_schema(&data) {
                     Ok(bad) if bad.is_empty() => eprintln!("schema ok: {}", registry::schema_path(&data)),
                     Ok(bad) => fail(&format!("schema hash mismatch for: {}", bad.join(", ")), 3),
                     Err(e) => fail(&e, 3),
                 }
             } else {
-                match registry::write_schema(&data, &panel_version) {
+                match registry::write_schema_for(&data, &panel_version, record.as_ref()) {
                     Ok(p) => eprintln!("schema written: {}", p),
                     Err(e) => fail(&e, 3),
                 }
@@ -406,11 +487,14 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
             if let Err(e) = check_columns(&panel_store, &family_store, &opts.columns, opts.skip_existing) {
                 fail(&e, 2);
             }
+            if let Err(e) = output_marker(&opts.target, &opts.family) {
+                fail(&e, 2);
+            }
             drop((panel_store, family_store));
-            match append_family(&opts) {
+            match append_family_locked(&opts, record.as_ref()) {
                 Ok(r) => {
                     eprintln!(
-                        "appended {} column(s); skipped existing {} ({}); unmatched rows {}; input sha256 {} (unchanged: {}); output sha256 {}; schema {}",
+                        "appended {} column(s); skipped existing {} ({}); unmatched rows {}; input sha256 {} (unchanged: {}); output sha256 {}; schema {}{}",
                         r.appended.len(),
                         r.skipped_existing.len(),
                         r.skipped_existing.join(","),
@@ -418,7 +502,8 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
                         r.input_sha256_before,
                         r.input_sha256_before == r.input_sha256_after,
                         r.output_sha256,
-                        r.schema
+                        r.schema,
+                        r.null_store.as_deref().map_or(String::new(), |m| format!("; {}", describe_marker(m)))
                     );
                 }
                 Err(e) => fail(&e, 3),

@@ -122,6 +122,20 @@ pub fn entry_for<'a>(specs: &'a [TargetSpec], target: &str) -> Option<&'a Target
         .find(|s| s.column == target || s.name == target || s.return_column.as_deref() == Some(target))
 }
 
+/// #929: why `book` cannot price the long/flat book of a formula fitted on `fit`
+/// (`--book-target`, in the search and the walk-forward), or `None`.
+pub fn book_pair_refusal(fit: &TargetSpec, book: &TargetSpec) -> Option<String> {
+    if let Some(s) = [book, fit].into_iter().find(|s| s.kind != "forward_return") {
+        return Some(format!("--book-target needs forward_return labels on both sides, '{}' declares '{}'", s.column, s.kind));
+    }
+    book.return_column.is_none().then(|| {
+        format!(
+            "--book-target: book target '{}' declares no return_column, so the book would be priced on the fit label: declare a return_column in the target spec",
+            book.column
+        )
+    })
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Scale {
     /// The label is divided by a constant (1 for a raw return).
@@ -147,6 +161,8 @@ pub struct TargetSpec {
     /// `log` or `simple`.
     pub return_units: String,
     pub horizon_seconds: f64,
+    /// Spacing of one independent return per group, when it is wider than the horizon.
+    pub stride_seconds: Option<f64>,
     pub entry_offset_seconds: f64,
     pub delay_seconds: f64,
     pub entry_price: String,
@@ -170,6 +186,11 @@ impl TargetSpec {
     pub fn window_seconds(&self) -> (f64, f64) {
         let a = self.entry_offset_seconds + self.delay_seconds;
         (a, a + self.horizon_seconds)
+    }
+
+    /// Width `S` of one return period: the label horizon, or the label stride when it is wider.
+    pub fn period_width_seconds(&self) -> f64 {
+        self.stride_seconds.map_or(self.horizon_seconds, |s| s.max(self.horizon_seconds))
     }
 
     /// Per-side cost in basis points: half the round-trip `cost_bps`. `None`
@@ -302,7 +323,7 @@ impl TargetSpec {
         };
         let cols: Vec<String> = self.construction_columns.iter().map(|c| text(c)).collect();
         format!(
-            "\"column\":{},\"name\":{},\"kind\":{},\"deprecated\":{},\"return_column\":{},\"return_units\":{},\"horizon_seconds\":{},\"entry_offset_seconds\":{},\"delay_seconds\":{},\"entry_price\":{},\"exit_price\":{},\"offset\":{},\"scale\":{},\"clip\":{},\"units\":{},\"cost_bps\":{},\"cost_in_label\":{},\"construction_columns\":[{}],\"note\":{},\"long_only\":{}",
+            "\"column\":{},\"name\":{},\"kind\":{},\"deprecated\":{},\"return_column\":{},\"return_units\":{},\"horizon_seconds\":{},\"entry_offset_seconds\":{},\"delay_seconds\":{},\"entry_price\":{},\"exit_price\":{},\"offset\":{},\"scale\":{},\"clip\":{},\"units\":{},\"cost_bps\":{},\"cost_in_label\":{},\"construction_columns\":[{}],\"note\":{},\"long_only\":{}{}",
             text(&self.column),
             text(&self.name),
             text(&self.kind),
@@ -322,7 +343,8 @@ impl TargetSpec {
             self.cost_in_label,
             cols.join(","),
             opt_s(&self.note),
-            self.long_only
+            self.long_only,
+            self.stride_seconds.map(|s| format!(",\"stride_seconds\":{}", num(s))).unwrap_or_default()
         )
     }
 
@@ -397,6 +419,14 @@ fn opt_str(o: &Json, key: &str, what: &str) -> Result<Option<String>, String> {
         None | Some(Json::Null) => Ok(None),
         Some(Json::Str(s)) => Ok(Some(s.clone())),
         _ => Err(format!("{}: field '{}' must be a string or null", what, key)),
+    }
+}
+
+fn opt_f64(o: &Json, key: &str, what: &str) -> Result<Option<f64>, String> {
+    match o.get(key) {
+        None | Some(Json::Null) => Ok(None),
+        Some(Json::Num(v)) if v.is_finite() => Ok(Some(*v)),
+        _ => Err(format!("{}: field '{}' must be a finite number or null", what, key)),
     }
 }
 
@@ -490,6 +520,7 @@ fn parse_one(o: &Json, index: usize) -> Result<TargetSpec, String> {
         return_column: opt_str(o, "return_column", &what)?,
         return_units: str_field(o, "return_units", &what)?,
         horizon_seconds: f64_field(o, "horizon_seconds", &what)?,
+        stride_seconds: opt_f64(o, "stride_seconds", &what)?,
         entry_offset_seconds: f64_field(o, "entry_offset_seconds", &what)?,
         delay_seconds: f64_field(o, "delay_seconds", &what)?,
         entry_price: opt_str(o, "entry_price", &what)?.unwrap_or_default(),
@@ -553,6 +584,11 @@ fn validate(s: &TargetSpec, what: &str) -> Result<(), String> {
     }
     if !(s.horizon_seconds > 0.0) {
         return Err(format!("{}: horizon_seconds must be positive", what));
+    }
+    if let Some(stride) = s.stride_seconds {
+        if !(stride >= s.horizon_seconds) {
+            return Err(format!("{}: stride_seconds must be at least horizon_seconds", what));
+        }
     }
     for (n, v) in [
         ("entry_offset_seconds", s.entry_offset_seconds),
@@ -1006,6 +1042,7 @@ pub fn schema_json() -> String {
         ("return_column", "string|null", false, "column holding the raw future return; refused as an input (D13a)"),
         ("return_units", "enum", true, "log | simple"),
         ("horizon_seconds", "number", true, "length of the label window, > 0"),
+        ("stride_seconds", "number|null", false, "spacing of one independent return per group, written by rcsr enrich only when the label stride is wider than the horizon; absent means the horizon. The walk-forward and search period width is max(horizon_seconds, stride_seconds); must be >= horizon_seconds"),
         ("entry_offset_seconds", "number", true, "row stamp to entry price, >= 0"),
         ("delay_seconds", "number", true, "decision to entry delay, >= 0"),
         ("entry_price", "string", false, "free text"),
@@ -1040,7 +1077,7 @@ pub fn schema_json() -> String {
             "\"sidecar\":\"<data stem>.targets.json beside the data, used when --target-spec is absent\",",
             "\"file\":{},",
             "\"fields\":[{}],",
-            "\"derived\":{{\"window_seconds\":\"[entry_offset_seconds + delay_seconds, + horizon_seconds]\",",
+            "\"derived\":{{\"period_width_seconds\":\"max(horizon_seconds, stride_seconds); one return period of the walk-forward and the search objective\",\"window_seconds\":\"[entry_offset_seconds + delay_seconds, + horizon_seconds]\",",
             "\"required_purge_seconds\":\"entry_offset_seconds + delay_seconds + horizon_seconds\",",
             "\"structural_term\":\"scale is a column and (offset != 0 or clip is asymmetric)\",",
             "\"null_formula\":\"label at zero return, e.g. clip(-0.002/(6*vol96),-1,1); 0 for a raw return\",",
@@ -1062,6 +1099,29 @@ pub fn schema_json() -> String {
         text("{\"schema\":\"rcsr-target-spec/1\",\"targets\":[<entry>,...]}"),
         items.join(",")
     )
+}
+
+/// Refuse a declared period width that the labelled rows contradict. `step` is
+/// the smallest per-group step between labelled rows (`None` when no group has
+/// two). The messages start with `missing stride_seconds` or `stride_seconds`
+/// so a command maps them to exit 2 by prefix.
+pub fn check_period_width(horizon_seconds: f64, stride_seconds: Option<f64>, step: Option<f64>) -> Result<(), String> {
+    let Some(step) = step else { return Ok(()) };
+    match stride_seconds {
+        None if step >= 2.0 * horizon_seconds => Err(format!(
+            "missing stride_seconds: the target spec has horizon_seconds {} and no stride_seconds, but labelled test rows of one group are at least {} s apart: \
+             one period per horizon would give a wrong periods_per_year; add \"stride_seconds\": {} to the spec \
+             (rcsr enrich writes it for a label with stride above the horizon)",
+            horizon_seconds, step, step
+        )),
+        Some(s) if step < s * (1.0 - 1e-9) => Err(format!(
+            "stride_seconds {} is wider than the smallest per-group step {} s of the labelled rows: \
+             one period per stride would average rows that are independent returns; fix or remove stride_seconds in the spec \
+             (rcsr enrich writes the stride of the label)",
+            s, step
+        )),
+        _ => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -1296,5 +1356,21 @@ mod tests {
             .unwrap_err()
             .contains("cost_per_side_bps"));
         assert_eq!(s.sha256(), with_cost(Some(20.0), false).sha256());
+    }
+
+    #[test]
+    fn check_period_width_cases() {
+        let h = 3600.0;
+        assert!(check_period_width(h, None, None).is_ok());
+        assert!(check_period_width(h, Some(86_400.0), None).is_ok());
+        assert!(check_period_width(h, None, Some(h)).is_ok());
+        assert!(check_period_width(h, None, Some(2.0 * h - 1.0)).is_ok());
+        let e = check_period_width(h, None, Some(2.0 * h)).unwrap_err();
+        assert!(e.starts_with("missing stride_seconds"), "{e}");
+        assert!(check_period_width(h, Some(86_400.0), Some(86_400.0)).is_ok());
+        assert!(check_period_width(h, Some(86_400.0), Some(172_800.0)).is_ok());
+        let e = check_period_width(h, Some(86_400.0), Some(3600.0)).unwrap_err();
+        assert!(e.starts_with("stride_seconds") && e.contains("86400") && e.contains("3600"), "{e}");
+        assert!(check_period_width(86_400.0, Some(129_600.0), Some(129_600.0)).is_ok());
     }
 }

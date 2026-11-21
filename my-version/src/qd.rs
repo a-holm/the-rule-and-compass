@@ -8,6 +8,10 @@
 //! * descriptor 2: **prediction skewness** — the third standardised moment of
 //!   the prediction vector, mapped monotonically to `[0, 1]`.
 //!
+//! #1084: under `--fitness pnl`, `--qd-descriptor book` replaces the two axes
+//! by the log exposure and the log mean holding length of the long/flat book
+//! the fitness prices ([`book_descriptor`]).
+//!
 //! Two archives are provided:
 //!
 //! * [`QdArchive::new`] — the original rectangular grid, kept for backward
@@ -27,10 +31,63 @@ use crate::rng::Mt;
 use std::collections::HashMap;
 
 /// A point in the two-dimensional descriptor space, each coordinate in `[0, 1]`.
+///
+/// Under [`DescriptorKind::Book`] (#1084) the first coordinate is the log
+/// exposure and the second the log mean holding length ([`book_descriptor`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Descriptor {
     pub usage: f64,
     pub skew: f64,
+}
+
+/// #1084: what the two descriptor axes measure (`--qd-descriptor`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DescriptorKind {
+    /// Variable usage and prediction skewness.
+    #[default]
+    Moments,
+    /// Log exposure and log mean holding length of the long/flat fitness book.
+    Book,
+}
+
+impl DescriptorKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DescriptorKind::Moments => "moments",
+            DescriptorKind::Book => "book",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<DescriptorKind, String> {
+        match s {
+            "moments" => Ok(DescriptorKind::Moments),
+            "book" => Ok(DescriptorKind::Book),
+            other => Err(format!("--qd-descriptor must be moments or book, got '{}'", other)),
+        }
+    }
+}
+
+/// #1084: the lowest exposure the book descriptor resolves; lower maps to 0.
+pub const BOOK_EXPOSURE_MIN: f64 = 1e-4;
+/// #1084: the longest mean holding length, in rows, the book descriptor
+/// resolves; longer maps to 1.
+pub const BOOK_HOLDING_MAX: f64 = 1e4;
+
+/// #1084: the book descriptor. Exposure `x = long_rows / rows` maps to
+/// `ln(x / BOOK_EXPOSURE_MIN) / ln(1 / BOOK_EXPOSURE_MIN)` and the mean holding
+/// length `h = long_rows / max(1, entries)` to `ln(h) / ln(BOOK_HOLDING_MAX)`,
+/// each clamped to `[0, 1]`. The bounds are constants, so a book maps to the
+/// same point on every panel. A flat book is `(0, 0)`.
+pub fn book_descriptor(shape: &crate::trading::BookShape) -> Descriptor {
+    let x = shape.exposure();
+    let h = shape.mean_holding();
+    let usage = if x > 0.0 {
+        ((x / BOOK_EXPOSURE_MIN).ln() / (1.0 / BOOK_EXPOSURE_MIN).ln()).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let skew = if h > 1.0 { (h.ln() / BOOK_HOLDING_MAX.ln()).clamp(0.0, 1.0) } else { 0.0 };
+    Descriptor { usage, skew }
 }
 
 /// Which tessellation the archive uses.
@@ -49,6 +106,15 @@ impl QdMode {
             QdMode::Grid => "grid",
             QdMode::Cvt => "cvt",
             QdMode::Random => "random",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<QdMode> {
+        match s {
+            "grid" => Some(QdMode::Grid),
+            "cvt" => Some(QdMode::Cvt),
+            "random" => Some(QdMode::Random),
+            _ => None,
         }
     }
 }
@@ -147,11 +213,34 @@ pub struct QdArchive {
     /// (GPU-scored, subset-scored or unknown trees). Reported so the one-pass
     /// claim is measurable from `--json` instead of asserted.
     fallbacks: usize,
+    /// #1084: what the descriptor axes measure.
+    kind: DescriptorKind,
 }
 
 /// Keep the descriptor cache bounded; a long run must not retain one entry per
 /// candidate it has ever seen.
 const KNOWN_CACHE_CAP: usize = 65_536;
+
+/// #1166: everything in a [`QdArchive`] that a later generation reads, as plain
+/// data for a `--qd-policy` checkpoint. The cell cap, the descriptor kind and
+/// the input count come from the configuration and the data, so a restore
+/// takes them from the archive it fills.
+#[derive(Clone, Debug)]
+pub struct QdState {
+    pub mode: QdMode,
+    /// Every cell's local front, in cell order and in the cell's own order.
+    pub cells: Vec<Vec<QdEntry>>,
+    /// CVT centroids in index order; empty for the grid and random archives.
+    pub centroids: Vec<Descriptor>,
+    pub visits: Vec<u64>,
+    /// The bounded Lloyd sample, in sample order.
+    pub observed: Vec<Descriptor>,
+    pub records: usize,
+    pub fallbacks: usize,
+    pub known_tag: u64,
+    /// The descriptor cache, in ascending structural-hash order.
+    pub known: Vec<(u64, Descriptor)>,
+}
 
 /// The per-run coverage summary reported by the CLI and `--json`.
 #[derive(Clone, Debug, PartialEq)]
@@ -197,6 +286,8 @@ pub struct QdReport {
     /// Archive insertions that needed the evaluating descriptor fallback. Zero
     /// on a CPU run whose candidates were all scored by the one-pass path.
     pub descriptor_fallbacks: usize,
+    /// #1084: the descriptor kind, `"moments"` or `"book"`.
+    pub descriptor: &'static str,
 }
 
 
@@ -279,6 +370,7 @@ impl QdArchive {
             known: HashMap::new(),
             known_tag: 0,
             fallbacks: 0,
+            kind: DescriptorKind::Moments,
         }
     }
 
@@ -306,6 +398,7 @@ impl QdArchive {
             known: HashMap::new(),
             known_tag: 0,
             fallbacks: 0,
+            kind: DescriptorKind::Moments,
         }
     }
 
@@ -326,6 +419,7 @@ impl QdArchive {
             known: HashMap::new(),
             known_tag: 0,
             fallbacks: 0,
+            kind: DescriptorKind::Moments,
         }
     }
 
@@ -334,6 +428,17 @@ impl QdArchive {
     pub fn with_nvars(mut self, nvars: usize) -> Self {
         self.nvars = nvars;
         self
+    }
+
+    /// #1084: declare what the descriptors measure. It changes the report and
+    /// the reachable cells, never the cell of a descriptor.
+    pub fn with_kind(mut self, kind: DescriptorKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    pub fn kind(&self) -> DescriptorKind {
+        self.kind
     }
 
     pub fn bins(&self) -> usize {
@@ -350,6 +455,68 @@ impl QdArchive {
 
     pub fn visits(&self) -> &[u64] {
         &self.visits
+    }
+
+    /// #1166: the state a `--qd-policy` checkpoint saves.
+    pub fn state(&self) -> QdState {
+        let mut known: Vec<(u64, Descriptor)> = self.known.iter().map(|(h, d)| (*h, *d)).collect();
+        known.sort_unstable_by_key(|(h, _)| *h);
+        QdState {
+            mode: self.mode,
+            cells: self.cells.iter().map(|c| c.entries.clone()).collect(),
+            centroids: self.centroids.clone(),
+            visits: self.visits.clone(),
+            observed: self.observed.clone(),
+            records: self.records,
+            fallbacks: self.fallbacks,
+            known_tag: self.known_tag,
+            known,
+        }
+    }
+
+    /// #1166: continue from a saved state. The archive must be built from the
+    /// configuration that saved it; a state of another tessellation, size or
+    /// cell cap is refused.
+    pub fn restore(&mut self, state: QdState) -> Result<(), String> {
+        let cells = self.cells.len();
+        if state.mode != self.mode || state.cells.len() != cells {
+            return Err(format!(
+                "the saved QD archive is {} with {} cells, but this run builds {} with {}",
+                state.mode.name(),
+                state.cells.len(),
+                self.mode.name(),
+                cells
+            ));
+        }
+        if state.visits.len() != cells || state.centroids.len() != self.centroids.len() {
+            return Err(format!(
+                "the saved QD archive has {} visit counts and {} centroids for {} cells",
+                state.visits.len(),
+                state.centroids.len(),
+                cells
+            ));
+        }
+        if let Some(i) = state.cells.iter().position(|c| c.len() > self.cell_cap) {
+            return Err(format!("the saved QD cell {} holds more than the cell cap {}", i, self.cell_cap));
+        }
+        if state.observed.len() > CVT_SAMPLE_CAP || state.known.len() > KNOWN_CACHE_CAP {
+            return Err(format!(
+                "the saved QD archive has {} Lloyd samples and {} cached descriptors, above the bounds {} and {}",
+                state.observed.len(),
+                state.known.len(),
+                CVT_SAMPLE_CAP,
+                KNOWN_CACHE_CAP
+            ));
+        }
+        self.cells = state.cells.into_iter().map(|entries| QdCell { entries }).collect();
+        self.centroids = state.centroids;
+        self.visits = state.visits;
+        self.observed = state.observed;
+        self.records = state.records;
+        self.fallbacks = state.fallbacks;
+        self.known_tag = state.known_tag;
+        self.known = state.known.into_iter().collect();
+        Ok(())
     }
 
     fn grid_index(&self, d: Descriptor) -> usize {
@@ -461,6 +628,19 @@ impl QdArchive {
         trees: impl IntoIterator<Item = (Node, f64, f64, Option<Descriptor>)>,
         sample: &Sample,
     ) {
+        self.record_with_descriptors_by(trees, sample, |tree| descriptor(tree, sample));
+    }
+
+    /// #1084: [`QdArchive::record_with_descriptors`] with the evaluating
+    /// fallback supplied by the caller, for a descriptor kind that needs more
+    /// than the sample (the book kind reads the fitness book). `fallback` must
+    /// describe `sample`.
+    pub fn record_with_descriptors_by(
+        &mut self,
+        trees: impl IntoIterator<Item = (Node, f64, f64, Option<Descriptor>)>,
+        sample: &Sample,
+        fallback: impl Fn(&Node) -> Descriptor,
+    ) {
         let tag = sample_tag(sample);
         if tag != self.known_tag {
             self.known.clear();
@@ -474,7 +654,7 @@ impl QdArchive {
                     Some(d) => d,
                     None => {
                         self.fallbacks += 1;
-                        descriptor(&tree, sample)
+                        fallback(&tree)
                     }
                 },
             };
@@ -571,8 +751,15 @@ impl QdArchive {
     /// reachable (a point on a Voronoi boundary is counted for both cells);
     /// that can only over-count by a measure-zero boundary and never invents a
     /// region the descriptor cannot approach.
+    ///
+    /// #1084: the book axes have no lattice, so under the book kind every cell
+    /// counts as reachable and `reachable_coverage` equals `coverage`.
     fn reachable_mask(&self) -> Vec<bool> {
         let mut reach = vec![false; self.cells.len()];
+        if self.kind == DescriptorKind::Book {
+            reach.fill(true);
+            return reach;
+        }
         match self.mode {
             QdMode::Random => {
                 // The control hashes arbitrary descriptors, so every cell is
@@ -723,6 +910,7 @@ impl QdArchive {
             qd_score,
             evaluations: self.records,
             descriptor_fallbacks: self.fallbacks,
+            descriptor: self.kind.as_str(),
         }
     }
 
@@ -1366,5 +1554,151 @@ mod tests {
             cell.entries.rotate_left(shift);
             assert_eq!(cell.best().map(|e| e.error), Some(1.5), "shift {shift}");
         }
+    }
+
+    fn shape(rows: u64, long_rows: u64, entries: u64) -> crate::trading::BookShape {
+        crate::trading::BookShape { rows, long_rows, entries }
+    }
+
+    /// #1084: hand-built books with known exposure and mean holding length land
+    /// on the closed-form coordinates and in the expected grid cells.
+    #[test]
+    fn book_descriptor_maps_hand_built_books_to_their_cells() {
+        let decades = (1.0 / BOOK_EXPOSURE_MIN).ln();
+        let held = BOOK_HOLDING_MAX.ln();
+        // (shape, exposure, holding, grid cell of a 4 x 4 grid)
+        let books = [
+            (shape(10_000, 0, 0), 0.0, 0.0, 0),
+            (shape(10_000, 20, 20), 2e-3, 1.0, 4),
+            (shape(10_000, 20, 1), 2e-3, 20.0, 5),
+            (shape(10_000, 300, 10), 3e-2, 30.0, 9),
+            (shape(10_000, 5_000, 2_500), 0.5, 2.0, 12),
+            (shape(10_000, 5_000, 2), 0.5, 2_500.0, 15),
+        ];
+        let mut archive = QdArchive::new(4, 1).with_kind(DescriptorKind::Book);
+        for (k, (s, x, h, cell)) in books.iter().enumerate() {
+            assert_eq!((s.exposure(), s.mean_holding()), (*x, *h), "book {k}");
+            let d = book_descriptor(s);
+            let (u, v) = if *x > 0.0 { ((x / BOOK_EXPOSURE_MIN).ln() / decades, h.ln() / held) } else { (0.0, 0.0) };
+            assert!((d.usage - u).abs() < 1e-12 && (d.skew - v).abs() < 1e-12, "book {k}: {d:?}");
+            assert_eq!(archive.cell_index(d), *cell, "book {k}: {d:?}");
+            assert!(archive.insert_descriptor(&constant(k as f64), 1.0, 1.0, d));
+        }
+        let occupied: Vec<usize> = archive.occupied_cells().iter().map(|(i, _)| *i).collect();
+        assert_eq!(occupied, [0, 4, 5, 9, 12, 15]);
+        // The same exposure and holding on a panel of another size is the same point.
+        assert_eq!(book_descriptor(&shape(20_000, 600, 20)), book_descriptor(&shape(10_000, 300, 10)));
+        // Bounds: exposure below 1e-4 and holding above 1e4 clamp; a full book is (1, 1).
+        assert_eq!(book_descriptor(&shape(100_000, 1, 1)), Descriptor { usage: 0.0, skew: 0.0 });
+        assert_eq!(book_descriptor(&shape(20_000, 20_000, 1)), Descriptor { usage: 1.0, skew: 1.0 });
+        assert_eq!(book_descriptor(&shape(10_000, 1, 1)).usage, 0.0);
+        assert_eq!(book_descriptor(&shape(0, 0, 0)), Descriptor { usage: 0.0, skew: 0.0 });
+    }
+
+    /// #1084: the book kind names itself in the report and counts every cell as
+    /// reachable; the moments kind keeps the usage-lattice denominator.
+    #[test]
+    fn book_kind_reports_itself_and_counts_every_cell_reachable() {
+        let moments = QdArchive::new_cvt(64, 4).with_nvars(2);
+        let book = QdArchive::new_cvt(64, 4).with_nvars(2).with_kind(DescriptorKind::Book);
+        assert_eq!(moments.report().descriptor, "moments");
+        assert_eq!(book.report().descriptor, "book");
+        assert_eq!(book.report().reachable, 64);
+        assert!(moments.report().reachable < 64, "{}", moments.report().reachable);
+        assert_eq!(DescriptorKind::parse("book"), Ok(DescriptorKind::Book));
+        assert_eq!(DescriptorKind::parse("moments"), Ok(DescriptorKind::Moments));
+        assert!(DescriptorKind::parse("usage").unwrap_err().contains("moments or book"));
+    }
+
+    /// #1084: a candidate without a descriptor takes the caller's fallback, once
+    /// per structural hash, and the fallback is counted.
+    #[test]
+    fn record_by_takes_the_callers_fallback() {
+        let s = sample();
+        let mut archive = QdArchive::new(4, 4).with_kind(DescriptorKind::Book);
+        let calls = std::cell::Cell::new(0usize);
+        let fixed = Descriptor { usage: 0.9, skew: 0.1 };
+        let tree = node(Op::Add, vec![input(0), constant(1.0)]);
+        let items = vec![(tree.clone(), 1.0, 3.0, None), (tree.clone(), 1.0, 3.0, None)];
+        archive.record_with_descriptors_by(items, &s, |_| {
+            calls.set(calls.get() + 1);
+            fixed
+        });
+        assert_eq!(calls.get(), 1, "the second offer reuses the known descriptor");
+        assert_eq!(archive.report().descriptor_fallbacks, 1);
+        let occupied = archive.occupied_cells();
+        assert_eq!(occupied.len(), 1);
+        assert_eq!(occupied[0].0, archive.cell_index(fixed));
+    }
+
+    /// #1166: an archive restored from its state continues exactly like the
+    /// original (cells, centroids, visits, Lloyd sample, counters, descriptor
+    /// cache), and a state of another archive is refused.
+    #[test]
+    fn a_restored_archive_continues_like_the_original() {
+        let s = sample();
+        let tree = |i: usize, salt: f64| {
+            let c = 0.1 * i as f64 + salt;
+            match i % 4 {
+                0 => node(Op::Add, vec![input(0), constant(c)]),
+                1 => node(Op::Mul, vec![input(1), constant(c)]),
+                2 => node(Op::Sin, vec![node(Op::Mul, vec![constant(c), input(0)])]),
+                _ => node(Op::Sub, vec![node(Op::Mul, vec![input(0), input(0)]), constant(c)]),
+            }
+        };
+        let batch = |range: std::ops::Range<usize>, salt: f64, scored: bool| -> Vec<(Node, f64, f64, Option<Descriptor>)> {
+            range
+                .map(|i| {
+                    let t = tree(i, salt);
+                    let d = scored.then(|| descriptor(&t, &s));
+                    (t, 1.0 + (i % 7) as f64 * 0.25, 3.0 + (i % 3) as f64, d)
+                })
+                .collect()
+        };
+        let dump = |q: &QdArchive| format!("{:?}", q.state());
+        let makers: [fn() -> QdArchive; 3] = [
+            || QdArchive::new(4, 2).with_nvars(2),
+            || QdArchive::new_cvt(8, 2).with_nvars(2),
+            || QdArchive::new_random(8, 2).with_nvars(2),
+        ];
+        for make in makers {
+            let mut original = make();
+            original.record_with_descriptors(batch(0..40, 0.0, true), &s);
+            original.record_with_descriptors(batch(30..60, 0.0, false), &s);
+            let state = original.state();
+            assert!(state.fallbacks > 0 && !state.known.is_empty(), "{:?}", original.report());
+            assert!(state.known.windows(2).all(|w| w[0].0 < w[1].0), "the cache is saved in hash order");
+            let mut restored = make();
+            restored.restore(state.clone()).expect("restore");
+            assert_eq!(dump(&original), dump(&restored));
+            for q in [&mut original, &mut restored] {
+                q.record_with_descriptors(batch(0..30, 0.0, false), &s);
+                q.record_with_descriptors(batch(0..50, 0.05, false), &s);
+            }
+            assert_eq!(dump(&original), dump(&restored), "{:?}", original.mode());
+            assert_eq!(original.report(), restored.report());
+            if original.mode() == QdMode::Cvt {
+                assert_ne!(original.centroids(), make().centroids(), "Lloyd steps moved the centroids");
+            }
+
+            // Without the cache the same offers count as evaluating fallbacks.
+            let mut uncached = make();
+            uncached.restore(QdState { known: Vec::new(), known_tag: 0, ..state.clone() }).expect("restore");
+            let mut cached = make();
+            cached.restore(state).expect("restore");
+            for q in [&mut uncached, &mut cached] {
+                q.record_with_descriptors(batch(0..30, 0.0, false), &s);
+            }
+            assert!(uncached.report().descriptor_fallbacks > cached.report().descriptor_fallbacks);
+        }
+        let cvt = QdArchive::new_cvt(16, 2).state();
+        let err = QdArchive::new(4, 2).restore(cvt).unwrap_err();
+        assert!(err.contains("saved QD archive is cvt with 16 cells"), "{err}");
+        let mut full = QdArchive::new(4, 2);
+        let d = Descriptor { usage: 0.5, skew: 0.5 };
+        full.insert_descriptor(&tree(0, 0.0), 1.0, 5.0, d);
+        full.insert_descriptor(&tree(1, 0.0), 2.0, 3.0, d);
+        let err = QdArchive::new(4, 1).restore(full.state()).unwrap_err();
+        assert!(err.contains("more than the cell cap 1"), "{err}");
     }
 }

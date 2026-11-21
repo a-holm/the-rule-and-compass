@@ -38,17 +38,123 @@ fn input_err<T>(m: impl Into<String>) -> Res<T> {
 pub fn usage() -> &'static str {
     "usage: rcsr trials --wf <report.json>... [--baseline <ladder.json>] [options]\n\
 \x20      rcsr trials --compare <A> <B> [options]\n\
+\x20      rcsr trials --cpcv-assemble <report.json>... --splits <csv> --out-dir <dir> [--summary <file>]\n\
+\x20      rcsr trials --wf <report.json>... --table [--rule <rule.json>] [options]\n\
 \n\
 Campaign trial accounting from walk-forward reports (pooled.period_net), or a paired\n\
 comparison of two runs. A and B are each one report or a comma-separated list (one per seed).\n\
 \n\
+CPCV paths (--cpcv-assemble, #1174): the walk-forward reports of one configuration, one per split\n\
+of a `rcsr protocol cpcv` table (--splits), each priced with --pool-reset-flat (and --period-grid target, so\n\
+the splits of a group share its period grid whatever NaN coverage or gate their formulas have). A report belongs to\n\
+the split with its test intervals. Path j of group g takes the j-th split, in lexicographic order of\n\
+the test groups, that tests g (López de Prado 2018, ch. 12); every group of a path is one book\n\
+segment that starts flat and pays its final exit. Writes <dir>/path_<j>.json in the walk-forward\n\
+schema (pooled.period_time, pooled.period_net, window_definition = the CPCV scheme hash, so\n\
+--wf reads them) and the summary (rcsr-cpcv-summary/1: per-path net, Sharpe and max drawdown,\n\
+the path Sharpe distribution, the share of positive paths, per-group net) to --summary or stdout.\n\
+A missing or extra split report, a report of no split, reset_flat not true, or reports that differ\n\
+in cost, purge, annualization, threshold rule, policy, period grid rule (pooled.grid.rule), missing-score rule\n\
+(book.missing_score) or a group's\n\
+period grid exit 2 naming the split or field. Target-grid reports add pooled.grid and pooled.period_rows\n\
+to every path and the empty periods per path and per group to the summary. Each of pooled.period_gross,\n\
+period_exposure, period_entries, period_bh, period_cost, period_entry_stamp and period_bh_net that the reports\n\
+carry (walkforward --period-series or --emit-series, #1236) goes into every path as the concatenation of the\n\
+chosen group series, and pooled.entry_times as the sum of the chosen groups' windows[].entry_times, so --table\n\
+gates paths on net at m x cost, exposure, entry_times and alpha_bh. A field on some reports only, a series of\n\
+another length than period_net or with a non-finite value, pooled.entry_times without windows[].entry_times, or\n\
+window counts that do not sum to pooled.entry_times exit 2 naming the field and the report.\n\
+\n\
 Campaign (--wf):\n\
-  --wf <files...>        walk-forward --json reports with identical windows, cost, threshold rule and period grid\n\
+  --wf <files...>        walk-forward --json reports with identical windows, cost, threshold rule (threshold.quantile, threshold.fixed,\n\
+                         threshold.fit, threshold.cut_min_entries, threshold.cut_blocks, threshold.cut_lambda), policy\n\
+                         and period grid (pooled.grid.rule, absent for the score grid, and pooled.period_time) and missing-score\n\
+                         rule (book.missing_score, absent in a report of a build that carried the position); a report\n\
+                         with null_store (priced on a null store) exits 2 naming its label and seed (#1304)\n\
+  --members <mode>      selected (default): one series per report, pooled.period_net; all: one series per\n\
+                         members[] row of a walkforward --front --all-members report (members[].series), named\n\
+                         <report>#<archive_rank>; a report without members exits 2\n\
   --baseline <file>      rcsr ladder --emit-series report; the best of cash, buy_and_hold, constant_long_flat,\n\
                          best_single_feature and any trend rung by mean is the SPA benchmark\n\
   --baseline-rung <name> use this rung as the SPA benchmark instead\n\
+  --baseline-wf <files...> with --table: walk-forward or CPCV path reports (pooled.period_net) as the SPA benchmark rungs;\n\
+                         excludes --baseline. Rungs: cash (zeros), buy_and_hold (pooled.period_bh_net of the first\n\
+                         report), one per report named by its label or file stem; the best by mean is the benchmark\n\
   --cluster-rho <R>      single-linkage threshold on |correlation| (default 0.9); N_eff = clusters\n\
   --pbo-blocks <even n>  CSCV blocks (default 16)\n\
+  --regimes <calendar>   per-stratum metrics of every series in its member entry. Calendar rows label,start,end\n\
+                         (UTC half-open, no overlap, any label set; `rcsr protocol regimes` writes one) are tested\n\
+                         against the period stamps; periods outside every row are `undated`. Each stratum reports\n\
+                         periods, years, net, Sharpe, Sortino, drawdown and the block-bootstrap interval of the mean\n\
+                         (--draws, --seed, --block-len). With pooled.period_gross, period_exposure, period_entries and\n\
+                         period_bh in the reports (walkforward --period-series) it also reports net at twice the cost,\n\
+                         exposure, entries, buy-and-hold and the alpha over exposure-matched buy-and-hold\n\
+\n\
+Candidate table (--table, #1177): one row per --wf series, with the campaign options above. Rows pass the gates,\n\
+the Pareto front ranks the passers, the average rank orders them inside a front, and a walk in the order front,\n\
+average rank, complexity, trades, input order picks rows below the diversity cap. Every picked row gets PSR, DSR\n\
+at N_eff, 10 N_eff and the nominal N (every row of the table, plus --prior-trials), MinBTL, the Harvey-Liu haircut\n\
+(Bonferroni, Holm, BHY over the rows) and its StepM and BH-FDR verdicts; SPA, StepM, BH-FDR and PBO run over the\n\
+distinct varying rows against the --baseline or --baseline-wf best rung, else cash at 0. With --family-table the deflation also\n\
+counts the sibling horizon tables. Output rcsr-trials-table/1.\n\
+  --rule <file>          rcsr-trials-rule/1 JSON with cost_multiples, gates, relaxed_gates (apply when no row passes\n\
+                         gates), pareto, rank, pick, diversity_rho, min_front, max_composites and freeze; its sha256 is\n\
+                         in the output; it excludes --gates, --pareto, --rank, --pick, --diversity-rho, --min-front,\n\
+                         --cost-multiples. max_composites K (#1237, D8): the walk skips a composite row (a report with\n\
+                         the composite marker of an rcsr compose run: selection.composite, or composite of a CPCV path)\n\
+                         once the picks hold K composites (skipped.reason max_composites). freeze (#1237):\n\
+                         {\"cpcv\":[N,k],\"cost_bps\":B,\"s4\":{\"window_days\":W,\"percentile\":P},\"p1\":{...},\n\
+                         \"drawdown_cap\":{\"window_days\":W,\"percentile\":P,\"floor\":F}} freezes per pick the sealed-read\n\
+                         thresholds over every CPCV(N,k) path of the pick's configuration (needs --freeze-map)\n\
+  --freeze-map <file>    rcsr-trials-freeze-map/1 JSON {\"rows\":[{\"row\",\"configuration\",\"paths\",\"run\"}]}: per\n\
+                         row (its report as given to --wf) the configuration name, its CPCV path reports and the\n\
+                         run.json to seal (optional). Every pick gets freeze: s4_floor and p1_floor (nearest-rank\n\
+                         percentile, k = (P n + 99) / 100, of the annualised mean nets at B bp of the windows\n\
+                         [t, t + W days) that start at each period and end inside one path, pooled over the paths),\n\
+                         drawdown_cap (max(F, the percentile of the windows' compounding max drawdown magnitudes)),\n\
+                         window counts and ranks, the path files with sha256 and run_sha256. A pick without a map\n\
+                         entry, a missing or doubled cpcv.path, paths of two splits tables, a split with two\n\
+                         report_sha256, cpcv.groups or cpcv.test_groups other than freeze.cpcv, a locked period, a\n\
+                         path priced at another cost without pooled.period_cost, or no window that fits exit 2\n\
+  --gates <file>         JSON object {metric: [op, value]}, op >, >=, <, <=, or [\"between\", lo, hi]; all must hold;\n\
+                         a NaN value fails; every failed gate is listed per row\n\
+  --pareto <m[:dir],...> Pareto metrics over the gate passers, dir max (default) or min; NaN is the worst value\n\
+  --rank <m[:dir],...>   average rank over the gate passers (1 = best, ties share the mean place) and the Friedman\n\
+                         chi2 over rows x metrics\n\
+  --pick <K>             pick K rows (default 0: none)\n\
+  --diversity-rho <R>    skip a row whose net series correlates at R or more with a picked row (default 1)\n\
+  --min-front <M>        keep the first fronts until at least M rows remain (default 0: every front)\n\
+  --cost-multiples <m,..> net<bps> metrics at m x cost_model.per_side_bps (default 1,2: net10 and net20 at 10 bp)\n\
+  --null-wf <files...>   null walk-forward reports; null_q = share of their annual Sharpes below the row's. A report\n\
+                         priced on a null store (null_store, rcsr panel permute-labels, #1272) is read only here: as\n\
+                         --wf (with or without --table, also with --members all), in --compare, as a --baseline-wf\n\
+                         rung or as a freeze population path it exits 2 (#1304)\n\
+  --prior-trials <N0>    add N0 earlier trials to the nominal N of the picked rows' DSR\n\
+  --family-table <files...> rcsr trials --table outputs of the sibling horizons over the same development span\n\
+                         (#1269, repeatable). DSR, DSR 10 N_eff and MinBTL use N_eff plus each sibling's own\n\
+                         trials.n_eff, DSR nominal the nominal N plus --prior-trials plus each sibling's trials.nominal,\n\
+                         always with this table's cross-trial Sharpe variance; spa.p_family = min(1, (1 + k)\n\
+                         spa.p_consistent) for k siblings; trials.family lists each sibling's path, sha256, n_eff,\n\
+                         nominal and spa_p, the family sha256 and the totals. A sibling's own trials.family is not\n\
+                         read. Two siblings with one sha256, a sibling that is the --out file, a sibling that is not\n\
+                         an rcsr-trials-table/1 output or lacks trials.n_eff, trials.nominal, spa.p_consistent or\n\
+                         inputs.reports, a sibling with a locked read, and a sibling whose inputs.reports share a report\n\
+                         with --wf or with an earlier sibling (by canonical path when the path resolves from the current\n\
+                         directory, else as given) exit 2 naming the file (and the shared report and the other table)\n\
+  --alpha <a>            family error rate of StepM and q of BH-FDR (default 0.05)\n\
+  --locked-test <S,E>    refuse a report with a period or test window in [S, E) (repeatable)\n\
+  --occam <files...>     run.json of a --select-rule occam re-selection or of rcsr compose: bits, p_occam and\n\
+                         bit_budget per row (report only), matched by the report's run sha256 (selection.run_sha256, else cpcv.run_sha256, else run_sha256) and\n\
+                         archive rank (a --from-run report: the run finalist); a CPCV path row gets null\n\
+  --markdown <file>      also write the table as Markdown\n\
+  Metrics: net<bps> (annualised mean net over cash at 0), sharpe, sortino (MAR 0), calmar (net at the report cost\n\
+  over |max_drawdown|), max_drawdown, exposure, entry_times, alpha_bh (mean of net - exposure x period_bh_net,\n\
+  annualised), psr, groups and groups_pos (test windows or CPCV groups with positive net); with --regimes\n\
+  bull_net, bear_excess (net minus buy-and-hold net in bear), worst_stratum (lowest stratum net), net:<label>,\n\
+  excess:<label>, alpha_bh:<label> and a strata block per row; null_q with --null-wf; baseline_excess with\n\
+  --baseline. A rule metric a report cannot give exits 2 naming the field and the report. A report with a locked\n\
+  read (protocol.test_read, protocol.lockbox.rows, evaluated or read_marker) or a period or test window inside a\n\
+  locked range (protocol.lockbox, its declared and also ranges, lockbox, --locked-test) exits 2 naming it.\n\
 \n\
 Comparison (--compare): d_t = A_t - B_t, with X_t the mean of the side's seeds\n\
   --bootstrap <kind>     stationary (default) | circular\n\
@@ -60,6 +166,9 @@ Both:\n\
                          (default max(horizon, hold, cbrt n) of the reports)\n\
   --draws <n>            bootstrap and SPA draws (default 10000)\n\
   --seed <n>             seed of every draw (default 20260101)\n\
+  --threshold-arms       let the reports differ in the fitted-cut rule (threshold.fit, threshold.cut_min_entries,\n\
+                         threshold.cut_blocks, threshold.cut_lambda) and record the rule of each report; every other\n\
+                         guard stays. The fitted and the fixed arm are separate trials\n\
   --out <file>           write the JSON report to this file instead of stdout\n\
 \n\
 Exit 0 ok, 2 usage error or reports that do not match (the message names the field), 3 unreadable input.\n"
@@ -70,7 +179,7 @@ Exit 0 ok, 2 usage error or reports that do not match (the message names the fie
 // ---------------------------------------------------------------------------
 
 /// Fields that must be equal across the reports of one comparison, as paths.
-const GUARDS: &[&[&str]] = &[
+pub(crate) const GUARDS: &[&[&str]] = &[
     &["window_definition"],
     &["purge"],
     &["cost_model", "per_side_bps"],
@@ -81,23 +190,50 @@ const GUARDS: &[&[&str]] = &[
     &["policy", "name"],
     &["policy", "band_width"],
     &["policy", "min_hold"],
+    GRID_RULE,
+    MISSING_SCORE,
 ];
 
-struct Wf {
-    label: String,
-    path: String,
-    net: Vec<f64>,
-    time: Vec<f64>,
-    ppy: f64,
+/// #1199: the period grid rule of `walkforward --period-grid`; a report without it is the score grid.
+pub(crate) const GRID_RULE: &[&str] = &["pooled", "grid", "rule"];
+
+/// #1203: the missing-score rule of the book. A report without it was priced by a build that carried the position
+/// across a row with no finite score (`carry`), so it never mixes with a `flat` or `hold` report.
+pub(crate) const MISSING_SCORE: &[&str] = &["book", "missing_score"];
+
+/// The fitted-cut rule of `walkforward --threshold-fit` (#1094). Reports written without the flag, and before it
+/// existed, read all four as `null` and match each other. `--threshold-arms` skips these paths only.
+pub(crate) const FIT_GUARDS: &[&[&str]] = &[
+    &["threshold", "fit"],
+    &["threshold", "cut_min_entries"],
+    &["threshold", "cut_blocks"],
+    &["threshold", "cut_lambda"],
+];
+
+pub(crate) struct Wf {
+    pub(crate) label: String,
+    pub(crate) path: String,
+    /// `pooled`, or `series` for a `members[]` entry (#1176).
+    pub(crate) prefix: &'static str,
+    pub(crate) net: Vec<f64>,
+    /// #1175: the per-period series a walkforward report carries with `--period-series`.
+    pub(crate) gross: Option<Vec<f64>>,
+    pub(crate) exposure: Option<Vec<f64>>,
+    entries: Option<Vec<f64>>,
+    bh: Option<Vec<f64>>,
+    pub(crate) time: Vec<f64>,
+    pub(crate) ppy: f64,
     guards: Vec<Json>,
-    default_block: usize,
+    fit_guards: Vec<Json>,
+    rule: String,
+    pub(crate) default_block: usize,
 }
 
 fn at<'a>(j: &'a Json, path: &[&str]) -> Option<&'a Json> {
     path.iter().try_fold(j, |cur, k| cur.get(k))
 }
 
-fn series(j: &Json, path: &[&str], file: &str) -> Res<Vec<f64>> {
+pub(crate) fn series(j: &Json, path: &[&str], file: &str) -> Res<Vec<f64>> {
     let name = path.join(".");
     let Some(Json::Arr(items)) = at(j, path) else {
         return usage_err(format!(
@@ -115,7 +251,7 @@ fn series(j: &Json, path: &[&str], file: &str) -> Res<Vec<f64>> {
     Ok(out)
 }
 
-fn label_of(path: &str) -> String {
+pub(crate) fn label_of(path: &str) -> String {
     std::path::Path::new(path)
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -131,71 +267,166 @@ fn median_step(time: &[f64]) -> f64 {
     d[d.len() / 2]
 }
 
-fn load_wf(path: &str) -> Res<Wf> {
+pub(crate) fn read_report(path: &str) -> Res<Json> {
     let text = std::fs::read_to_string(path).or_else(|e| input_err(format!("{}: {}", path, e)))?;
-    let j = Json::parse(text.trim()).map_or_else(|| input_err(format!("{}: not a JSON report", path)), Ok)?;
-    let net = series(&j, &["pooled", "period_net"], path)?;
-    let time = series(&j, &["pooled", "period_time"], path)?;
+    Json::parse(text.trim()).map_or_else(|| input_err(format!("{}: not a JSON report", path)), Ok)
+}
+
+/// #1304: a report priced on a null store is never a campaign or comparison series.
+fn load_wf(path: &str) -> Res<Wf> {
+    let j = read_report(path)?;
+    crate::trials_table::refuse_null_store(&j, path)?;
+    wf_entry(&j, &j, "pooled", path, label_of(path))
+}
+
+/// #1176: one entry per `members[]` row of a `walkforward --all-members` report,
+/// labelled `<report>#<archive_rank>`, with the series of `members[].series`.
+fn load_members(path: &str) -> Res<Vec<Wf>> {
+    let j = read_report(path)?;
+    crate::trials_table::refuse_null_store(&j, path)?;
+    let Some(Json::Arr(members)) = j.get("members") else {
+        return usage_err(format!(
+            "field 'members' is missing in {} (write the report with walkforward --front --all-members, or read it with --members selected)",
+            path
+        ));
+    };
+    members
+        .iter()
+        .enumerate()
+        .map(|(k, m)| {
+            let rank = m.get("archive_rank").and_then(Json::as_f64).map_or_else(|| (k + 1).to_string(), jnum);
+            wf_entry(&j, m, "series", &format!("{}#{}", path, rank), format!("{}#{}", label_of(path), rank))
+        })
+        .collect()
+}
+
+/// `root.<prefix>` holds the series; the guards, the annualisation and the rule come
+/// from the report `j`, the hold length from `root.pooled`.
+pub(crate) fn wf_entry(j: &Json, root: &Json, prefix: &'static str, path: &str, label: String) -> Res<Wf> {
+    let net = series(root, &[prefix, "period_net"], path)?;
+    let time = series(root, &[prefix, "period_time"], path)?;
     if net.len() != time.len() {
         return usage_err(format!(
-            "field 'pooled.period_time' has {} values but 'pooled.period_net' has {} in {}",
+            "field '{}.period_time' has {} values but '{}.period_net' has {} in {}",
+            prefix,
             time.len(),
+            prefix,
             net.len(),
             path
         ));
     }
-    let Some(ppy) = at(&j, &["annualization", "periods_per_year"]).and_then(Json::as_f64) else {
+    let optional = |key: &str| -> Res<Option<Vec<f64>>> {
+        let v = at(root, &[prefix, key]).is_some().then(|| series(root, &[prefix, key], path)).transpose()?;
+        match v {
+            Some(x) if x.len() != net.len() => usage_err(format!("field '{}.{}' has {} values but '{}.period_net' has {} in {}", prefix, key, x.len(), prefix, net.len(), path)),
+            v => Ok(v),
+        }
+    };
+    let (gross, exposure, entry_series, bh) = (optional("period_gross")?, optional("period_exposure")?, optional("period_entries")?, optional("period_bh")?);
+    let Some(ppy) = at(j, &["annualization", "periods_per_year"]).and_then(Json::as_f64) else {
         return usage_err(format!("field 'annualization.periods_per_year' is missing in {}", path));
     };
-    let guards = GUARDS.iter().map(|g| at(&j, g).cloned().unwrap_or(Json::Null)).collect();
-    let horizon = at(&j, &["purge", "horizon_seconds"]).and_then(Json::as_f64).unwrap_or(0.0);
+    let guards = GUARDS.iter().map(|g| at(j, g).cloned().unwrap_or(Json::Null)).collect();
+    let fit_guards: Vec<Json> = FIT_GUARDS.iter().map(|g| at(j, g).cloned().unwrap_or(Json::Null)).collect();
+    let rule = threshold_rule(j);
+    let horizon = at(j, &["purge", "horizon_seconds"]).and_then(Json::as_f64).unwrap_or(0.0);
     let dt = median_step(&time);
     let horizon_periods = if horizon > 0.0 && dt > 0.0 { (horizon / dt).ceil() as usize } else { 0 };
-    let entries = at(&j, &["pooled", "entries"]).and_then(Json::as_f64).unwrap_or(0.0);
-    let active = at(&j, &["pooled", "active_rows"]).and_then(Json::as_f64).unwrap_or(0.0);
+    let entries = at(root, &["pooled", "entries"]).and_then(Json::as_f64).unwrap_or(0.0);
+    let active = at(root, &["pooled", "active_rows"]).and_then(Json::as_f64).unwrap_or(0.0);
     let hold = if entries > 0.0 { (active / entries).ceil() as usize } else { 1 };
     Ok(Wf {
-        label: label_of(path),
+        label,
         path: path.to_string(),
+        prefix,
         default_block: inference::auto_block_len(net.len(), horizon_periods, hold),
         net,
+        gross,
+        exposure,
+        entries: entry_series,
+        bh,
         time,
         ppy,
         guards,
+        fit_guards,
+        rule,
     })
 }
 
-fn require_same(a: &Wf, b: &Wf) -> Res<()> {
-    for (g, (x, y)) in GUARDS.iter().zip(a.guards.iter().zip(&b.guards)) {
+/// The `threshold_rule` member of a report entry, only with `--threshold-arms`.
+fn rule_field(arms: bool, rule: &str) -> String {
+    if arms { format!(",\"threshold_rule\":{}", jstr(rule)) } else { String::new() }
+}
+
+fn threshold_rule(j: &Json) -> String {
+    let t = at(j, &["threshold"]);
+    let num = |k: &str| t.and_then(|t| t.get(k)).and_then(Json::as_f64);
+    if t.and_then(|t| t.get("fit")).is_some_and(|f| *f != Json::Null) {
+        let (e, b, l) = (num("cut_min_entries"), num("cut_blocks"), num("cut_lambda"));
+        let f = |v: Option<f64>| v.map_or("?".to_string(), jnum);
+        return format!("fitness(min_entries={},blocks={},lambda={})", f(e), f(b), f(l));
+    }
+    if num("quantile").is_some() { "quantile" } else { "fixed" }.to_string()
+}
+
+/// `arms`: the fit paths may differ (`--threshold-arms`).
+pub(crate) fn require_same(a: &Wf, b: &Wf, arms: bool) -> Res<()> {
+    let fit = FIT_GUARDS.iter().zip(a.fit_guards.iter().zip(&b.fit_guards)).filter(|_| !arms);
+    let all = GUARDS.iter().zip(a.guards.iter().zip(&b.guards)).chain(fit);
+    for (g, (x, y)) in all {
         if x != y {
+            let hint = if FIT_GUARDS.contains(g) {
+                "; pass --threshold-arms to compare a fitted cut with a fixed cut"
+            } else if g == &MISSING_SCORE {
+                "; price every report with the same walkforward --missing-score (null is a report of a build that carried the position)"
+            } else if g == &GRID_RULE {
+                "; price every report with the same walkforward --period-grid (null is the score grid)"
+            } else {
+                ""
+            };
             return usage_err(format!(
-                "reports differ in field '{}': {} vs {}",
+                "reports differ in field '{}': {} vs {}{}",
                 g.join("."),
                 a.path,
-                b.path
+                b.path,
+                hint
             ));
         }
     }
     if a.time != b.time {
+        let (field, hint) = if a.prefix == "pooled" && b.prefix == "pooled" {
+            ("pooled.period_time".to_string(), "")
+        } else {
+            (format!("{}.period_time", if a.prefix == b.prefix { a.prefix } else { "series" }), "; price the members with walkforward --period-grid target")
+        };
         return usage_err(format!(
-            "reports differ in field 'pooled.period_time': {} ({} periods) vs {} ({} periods)",
+            "reports differ in field '{}': {} ({} periods) vs {} ({} periods){}",
+            field,
             a.path,
             a.time.len(),
             b.path,
-            b.time.len()
+            b.time.len(),
+            hint
         ));
     }
     Ok(())
 }
 
 fn load_all(paths: &[String]) -> Res<Vec<Wf>> {
+    load_set(paths, false, false)
+}
+
+/// `members`: one entry per `members[]` row of every report (`--members all`, #1176).
+fn load_set(paths: &[String], arms: bool, members: bool) -> Res<Vec<Wf>> {
     let mut out: Vec<Wf> = Vec::with_capacity(paths.len());
     for p in paths {
-        let w = load_wf(p)?;
-        if let Some(first) = out.first() {
-            require_same(first, &w)?;
+        let entries = if members { load_members(p)? } else { vec![load_wf(p)?] };
+        for w in entries {
+            if let Some(first) = out.first() {
+                require_same(first, &w, arms)?;
+            }
+            out.push(w);
         }
-        out.push(w);
     }
     Ok(out)
 }
@@ -208,23 +439,27 @@ fn default_block(wfs: &[Wf]) -> usize {
 // Options
 // ---------------------------------------------------------------------------
 
-struct Options {
-    wf: Vec<String>,
-    compare: Option<(String, String)>,
-    baseline: Option<String>,
-    baseline_rung: Option<String>,
-    rho: f64,
-    pbo_blocks: usize,
+pub(crate) struct Options {
+    pub(crate) wf: Vec<String>,
+    pub(crate) compare: Option<(String, String)>,
+    pub(crate) baseline: Option<String>,
+    pub(crate) baseline_rung: Option<String>,
+    pub(crate) rho: f64,
+    pub(crate) pbo_blocks: usize,
     bootstrap: String,
     level: f64,
     s_seed: Option<f64>,
-    block_len: Option<usize>,
-    draws: usize,
-    seed: u32,
-    out: Option<String>,
+    pub(crate) block_len: Option<usize>,
+    pub(crate) draws: usize,
+    pub(crate) seed: u32,
+    pub(crate) out: Option<String>,
+    pub(crate) threshold_arms: bool,
+    /// #1176: `--members all`: one series per `members[]` row.
+    pub(crate) all_members: bool,
+    pub(crate) regimes: Option<String>,
 }
 
-fn parse_args(args: &[String]) -> Res<Options> {
+pub(crate) fn parse_args(args: &[String]) -> Res<Options> {
     let mut o = Options {
         wf: Vec::new(),
         compare: None,
@@ -239,6 +474,9 @@ fn parse_args(args: &[String]) -> Res<Options> {
         draws: inference::DEFAULT_DRAWS,
         seed: DEFAULT_SEED,
         out: None,
+        threshold_arms: false,
+        all_members: false,
+        regimes: None,
     };
     let mut given: Vec<&str> = Vec::new();
     let mut i = 0;
@@ -282,6 +520,17 @@ fn parse_args(args: &[String]) -> Res<Options> {
             "--draws" => o.draws = num(a, &val(&mut i)?)?,
             "--seed" => o.seed = num(a, &val(&mut i)?)?,
             "--out" => o.out = Some(val(&mut i)?),
+            "--threshold-arms" => o.threshold_arms = true,
+            "--members" => {
+                let v = val(&mut i)?;
+                o.all_members = match v.as_str() {
+                    "all" => true,
+                    "selected" => false,
+                    _ => return usage_err(format!("--members must be all or selected, got '{}'", v)),
+                };
+            }
+            "--regimes" => o.regimes = Some(val(&mut i)?),
+            other if crate::trials_table::FLAGS.contains(&other) => return usage_err(format!("{} needs --table", other)),
             other => return usage_err(format!("unknown argument '{}'", other)),
         }
         given.push(a);
@@ -294,7 +543,7 @@ fn parse_args(args: &[String]) -> Res<Options> {
         return usage_err("give --wf <reports...> or --compare <A> <B>");
     }
     let (campaign_only, compare_only): (&[&str], &[&str]) = (
-        &["--baseline", "--baseline-rung", "--cluster-rho", "--pbo-blocks"],
+        &["--baseline", "--baseline-rung", "--cluster-rho", "--pbo-blocks", "--regimes", "--members"],
         &["--bootstrap", "--level", "--s-seed"],
     );
     let wrong = if o.compare.is_some() { campaign_only } else { compare_only };
@@ -336,7 +585,7 @@ fn parse_args(args: &[String]) -> Res<Options> {
 // Campaign accounting
 // ---------------------------------------------------------------------------
 
-fn book_hash(x: &[f64]) -> String {
+pub(crate) fn book_hash(x: &[f64]) -> String {
     let mut bytes = Vec::with_capacity(x.len() * 8);
     for v in x {
         bytes.extend_from_slice(&((v * BOOK_RESOLUTION).round() as i64).to_le_bytes());
@@ -344,7 +593,7 @@ fn book_hash(x: &[f64]) -> String {
     crate::manifest::sha256_hex(&bytes)
 }
 
-fn is_constant(x: &[f64]) -> bool {
+pub(crate) fn is_constant(x: &[f64]) -> bool {
     x.first().map_or(true, |&f| x.iter().all(|&v| v == f))
 }
 
@@ -354,7 +603,7 @@ fn is_baseline_name(name: &str) -> bool {
     matches!(name, "cash" | "buy_and_hold" | "constant_long_flat" | "best_single_feature") || name.starts_with("trend")
 }
 
-fn load_baseline(path: &str, rung: Option<&str>, time: &[f64]) -> Res<(String, Vec<f64>)> {
+pub(crate) fn load_baseline(path: &str, rung: Option<&str>, time: &[f64]) -> Res<(String, Vec<f64>)> {
     let text = std::fs::read_to_string(path).or_else(|e| input_err(format!("{}: {}", path, e)))?;
     let j = Json::parse(text.trim()).map_or_else(|| input_err(format!("{}: not a JSON report", path)), Ok)?;
     let Some(s) = j.get("series") else {
@@ -398,7 +647,7 @@ fn load_baseline(path: &str, rung: Option<&str>, time: &[f64]) -> Res<(String, V
     )
 }
 
-fn dsr_json(d: &inference::Dsr, n_eff: f64) -> String {
+pub(crate) fn dsr_json(d: &inference::Dsr, n_eff: f64) -> String {
     format!(
         "{{\"n_eff\":{},\"sharpe_per_period\":{},\"t\":{},\"skew\":{},\"kurtosis\":{},\"var_sr\":{},\"sr0\":{},\"value\":{}}}",
         jnum(n_eff),
@@ -417,7 +666,7 @@ fn skipped(reason: &str) -> String {
 }
 
 fn campaign(o: &Options) -> Res<String> {
-    let wfs = load_all(&o.wf)?;
+    let wfs = load_set(&o.wf, o.threshold_arms, o.all_members)?;
     let n = wfs[0].net.len();
     let ppy = wfs[0].ppy;
     let block = o.block_len.unwrap_or_else(|| default_block(&wfs)).clamp(1, n.max(1));
@@ -557,24 +806,41 @@ fn campaign(o: &Options) -> Res<String> {
             constant_books
         ));
     }
+    let calendar = match o.regimes.as_deref() {
+        None => None,
+        Some(path) => {
+            let text = std::fs::read_to_string(path).or_else(|e| input_err(format!("{}: {}", path, e)))?;
+            Some(crate::regimes::Calendar::parse(&text).or_else(|e| usage_err(format!("--regimes {}: {}", path, e)))?)
+        }
+    };
+    let strata_of = |w: &Wf| -> String {
+        use crate::regimes::{strata, strata_json, Series, StatOpts};
+        let Some(cal) = &calendar else { return String::new() };
+        let (names, assign) = cal.assign(&w.time);
+        let s = Series { net: &w.net, gross: w.gross.as_deref(), exposure: w.exposure.as_deref(), entries: w.entries.as_deref(), bh: w.bh.as_deref() };
+        let so = StatOpts { periods_per_year: w.ppy, draws: o.draws, block_len: Some(block), seed: o.seed };
+        format!(",\"regimes\":{}", strata_json(&strata(&names, "calendar", &assign, &s, &so)))
+    };
     let members: Vec<String> = wfs
         .iter()
         .enumerate()
         .map(|(i, w)| {
             let v = varying.iter().position(|&x| x == distinct[book_of[i]]);
             format!(
-                "{{\"label\":{},\"book\":{},\"cluster\":{},\"sharpe_annual\":{}}}",
+                "{{\"label\":{},\"book\":{},\"cluster\":{},\"sharpe_annual\":{}{}{}}}",
                 jstr(&w.label),
                 book_of[i],
                 v.map_or("null".to_string(), |p| cluster_of[p].to_string()),
-                jnum(inference::sharpe_per_period(&w.net) * ann)
+                jnum(inference::sharpe_per_period(&w.net) * ann),
+                rule_field(o.threshold_arms, &w.rule),
+                strata_of(w)
             )
         })
         .collect();
     Ok(format!(
         "{{\"schema\":{},\"series\":{},\"distinct_books\":{},\"constant_books\":{},\"clusters\":{},\"cluster_rho\":{},\
 \"participation_ratio\":{},\"periods\":{},\"periods_per_year\":{},\"block_len\":{},\"draws\":{},\"seed\":{},\
-\"best\":{},\"spa\":{},\"pbo\":{},\"min_btl_years\":{},\"span_years\":{},\"notes\":[{}],\"members\":[{}]}}\n",
+\"best\":{},\"spa\":{},\"pbo\":{},\"min_btl_years\":{},\"span_years\":{},\"notes\":[{}],\"members\":[{}]{}}}\n",
         jstr(SCHEMA),
         wfs.len(),
         distinct.len(),
@@ -593,7 +859,17 @@ fn campaign(o: &Options) -> Res<String> {
         jnum(min_btl),
         jnum(span_years),
         notes.iter().map(|s| jstr(s)).collect::<Vec<_>>().join(","),
-        members.join(",")
+        members.join(","),
+        format!(
+            "{}{}",
+            if o.threshold_arms { ",\"threshold_arms\":true" } else { "" },
+            calendar.as_ref().map_or(String::new(), |c| format!(
+                ",\"regimes_calendar\":{{\"sha256\":{},\"rows\":{},\"labels\":[{}]}}",
+                jstr(&c.sha256),
+                c.rows.len(),
+                c.labels().iter().map(|l| jstr(l)).collect::<Vec<_>>().join(",")
+            ))
+        )
     ))
 }
 
@@ -642,7 +918,7 @@ fn compare(o: &Options) -> Res<String> {
     }
     let a = load_all(&a_paths)?;
     let b = load_all(&b_paths)?;
-    require_same(&a[0], &b[0])?;
+    require_same(&a[0], &b[0], o.threshold_arms)?;
     let n = a[0].net.len();
     let ppy = a[0].ppy;
     if n < 2 {
@@ -691,7 +967,7 @@ fn compare(o: &Options) -> Res<String> {
         "{{\"schema\":{},\"a\":[{}],\"b\":[{}],\"n\":{},\"periods_per_year\":{},\"bootstrap\":{},\"block_len\":{},\
 \"draws\":{},\"seed\":{},\"mean_diff\":{},\"mean_diff_annual\":{},\"ci\":[{},{}],\"level\":{},\"p_period\":{},\
 \"p_two_sided\":{},\"design_effect\":{},\"effective_n\":{},\"short_series\":{},\
-\"seeds\":{{\"n_a\":{},\"n_b\":{},\"delta\":{},\"s_seed\":{},\"df\":{},\"z\":{},\"z_reason\":{}}}}}\n",
+\"seeds\":{{\"n_a\":{},\"n_b\":{},\"delta\":{},\"s_seed\":{},\"df\":{},\"z\":{},\"z_reason\":{}}}{}}}\n",
         jstr(COMPARE_SCHEMA),
         labels(&a),
         labels(&b),
@@ -717,7 +993,13 @@ fn compare(o: &Options) -> Res<String> {
         opt(s_seed),
         opt(df),
         opt(z),
-        z_reason.map_or("null".to_string(), jstr)
+        z_reason.map_or("null".to_string(), jstr),
+        if o.threshold_arms {
+            let rules = |s: &[Wf]| s.iter().map(|w| jstr(&w.rule)).collect::<Vec<_>>().join(",");
+            format!(",\"threshold_arms\":true,\"threshold_rule_a\":[{}],\"threshold_rule_b\":[{}]", rules(&a), rules(&b))
+        } else {
+            String::new()
+        }
     ))
 }
 
@@ -729,6 +1011,12 @@ fn run_inner(args: &[String]) -> Res<()> {
     if args.iter().any(|a| a == "-h" || a == "--help") {
         print!("{}", usage());
         return Ok(());
+    }
+    if args.iter().any(|a| a == "--cpcv-assemble") {
+        return crate::cpcv::assemble_cli(args);
+    }
+    if args.iter().any(|a| a == "--table") {
+        return crate::trials_table::cli(args);
     }
     let o = parse_args(args)?;
     let text = if o.compare.is_some() { compare(&o)? } else { campaign(&o)? };

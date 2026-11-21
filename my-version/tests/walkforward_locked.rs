@@ -6,7 +6,10 @@
 
 #[path = "common/rcsr.rs"]
 mod rcsr_cmd;
+#[path = "common/timing.rs"]
+mod timing;
 
+use rcsr::devlog::Json;
 use rcsr::lockbox::{self, Lockbox};
 use rcsr::{data, store};
 use std::path::{Path, PathBuf};
@@ -149,26 +152,11 @@ fn wf(data: &str, window: &str, extra: &[String]) -> (i32, String, String) {
     rcsr(&a)
 }
 
-/// Drops the tokens that carry wall clock, timing-derived ledger ratios and the data path.
+/// Parses the report and drops wall clock, the ledger and the hash by key; the data path is masked.
 fn stable(out: &str, data: &str) -> String {
-    out.replace(data, "<data>")
-        .split(',')
-        .filter(|t| {
-            !(t.contains("report_sha256")
-                || t.contains("_s\"")
-                || t.contains("seconds")
-                || t.contains("wall")
-                || t.contains("elapsed")
-                || t.contains("denominator")
-                || t.contains("\"numerator\"")
-                || t.contains("\"device_fraction\"")
-                || t.contains("\"duty_run\"")
-                || t.contains("declared_in")
-                || t.contains("bytes_per_s")
-                || t.contains("rows_per_s"))
-        })
-        .collect::<Vec<_>>()
-        .join(",")
+    let text = out.replace(data, "<data>");
+    let json = Json::parse(&text).unwrap_or_else(|| panic!("not one JSON document: {text}"));
+    format!("{:?}", timing::drop_timing(json))
 }
 
 fn sha(out: &str) -> String {
@@ -339,6 +327,16 @@ fn the_report_filter_drops_timing_ledger_fields_and_keeps_data_fields() {
     assert_ne!(stable(a, "/data.rcsb"), stable(&a.replace("10", "11"), "/data.rcsb"));
 }
 
+#[test]
+fn the_report_filter_drops_the_closure_ratio() {
+    let ledger = |v: &str| format!(r#"{{"ledger":{{"wall_s":1.0,"unaccounted_s":0,"closure":{{"value":{v},"numerator":0,"denominator":1,"units":"fraction","scope":"run"}}}},"batch_timings":{{"a":{v}}},"sharpe":1.5,"n_rows":10,"label":"a"}}"#);
+    let (a, b) = (ledger("0"), ledger("1.18e-16"));
+    assert_eq!(stable(&a, "/data.rcsb"), stable(&b, "/data.rcsb"));
+    assert_ne!(stable(&a, "/data.rcsb"), stable(&a.replace("1.5", "1.6"), "/data.rcsb"));
+    assert_ne!(stable(&a, "/data.rcsb"), stable(&a.replace("10", "11"), "/data.rcsb"));
+    assert_ne!(stable(&a, "/data.rcsb"), stable(&a.replace("\"a\"}", "\"b\"}"), "/data.rcsb"));
+}
+
 // ---------------------------------------------------------------------------
 // #931: the lockbox reach at 168 and 336 hours.
 // ---------------------------------------------------------------------------
@@ -367,7 +365,7 @@ fn locked_window_inside_h168_purge_exits_3() {
         let w = format!("w,{},{},{},{}", T0, T0 + 1500 * H, test_start, test_end);
         rcsr(&[
             "walkforward", "--data", &path, "--target", "lbl_h168_y", "--target-spec", s(&spec_path).as_str(), "--expr", "x",
-            "--time", "ts", "--periods-per-year", "52", "--window", &w, "--json",
+            "--time", "ts", "--window", &w, "--json",
         ])
     };
     let (code, out, err) = wf(s0 - 608_399, s0 - 1);
@@ -512,7 +510,7 @@ fn short_declared_embargo_keeps_h168_labels_after_the_end() {
         let w = format!("w,{},{},{},{}", train_start, train_start + 1500 * H, train_start + 1500 * H + purge, train_start + 3000 * H + purge);
         rcsr(&[
             "walkforward", "--data", &path, "--target", "lbl_h168_y", "--target-spec", &spec_path, "--expr", "x", "--time", "ts",
-            "--periods-per-year", "52", "--window", &w, "--json",
+            "--window", &w, "--json",
         ])
     };
     let (code, _, err) = wf(e0 + H);
@@ -520,4 +518,89 @@ fn short_declared_embargo_keeps_h168_labels_after_the_end() {
     assert!(err.contains("reaches the declared locked test"), "{err}");
     let (code, _, err) = wf(e0 + purge);
     assert_eq!(code, 0, "{err}");
+}
+
+/// #1312: daily rows of two symbols from 2021-01-04 and a target spec with two entries on one
+/// return column `lbl_fwd`. `lbl_b_y` is empty every fifth day, so under the #1291 row rule the
+/// entries price different rows.
+fn fit_label_pair(dir: &Path) -> (String, String) {
+    let frac = |v: f64| v - v.floor();
+    let mut csv = String::from("t,s,x1,lbl_a_y,lbl_b_y,lbl_fwd\n");
+    for d in 0..200i64 {
+        for (j, sym) in ["a", "b"].iter().enumerate() {
+            let i = (2 * d) as f64 + j as f64;
+            let x1 = frac(i * 0.618_033_988_7) - 0.5;
+            let r = 0.01 * x1 + 0.0005 * (frac(i * 0.324_717_957_2) - 0.5);
+            let b = if d % 5 == 2 { String::new() } else { r.to_string() };
+            csv.push_str(&format!("{},{sym},{x1},{r},{b},{r}\n", 1_609_718_400 + 86_400 * d));
+        }
+    }
+    let data = dir.join("d.csv");
+    std::fs::write(&data, csv).unwrap();
+    let entry = |c: &str| {
+        format!(
+            "{{\"column\":\"{c}\",\"name\":\"{c}\",\"kind\":\"forward_return\",\"deprecated\":false,\"return_column\":\"lbl_fwd\",\
+             \"return_units\":\"log\",\"horizon_seconds\":86400,\"entry_offset_seconds\":0,\"delay_seconds\":0,\"entry_price\":\"open\",\
+             \"exit_price\":\"close\",\"offset\":0.0,\"scale\":{{\"kind\":\"constant\",\"value\":1.0}},\"clip\":null,\"units\":\"log_return\",\
+             \"cost_bps\":10,\"cost_in_label\":false,\"construction_columns\":[],\"note\":null}}"
+        )
+    };
+    let spec = dir.join("spec.json");
+    std::fs::write(&spec, format!("{{\"schema\":\"rcsr-target-spec/1\",\"targets\":[{},{}]}}", entry("lbl_a_y"), entry("lbl_b_y"))).unwrap();
+    (s(&data), s(&spec))
+}
+
+/// #1312: the fit label column is part of the candidate id, so a sealed candidate is not read
+/// under another fit label on the same return column (exit 3).
+#[test]
+fn sealed_read_refuses_another_fit_label() {
+    let (_scratch, dir) = scratch("fit-label-seal");
+    let (data, spec) = fit_label_pair(&dir);
+    let dev = "dev,1609718400,1618358400,1618444800,1622505600";
+    let locked = "locked,1609718400,1622592000,1622678400,1626998400";
+    let wf = |label: &str, window: &str, extra: &[&str]| {
+        let mut a = vec![
+            "walkforward", "--data", &data, "--time", "t", "--group-by", "s", "--json", "--target-spec", &spec, "--target", label,
+            "--expr", "x1", "--vars", "x1", "--window", window, "--lockbox", "2021-06-03,2021-07-23",
+        ];
+        a.extend_from_slice(extra);
+        rcsr(&a)
+    };
+    let field = |text: &str, key: &str| -> String {
+        let at = text.find(&format!("\"{key}\":\"")).unwrap_or_else(|| panic!("no {key} in {text}"));
+        text[at + key.len() + 4..].split('"').next().unwrap().to_string()
+    };
+    let id_of = |out: &str| Json::parse(out.trim()).unwrap().get("protocol").and_then(|p| p.get("candidate_id")).and_then(Json::as_str).unwrap().to_string();
+    let test_rows = |j: &Json| match j.get("windows") {
+        Some(Json::Arr(w)) => w.iter().map(|w| w.get("test_rows").and_then(Json::as_f64).unwrap()).sum::<f64>(),
+        _ => panic!("no windows"),
+    };
+    let mut ids = Vec::new();
+    let mut specs = Vec::new();
+    let mut rows = Vec::new();
+    for label in ["lbl_a_y", "lbl_b_y"] {
+        let ledger = s(&dir.join(format!("L-{label}.jsonl")));
+        let (code, out, err) = wf(label, dev, &["--ledger", &ledger]);
+        assert_eq!(code, 0, "{label}: {err}");
+        ids.push(id_of(&out));
+        rows.push(test_rows(&Json::parse(out.trim()).unwrap()));
+        specs.push(field(&std::fs::read_to_string(&ledger).unwrap(), "spec_sha256"));
+    }
+    assert_ne!(rows[0], rows[1], "the two fit labels price different rows");
+    assert_ne!(ids[0], ids[1], "one candidate id for two row rules");
+    assert_ne!(specs[0], specs[1], "one spec_sha256 for two row rules");
+    let ledger = s(&dir.join("Ls.jsonl"));
+    let sealed = s(&dir.join("sealed.json"));
+    let (code, out, err) = wf("lbl_a_y", dev, &["--ledger", &ledger]);
+    assert_eq!(code, 0, "{err}");
+    let id = id_of(&out);
+    let (code, _, err) = rcsr(&["protocol", "seal", "--ledger", &ledger, "--out", &sealed, "--id", &id]);
+    assert_eq!(code, 0, "{err}");
+    let read = &["--ledger", ledger.as_str(), "--locked-test", "--sealed", sealed.as_str()];
+    let (code, _, err) = wf("lbl_b_y", locked, read);
+    assert_eq!(code, 3, "the read under the other fit label is refused: {err}");
+    assert!(err.contains("is not in the sealed list"), "{err}");
+    let (code, out, err) = wf("lbl_a_y", locked, read);
+    assert_eq!(code, 0, "the sealed fit label reads: {err}");
+    assert_eq!(id_of(&out), id);
 }

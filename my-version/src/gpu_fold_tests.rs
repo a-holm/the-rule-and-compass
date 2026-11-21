@@ -136,7 +136,7 @@ fn a_tree_without_redundant_constants_keeps_its_device_fit() {
     assert_eq!((g.fit_fold_count, g.fit_folded), (0, 0));
     assert_eq!(g.fit_gpu, trees.len(), "{:?}", g.fit_fallback_by_cause);
     let plans: Vec<crate::fit::GpuFitPlan> =
-        trees.iter().map(|t| crate::fit::gpu_fit_plan_reason(t).expect("a plan")).collect();
+        trees.iter().map(|t| crate::fit::gpu_fit_plan_reason(t, false).expect("a plan")).collect();
     let refs: Vec<&crate::fit::GpuFitPlan> = plans.iter().collect();
     g.ev.set_fit_polish(cfg.fit_polish);
     let (out, _) = g.ev.fit_batch(&refs, cfg.fit_iters, crate::fit::DeviceLoss::Squared);

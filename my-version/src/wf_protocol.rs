@@ -22,7 +22,7 @@ pub struct NullBook {
     pub groups: Vec<u64>,
     /// Period index of each row.
     pub period: Vec<u32>,
-    /// Rows per period.
+    /// Rows per period; 0 for an empty period of `--period-grid target`, which books 0.
     pub period_count: Vec<u32>,
     /// Observed cost per period (`gross - net`), held fixed under the nulls.
     pub period_cost: Vec<f64>,
@@ -68,6 +68,8 @@ pub struct Economics {
     pub break_even_status: &'static str,
     pub ladder: Vec<LadderRow>,
     pub daily: Option<Daily>,
+    /// Why `daily` is null although the series has stamps: the period is a day or longer.
+    pub daily_unavailable: Option<&'static str>,
     /// Strategy, cash, buy-and-hold, equal-weight universe, constant long/flat.
     pub benchmarks: Vec<BenchRow>,
     /// The best of cash, buy-and-hold and constant long/flat by mean return.
@@ -79,6 +81,8 @@ pub struct EconomicsInput<'a> {
     pub gross: &'a [f64],
     pub times: &'a [f64],
     pub cost_bps: f64,
+    /// Period width in seconds when the run declares it.
+    pub period_seconds: Option<f64>,
     pub periods_per_year: f64,
     pub sortino: f64,
     pub cagr: f64,
@@ -150,7 +154,8 @@ pub fn economics(i: &EconomicsInput) -> Economics {
         name: "best_long_flat_baseline".to_string(),
         ..benchmarks[best].clone()
     });
-    let daily_ok = i.periods_per_year >= 2.0 && i.times.first().map_or(false, |&t| t > 1e8);
+    let period_is_day = i.period_seconds.is_some_and(|s| s >= 86_400.0);
+    let daily_ok = !period_is_day && i.periods_per_year >= 2.0 && i.times.first().map_or(false, |&t| t > 1e8);
     let daily = if daily_ok {
         let d = daily_returns(i.times, i.net);
         let r = risk_stats(&d, 365.0, DEFAULT_SORTINO_MAR);
@@ -173,6 +178,7 @@ pub fn economics(i: &EconomicsInput) -> Economics {
         break_even_status: inference::break_even_status(i.net, i.gross),
         ladder: inference::cost_ladder(i.net, i.gross, i.cost_bps, &COST_LADDER, i.periods_per_year),
         daily,
+        daily_unavailable: period_is_day.then_some("period >= 1 day"),
         benchmarks,
         best_baseline,
     }
@@ -185,12 +191,15 @@ pub fn economics(i: &EconomicsInput) -> Economics {
 #[derive(Clone, Debug)]
 pub struct Multiple {
     pub trials: usize,
+    pub trials_source: &'static str,
     pub candidates: usize,
     pub participation_ratio: f64,
     pub n_eff: f64,
     pub t_used: f64,
+    pub psr: Dsr,
     pub dsr_n_eff: Dsr,
     pub dsr_10_n_eff: Dsr,
+    pub min_btl_years: f64,
     pub pbo: Option<Pbo>,
     pub pbo_error: Option<String>,
     pub p_values: Vec<f64>,
@@ -215,6 +224,8 @@ pub struct NullTests {
     pub observed_sharpe: f64,
     pub block_permutation: NullRow,
     pub matched_exposure_random: NullRow,
+    pub matched_scheme: &'static str,
+    pub matched_distinct_shifts: u64,
     pub always_long_mean: f64,
     pub always_long_sharpe: f64,
 }
@@ -239,6 +250,7 @@ pub struct InferenceInput<'a> {
     /// One column per candidate on the strategy's periods.
     pub candidates: &'a [Vec<f64>],
     pub trials: usize,
+    pub trials_source: &'static str,
     pub pbo_blocks: usize,
     pub fdr_q: f64,
     pub best_baseline: &'a str,
@@ -278,6 +290,7 @@ pub fn infer(i: &InferenceInput) -> Result<Inference, String> {
             1.0
         };
         let trials = i.trials.max(k).max(1);
+        let trials_source = if i.trials_source == "flag" && i.trials < trials { "candidate_count" } else { i.trials_source };
         let n_eff = if k >= 2 { trials as f64 * pr / k as f64 } else { trials as f64 };
         let (pbo, pbo_error) = match inference::pbo_cscv(i.candidates, i.pbo_blocks) {
             Ok(p) => (Some(p), None),
@@ -298,12 +311,15 @@ pub fn infer(i: &InferenceInput) -> Result<Inference, String> {
         out.bootstrap = Some(summary.clone());
         out.multiple = Some(Multiple {
             trials,
+            trials_source,
             candidates: k.max(1),
             participation_ratio: pr,
             n_eff,
             t_used,
+            psr: inference::deflated_sharpe(sr, t_used, skew, kurt, 1.0, var_sr),
             dsr_n_eff: inference::deflated_sharpe(sr, t_used, skew, kurt, n_eff, var_sr),
             dsr_10_n_eff: inference::deflated_sharpe(sr, t_used, skew, kurt, 10.0 * n_eff, var_sr),
+            min_btl_years: inference::min_btl_years(sr * i.periods_per_year.sqrt(), n_eff),
             pbo,
             pbo_error,
             bh: inference::bh_fdr(&p_values, i.fdr_q),
@@ -409,6 +425,41 @@ fn permuted_sources(periods: usize, block: usize, rng: &mut Mt) -> Vec<u32> {
     src
 }
 
+/// Smallest offset of the shared shift and the number of offsets of a window of `periods`.
+pub(crate) fn shift_range(periods: usize, block: usize) -> (u64, u64) {
+    let lo = block.min(periods / 4).max(1) as u64;
+    let p = periods as u64;
+    (lo, (p + 1).saturating_sub(2 * lo))
+}
+
+/// Fewer distinct shifts than this cannot give a p-value below 0.05.
+const MIN_DISTINCT_SHIFTS: u64 = 20;
+
+/// Mean and Sharpe of the shifted long/flat book pooled over windows, with `shift_of` giving the
+/// shift of each window.
+fn shifted_stats(
+    i: &InferenceInput,
+    dense_books: &[Dense],
+    shift_of: &dyn Fn(usize, u64, u64) -> u64,
+) -> Result<(f64, f64), String> {
+    let mut r_stat = Stat::new();
+    for (w, (book, d)) in i.books.iter().zip(dense_books).enumerate() {
+        let periods = d.periods;
+        let (lo, count) = shift_range(periods, i.block_len.max(1));
+        let shift = shift_of(w, lo, count);
+        let pos = baselines::shifted_positions(&book.positions, &book.groups, shift, periods as u64)?;
+        let net = baselines::net_rows(&pos, &book.returns, &book.groups, book.side);
+        let mut bins = vec![0.0f64; periods];
+        for (row, &v) in net.iter().enumerate() {
+            bins[book.period[row] as usize] += v;
+        }
+        for k in 0..periods {
+            r_stat.push(if book.period_count[k] == 0 { 0.0 } else { bins[k] / book.period_count[k] as f64 });
+        }
+    }
+    Ok((r_stat.mean(), r_stat.sharpe()))
+}
+
 fn run_nulls(i: &InferenceInput) -> Result<NullTests, String> {
     if i.books.is_empty() {
         return Err("nulls need the window books".to_string());
@@ -423,12 +474,15 @@ fn run_nulls(i: &InferenceInput) -> Result<NullTests, String> {
     let mut perm_rng = Mt::new(i.seed.wrapping_add(7919));
     let mut perm_mean = Vec::with_capacity(i.null_draws);
     let mut perm_sharpe = Vec::with_capacity(i.null_draws);
+    let exact = dense_books
+        .iter()
+        .try_fold(1u64, |acc, d| acc.checked_mul(shift_range(d.periods, block).1.max(1)))
+        .filter(|&d| d <= i.null_draws as u64);
     let mut rand_mean = Vec::with_capacity(i.null_draws);
     let mut rand_sharpe = Vec::with_capacity(i.null_draws);
     for b in 0..i.null_draws {
         let mut p_stat = Stat::new();
-        let mut r_stat = Stat::new();
-        for (w, (book, d)) in i.books.iter().zip(&dense_books).enumerate() {
+        for (book, d) in i.books.iter().zip(&dense_books) {
             let periods = d.periods;
             let src = permuted_sources(periods, block, &mut perm_rng);
             let mut sum = vec![0.0f64; periods];
@@ -440,29 +494,46 @@ fn run_nulls(i: &InferenceInput) -> Result<NullTests, String> {
                 }
             }
             for k in 0..periods {
-                p_stat.push(sum[k] / book.period_count[k] as f64 - book.period_cost[k]);
-            }
-            let seed = splitmix(i.control_seed ^ splitmix((b as u64) << 20 | w as u64));
-            let pos = baselines::matched_exposure_positions(&book.positions, &book.groups, seed)?;
-            let net = baselines::net_rows(&pos, &book.returns, &book.groups, book.side);
-            let mut bins = vec![0.0f64; periods];
-            for (row, &v) in net.iter().enumerate() {
-                bins[book.period[row] as usize] += v;
-            }
-            for k in 0..periods {
-                r_stat.push(bins[k] / book.period_count[k] as f64);
+                p_stat.push(if book.period_count[k] == 0 { 0.0 } else { sum[k] / book.period_count[k] as f64 - book.period_cost[k] });
             }
         }
         perm_mean.push(p_stat.mean());
         perm_sharpe.push(p_stat.sharpe());
-        rand_mean.push(r_stat.mean());
-        rand_sharpe.push(r_stat.sharpe());
+        if exact.is_none() {
+            let (m, s) = shifted_stats(i, &dense_books, &|w, lo, count| {
+                if count == 0 {
+                    return 0;
+                }
+                let seed = splitmix(i.control_seed ^ splitmix((b as u64) << 20 | w as u64));
+                lo + ((seed as u128 * count as u128) >> 64) as u64
+            })?;
+            rand_mean.push(m);
+            rand_sharpe.push(s);
+        }
+    }
+    if let Some(d) = exact {
+        for idx in 0..d {
+            let mut rest = idx;
+            let mut digits = Vec::with_capacity(dense_books.len());
+            for book in &dense_books {
+                let count = shift_range(book.periods, block).1.max(1);
+                digits.push(rest % count);
+                rest /= count;
+            }
+            let (m, s) = shifted_stats(i, &dense_books, &|w, lo, count| if count == 0 { 0 } else { lo + digits[w] })?;
+            rand_mean.push(m);
+            rand_sharpe.push(s);
+        }
     }
     let q95 = |v: &[f64]| {
         let mut s: Vec<f64> = v.iter().copied().filter(|x| x.is_finite()).collect();
         s.sort_by(|a, b| a.partial_cmp(b).unwrap());
         inference::quantile_sorted(&s, 0.95)
     };
+    let distinct_shifts = dense_books
+        .iter()
+        .fold(1u64, |acc, d| acc.saturating_mul(shift_range(d.periods, block).1.max(1)));
+    let shifts_ok = distinct_shifts >= MIN_DISTINCT_SHIFTS;
     let row = |mean: &[f64], sharpe: &[f64]| NullRow {
         p_mean: inference::null_p(obs_mean, mean),
         p_sharpe: inference::null_p(obs_sharpe, sharpe),
@@ -481,7 +552,16 @@ fn run_nulls(i: &InferenceInput) -> Result<NullTests, String> {
         observed_mean: obs_mean,
         observed_sharpe: obs_sharpe,
         block_permutation: row(&perm_mean, &perm_sharpe),
-        matched_exposure_random: row(&rand_mean, &rand_sharpe),
+        matched_exposure_random: {
+            let mut r = row(&rand_mean, &rand_sharpe);
+            if !shifts_ok {
+                r.p_mean = f64::NAN;
+                r.p_sharpe = f64::NAN;
+            }
+            r
+        },
+        matched_scheme: "shared_circular_shift",
+        matched_distinct_shifts: distinct_shifts,
         always_long_mean: bh.mean(),
         always_long_sharpe: bh.sharpe(),
     })
@@ -510,6 +590,16 @@ fn dsr_json(d: &Dsr) -> String {
     )
 }
 
+fn matched_row_json(n: &NullTests) -> String {
+    let row = null_row_json(&n.matched_exposure_random);
+    format!(
+        "{{\"scheme\":{},\"distinct_shifts\":{},{}",
+        jstr(n.matched_scheme),
+        n.matched_distinct_shifts,
+        &row[1..]
+    )
+}
+
 fn null_row_json(r: &NullRow) -> String {
     format!(
         "{{\"p_mean\":{},\"p_sharpe\":{},\"null_mean_q95\":{},\"null_sharpe_q95\":{}}}",
@@ -521,7 +611,8 @@ fn null_row_json(r: &NullRow) -> String {
 }
 
 impl Economics {
-    pub fn json(&self) -> String {
+    /// The `cost_ladder` array.
+    pub fn ladder_json(&self) -> String {
         let ladder: Vec<String> = self
             .ladder
             .iter()
@@ -538,6 +629,10 @@ impl Economics {
                 )
             })
             .collect();
+        format!("[{}]", ladder.join(","))
+    }
+
+    pub fn json(&self) -> String {
         let bench: Vec<String> = self
             .benchmarks
             .iter()
@@ -566,10 +661,13 @@ impl Economics {
                 jnum(d.sortino)
             )
         });
+        let unavailable = self
+            .daily_unavailable
+            .map_or(String::new(), |why| format!(",\"daily_unavailable\":{}", jstr(why)));
         format!(
             "{{\"book\":\"long_flat_vs_cash\",\"cost_bps_per_side\":{},\"periods_per_year\":{},\
              \"sortino\":{},\"calmar\":{},\"cvar_95\":{},\"cvar_99\":{},\
-             \"break_even_bps_per_side\":{},\"break_even_status\":{},\"cost_ladder\":[{}],\"daily\":{},\
+             \"break_even_bps_per_side\":{},\"break_even_status\":{},\"cost_ladder\":{},\"daily\":{}{},\
              \"benchmark_series\":\"every window started flat\",\"best_baseline\":{},\"benchmarks\":[{}]}}",
             jnum(self.cost_bps),
             jnum(self.periods_per_year),
@@ -579,8 +677,9 @@ impl Economics {
             jnum(self.cvar99),
             jnum(self.break_even_bps_per_side),
             jstr(self.break_even_status),
-            ladder.join(","),
+            self.ladder_json(),
             daily,
+            unavailable,
             jstr(&self.best_baseline),
             bench.join(",")
         )
@@ -682,16 +781,19 @@ impl Inference {
                 )
             });
             format!(
-                "{{\"trials\":{},\"candidates\":{},\"participation_ratio\":{},\"n_eff\":{},\
-                 \"t_used\":{},\"dsr_at_n_eff\":{},\"dsr_at_10_n_eff\":{},\"pbo\":{},\"pbo_error\":{},\
+                "{{\"trials\":{},\"n_trials_source\":{},\"candidates\":{},\"participation_ratio\":{},\"n_eff\":{},\
+                 \"t_used\":{},\"psr\":{},\"dsr_at_n_eff\":{},\"dsr_at_10_n_eff\":{},\"min_btl_years\":{},\"pbo\":{},\"pbo_error\":{},\
                  \"p_values\":[{}],\"bh_fdr\":{{\"q\":{},\"rejected\":{},\"adjusted\":[{}]}}}}",
                 m.trials,
+                jstr(m.trials_source),
                 m.candidates,
                 jnum(m.participation_ratio),
                 jnum(m.n_eff),
                 jnum(m.t_used),
+                dsr_json(&m.psr),
                 dsr_json(&m.dsr_n_eff),
                 dsr_json(&m.dsr_10_n_eff),
+                jnum(m.min_btl_years),
                 pbo,
                 m.pbo_error.as_ref().map_or("null".to_string(), |e| jstr(e)),
                 m.p_values.iter().map(|v| jnum(*v)).collect::<Vec<_>>().join(","),
@@ -730,7 +832,7 @@ impl Inference {
                 jnum(n.observed_mean),
                 jnum(n.observed_sharpe),
                 null_row_json(&n.block_permutation),
-                null_row_json(&n.matched_exposure_random),
+                matched_row_json(n),
                 jnum(n.always_long_mean),
                 jnum(n.always_long_sharpe)
             )
@@ -765,15 +867,17 @@ impl Inference {
         }
         if let Some(m) = &self.multiple {
             s.push_str(&format!(
-                "Trials N = {} over {} candidate(s); participation ratio {}, N_eff {}; T used {}.\n\n",
+                "Trials N = {} (source {}) over {} candidate(s); participation ratio {}, N_eff {}; T used {}.{}\n\n",
                 m.trials,
+                m.trials_source,
                 m.candidates,
                 f(m.participation_ratio),
                 f(m.n_eff),
-                f(m.t_used)
+                f(m.t_used),
+                if m.trials_source == "out_of_sample_book" { " Deflate across runs with rcsr trials." } else { "" }
             ));
             s.push_str("| DSR at | N | SR0 | DSR | Sharpe/period | skew | kurtosis | T |\n|---|---|---|---|---|---|---|---|\n");
-            for (name, d) in [("N_eff", &m.dsr_n_eff), ("10 N_eff", &m.dsr_10_n_eff)] {
+            for (name, d) in [("PSR (N = 1)", &m.psr), ("N_eff", &m.dsr_n_eff), ("10 N_eff", &m.dsr_10_n_eff)] {
                 s.push_str(&format!(
                     "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
                     name,
@@ -826,7 +930,7 @@ impl Inference {
             s.push_str("| null | p (mean) | p (Sharpe) | null mean q95 |\n|---|---|---|---|\n");
             for (name, r) in [
                 ("hour-block permutation", &n.block_permutation),
-                ("matched-exposure random long/flat", &n.matched_exposure_random),
+                ("matched-exposure shifted long/flat", &n.matched_exposure_random),
             ] {
                 s.push_str(&format!(
                     "| {} | {} | {} | {} |\n",

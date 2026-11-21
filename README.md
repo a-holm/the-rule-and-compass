@@ -181,7 +181,12 @@ horizon, and the threshold comes from training (or an optional trailing
 validation slice), never from the test block. Per-window metrics start every
 group flat; pooled P&L carries each group's ending position across a window
 boundary and charges the seam term `|p_end - q_start|` (pass
-`--pool-reset-flat` for the historical reset). Repeat `--expr` to select among
+`--pool-reset-flat` for the historical reset). A row with a finite target and
+no finite score ends the group's run: the run pays its exit at its last
+priced row and the next priced row starts flat (`--missing-score flat`, the
+default; `hold` keeps the position and prices the row). The search's
+validation and test books use the same rule, and the report names it in
+`book.missing_score`. Repeat `--expr` to select among
 candidates by their validation error; the test block is never a selection
 input. `--select-band` selects those repeated candidates with the long-only P&L
 band instead: a screening score admits a measured `epsilon` band, the admitted
@@ -197,12 +202,18 @@ Every window also lists the long-only controls (cash, buy-and-hold, constant
 long/flat from the training mean, matched-exposure random long seeded by
 `--control-seed`) with exposure, turnover, beta and excess over cash; see
 `src/baselines.rs`.
-`--front run.json` takes the candidates from the Pareto front of a run, carries the run's threshold and per-side cost, defaults `--trials` to the offspring the search scored and refuses a window that tests rows the run trained or selected on (`docs/walkforward.md`).
+`--front run.json` takes the candidates from the Pareto front of a run, carries the run's threshold and per-side cost, defaults `--trials` to the front size (the search trials only when a window is in sample; `--from-run` uses one trial for an out-of-sample book) and refuses a window that tests rows the run trained or selected on (`docs/walkforward.md`).
+`--front run.json --all-members` (#1176) also prices every front member alone, with its own carried threshold and band, into `members[]` (per-window and pooled metrics, cost ladder, entry timestamps and per-period series) without changing the selection; `--emit-series` writes the per-period gross, cost, exposure, entries, entry stamps and buy-and-hold net beside `pooled.period_net`, and `rcsr trials --members all` reads one series per member (`docs/walkforward.md`).
+`--book-target COL` (#1212) prices the book of a formula fitted on `--target` on another label of the `--target-spec` file, for example a weekly fit traded on a daily book: the book label's return column, horizon, stride and cost set the priced rows, the period grid and the annualisation, the purge of every window is the larger of the two labels' `entry_offset + horizon + delay` (a shorter gap exits 2 and names the label that binds), and the report's `book` block names the book label (`target`), the fit label (`fit_target`) and the `source`: `flag`, or `run` for a `--from-run` or `--front` run searched with `--book-target`, which needs no flag. The candidate id binds both labels; `--device-pnl` and `--batch-pnl` exit 2 with a book label.
 Pass `--batch-pnl` to score every candidate on every window in one batch (`src/wf_batch.rs`, kernel `src/cuda/wf_batch.cu`), per window and pooled, with the baseline ladder; finalist values stay exact CPU f64 and batch values are labelled `gpu_proxy`. Its timings are printed in a separate `batch_timings` object, outside `report_sha256`.
 `--policy top-tercile` holds the top `floor(n/3)` finite scores of each timestamp long and the rest flat (no threshold); it prices the book of a search run with `--position top_tercile` on an `xs_rank` target made by `rcsr panel rank` (`docs/time-series.md`).
-`--policy vote --quorum Q` builds one long/flat book from the K repeated `--expr` members: long when at least `ceil(Q x K)` members have `score > own threshold`; `--band` counts votes (`docs/walkforward.md`). `--locked-test --sealed` reads a sealed vote book once (members, quorum, band and thresholds are bound by the candidate id).
+
+A `.rcsb` walk-forward reads only the columns the run uses (the variables a candidate names, the target, an `f64` time column, a numeric group column) and skips a group in which the current pass wants no row; the printed JSON reports the reads in a `scan` object (`store_columns`, `named_variables`, `projected_columns`, `groups_read`, `groups_skipped`, `value_bytes`), outside `report_sha256`.
+`--policy vote --quorum Q` builds one long/flat book from the K repeated `--expr` members: long when at least `ceil(Q x K)` members have `score > own threshold`; `--band` counts votes (`docs/walkforward.md`). When `Q x K` lies up to 0.05 above a whole number (`0.67` of 3 members needs 3 votes), stderr carries a `warning:` naming the votes and a lower quorum; the report is unchanged. `--locked-test --sealed` reads a sealed vote book once (members, quorum, band and thresholds are bound by the candidate id).
+`--threshold-fit fitness` fits the cut of every window on its validation slice (training rows without one) by one sort and one sweep of the block fitness (`--cut-min-entries`, default 30 distinct entry timestamps; `--cut-blocks`, default 4; `--cut-lambda`, default 1) and freezes it on the test block. `--threshold-fixed` or the `--from-run` threshold is the reference cut and the fallback. Each window reports a `cut` object with the source-row fitness, the reference cut, the plateau and a 32-cut profile; the trial count is unchanged and the cut rule is part of the sealed candidate (`docs/walkforward.md`).
 
 `rcsr panel spread` prints the market-neutral bucket spread of a feature (for example `clv1` against `lbl_h1_fwd`) in bp with a block-bootstrap interval, on a `--range` that must not reach the declared locked test (`docs/time-series.md`).
+`rcsr panel permute-labels --label NAME --block ROWS --seed N` writes the search-capacity null store: the label family `lbl_NAME_*` moves per symbol by one seeded circular-block order over the rows with a finite `y` (and, in a pool of their own, the rows with a NaN `y` and a finite return), while time, symbol, `t1`, `weight` and every feature keep their bytes; its store header carries the `null_store` marker (it survives a copy of the store bytes, and `rcsr enrich`, `rcsr panel rank` and `rcsr panel append` with it as `--data` or `--family` mark their output; `panel append` refuses two different markers), its walk-forward reports carry `null_store`, `walkforward --ledger`, `ladder --locked-test` and `protocol regimes --after-read` refuse it (exit 2), and `rcsr trials` reads its reports only with `--table --null-wf` (`docs/panel.md`).
 `--policy band` adds a long-only no-trade band (`--band`, `--min-hold`) whose
 associative `Carry2`/`CooldownCarry` is chunk-invariant, and `--policy dp`
 adds the exact `O(2n)` hindsight DP as a labelled bound, never as the
@@ -211,9 +222,11 @@ CPU scans, and names the reason when it falls back to the CPU. See [`docs/walkfo
 semantics and metric definitions, and [`docs/eval-benchmark.md`](docs/eval-benchmark.md) for
 the pinned 4M-row benchmark protocol and the measured wall time.
 
-The long-only evaluation protocol builds on it: the UTC windows table `protocol/windows.csv`, a purge of `--entry-offset + --horizon + --delay`, an economics block (Sortino, Calmar, CVaR, break-even cost (null with a `break_even_status` when gross is not positive or no cost was paid), cost ladder, cash, buy-and-hold and equal-weight benchmarks with exposure and beta), a circular block bootstrap with a design effect (`--bootstrap`), block-permutation and matched-exposure nulls (`--null-draws`), DSR, PBO, SPA and BH-FDR, and a candidate ledger with a sealed list and a one-read locked test (`--ledger`, `--locked-test`, `rcsr protocol`). See the "Long-only evaluation protocol" section of [`docs/walkforward.md`](docs/walkforward.md).
+The long-only evaluation protocol builds on it: the UTC windows table `protocol/windows.csv`, a purge of `--entry-offset + --horizon + --delay`, an economics block (Sortino, Calmar, CVaR, break-even cost (null with a `break_even_status` when gross is not positive or no cost was paid), cost ladder, cash, buy-and-hold and equal-weight benchmarks with exposure and beta), a circular block bootstrap with a design effect (`--bootstrap`), block-permutation and matched-exposure nulls (`--null-draws`), DSR, PBO, SPA and BH-FDR, and a candidate ledger with a sealed list and a one-read locked test (`--ledger`, `--locked-test`, `rcsr protocol`). A candidate id binds the procedure, the data hash and the build commit; the procedure binds every input of the row rule in one `rows=` line (the fit label column, the run's `preparation.fill`, the book label, #1312), so a sealed candidate read under another fit label, or a list sealed by another build, exits 3 and the refusal names the cause. `rcsr protocol freeze` records the files the sealed-read verdict uses (the candidate table with its frozen thresholds, a development table, the subwindows and years calendars) in the ledger before the final seal, and `rcsr protocol verdict` (#1238) judges the sealed reads against them: gates S1-S5, R1, R2, P1 and D1-D3, the verdict good, promising, not confirmed or falsified, Holm for the secondaries when the primary is good, and report-only parts, years and strata ([`docs/overfitting.md`](docs/overfitting.md#315-sealed-read-verdict-rcsr-protocol-verdict-1238)). See the "Long-only evaluation protocol" section of [`docs/walkforward.md`](docs/walkforward.md).
 
-The search objective, `walkforward`, `ablation score` and `ladder` price one book: the cost (`cost_bps / 2` per side), the return units (`log` is converted with `exp_m1`) and the label window come from the target spec, and `rcsr walkforward --from-run run.json` / `rcsr ablation score --from-run run.json` take the expression, the fixed threshold and the cost of the book the search selected. A `--cost-bps` that differs from the spec is refused; `--cost-override` prices another cost on purpose. Every report carries `cost: {per_side_bps, source, return_units}`, and `rcsr enrich --label long:<h>` needs an explicit `fee=`. See the "One book from search to evaluation" section of [`docs/walkforward.md`](docs/walkforward.md).
+A walk-forward period is one label horizon `S` wide, or one label stride when the target spec carries a wider `stride_seconds` (`rcsr enrich` writes it for `stride=` above the horizon; the bucket `floor(t / S)`, equal-weight mean of its rows; without a declared horizon a period is one timestamp) and `periods_per_year = 31536000 / S`, so 8760 for hourly labels, 365 for daily and 52.14 for 168 h. `S` comes from the target spec (a spec without `stride_seconds` whose labelled rows of one group are 2 horizons or more apart exits 2), else `--horizon`, else the median step of labelled rows. `annualization.source` and `annualization.period_seconds` say which. A `--periods-per-year` that conflicts with the target spec exits 2. `rcsr ladder`, `rcsr ablation score` and the search objective use the same width and refuse a spec without `stride_seconds` over sparse labels, and a `stride_seconds` wider than the measured per-group step (exit 2); the ladder JSON carries `annualization {source, period_seconds}`. The search objective uses the same period rule and reports `net_per_row_annualised`.
+
+The search objective, `walkforward`, `ablation score` and `ladder` price one book: the cost (`cost_bps / 2` per side), the return units (`log` is converted with `exp_m1`) and the label window come from the target spec, and `rcsr walkforward --from-run run.json` / `rcsr ablation score --from-run run.json` take the expression, the fixed threshold and the cost of the book the search selected. A `--cost-bps` that differs from the spec is refused; `--cost-override` prices another cost on purpose. Every report carries `cost: {per_side_bps, source, return_units}`, and `rcsr enrich --label long:<h>` needs an explicit `fee=`. `walkforward`, `ladder` and `ablation score` price the rows of the search's books (#1291), named in `split.labelled_rows` (`labelled_rows` in the `ablation score` report). A threshold book needs a finite return and a finite fit label (the spec's label column). Every finite return counts for a top-tercile book (walk-forward `--policy top-tercile`; in the ladder a `--target` spec of kind `xs_rank`, which the search prices only as the top-tercile book), for a run whose `--fill` filled missing labels (mean, median, zero, previous or interpolate; drop and none fill nothing) and for a ladder without a target spec. A run searched with `--book-target` prices every finite return of its book label (`objective.book_target_spec`): `walkforward --from-run` and `--front`, `ladder --sr-run` and `ablation score` (#1311) price it on the book label's return column, horizon, stride and cost, with the larger of the two labels' purge, and a run without `objective.book_target_spec` exits 2. See the "One book from search to evaluation" section of [`docs/walkforward.md`](docs/walkforward.md).
 
 Grammar: `+ - * / ^` (`^` is right-associative and binds tighter than unary
 minus), function calls with any arity (`sin(x)`, `min(x, y)`, `if(c, a, b)`),
@@ -244,7 +257,7 @@ rcsr ladder --data panel.rcsb --target y60 --return-col fwd60 --time ts --group 
   --vol-col vol96 --reversal-col ret_1 --signal-col trend96 --sr-run pilot/A2.run.json --out ladder.json --markdown ladder.md
 ```
 
-`--sr-run` scores the finalist of one search run on every fold; a fold that starts before the run's last seen row plus purge is refused (exit 3) unless `--allow-in-sample`, which labels it `oof:false` and drops it from every pooled statistic. `rcsr ablation score` applies the same check.
+`--sr-run` scores the finalist of one search run on every fold; a fold that starts before the run's last seen row plus purge is refused (exit 3) unless `--allow-in-sample`, which labels it `oof:false` and drops it from every pooled statistic. `rcsr ablation score` applies the same check. A run that searched under `--pnl-mask` (`objective.spec.pnl_mask`) exits 2 naming `pnl_mask`: the rung prices the raw formula and cannot price a mask; `walkforward --from-run` prices it.
 
 `rcsr ablation` runs the add-one-family ablation under the decision rule committed in `protocol/ablation.json`: arms `A0` (B0) to `A5`, a fixed generation budget, 3 seeds per arm (5 with `--finalist`), one manifest per arm, a placebo arm and a circular-block-permuted arm. `rcsr ablation prepare` builds the null columns separately per segment of every guarded locked range and its purge band (`--purge-seconds`, `--target-spec`, default 219,600 s) and lists the segments in `<csv>.lockbox.json`. `rcsr --arm A1` writes the arm, the feature-list hash, the generation budget and the generations reached into run.json.
 
@@ -259,7 +272,63 @@ The verdict (`ablation/verdict.json`, `ablation/verdict.md`) says ship or drop p
 
 ### Campaign trial accounting
 
-`rcsr trials --wf <reports...> --baseline ladder.json` counts the finalists of a campaign from the pooled out-of-fold series (`pooled.period_net`) of their walk-forward reports: distinct books, single-linkage clusters at `|rho| >= --cluster-rho` as the effective trial count, the DSR at that count, at 10x and at the nominal count, SPA against the best long-only baseline (`rcsr ladder --emit-series`), PBO by CSCV and MinBTL. `rcsr trials --compare A B` compares two runs, or two sets of seeds, with a paired stationary block bootstrap of the per-period difference and a seed-spread z. See [`docs/overfitting.md`](docs/overfitting.md#314-campaign-trial-accounting-rcsr-trials).
+`rcsr trials --wf <reports...> --baseline ladder.json` counts the finalists of a campaign from the pooled out-of-fold series (`pooled.period_net`) of their walk-forward reports: distinct books, single-linkage clusters at `|rho| >= --cluster-rho` as the effective trial count, the DSR at that count, at 10x and at the nominal count, SPA against the best long-only baseline (`rcsr ladder --emit-series`), PBO by CSCV and MinBTL. `rcsr trials --compare A B` compares two runs, or two sets of seeds, with a paired stationary block bootstrap of the per-period difference and a seed-spread z. Reports must agree on the threshold rule, including the fitted-cut fields (`threshold.fit`, `threshold.cut_min_entries`, `threshold.cut_blocks`, `threshold.cut_lambda`); `--threshold-arms` lets a fitted-cut and a fixed-cut report be compared as separate arms. `rcsr trials --wf <reports...> --table --rule rule.json` (#1177) builds the multi-metric candidate table: one row per series with net at each cost multiple, Sharpe, Sortino, Calmar, drawdown, exposure, entry times, exposure-matched alpha, PSR, positive groups, regime strata and the null quantile; hard gates, then the Pareto front, the average rank with the Friedman statistic and a diversity cap pick the candidates, and every pick gets DSR at `N_eff`, `10 N_eff` and the nominal count (`--prior-trials` adds earlier trials), MinBTL, the Harvey-Liu haircut and StepM and BH-FDR verdicts; `--baseline-wf <path reports...>` (#1271) takes the SPA benchmark from walk-forward or CPCV path reports (rungs `cash` at 0, `buy_and_hold` and one per report; the best by mean feeds SPA, StepM, BH-FDR and `baseline_excess`) instead of a ladder file; `--family-table` (#1269) adds the trials of the sibling horizon tables to the DSR and MinBTL and writes `spa.p_family`, the SPA p times the number of tables (at most 1), which the verdict D2 reads. The rule file is hashed into the output, and a report with a locked read or locked-range periods exits 2. With `freeze` in the rule and `--freeze-map` (#1237) every pick also gets its frozen sealed-read thresholds, the S4 floor, the P1 floor and the D9 drawdown cap, as nearest-rank percentiles of rolling windows over every CPCV path of its configuration, and `max_composites` caps the picks from the composition family (walk-forward reports of `rcsr compose` runs carry `selection.composite`). See [`docs/overfitting.md`](docs/overfitting.md#314-campaign-trial-accounting-rcsr-trials).
+
+Regime strata (#1175): `rcsr protocol regimes` writes a bull, bear and sideways calendar from daily closes (ex-post by default, `--mode causal` for a causal label; locked ranges are written `not_dated`). `rcsr walkforward --regimes calendar.csv --regime-expr <expr>` and `rcsr trials --regimes calendar.csv` report the pooled periods per stratum with switch counts, exposure and alpha against the equal-weight series. Without the flags the output is byte-identical. See [`docs/walkforward.md`](docs/walkforward.md) and [`docs/time-series.md`](docs/time-series.md).
+
+### Two books and a gate (`rcsr switch`)
+
+`rcsr switch` takes the flags of a `--fitness pnl` run, builds that run's training book and stops before any search. For two fixed books `--a` and `--b` (an expression or `flat`) and each `--gate`, it gives the net, cost counts and block fitness of `if(greater(g, c), A, B)` at every cut `c` from one sort and one sweep, the best cut over all cuts and over a grid of `--cuts Q` quantiles with its plateau, the seam identity at that cut and the composite as one exact expression that `walkforward --expr` accepts. It also gives the k-switch bound: the best net of any time-level switch between A and B with at most k switches (`--switches 2,8,32`), which no time-level gate with at most k flips can beat. The bound is a pruning bound, not evidence of an edge, and every number is a training-row value. Gate columns pass the `--pnl-mask` column checks. `--pnl-stat` sets the block statistic of the fitness; under `--pnl-excess xs-mean` net, gross, fitness and the bound are on the excess over the equal-weight timestamp mean (`excess: xs_mean`), with the same flip, exit and seam counts as the absolute book.
+
+```sh
+rcsr switch --data dev.rcsb --target lbl_h1_y --target-spec dev.targets.json --vars "$VIEW" \
+  --time ts --group-by symbol --split temporal --validation-frac 0.3 \
+  --objective sharpe --threshold 1e-30 --cost-bps 10 --pnl-blocks 4 \
+  --a "<expression>" --b flat --gate btc_r672 --gate mtf_1d_ma_ratio --cuts 16 --switches 2,8,32 --json --out switch.json
+```
+
+See [`docs/walkforward.md`](docs/walkforward.md#two-books-and-a-gate-rcsr-switch-1185).
+
+### Regime-switching composition (`rcsr compose`)
+
+`rcsr compose` takes the flags of the pool searches, a pre-registered gate menu (`--gates`, at most 8 gates with fixed 3-bit codewords, bands and dwells) and the run.json files of a bull pool, a bear pool and an all-weather pool. From the top `--top K` members of each run it builds every composite of the menu: an all-weather member alone (C0), a bull member with cash in the gate-off state and a bear member with cash in the gate-on state (C1), and every bull and bear pair `if(greater(gate, 0), f_bull, f_bear)` (C2). Every composite is one exact expression priced by the long/flat book code, counted in `search.candidates_evaluated` and listed with its description length under the composite code. The choice reads the training and validation rows only (the robust rule plus a non-negative alpha in each gate state); the test rows are priced once the finalist is fixed. The output is a run.json with the per-state net, exposure and alpha, the gate switches per year and the cost paid in switch periods. Every composite whose gate decides between two branches is a switch: the run carries `objective.finalist.switch` and `pareto[].switch`, and walk-forward (`--from-run`, `--front`), `ladder --sr-run`, `--reselect-run`, the seal and the sealed read price it as one book. Its training, validation and test rows, the `--pnl-mask` training fitness, validation and test books and every out-of-sample reader take the gate state of one rule, `rcsr-gate-state/1`: the kernel over the whole readable prefix of the data file, never reading a label, a row filter, a locked range the command does not open or (for a selection read) a test interval. Pools searched with `--pnl-excess xs-mean` or another `--pnl-stat` compose with the same flags (a pool with other flags exits 2): the choice still ranks absolute net and alpha, the pruning bound reads the training excess, and every priced book reports `xs_excess_net` under xs-mean.
+
+```sh
+rcsr compose --data dev.rcsb --target lbl_h24a_y --target-spec dev.targets.json --vars "$VIEW" \
+  --time ts --group-by symbol --split-table cpcv61/splits.csv --split-id s07 \
+  --objective sharpe --cost-bps 10 --gates menu.json --bull bull_s07.run.json --bear bear_s07.run.json \
+  --all-weather f1_s07.run.json --top 5 --json --out compose_s07.run.json
+```
+
+See [`docs/compose.md`](docs/compose.md).
+
+### Every small formula, scored exactly (`rcsr enumerate`)
+
+`rcsr enumerate` takes the flags of a `--fitness pnl` run, builds that run's training book and stops before any search. It scores every tree of at most `--max-size` nodes over the normalised `--vars` and the unary and binary `--ops` (no constant leaf, canonical forms only) at `--cuts Q` quantiles of each tree's own training predictions, with the same book code the search ranks by. The report gives the class counts, the best member of every size (the certified class optimum), the `--top` members with their validation book, and the expression of each member in original units. `--compare-run run.json` gives the gap of a finished search to the class optimum at each complexity, `--null-shifts R` the family-wise p-value of the class under R shared circular shifts of the returns (White 2000; Romano and Wolf 2005), and `--emit-seeds` writes the top members for `--seed-file` and `walkforward --expr`. One walk over the training rows prices every cut of a tree on up to 20 books at once, and a tree whose predictions equal an earlier tree's bit for bit reuses its outcome (`work` in the report; docs/optimisation.md section 3.6 gives the rules and the measured cost). Above 4 nodes the command needs `--allow-large`. `--gpu` (#1258) scores the class on the device: batched `f32` evaluation, the cut grid from exact order statistics on the device and one kernel for every cut and book, bit for bit the CPU book on the device's `f32` predictions; the device fitness ranks the class and gives the family null, and the CPU prices the reported members again in `f64` (docs/gpu-backend.md, enumerate device arm).
+
+```sh
+rcsr enumerate --data dev.rcsb --target lbl_h1_y --target-spec dev.targets.json --vars "$VIEW" \
+  --ops add,sub,mul,div,abs,exp,square,tanh,logistic,gauss --time ts --group-by symbol \
+  --split temporal --validation-frac 0.3 --objective sharpe --cost-bps 10 --pnl-blocks 4 \
+  --max-size 4 --null-shifts 19 --compare-run run.json --emit-seeds seeds.txt --json --out enumerate.json
+```
+
+See [`docs/optimisation.md`](docs/optimisation.md) section 3.6 and [`docs/overfitting.md`](docs/overfitting.md) section 3.12.
+
+### Gate search between frozen branches (`--gate-search`)
+
+`--gate-search` searches the gate of a switch itself. The genome is one formula `g` over `--vars`; the two branches are frozen: the finalist of a run (with its threshold folded in), an expression, or cash. A candidate gate is scored at its best cut of the 16-quantile grid of its training values by the `--fitness pnl` book of the one composite that holds `--branch-on` where the gate state is on and `--branch-off` elsewhere (the state is the `--pnl-mask` kernel over `g - c` with `--gate-band` and `--gate-dwell`, under `rcsr-gate-state/1` over every data row, read on the training rows). The front goes to the choice and the pricing of `rcsr compose`: every member is a searched gate with one composite, chosen on the validation rows by the robust rule with a non-negative alpha in each gate state, and the run.json carries the switch of every composite, so walk-forward, `ladder --sr-run`, `--reselect-run`, the seal and the sealed read price it unchanged. Every candidate counts in `search.candidates_evaluated` and every composite pays its full description length (the gate tree under the composite code plus the 4-bit cut).
+
+```sh
+rcsr --data dev.rcsb --target lbl_h24a_y --target-spec dev.targets.json --vars btc_r96,btc_r672,mkt_breadth \
+  --time ts --group-by symbol --split-table cpcv61/splits.csv --split-id s07 --objective sharpe --cost-bps 10 \
+  --gate-search --branch-on bull_s07.run.json --branch-off bear_s07.run.json --gate-dwell 24 \
+  --pop 64 --islands 4 --generations 300 --max-complexity 7 --ops add,sub,mul,min,max --json > gate_s07.run.json
+```
+
+### Combinatorial purged cross-validation (CPCV)
+
+`rcsr protocol cpcv --start 2017-12-15 --end 2023-11-01 --groups 6 --test-groups 2 --purge-seconds 7200 --embargo-seconds auto --vars "$VIEW" --bar-seconds 3600 --validation-share 0.2 --out cpcv62` writes the C(N, k) splits of N equal calendar groups as a `--split-table` (training and validation intervals already purged before and embargoed after every test group, locked ranges as holes), one walk-forward windows file per split and `cpcv.json`. After one search and one `walkforward --pool-reset-flat --period-grid target` per split (the target grid gives every split the same periods on a group, whatever NaN coverage or gate its formula has; a period where the book prices no row books net 0), `rcsr trials --cpcv-assemble wf_s*.json --splits cpcv62/splits.csv --out-dir paths` joins the test series into C(N-1, k-1) complete backtest paths (López de Prado 2018, ch. 12): path j of group g takes the j-th split that tests g, and every group starts flat and pays its final exit. The paths are walk-forward-schema reports, so `rcsr trials --wf` gives `N_eff`, DSR, SPA and PBO across configurations; the summary gives the path Sharpe distribution. Split reports written with `--emit-series` give every path their per-period series and `entry_times` (#1236), so `rcsr trials --table` gates path rows on net at twice the cost, exposure, entry times and the alpha over buy-and-hold. See [`docs/walkforward.md`](docs/walkforward.md#cpcv).
 
 ## GUI
 
@@ -414,7 +483,7 @@ records version, build commit, binary SHA-256, device, driver and threads;
 `--resume` refuses a mismatch unless `--allow-build-change` is given. A different CPU count (`threads`) is reported and never refused. It also refuses a different target spec (sha256 recorded in the checkpoint), exit 2. Saves are crash-safe: temp file, `fsync`, atomic rename,
 with the previous good generation kept as `run.rcsr.prev`. Saving does not
 consume randomness, so it cannot change the result. The saved search settings
-win on resume; only the generation budget may be raised, and data that does not
+win on resume (an explicit flag that differs from the saved value, including `--variation`, `--qd*`, `--units` and `--require-dimensions`, exits 2); only the generation budget may be raised, and data that does not
 match the saved fingerprint is refused. A CPU checkpoint is never silently
 continued on the GPU (or vice versa): `--resume` refuses the backend change
 unless `--allow-backend-change` is explicit. See
@@ -460,7 +529,7 @@ atomically instead of streaming it. See
   estimate is 7.83 GB against a 7.26 GB measured peak, instead of the old
   61.71 GiB that produced a 577k-row sample. A store that does not fit is
   refused; sampling is explicit via `--sample-rows N` (mutually exclusive with
-  `--force`, and still budget-guarded) and is recorded as `full_rows=false` in
+  `--force`, still budget-guarded, and refused with `--pnl-mask`, `rcsr compose`, `rcsr switch` and `--gate-search`, whose gate states need every row) and is recorded as `full_rows=false` in
   the preparation block, manifest and dev log. When a store is read with
   `--vars` and `--time`, the default **projects the read** to those variables,
   targets, `--weight`, `--time` and `--group-by`: only those blocks are read,
@@ -639,16 +708,16 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--seed-expr expr] [--seed-file path]
      [--implicit] [--implicit-derivative] [--function def]
      [--op-complexity spec] [--complexity-weights spec] [--depth-weight w]
-     [--split random|temporal|group|temporal-group|auto] [--time col]
+     [--split random|temporal|group|temporal-group|temporal-intervals|auto] [--time col]
+     [--split-table csv --split-id id] [--embargo seconds|auto]
      [--date-only error|utc-midnight|session-close] [--time-unit s|ms|us|ns] [--tz offset]
      [--group-by col] [--no-project] [--project n|auto] [--view k] [--gap N] [--folds K]
      [--lags K | --lag-set k,..|default] [--history-frac f]
      [--validation-frac f] [--select-by train|validation|aicc] [--require-validation]
      [--objective mse|pnl|sharpe|log_growth] [--position long_only|top_tercile] [--threshold f]
-     [--cost-bps f | --cost-override f] [--slippage-bps f] [--cash-return f] [--funding col]
+     [--cost-bps f | --cost-override f] [--slippage-bps f] [--cash-return f|train-mean] [--funding col]
      [--max-position f] [--min-trades n] [--min-holding n] [--band B] [--band-units score|sd] [--allow-short]
-     [--fitness metric|pnl] [--pnl-blocks K] [--pnl-block-lambda L] [--book-target col]
-|pnl]
+     [--fitness metric|pnl] [--pnl-blocks K] [--pnl-block-lambda L] [--pnl-stat mean-sd|mean-semi|cvar] [--pnl-cvar-q q] [--pnl-mask expr] [--pnl-mask-band h] [--pnl-mask-dwell D] [--gate-search --branch-on run.json|expr|cash --branch-off run.json|expr|cash] [--gate-band h] [--gate-dwell D] [--pnl-excess none|xs-mean] [--book-target col]
      [--equivalence-z z] [--noise-lag n|auto]
      [--allow-lockbox] [--lockbox START,END|none] [--lockbox-embargo SECONDS] [--retired retired.json] [--ledger file] [--arm name] [--target-spec file] [--allow-target-structure] [--require-clean-inputs]
      [--gap-break f] [--fill method] [--allow-interpolate] [--outlier-iqr k]
@@ -658,19 +727,19 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--null-runs N] [--null-block N] [--baseline-samples N] [--bootstrap-error N] [--cv mode] [--cv-k K]
      [--stability B] [--eval-expr expr]
      [--units name=unit,..] [--require-dimensions]
-     [--fit-iters N] [--fit-strategy exact|auto|linear|varpro|stream|gpu] [--fit-report] [--fit-rows N] [--fit-fallback-max N] [--fit-polish f64|f32|off] [--fit-max-iters N] [--fit-irls nested|reweighted|reweighted-final] [--refit-band F|inf] [--no-fit]
+     [--fit-iters N] [--fit-strategy exact|auto|linear|varpro|stream|gpu] [--fit-report] [--fit-rows N] [--fit-fallback-max N] [--fit-polish f64|f32|off] [--fit-max-iters N] [--fit-irls nested|reweighted|reweighted-final] [--fit-thresholds] [--fit-accept always|fitness] [--refit-band F|inf] [--no-fit]
      [--no-dedup] [--no-simd] [--predictor-samples N]
      [--pipeline-depth N] [--threads N] [--variation auto|node|postfix]
      [--no-front-parents] [--prune] [--no-prune] [--prune-rows N] [--prune-budget N] [--reject-constant-offspring] [--reject-fixed-position]
-     [--selection lexicographic|afp]
+     [--selection lexicographic|afp|lexicase] [--lexicase-cases K] [--migration-interval N] [--restart-interval N] [--restart-policy archive|island] [--restart-isolation N] [--explore-islands K] [--front-scope global|island] [--migration-policy ring|ring-tournament]
      [--mutation-mix classic|extended] [--crossover-internal P] [--adaptive-mix]
      [--fit-samples N]
      [--patience N]
      [--gpu] [--gpu-memory size] [--dispatch auto|device] [--calibration anchors|probe|PATH] [--no-gpu|--cpu] [--qd] [--qd-cells N] [--qd-cell-cap N]
-     [--qd-cvt] [--qd-policy] [--qd-uniform] [--qd-random]
+     [--qd-cvt] [--qd-policy] [--qd-uniform] [--qd-random] [--qd-descriptor moments|book]
      [--time-budget seconds] [--interim-chunk] [--save file] [--save-every N] [--resume file]
      [--allow-backend-change] [--allow-build-change] [--run-manifest file] [--json-out file]
-     [--select-rule validation_objective|robust] [--select-blocks K] [--select-se Z] [--select-block-len L] [--select-require-edge]
+     [--select-rule validation_objective|robust|occam] [--select-blocks K|intervals] [--select-se Z] [--select-block-len L] [--select-delta D] [--select-min-entries E] [--select-require-edge]
      [--reselect checkpoint] [--reselect-run run.json]
      [--format text|json|ndjson] [--json] [--ndjson] [--progress]
      [--dev-log-level summary|full] [--dev-log file.ndjson] [--no-dev-log]
@@ -775,6 +844,7 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
   `--select-by train|validation|aicc` chooses the display order; the test
   block is a scoring-only lockbox and is never used to select. See
   [`docs/overfitting.md`](docs/overfitting.md) for the lockbox argument.
+* `--split-table <csv> --split-id <id>` (#1173) assigns training, validation and test from UTC half-open intervals (`split_id,role,start,end`), so a model can train before and after a test interval (the base of combinatorial purged cross-validation; `rcsr protocol cpcv` writes such tables, #1174). A training or validation row is left out when its label window reaches a test interval (the purge of the `--target-spec`) or when it lies within `--embargo` after one; `--embargo auto` is the larger of the label purge and the longest lookback of the `--vars` columns. Training rows are also purged on both sides of every validation interval. Under `--fitness pnl` every contiguous training interval is its own book segment; `--select-blocks intervals` gives the robust rule one block per validation interval; `walkforward --from-run` compares intervals, so a test interval before later training rows is out of sample. See [`docs/data-splitting.md`](docs/data-splitting.md#interval-list-splits) and [`docs/time-series.md`](docs/time-series.md).
 * `--objective pnl|sharpe|log_growth` chooses the finalist on the validation
   slice by an exact long/flat book (position 0 or 1, never short, cost per side
   on `|delta p|` including the exit, daily `sqrt(365)` Sharpe) instead of the
@@ -791,16 +861,25 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
   `--max-position` other than 1, multiple targets or overlapping rows. `--band B` and
   `--min-holding K` price the no-trade band of `walkforward --policy band` in the fitness and in
   the validation and test books (#925); `--band-units sd` reads `B` as a multiple of each
-  candidate's training-score sd, resolved on the training rows only (`objective.spec.band_sd`,
+  candidate's training-score sd, resolved on the training rows only (with `--pnl-mask`, the gate-on training rows; `objective.spec.band_sd`,
   `band_resolved`). The device holds at most 32 rows (`--gpu` exits 2 above that).
   On the GPU the device scores the regret natively, fused with the program interpreter
   (`search_fitness.scorer_backend` `cuda`); it equals the CPU book on the device's own `f32`
-  predictions bit for bit, and every reported value stays exact CPU `f64`. Resume needs the
-  same cost, threshold, band, band units, minimum hold and rows (an sd-unit checkpoint written
-  before the one-pass sd of #945 does not resume). `--pnl-blocks K` (1 to 8, default 1 = off) cuts the training
-  timestamps into `K` blocks, scores each as its own long/flat book and ranks by the mean block
-  regret plus `--pnl-block-lambda` (default 1.0) times their standard deviation, so a formula
-  that earns in one regime only scores worse; the device computes it bit for bit like the CPU.
+  predictions bit for bit, and every reported value stays exact CPU `f64`. Resume needs every input of
+  the book hash (cost, cash, funding, threshold, band, hold, blocks, statistic, mask, split table, rows); the conflict message lists the flags and those given now (an sd-unit checkpoint written
+  before the one-pass sd of #945 does not resume). `--pnl-blocks K` (1 to 64, default 1 = off) cuts the training
+  timestamps into `K` blocks, scores each as its own long/flat book and ranks by a statistic of
+  the block regrets, so a formula that earns in one regime only scores worse. `--pnl-stat`
+  picks it: `mean-sd` (default) the mean plus `--pnl-block-lambda` (default 1.0) times their
+  standard deviation, `mean-semi` the mean plus lambda times the downside semi-deviation of the
+  block captures (only blocks that lose against cash cost), `cvar` the mean of the worst
+  `ceil(q K)` blocks (`--pnl-cvar-q q`, default 0.25). With many blocks use lambda about
+  `2 / sqrt(K)`: lambda `t / sqrt(K)` keeps the t-statistic test level `t` across block counts.
+  The device computes every statistic bit for bit like the CPU.
+  `--pnl-mask <expr>` (with `--pnl-mask-band h` and `--pnl-mask-dwell D`) scores only the rows inside a causal regime gate, so bull and bear specialists can be searched: rows outside are flat, every run of on rows starts flat and pays its exit, a row without a return (an unlabelled row of a strided label) neither starts nor ends a run in any book or walk-forward window, and the training fitness and the validation and test books read one gate state, `rcsr-gate-state/1` (the whole readable prefix of the data file; `--pnl-mask-dwell` counts rows of the data file in every slice, so 168 is a week on hourly rows under any label stride; `--gpu` scores it on the device, except with `--band-units sd`, which exits 2; `docs/optimisation.md`).
+  `--gate-search` (with `--branch-on`, `--branch-off`, `--gate-band h` and `--gate-dwell D`) searches a regime gate over `--vars` between two frozen branches: each candidate is scored at its best 16-quantile cut by the composite book, and the front is chosen and priced by `rcsr compose` (CPU only; `docs/compose.md`).
+  `--pnl-excess xs-mean` (default `none`) scores the excess over the equal-weight mean return of the training rows at each timestamp instead of over cash, so the fitness pays for timing and selection relative to the cross-section, not for market beta; the validation and test books, robust selection and walk-forward stay absolute and `objective.validation` and `objective.test` gain `xs_excess_net` (needs `--fitness pnl` and `--cash-return 0`; `docs/optimisation.md`).
+  `--cash-return train-mean` (with `--fitness pnl`) credits the fitness book with the mean return of its training rows, the assets' own drift and never an interest rate; validation, test, reports and walk-forward keep cash at 0 (`docs/optimisation.md`).
   `--book-target COL` prices the book on another label of the same target spec (fit on `--target`); a row with a NaN fit label and a finite book return stays in the book and leaves the constant fit.
   `--reject-fixed-position` (off by default) rejects trees whose position cannot depend on the
   inputs, such as `gauss(c * x)` or `exp(c * x)` at threshold 0, before the constant fit and keeps them
@@ -824,6 +903,7 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
   `rcsr panel build` window and a labelled `rcsr prep`; see
   [`docs/panel.md`](docs/panel.md#the-2026h2-lockbox).
 * The protocol locked test (2025-07-01..2026-07-01, or the range declared with the data) guards every evaluator: search, `walkforward`, `ladder`, `ablation`, `enrich` and `audit`. Undeclared data gets the default. `--lockbox none` is the only opt-out and the report records `"source":"none"`. A flag that narrows a stored declaration, and conflicting declaration files, are refused. See [`docs/panel.md`](docs/panel.md#the-declared-locked-test).
+* A lock record (`--lock-record record.json` on `rcsr panel snapshot|base|build|validate|schema|append` and `rcsr enrich`) keeps the rows of its range out of every sidecar summary; the store keeps them. `rcsr lock check --record record.json PATH...` counts range hits in `.json` and `.csv` sidecars (exit 4 on a hit). See [`docs/panel.md`](docs/panel.md#lock-record-sidecars-without-locked-range-information).
 * The protocol locked test is declared once, with the data
   (`rcsr panel base`, `prep` or `panel build --locked-test START,END`; `panel build`,
   `panel append`, `enrich` and `ablation prepare` copy it, and a writer never drops or
@@ -831,7 +911,7 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
   `ablation score` then refuse any split or window that touches it (exit 3).
   Only `walkforward --locked-test` and `ladder --locked-test`, both with
   `--ledger` and `--sealed`, read it, once each; both write `--out` and `--markdown` before the
-  read is recorded and take `--verify-read` to recompute a recorded read (see
+  read is recorded and take `--verify-read` to recompute a recorded read (both refuse a verify with no recorded read, with a different window set or another setting that binds the report, and a read recorded without a binding digest or by another build line, before any locked row is scored and without printing a report hash; the ladder also refuses a store whose data hash differs from the recorded read or that has no read marker, and `--expect-report-sha256` needs `--verify-read`) (see
   [`docs/walkforward.md`](docs/walkforward.md#report-files-of-a-locked-read)); see
   [`docs/panel.md`](docs/panel.md#the-declared-locked-test).
 * `--train-select` / `--test-select` assign rows by expression (`> 0` is true)
@@ -867,7 +947,9 @@ run:
 | `--allow-target-structure` | run a D13c target for a diagnostic replay (warns, records `check.status = overridden` and a proxy table) |
 | `--require-clean-inputs` | refuse (exit 5) a run whose inputs include a construction column of the target spec; default off, the column is only recorded in `check.construction_in_vars` |
 | `--calibration anchors` or `--calibration <path>` (`rcsr enrich`) | planner rates for `--gpu auto`: the measured anchors, or the `enrich` object of a `rcsr calibrate` file (schema `rcsr-calibration/2`, each value limited to 0.25x to 4x of its anchor). Default: the default calibration file when it exists, else the anchors. An invalid or other-device file exits 2. `--json` `plan_rates` and `<out>.enrich.json` record `source` (`anchors` or `file`), `file_path`, `file_sha256` and `schema`; `--write-bw` overrides the file's bandwidth. Every `plan[]` entry carries `benchmark_present` (the store holds the `--cross-symbol` series), which selects the compact-pass cost |
-| `--threads <n>` (`rcsr enrich`) | feature-pass workers, default the CPUs the process may run on (a taskset mask is honoured). Segments are computed in parallel and committed in segment order, so every per-feature hash and the store checksum are identical for every `n` (tested). At most `2 x n` segment outputs are held at once (one output is the segment rows times the feature columns times 8 bytes). `--chunk-rows` then bounds each batch per worker. `--json` and `<out>.enrich.json` record `threads` |
+| `--threads <n>` (`rcsr enrich`) | feature-pass workers, default the CPUs the process may run on (a taskset mask is honoured). Segments are computed in parallel and committed in segment order, so every per-feature hash and the store checksum are identical for every `n` (tested). At most `2 x n` segment outputs are held at once (one output is the segment rows times the feature columns times 8 bytes). `--chunk-rows` then bounds each batch per worker. `--json` and `<out>.enrich.json` record `threads`. The planner divides its CPU estimates by `min(n, symbol segments)`. |
+| `--min-cross-members <n>` (`rcsr enrich`) | member floor of the cross-section mean, share, sd and sum-ratio columns (`mkt_*`, `breadth`, `dispersion`, `rel_mkt*`, `btc_volume_share`, `mkt_trend_*`): a timestamp with fewer finite point-in-time members is `NaN`. Integer in `5..=200`, default 20 (exit 2 otherwise); the default keeps every output byte-identical. Recorded as `cross_floor` and `min_members` in `<out>.enrich.json` and copied into `<panel>.schema.json` by `rcsr panel append`. `enrich` exits 2 and `panel append` exits 3 when the floors differ from those already in the store or panel (a store without the record counts as 20). See [`docs/ohlcv.md`](docs/ohlcv.md) |
+| `--min-cross-members-rank <m>` (`rcsr enrich`) | the same floor for the rank columns (`xs_rank_*`, `cs_rank_r60`) and `avg_corr`; default the value of `--min-cross-members` |
 | `--no-enrich` (`rcsr calibrate`) | skip the enrich planner probe; the file then carries `enrich: null` and `rcsr enrich` uses its anchors |
 | `--allow-overlap` (`rcsr enrich`, `rcsr prep`) | permit a `--label` stride below the horizon for horizons of 4 h and longer; without it such a label is refused. `--side short` and `--allow-short` are always refused: labels are long-only (action `{0,+1}`, long-side barriers, see [`docs/time-series.md`](docs/time-series.md#3b-long-only-labels-and-their-purge)) |
 | `--label long:<horizon>,fee=<bp>,...[,stride=<n>[,anchor=<ISO date\|epoch>]]` (`rcsr enrich`; `fee=` is required, `fee=0` for none; `anchor` aligns the stride of every symbol to the same stamps) | long-only label family `lbl_<name>_{fwd,y,long_net,action,t1,exit_ret,m_net,m_barrier,weight}`, the label report with hash and top 10 absolute moves in `<out>.labels.json` (rows reaching the declared locked test, `--locked-test` or the input declaration, are left out of its statistics and counted; `<out>.enrich.json` leaves them out of every per-column statistic the same way and reports `rows_left_out`), the enrich report and `run.json` (`target_spec.label_report`), and `split.fit_label` in `walkforward` and `ladder` reports; the store embargo is at least the longest label purge; label columns are never `--vars` inputs (exit 5), see [`docs/time-series.md`](docs/time-series.md#3b-long-only-labels-and-their-purge) |
@@ -1263,6 +1345,44 @@ constant can move the mean the arm says so instead of fabricating a fit. With `-
   crowding distance, a few random immigrants join each generation, and parents
   are drawn by Pareto rank. Small correct shapes and new lineages survive next
   to large approximations. Node path only; the default stays `lexicographic`;
+- **opt-in epsilon-lexicase parent selection** (`--selection lexicase`, `--lexicase-cases K`): the
+  island tournament on the aggregate error is replaced by semi-dynamic epsilon-lexicase (La Cava et al.
+  2016, 2019) on `K` cases drawn per generation (down-sampled lexicase, Hernandez et al. 2019): row
+  losses under the metric fitness, `(group, time block)` sub-book regrets under `--fitness pnl`. A
+  formula that is best on some rows, symbols or periods gets parents even when it does not win the
+  aggregate. CPU node path; needs a metric with a per-row loss; the default stays `lexicographic`;
+- **opt-in island-local restarts** (`--restart-policy island`, `--restart-isolation W`):
+  the default rule restarts an island only while its best is worse than the
+  archive best, which ring migration makes false for every island within a few
+  migration intervals. `island` restarts an island whose own best error has not
+  improved for one restart interval (never the keeper that holds the archive
+  best) and keeps it from front parents and migrants for `W` generations
+  (default 25). Node and flat postfix paths. Saved search setting; the default
+  stays `archive`;
+- **opt-in scheduled explore tier** (`--explore-islands K`): the highest `K`
+  islands take no front parent and no `--qd-policy` parent, send and receive no
+  migrant, and restart at the end of each lifetime of a Luby schedule (1, 1, 2,
+  1, 1, 2, 4, ... units of the 60-generation restart interval, spread over the
+  explore islands), so a run holds many independent trials instead of one. The
+  other islands keep the restart rule and a ring of their own and see explore
+  results only through the archive. Node and flat postfix paths. Saved search
+  setting; the default stays 0;
+- **opt-in island-local fronts** (`--front-scope island`): each island draws
+  its 15 % front parents from its own error/complexity front instead of the
+  global one, so a new best no longer reaches every island in about one
+  generation. A front moves only with a migrant (the destination front becomes
+  the front of both) and a restart empties it; the reported archive stays
+  global. Node and flat postfix paths; not with `--qd-policy`. Saved search
+  setting; the default stays `global`;
+- **opt-in tournament migrant** (`--migration-policy ring-tournament`): the
+  migrant is the winner of a tournament of 8 draws over the source island
+  instead of its best member, drawn with the destination island's own
+  generator, so the source island's trajectory does not depend on who migrates
+  from it. A source without a finite member sends nothing, and a destination
+  that already holds a member with the migrant's error bits skips the
+  migration. The best then spreads far slower than under the default `ring`.
+  The development log counts `migrants` and `migrants_skipped`. Node and flat
+  postfix paths. Saved search setting; the default stays `ring`;
 - **opt-in quality-diversity search** (`--qd`, `--qd-cvt`, `--qd-policy`,
   `--qd-cells`, `--qd-cell-cap`): CVT-MAP-Elites over variable usage ×
   prediction skewness, with deterministic Halton initialisation, Lloyd
@@ -1271,7 +1391,12 @@ constant can move the mean the arm says so instead of fabricating a fit. With `-
   passive layer reports reachable-support coverage, occupancy entropy and a
   QD-score in text and `--json` without changing the Pareto front; every run
   also reports a fixed-reference validation hypervolume that is comparable
-  across arms. `--qd-policy` is the opt-in search change. See
+  across arms. `--qd-policy` is the opt-in search change. Under `--fitness pnl`,
+  `--qd-descriptor book` keys the archive by the log exposure and the log mean
+  holding length of the long/flat book the fitness prices, from the same
+  reduction as the regret (#1084); `--json` `qd.descriptor` is then `book`.
+  Under `--qd-policy` the archive is search state: `--save` writes it and
+  `--resume` restores it, so a resumed run equals the uninterrupted one (#1166). See
   [`docs/qd.md`](docs/qd.md);
 - **configurable complexity** (`--op-complexity`, `--complexity-weights`,
   `--depth-weight`): per-operator costs, variable/constant weights and a
@@ -1312,6 +1437,8 @@ constant can move the mean the arm says so instead of fabricating a fit. With `-
   `--predictor-samples`;
 - **a cheaper `absolute` fit** (`--fit-irls reweighted|reweighted-final`, default `nested`): the CPU twin of the device L1 kernel, one Levenberg-Marquardt over the true L1 loss with the weights rebuilt at every assembly, needing about half the row passes of today's nested IRLS. It changes the fitted constants, so it is off by default and saved in the checkpoint; every reported front member is refit on `nested` IRLS (see `docs/optimisation.md`);
 - **device fit convergence** (`--fit-max-iters N`, default `4 x --fit-iters`): after `--fit-iters` damped trials the device fit kernel tests convergence on the squared arm (the Gauss-Newton model drop at the current constants against `1e-3` of the loss) and takes more damped trials while it fails, up to `N` in all, before the polish. `N = --fit-iters` runs no extra trial. `gpu.fit.fallback_device_kept_by_cause` counts routed fits whose device answer beat the CPU refit (see `docs/gpu-backend.md`);
+- **exact threshold fit** (`--fit-thresholds`, default off): the LM never moves a constant that is an operand of a comparison or sits in the condition of `if` (its gradient is zero), so it keeps its random grid value. The flag adds an exact 1-D search over the midpoints between sorted operand values after the LM, on the loss the constants are fitted on. Trees with such a constant take the CPU fit arm. Details in `docs/optimisation.md` section 3.0.0a;
+- **fit acceptance** (`--fit-accept always|fitness`, default `always`): under `--fitness pnl` the fit minimises squared error and the score is the long/flat regret, so the fit can move a profitable sign boundary. With `fitness` a candidate keeps its fitted constants only when its search fitness, scored on the scoring rows, is not worse than with the constants it had before the fit. A strictly lower unfitted error keeps the unfitted tree; a tie keeps the fit. The rule covers the offspring fit, the restart fill, the carried-member refit (`--predictor-samples`), the device fit with its CPU tail and fallback fits, the screening-survivor refit, the finalist refit, the prune refit and the seed fit before generation 1 (`seeds[].fit_kept` in `--json`). It costs one extra score per candidate whose fit moved a constant, and the overlap pipeline does not fit under it (the synchronous batches run instead). Under `fitness` the development log fit record carries `accepted` and `rejected` per generation and `--json` carries `search.fit_accept` with the totals and a `by_path` breakdown; nothing is written under `always`. Saved search setting.
 - **seeded starts** (`--seed-expr`, `--seed-file`): prior solutions are parsed,
   simplified, fitted and inserted into the archive and every island before
   generation 1; a seed is an elite, kept even above `--max-complexity`;
@@ -1457,6 +1584,7 @@ docs/data-preparation.md      missing values, outliers, smoothing, scaling and f
 docs/memory-model.md          bytes per cell, dictionary encoding and row selectors
 docs/data-format.md           versioned .rcsb column store, import and the memory guard
 docs/walkforward.md           walk-forward evaluation, costs, metrics and the long/flat rule
+docs/compose.md               regime-switching composition of specialist pools (rcsr compose) and the gate search (--gate-search)
 docs/variable-types.md        boolean and categorical inputs, one-hot encoding
 docs/weights.md               per-row weights, weighted metrics and weighted least squares
 docs/implicit.md              implicit relations f(x, y) = 0 and the level-set metric

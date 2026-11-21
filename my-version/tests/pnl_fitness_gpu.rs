@@ -16,7 +16,7 @@ use rcsr::expr::{constant, input, node, Node, Op};
 use rcsr::gpu::{GpuEvaluator, Population};
 use rcsr::metrics::{Metric, ScoreObjective, ScoreStatus};
 use rcsr::search::{self, Config, Fitness};
-use rcsr::trading::{FitnessBook, FitnessTotals, TradingRows, TradingSpec};
+use rcsr::trading::{FitnessBook, FitnessTotals, PnlExcess, TradingRows, TradingSpec};
 use std::sync::{Arc, Mutex};
 
 #[path = "common/scratch.rs"]
@@ -96,6 +96,9 @@ fn book(f: &Fixture, min_trades: usize) -> FitnessBook {
 }
 
 fn evaluator(f: &Fixture, b: &FitnessBook) -> Option<GpuEvaluator> {
+    if !device_present() {
+        return None;
+    }
     let Some(mut ev) = GpuEvaluator::new(&f.cols, f.n, VARS, &f.y) else {
         rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return None;
@@ -209,6 +212,42 @@ fn device_totals_equal_the_cpu_tree_on_a_small_book() {
     assert!(cpu.iter().any(|t| !t.nonfinite && t.flips > 2 && t.exits > 0), "a program trades");
 }
 
+/// #1273: the device scores the CPU-built `--cash-return train-mean` excess.
+#[test]
+fn device_cash_train_mean_parity() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    let f = fixture(&STARTS_SMALL, 16_401, 13);
+    let tm = FitnessBook::new(&f.slice, &TradingSpec { cash_mode: rcsr::trading::CashMode::TrainMean, ..spec(1) }, 900.0).expect("a profitable book");
+    let plain = book(&f, 1);
+    assert_ne!(tm.hash(), plain.hash());
+    let mean = f.slice.ret.iter().sum::<f64>() / f.slice.ret.len() as f64;
+    assert_eq!(tm.cash_return().to_bits(), mean.to_bits());
+    assert!(mean != 0.0 && tm.excess().iter().zip(plain.excess()).all(|(a, b)| *a == *b - mean || (a - (b - mean)).abs() <= 1e-15));
+    let cpu = assert_exact(&f, &tm, &programs(24, 17));
+    if cpu.is_empty() {
+        return;
+    }
+    assert!(cpu.iter().any(|t| !t.nonfinite && t.flips > 2 && t.exits > 0), "a program trades");
+}
+
+/// #1179: the device scores the CPU-built `--pnl-excess xs-mean` excess. The
+/// groups share timestamps, so the cross-sections hold one to twelve rows.
+#[test]
+fn device_xs_mean_parity() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    let f = fixture(&STARTS_SMALL, 16_401, 13);
+    let xs = FitnessBook::new(&f.slice, &TradingSpec { pnl_excess: PnlExcess::XsMean, ..spec(1) }, 900.0).expect("a profitable xs-mean book");
+    let plain = book(&f, 1);
+    assert_ne!(xs.hash(), plain.hash());
+    let moved = xs.excess().iter().zip(plain.excess()).filter(|(a, b)| a != b).count();
+    assert!(moved > f.n / 2, "{moved} of {} rows have another excess", f.n);
+    let cpu = assert_exact(&f, &xs, &programs(24, 17));
+    if cpu.is_empty() {
+        return;
+    }
+    assert!(cpu.iter().any(|t| !t.nonfinite && t.flips > 2 && t.exits > 0), "a program trades");
+}
+
 #[test]
 fn device_totals_equal_the_cpu_tree_on_device_predictions() {
     let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
@@ -309,6 +348,9 @@ fn a_context_without_a_book_or_with_a_refused_book_is_refused() {
     let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
     let f = fixture(&STARTS_SMALL, 16_401, 4);
     let b = book(&f, 1);
+    if !device_present() {
+        return;
+    }
     let Some(mut ev) = GpuEvaluator::new(&f.cols, f.n, VARS, &f.y) else {
         rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
@@ -368,10 +410,12 @@ fn assert_exact_blocks(f: &Fixture, b: &FitnessBook, trees: &[Node]) -> usize {
         let cpu = b.block_totals(&pred);
         let want = b.fitness_of(&cpu);
         assert_eq!(blocks[k].len(), cpu.len());
+        // The device flag is the whole candidate's (`long_pnl_block_totals_for_tests`).
+        let any_bad = cpu.iter().any(|t| t.nonfinite);
         for (j, (d, c)) in blocks[k].iter().zip(&cpu).enumerate() {
             assert_eq!(d.flips, c.flips, "program {k} block {j} flips");
             assert_eq!(d.exits, c.exits, "program {k} block {j} exits");
-            assert_eq!(d.nonfinite, c.nonfinite, "program {k} block {j} non-finite");
+            assert_eq!(d.nonfinite, any_bad, "program {k} block {j} non-finite");
             assert_eq!(d.gross.to_bits(), c.gross.to_bits(), "program {k} block {j} gross {} vs {}", d.gross, c.gross);
         }
         assert_eq!(batch.values[k].to_bits(), want.to_bits(), "program {k} fitness {} vs {}", batch.values[k], want);
@@ -449,6 +493,94 @@ fn block_trade_floor_and_flat_programs_have_exact_values() {
     let b = ev.score_batch(prog, off, ScoreObjective::LongPnl, &vec![0; trees.len()]);
     for k in 0..3 {
         assert_eq!(b.values[k], f64::INFINITY, "program {k} is under the trade floor");
+    }
+}
+
+// ---- #1178: up to 64 blocks and the block statistics ----
+
+use rcsr::trading::BlockStat;
+
+const STATS: [BlockStat; 4] = [BlockStat::MeanSd, BlockStat::MeanSemi, BlockStat::Cvar(0.25), BlockStat::Cvar(1.0)];
+
+fn stat_book(f: &Fixture, blocks: usize, lambda: f64, stat: BlockStat) -> FitnessBook {
+    book_blocks(f, 1, blocks, lambda).with_stat(stat).expect("a valid block statistic")
+}
+
+/// The memcheck book: 9, 32 and 64 blocks (ids beside the flags, the wide
+/// kernel) under every statistic, and the new statistics on the flag-byte
+/// kernels (1, 4 and 8 blocks): device per-block totals and fitness against
+/// the CPU on the device predictions, bit for bit.
+#[test]
+fn device_block_stat_parity() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    let f = fixture(&STARTS_SMALL, 16_401, 11);
+    let trees = programs(24, 5);
+    for blocks in [9usize, 32, 64] {
+        for stat in STATS {
+            let b = stat_book(&f, blocks, 1.5, stat);
+            assert_eq!(b.block_ids().len(), f.n);
+            let finite = assert_exact_blocks(&f, &b, &trees);
+            assert!(finite == 0 || finite >= 8, "{finite} finite programs at {blocks} blocks, {stat:?}");
+        }
+    }
+    for blocks in [1usize, 4, 8] {
+        for stat in [BlockStat::MeanSemi, BlockStat::Cvar(0.25)] {
+            let b = stat_book(&f, blocks, 2.0, stat);
+            let finite = assert_exact_blocks(&f, &b, &trees);
+            assert!(finite == 0 || finite >= 8, "{finite} finite programs at {blocks} blocks, {stat:?}");
+        }
+    }
+}
+
+/// Two 16384-row groups: 64 blocks cut both groups every 256 rows (on warp
+/// steps and on the 8192-row segment seam), 33 blocks cut inside warp steps,
+/// and a one-row group follows.
+#[test]
+fn device_block_stat_parity_when_cuts_meet_steps_and_segments() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    let f = fixture(&[0, 16_384, 32_768], 32_769, 19);
+    let trees = programs(24, 7);
+    for blocks in [64usize, 33] {
+        for stat in [BlockStat::MeanSemi, BlockStat::Cvar(0.25)] {
+            let b = stat_book(&f, blocks, 1.0, stat);
+            let finite = assert_exact_blocks(&f, &b, &trees);
+            assert!(finite == 0 || finite >= 8, "{finite} finite programs at {blocks} blocks, {stat:?}");
+        }
+    }
+}
+
+/// The band kernels with ids beside the flags: a 1-row and a 24-row hold in
+/// score units and a 12-row hold in sd units, 9 and 64 blocks.
+#[test]
+fn device_block_stat_parity_with_a_band() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    if !device_present() {
+        return;
+    }
+    let f = fixture(&STARTS_SMALL, 16_401, 11);
+    let trees = band_programs(16, 5);
+    for (band, hold, units) in [(0.3, 1, BandUnits::Score), (0.5, 24, BandUnits::Score), (1.0, 12, BandUnits::Sd)] {
+        for blocks in [9usize, 64] {
+            for stat in [BlockStat::MeanSd, BlockStat::Cvar(0.25)] {
+                let b = band_book(&f, band, units, hold, blocks).with_stat(stat).expect("a valid block statistic");
+                assert!(!b.is_plain());
+                let n = assert_exact_blocks(&f, &b, &trees);
+                assert!(n > 0, "band {band} hold {hold} {units:?} blocks {blocks} {stat:?}: no finite program");
+            }
+        }
+    }
+}
+
+/// Thirteen segments and 37 groups: 64 and 9 blocks on device predictions.
+#[test]
+fn device_block_stat_parity_on_device_predictions() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    let f = fixture(&STARTS_100K, 100_003, 7);
+    let trees = programs(64, 9);
+    for (blocks, stat) in [(64usize, BlockStat::MeanSd), (64, BlockStat::Cvar(0.25)), (9, BlockStat::MeanSemi)] {
+        let b = stat_book(&f, blocks, 1.0, stat);
+        let finite = assert_exact_blocks(&f, &b, &trees);
+        assert!(finite == 0 || finite >= 32, "{finite} finite programs at {blocks} blocks, {stat:?}");
     }
 }
 
@@ -551,8 +683,7 @@ fn pipelined_search_archives_device_long_pnl_scores() {
     let (sample, b) = search_fixture();
     let seen: Archived = Arc::default();
     let cfg = config(&b, &seen);
-    if GpuEvaluator::new(&[0.0], 1, 1, &[0.0]).is_none() {
-        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
+    if !device_present() {
         return;
     }
     let out = search::run(&cfg, &sample, &sample);
@@ -575,8 +706,7 @@ fn pipelined_device_fit_archives_device_long_pnl_scores() {
         fit_admission: rcsr::fit::FitAdmission::All,
         ..config(&b, &seen)
     };
-    if GpuEvaluator::new(&[0.0], 1, 1, &[0.0]).is_none() {
-        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
+    if !device_present() {
         return;
     }
     let out = search::run(&cfg, &sample, &sample);
@@ -597,14 +727,38 @@ fn synchronous_device_fit_archives_device_long_pnl_scores() {
         pipeline_depth: 0,
         ..config(&b, &seen)
     };
-    if GpuEvaluator::new(&[0.0], 1, 1, &[0.0]).is_none() {
-        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
+    if !device_present() {
         return;
     }
     let out = search::run(&cfg, &sample, &sample);
     assert_device_scored(&out);
     let gpu = out.gpu.as_ref().unwrap();
     assert!(gpu.fit_gpu > 0 && gpu.fit_screened > 0, "screened and fitted on the device");
+    assert_archived_values_are_device_scores(&sample, &b, &seen);
+}
+
+/// #1084: a device-scored generation carries no book descriptor; the archive
+/// takes it from one CPU evaluation of the same book and counts it.
+#[test]
+fn device_scored_members_get_the_cpu_book_descriptor() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    let (sample, b) = search_fixture();
+    let seen: Archived = Arc::default();
+    let cfg = Config {
+        qd_bins: 64,
+        qd_cvt: true,
+        qd_policy: true,
+        qd_descriptor: rcsr::qd::DescriptorKind::Book,
+        ..config(&b, &seen)
+    };
+    if !device_present() {
+        return;
+    }
+    let out = search::run(&cfg, &sample, &sample);
+    assert_device_scored(&out);
+    let qd = out.qd.as_ref().expect("the QD report");
+    assert_eq!(qd.descriptor, "book");
+    assert!(qd.occupied > 0 && qd.descriptor_fallbacks > 0, "{qd:?}");
     assert_archived_values_are_device_scores(&sample, &b, &seen);
 }
 
@@ -617,6 +771,9 @@ fn a_refused_book_allocation_falls_back_to_the_cpu_scorer() {
         .flat_map(|v| sample.x.iter().map(move |r| r[v] as f32))
         .collect();
     let y: Vec<f32> = sample.y.iter().map(|&v| v as f32).collect();
+    if !device_present() {
+        return;
+    }
     // The device probe allocates once per process; take it before counting.
     let _ = rcsr::dispatch_gpu::device_rates();
     rcsr::enrich_gpu::set_alloc_fault_for_tests(u64::MAX);
@@ -657,6 +814,9 @@ fn tiled_residency_names_its_refusal() {
     );
     let f = fixture(&STARTS_SMALL, 16_401, 8);
     let b = book(&f, 1);
+    if !device_present() {
+        return;
+    }
     let Some(mut ev) = GpuEvaluator::new_tiled(f.cols.clone(), f.n, VARS, &f.y, 4096, None, None) else {
         rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
@@ -674,8 +834,7 @@ fn blocked_pipelined_search_archives_device_scores() {
     assert_eq!(b.blocks(), 3);
     let seen: Archived = Arc::default();
     let cfg = config(&b, &seen);
-    if GpuEvaluator::new(&[0.0], 1, 1, &[0.0]).is_none() {
-        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
+    if !device_present() {
         return;
     }
     let out = search::run(&cfg, &sample, &sample);
@@ -697,14 +856,162 @@ fn blocked_synchronous_device_fit_archives_device_scores() {
         pipeline_depth: 0,
         ..config(&b, &seen)
     };
-    if GpuEvaluator::new(&[0.0], 1, 1, &[0.0]).is_none() {
-        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
+    if !device_present() {
         return;
     }
     let out = search::run(&cfg, &sample, &sample);
     assert_device_scored(&out);
     assert!(out.gpu.as_ref().unwrap().fit_gpu > 0, "the device fitted constants");
     assert_archived_values_are_device_scores(&sample, &b, &seen);
+}
+
+/// #1178: a 12-block cvar book and a 9-block mean-semi book in a device-
+/// dispatched search: every archived value is the device score of its tree
+/// and the reported front is the exact CPU fitness.
+#[test]
+fn wide_block_stat_search_archives_device_scores() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    if !device_present() {
+        return;
+    }
+    for (blocks, stat) in [(12usize, BlockStat::Cvar(0.25)), (9, BlockStat::MeanSemi)] {
+        let (sample, plain) = search_fixture_blocks(blocks);
+        let b = Arc::new((*plain).clone().with_stat(stat).expect("a valid block statistic"));
+        let seen: Archived = Arc::default();
+        let cfg = config(&b, &seen);
+        let out = search::run(&cfg, &sample, &sample);
+        assert_device_scored(&out);
+        assert_archived_values_are_device_scores(&sample, &b, &seen);
+        for s in &out.archive.items {
+            let pred: Vec<f64> = sample.x.iter().map(|r| rcsr::expr::eval(&s.tree, r)).collect();
+            assert_eq!(s.error.to_bits(), b.regret(&pred).to_bits(), "{}", show(&s.tree));
+        }
+    }
+}
+
+/// #1267: a `--fitness pnl` search with `--fit-strategy gpu` is a pure function
+/// of the seed: front, archive hash and counted fit work repeat exactly.
+fn search_sample(f: &Fixture) -> Sample {
+    let x = (0..f.n)
+        .map(|i| (0..2).map(|v| f.cols[v * f.n + i] as f64).collect())
+        .collect();
+    Sample { x, y: f.slice.ret.clone(), w: Vec::new(), ys: Vec::new(), pairs: None }
+}
+
+fn counted_fit_work(g: &rcsr::search::GpuRunStats) -> String {
+    format!(
+        "{:?}{:?}",
+        (
+            g.fit_attempts,
+            g.fit_gpu,
+            g.fit_fallback,
+            g.fit_screened,
+            g.fit_admitted_wide,
+            g.fit_folded,
+            g.fit_refits,
+            g.fit_refit_candidates,
+            g.fit_carried_kept,
+            g.fit_calls,
+            g.fit_call_candidates,
+        ),
+        (
+            &g.fit_fallback_by_cause,
+            &g.fit_fallback_improved_by_cause,
+            &g.fit_status_by_label,
+            &g.fit_fallback_skipped_by_cause,
+        )
+    )
+}
+
+fn assert_pnl_gpu_fit_is_deterministic(label: &str, sample: &Sample, b: &Arc<FitnessBook>) {
+    for pipeline_depth in [0usize, 2] {
+        let seen: Archived = Arc::default();
+        let cfg = Config {
+            fit_strategy: rcsr::fit::FitStrategy::Gpu,
+            fit_admission: rcsr::fit::FitAdmission::All,
+            pipeline_depth,
+            ..config(b, &seen)
+        };
+        let runs: Vec<_> = (0..2).map(|_| search::run(&cfg, sample, sample)).collect();
+        for out in &runs {
+            assert_device_scored(out);
+            let g = out.gpu.as_ref().unwrap();
+            assert!(g.fit_gpu > 0, "{label} depth {pipeline_depth}: the device fitted constants");
+            assert!(g.fit_refits > 0, "{label} depth {pipeline_depth}: finalists were refit");
+            assert!(!out.archive.items.is_empty());
+            for s in &out.archive.items {
+                let pred: Vec<f64> = sample.x.iter().map(|r| rcsr::expr::eval(&s.tree, r)).collect();
+                assert_eq!(s.error.to_bits(), b.regret(&pred).to_bits(), "{label} depth {pipeline_depth}: {}", show(&s.tree));
+            }
+        }
+        let front = |o: &search::Outcome| {
+            o.archive
+                .items
+                .iter()
+                .map(|s| (s.error.to_bits(), s.complexity, show(&s.tree)))
+                .collect::<Vec<_>>()
+        };
+        let (a, c) = (&runs[0], &runs[1]);
+        assert_eq!(front(a), front(c), "{label} depth {pipeline_depth}: front");
+        assert_eq!(a.archive.hash(), c.archive.hash(), "{label} depth {pipeline_depth}: archive hash");
+        assert_eq!(
+            counted_fit_work(a.gpu.as_ref().unwrap()),
+            counted_fit_work(c.gpu.as_ref().unwrap()),
+            "{label} depth {pipeline_depth}: fit counters"
+        );
+    }
+}
+
+fn skip_without_device() -> bool {
+    !device_present()
+}
+
+#[test]
+fn pnl_gpu_fit_is_deterministic_on_a_plain_book() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    if skip_without_device() {
+        return;
+    }
+    let (sample, b) = search_fixture();
+    assert_pnl_gpu_fit_is_deterministic("plain", &sample, &b);
+}
+
+#[test]
+fn pnl_gpu_fit_is_deterministic_on_a_masked_score_unit_book() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    if skip_without_device() {
+        return;
+    }
+    let f = fixture(&[0, 600, 1200, 1800], 2_400, 17);
+    let b = Arc::new(band_book(&f, 0.3, BandUnits::Score, 4, 1));
+    assert!(!b.is_plain());
+    assert_pnl_gpu_fit_is_deterministic("masked score-unit", &search_sample(&f), &b);
+}
+
+#[test]
+fn pnl_gpu_fit_is_deterministic_on_a_nine_block_book() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    if skip_without_device() {
+        return;
+    }
+    let (sample, b) = search_fixture_blocks(9);
+    assert_eq!(b.blocks(), 9);
+    assert_pnl_gpu_fit_is_deterministic("9 blocks", &sample, &b);
+}
+
+#[test]
+fn pnl_gpu_fit_is_deterministic_on_an_xs_mean_book() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    if skip_without_device() {
+        return;
+    }
+    let f = fixture(&[0, 600, 1200, 1800], 2_400, 17);
+    let b = Arc::new(
+        FitnessBook::new(&f.slice, &TradingSpec { pnl_excess: PnlExcess::XsMean, ..spec(1) }, 900.0)
+            .expect("a profitable xs-mean book"),
+    );
+    assert_ne!(b.hash(), book(&f, 1).hash());
+    assert_pnl_gpu_fit_is_deterministic("xs-mean", &search_sample(&f), &b);
 }
 
 /// Throughput of the blocked kernel against the unblocked one on the same
@@ -862,8 +1169,7 @@ fn cli(data: &str, spec: &str, backend: &[&str]) -> rcsr::devlog::Json {
 #[test]
 fn cli_names_the_device_scorer_and_reports_exact_values() {
     let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
-    if GpuEvaluator::new(&[0.0], 1, 1, &[0.0]).is_none() {
-        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
+    if !device_present() {
         return;
     }
     let (_scratch, data, spec) = write_cli_fixture();
@@ -887,8 +1193,7 @@ fn cli_names_the_device_scorer_and_reports_exact_values() {
 #[test]
 fn reject_fixed_position_runs_on_the_device() {
     let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
-    if GpuEvaluator::new(&[0.0], 1, 1, &[0.0]).is_none() {
-        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
+    if !device_present() {
         return;
     }
     let (scratch, data, spec) = write_cli_fixture();
@@ -948,7 +1253,8 @@ impl Drop for Faults {
 }
 
 fn device_present() -> bool {
-    let present = GpuEvaluator::new(&[0.0], 1, 1, &[0.0]).is_some();
+    let present = rcsr::gpu::probe().available()
+        && GpuEvaluator::new(&[0.0], 1, 1, &[0.0]).is_some();
     if !present {
         rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
     }
@@ -1030,6 +1336,9 @@ fn a_failed_pipeline_stage_falls_back_labelled_in_auto_mode() {
 fn every_device_side_book_refusal_names_its_cause() {
     let f = fixture(&STARTS_SMALL, 16_401, 4);
     let b = book(&f, 1);
+    if !device_present() {
+        return;
+    }
     let Some(mut ev) = GpuEvaluator::new(&f.cols, f.n, VARS, &f.y) else {
         rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
@@ -1037,8 +1346,13 @@ fn every_device_side_book_refusal_names_its_cause() {
     let _faults = Faults::arm("");
     let bound = b.block_bounds()[0];
     let nine = [bound; 9];
+    let many = [bound; 65];
     let zero = [0.0];
-    let cases: [(&str, Result<(), String>); 6] = [
+    // #1178: ids beside the flags for more than 8 blocks, and the statistic.
+    let ids = vec![0u8; f.n];
+    let mut bad_ids = ids.clone();
+    bad_ids[f.n / 2] = 9;
+    let cases: [(&str, Result<(), String>); 11] = [
         (
             "the row count differs",
             ev.upload_pnl_book(&b.excess()[..100], &b.flags()[..100], b.side(), b.threshold(), &[bound], 1.0, 1),
@@ -1048,8 +1362,28 @@ fn every_device_side_book_refusal_names_its_cause() {
             ev.upload_pnl_book(b.excess(), b.flags(), b.side(), b.threshold(), &[], 1.0, 1),
         ),
         (
-            "the block count is outside 1 to 8",
+            "the block count is outside 1 to 64",
+            ev.upload_pnl_book(b.excess(), b.flags(), b.side(), b.threshold(), &many, 1.0, 1),
+        ),
+        (
+            "more than 8 blocks need a block id per row",
             ev.upload_pnl_book(b.excess(), b.flags(), b.side(), b.threshold(), &nine, 1.0, 1),
+        ),
+        (
+            "a block id is not below the block count",
+            ev.upload_pnl_book_with(b.excess(), b.flags(), &bad_ids, b.side(), b.threshold(), &nine, 1.0, (0, 0), 1),
+        ),
+        (
+            "block ids are read with more than 8 blocks only",
+            ev.upload_pnl_book_with(b.excess(), b.flags(), &ids, b.side(), b.threshold(), &[bound], 1.0, (0, 0), 1),
+        ),
+        (
+            "the block statistic is unknown",
+            ev.upload_pnl_book_with(b.excess(), b.flags(), &[], b.side(), b.threshold(), &[bound], 1.0, (3, 0), 1),
+        ),
+        (
+            "the cvar block count is outside 1 to the block count",
+            ev.upload_pnl_book_with(b.excess(), b.flags(), &ids, b.side(), b.threshold(), &nine, 1.0, (2, 10), 1),
         ),
         (
             "the block spread weight",
@@ -1268,6 +1602,9 @@ fn a_hold_above_32_is_refused_by_the_device() {
     let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
     let f = fixture(&STARTS_SMALL, 16_401, 3);
     let b = band_book(&f, 0.1, BandUnits::Score, 33, 1);
+    if !device_present() {
+        return;
+    }
     let Some(mut ev) = GpuEvaluator::new(&f.cols, f.n, VARS, &f.y) else {
         rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
@@ -1330,8 +1667,7 @@ fn assert_archived_values_are_the_cpu_band_book(sample: &Sample, b: &FitnessBook
 #[test]
 fn band_pipelined_search_archives_device_scores() {
     let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
-    if GpuEvaluator::new(&[0.0], 1, 1, &[0.0]).is_none() {
-        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
+    if !device_present() {
         return;
     }
     for (band, units, hold) in [(0.2, BandUnits::Score, 4), (0.5, BandUnits::Sd, 3)] {
@@ -1444,4 +1780,768 @@ fn a_hold_above_32_exits_2_on_gpu_and_falls_back_in_auto() {
         let pred: Vec<f64> = sample.x.iter().map(|r| rcsr::expr::eval(&s.tree, r)).collect();
         assert_eq!(s.error.to_bits(), b.regret(&pred).to_bits(), "{}", show(&s.tree));
     }
+}
+
+// ---- #1244: the regime-masked book on the device ----
+
+use rcsr::trading::BookMask;
+
+/// On in alternate 50-row runs of the canonical rows.
+fn alternate_mask(n: usize) -> Vec<bool> {
+    (0..n).map(|i| (i / 50) % 2 == 0).collect()
+}
+
+/// `regime_gate::hysteresis_states` with band 0.02 and dwell 7 on a slow gate:
+/// a sine of the row's time step with a period of 160 steps and a phase per
+/// group, plus a small fast term, so the band and the dwell decide near every
+/// crossing. An off-run is shorter than a time block of 64 even where one
+/// group alone has rows, so every block keeps on rows.
+fn gate_mask(f: &Fixture) -> Vec<bool> {
+    let rows = &f.slice.rows;
+    let g: Vec<f64> = (0..f.n)
+        .map(|i| {
+            let step = (rows.time[i] - 1.6e9) / 900.0;
+            (std::f64::consts::TAU * step / 160.0 + 0.7 * rows.group[i] as f64).sin() + 0.05 * (1.3 * step).sin()
+        })
+        .collect();
+    rcsr::regime_gate::hysteresis_states(&g, &rows.group, 0.02, 7)
+}
+
+/// One-row on and off runs: alternate rows in `[c - 4, c + 4)` around the warp
+/// step at row 32 and every segment seam `c = 8192 k`. At the seams the segment
+/// starts with an off row, or the row before it is off and the segment starts
+/// with a one-row on-run.
+fn seam_mask(n: usize) -> Vec<bool> {
+    let mut on = vec![true; n];
+    let seams = std::iter::once(32).chain((1..).map(|k| k * 8192).take_while(|&c| c < n));
+    for (k, c) in seams.enumerate() {
+        for (i, o) in on.iter_mut().enumerate().take((c + 4).min(n)).skip(c - 4) {
+            *o = (i + k) % 2 == 1;
+        }
+    }
+    on
+}
+
+fn masks(f: &Fixture) -> [(&'static str, Vec<bool>); 3] {
+    [("alternate", alternate_mask(f.n)), ("gate", gate_mask(f)), ("seams", seam_mask(f.n))]
+}
+
+fn masked(f: &Fixture, spec: &TradingSpec, blocks: usize, starts: &[f64], on: &[bool]) -> FitnessBook {
+    let mask = BookMask { on, identity: "test-gate" };
+    let b = FitnessBook::with_segments(&f.slice, spec, 900.0, blocks, 1.5, starts, Some(mask)).expect("a profitable masked book");
+    assert!(b.is_masked() && b.masked_rows() > 0 && b.masked_rows() < f.n);
+    b
+}
+
+/// One evaluator, the compiled programs and their device predictions, shared
+/// by every book of a fixture.
+struct DeviceRun {
+    ev: GpuEvaluator,
+    pop: Population,
+    preds: Vec<Vec<f64>>,
+}
+
+fn device_run(f: &Fixture, trees: &[Node]) -> Option<DeviceRun> {
+    if !device_present() {
+        return None;
+    }
+    let Some(mut ev) = GpuEvaluator::new(&f.cols, f.n, VARS, &f.y) else {
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
+        return None;
+    };
+    let pop = compiled(trees);
+    let (prog, off) = pop.programs();
+    let preds = (0..trees.len())
+        .map(|k| {
+            let words = &prog[off[k] as usize..off[k + 1] as usize];
+            ev.predict_one_for_tests(words).expect("the device predicts").iter().map(|&p| p as f64).collect()
+        })
+        .collect();
+    Some(DeviceRun { ev, pop, preds })
+}
+
+impl DeviceRun {
+    /// Upload `b` and check every program: the device whole-book totals,
+    /// per-block totals, value and status equal the CPU book on the same device
+    /// predictions, bit for bit. Returns the programs with a finite value that
+    /// trade.
+    fn assert_book(&mut self, b: &FitnessBook, what: &str) -> usize {
+        self.ev.set_pnl_book(b).unwrap_or_else(|e| panic!("{what}: {e}"));
+        let (prog, off) = self.pop.programs();
+        let (batch, totals) = self.ev.long_pnl_totals_for_tests(prog, off).expect("the totals launch runs");
+        let (_, blocks) = self.ev.long_pnl_block_totals_for_tests(prog, off, b.blocks()).expect("the block totals launch runs");
+        let scored = self.ev.score_batch(prog, off, ScoreObjective::LongPnl, &vec![0; self.preds.len()]);
+        assert!(scored.ms >= 0.0, "{what}: the score batch runs");
+        let mut trading = 0usize;
+        for (k, pred) in self.preds.iter().enumerate() {
+            let cpu = b.block_totals(pred);
+            let want = b.regret(pred);
+            assert_eq!(want.to_bits(), b.fitness_of(&cpu).to_bits(), "{what}: program {k}");
+            let bad = cpu.iter().any(|t| t.nonfinite);
+            let sum = |count: fn(&FitnessTotals) -> u64| cpu.iter().map(count).sum::<u64>();
+            let t = totals[k];
+            assert_eq!(t.flips, sum(|c| c.flips), "{what}: program {k} flips");
+            assert_eq!(t.exits, sum(|c| c.exits), "{what}: program {k} exits");
+            assert_eq!(t.long_rows, sum(|c| c.long_rows), "{what}: program {k} long rows");
+            assert_eq!(t.nonfinite, bad, "{what}: program {k} non-finite");
+            let gross = cpu.iter().fold(0.0f64, |g, c| g + c.gross);
+            assert_eq!(t.gross.to_bits(), gross.to_bits(), "{what}: program {k} gross {} vs {gross}", t.gross);
+            assert_eq!(blocks[k].len(), cpu.len(), "{what}: program {k}");
+            for (j, (d, c)) in blocks[k].iter().zip(&cpu).enumerate() {
+                assert_eq!((d.flips, d.exits), (c.flips, c.exits), "{what}: program {k} block {j} flips and exits");
+                assert_eq!(d.gross.to_bits(), c.gross.to_bits(), "{what}: program {k} block {j} gross {} vs {}", d.gross, c.gross);
+            }
+            let status = if bad { ScoreStatus::NonFinite } else { ScoreStatus::Ok };
+            for (path, s) in [("totals", &batch), ("score_batch", &scored)] {
+                assert_eq!(s.values[k].to_bits(), want.to_bits(), "{what}: program {k} {path} {} vs {want}", s.values[k]);
+                assert_eq!(s.status[k], status, "{what}: program {k} {path} status");
+            }
+            if want.is_finite() && t.flips > 0 {
+                trading += 1;
+            }
+        }
+        trading
+    }
+
+    fn values(&mut self, b: &FitnessBook) -> Vec<u64> {
+        self.ev.set_pnl_book(b).expect("the book uploads");
+        let (prog, off) = self.pop.programs();
+        let s = self.ev.score_batch(prog, off, ScoreObjective::LongPnl, &vec![0; self.preds.len()]);
+        assert!(s.ms >= 0.0);
+        s.values.iter().map(|v| v.to_bits()).collect()
+    }
+}
+
+/// The memcheck book, one block: three masks, 64 programs.
+#[test]
+fn device_mask_parity() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    let f = fixture(&STARTS_SMALL, 16_401, 11);
+    let Some(mut run) = device_run(&f, &programs(64, 5)) else {
+        return;
+    };
+    for (name, on) in masks(&f) {
+        let trading = run.assert_book(&masked(&f, &spec(1), 1, &[], &on), name);
+        assert!(trading >= 16, "{name}: {trading} trading programs");
+    }
+}
+
+/// Thirteen segments and 37 groups, one block.
+#[test]
+fn device_mask_parity_on_device_predictions() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    let f = fixture(&STARTS_100K, 100_003, 7);
+    let Some(mut run) = device_run(&f, &programs(64, 9)) else {
+        return;
+    };
+    for (name, on) in masks(&f) {
+        let trading = run.assert_book(&masked(&f, &spec(1), 1, &[], &on), name);
+        assert!(trading >= 16, "{name}: {trading} trading programs");
+    }
+}
+
+fn assert_block_parity(f: &Fixture, run: &mut DeviceRun) {
+    for (name, on) in masks(f) {
+        for blocks in [1usize, 3, 8, 9, 48, 64] {
+            for stat in STATS {
+                let b = masked(f, &spec(1), blocks, &[], &on).with_stat(stat).expect("a valid block statistic");
+                assert_eq!(b.block_ids().len(), if blocks > 1 { f.n } else { 0 });
+                let trading = run.assert_book(&b, &format!("{name}, {blocks} blocks, {stat:?}"));
+                assert!(trading >= 8, "{name}, {blocks} blocks, {stat:?}: {trading} trading programs");
+            }
+        }
+    }
+}
+
+/// The memcheck book: 1 to 8 blocks (ids in the flags) and 9 to 64 blocks (ids
+/// beside them) under every block statistic and three masks.
+#[test]
+fn device_mask_block_parity() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    let f = fixture(&STARTS_SMALL, 16_401, 11);
+    if let Some(mut run) = device_run(&f, &programs(64, 5)) {
+        assert_block_parity(&f, &mut run);
+    }
+}
+
+#[test]
+fn device_mask_block_parity_on_device_predictions() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    let f = fixture(&STARTS_100K, 100_003, 7);
+    if let Some(mut run) = device_run(&f, &programs(64, 9)) {
+        assert_block_parity(&f, &mut run);
+    }
+}
+
+fn assert_band_parity(f: &Fixture, run: &mut DeviceRun, blocks: &[usize]) {
+    for (name, on) in masks(f) {
+        for (band, hold) in [(0.3, 1usize), (0.0, 12), (0.5, 32)] {
+            for &nb in blocks {
+                let b = masked(f, &band_spec(1, band, BandUnits::Score, hold), nb, &[], &on);
+                assert!(!b.is_plain());
+                let trading = run.assert_book(&b, &format!("{name}, band {band}, hold {hold}, {nb} blocks"));
+                assert!(trading > 0, "{name}, band {band}, hold {hold}, {nb} blocks: no trading program");
+            }
+        }
+    }
+}
+
+/// The band kernels in score units: a band with a hold of 1, a hold of 12 and
+/// the 33-state hold of 32, at 1, 8 and 64 blocks, under three masks.
+#[test]
+fn device_mask_band_parity() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    let f = fixture(&STARTS_SMALL, 16_401, 11);
+    if let Some(mut run) = device_run(&f, &band_programs(64, 5)) {
+        assert_band_parity(&f, &mut run, &[1, 8, 64]);
+    }
+}
+
+/// Two rounds of eight segments.
+#[test]
+fn device_mask_band_parity_over_two_rounds() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    let f = fixture(&STARTS_100K, 100_003, 7);
+    if let Some(mut run) = device_run(&f, &band_programs(32, 9)) {
+        assert_band_parity(&f, &mut run, &[1, 64]);
+    }
+}
+
+/// `--band-units sd` under a mask stays on the CPU: the device sd reads every
+/// row. The upload is refused with the reason and leaves no book; the unmasked
+/// sd book and a masked score-unit band upload; an automatic search scores the
+/// masked sd book on the CPU and names the reason.
+#[test]
+fn device_mask_sd_band_stays_on_the_cpu() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    let f = fixture(&STARTS_SMALL, 16_401, 11);
+    let on = alternate_mask(f.n);
+    let sd = masked(&f, &band_spec(1, 0.5, BandUnits::Sd, 12), 1, &[], &on);
+    if !device_present() {
+        return;
+    }
+    let Some(mut ev) = GpuEvaluator::new(&f.cols, f.n, VARS, &f.y) else {
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
+        return;
+    };
+    assert_eq!(ev.set_pnl_book(&sd).unwrap_err(), rcsr::gpu::LONG_PNL_MASKED_SD);
+    let pop = compiled(&programs(4, 1));
+    let (prog, off) = pop.programs();
+    assert!(ev.score_batch(prog, off, ScoreObjective::LongPnl, &[0; 4]).ms < 0.0, "a refused book leaves no book");
+    ev.set_pnl_book(&band_book(&f, 0.5, BandUnits::Sd, 12, 1)).expect("the unmasked sd book uploads");
+    ev.set_pnl_book(&masked(&f, &band_spec(1, 0.5, BandUnits::Score, 12), 1, &[], &on)).expect("a masked score-unit band uploads");
+    drop(ev);
+
+    let (sample, _) = search_fixture();
+    let g = fixture(&[0, 600, 1200, 1800], 2_400, 17);
+    let b = Arc::new(masked(&g, &band_spec(1, 0.5, BandUnits::Sd, 3), 1, &[], &alternate_mask(g.n)));
+    let out = search::run_seeded_checked(&required_config(&b, false), &sample, &sample, &[]).expect("auto mode runs on the CPU");
+    assert_eq!(out.backend, rcsr::backend::Kind::Cpu);
+    assert_eq!(out.backend_reason.as_deref(), Some(rcsr::gpu::LONG_PNL_MASKED_SD));
+    assert!(!out.archive.items.is_empty());
+    for s in &out.archive.items {
+        let pred: Vec<f64> = sample.x.iter().map(|r| rcsr::expr::eval(&s.tree, r)).collect();
+        assert_eq!(s.error.to_bits(), b.regret(&pred).to_bits(), "{}", show(&s.tree));
+    }
+}
+
+/// #1179 under a mask: the CPU-built xs-mean excess over the on rows. Four
+/// groups of 4,000 rows share every timestamp, so each time block holds
+/// cross-sections of several rows; the segment seam at row 8192 falls inside a group.
+#[test]
+fn device_mask_xs_mean_parity() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    let f = fixture(&[0, 4_000, 8_000, 12_000], 16_000, 13);
+    let Some(mut run) = device_run(&f, &programs(32, 17)) else {
+        return;
+    };
+    let xs_spec = TradingSpec { pnl_excess: PnlExcess::XsMean, ..spec(1) };
+    for (name, on) in masks(&f) {
+        for blocks in [1usize, 8, 9] {
+            let xs = masked(&f, &xs_spec, blocks, &[], &on);
+            let abs = masked(&f, &spec(1), blocks, &[], &on);
+            assert_ne!(xs.hash(), abs.hash());
+            let moved = xs.excess().iter().zip(abs.excess()).filter(|(a, b)| a != b).count();
+            assert!(moved > f.n / 4, "{name}: {moved} rows have another excess");
+            let trading = run.assert_book(&xs, &format!("{name}, xs-mean, {blocks} blocks"));
+            assert!(trading > 0, "{name}, {blocks} blocks: no trading program");
+        }
+    }
+}
+
+/// #1173 under a mask: three interval segments, plain and with a band.
+#[test]
+fn device_mask_segment_parity() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    let f = fixture(&STARTS_SMALL, 16_401, 11);
+    let starts = [1.6e9, 1.6e9 + 900.0 * 2500.0, 1.6e9 + 900.0 * 5000.0];
+    let Some(mut run) = device_run(&f, &band_programs(32, 5)) else {
+        return;
+    };
+    for (name, on) in masks(&f) {
+        for (sp, blocks) in [(spec(1), 1usize), (spec(1), 9), (band_spec(1, 0.3, BandUnits::Score, 12), 8)] {
+            let b = masked(&f, &sp, blocks, &starts, &on);
+            let unsegmented = masked(&f, &sp, blocks, &[], &on);
+            let seams = |b: &FitnessBook| b.flags().iter().filter(|&&x| x & TradingRows::FIRST != 0).count();
+            assert!(seams(&b) > seams(&unsegmented), "{name}: the segments add run starts");
+            let trading = run.assert_book(&b, &format!("{name}, segments, {blocks} blocks, hold {}", sp.min_holding));
+            assert!(trading > 0, "{name}, {blocks} blocks: no trading program");
+        }
+    }
+}
+
+/// A NaN prediction outside the mask is ignored (status 0 and the CPU value,
+/// the value of the same program without the NaN); the same NaN inside the
+/// mask makes the program non-finite (status 2, `+inf`).
+#[test]
+fn device_mask_ignores_scores_outside_the_mask() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    let mut f = fixture(&STARTS_SMALL, 16_401, 3);
+    let on = alternate_mask(f.n);
+    let (off_row, on_row) = (75usize, 125usize);
+    assert!(!on[off_row] && on[on_row]);
+    for i in 0..f.n {
+        f.cols[2 * f.n + i] = if i == on_row { -1.0 } else { 1.0 };
+        f.cols[3 * f.n + i] = if i == off_row { -1.0 } else { 1.0 };
+    }
+    let times_sqrt = |v: usize| node(Op::Mul, vec![input(0), node(Op::Sqrt, vec![input(v)])]);
+    let trees = vec![times_sqrt(3), times_sqrt(2), input(0)];
+    let b = masked(&f, &spec(1), 1, &[], &on);
+    let plain = book(&f, 1);
+    let Some(mut run) = device_run(&f, &trees) else {
+        return;
+    };
+    for (k, row) in [(0usize, off_row), (1, on_row)] {
+        let bad: Vec<usize> = (0..f.n).filter(|&i| !run.preds[k][i].is_finite()).collect();
+        assert_eq!(bad, vec![row], "program {k} is NaN on one row only");
+    }
+    run.assert_book(&b, "masked");
+    let (prog, off) = run.pop.programs();
+    let s = run.ev.score_batch(prog, off, ScoreObjective::LongPnl, &[0; 3]);
+    assert_eq!((s.status[0], s.status[1], s.status[2]), (ScoreStatus::Ok, ScoreStatus::NonFinite, ScoreStatus::Ok));
+    assert!(s.values[0].is_finite());
+    assert_eq!(s.values[0].to_bits(), b.regret(&run.preds[0]).to_bits());
+    assert_eq!(s.values[0].to_bits(), s.values[2].to_bits(), "the score outside the mask is never read");
+    assert_eq!(s.values[1], f64::INFINITY);
+    run.ev.set_pnl_book(&plain).expect("the plain book uploads");
+    let s = run.ev.score_batch(prog, off, ScoreObjective::LongPnl, &[0; 3]);
+    assert_eq!((s.status[0], s.status[1], s.status[2]), (ScoreStatus::NonFinite, ScoreStatus::NonFinite, ScoreStatus::Ok));
+}
+
+/// An all-on mask is the plain book: same flags and hash, and the device
+/// values of the unmasked book.
+#[test]
+fn device_mask_all_on_is_the_plain_book() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    let f = fixture(&STARTS_SMALL, 16_401, 11);
+    let Some(mut run) = device_run(&f, &programs(24, 5)) else {
+        return;
+    };
+    let all = vec![true; f.n];
+    for blocks in [1usize, 8, 64] {
+        let mask = BookMask { on: &all, identity: "test-gate" };
+        let all_on = FitnessBook::with_segments(&f.slice, &spec(1), 900.0, blocks, 1.5, &[], Some(mask)).expect("a profitable book");
+        let plain = book_blocks(&f, 1, blocks, 1.5);
+        assert!(!all_on.is_masked());
+        assert_eq!((all_on.hash(), all_on.flags()), (plain.hash(), plain.flags()));
+        run.assert_book(&all_on, &format!("all on, {blocks} blocks"));
+        assert_eq!(run.values(&all_on), run.values(&plain), "{blocks} blocks");
+    }
+}
+
+/// The mask bit rides in the flags byte: a masked book takes the device bytes
+/// of the unmasked book of the same rows.
+#[test]
+fn device_mask_book_adds_no_device_bytes() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    let f = fixture(&STARTS_SMALL, 16_401, 11);
+    if !device_present() {
+        return;
+    }
+    let Some(mut ev) = GpuEvaluator::new(&f.cols, f.n, VARS, &f.y) else {
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
+        return;
+    };
+    let on = alternate_mask(f.n);
+    let mut live = Vec::new();
+    for blocks in [8usize, 64] {
+        ev.set_pnl_book(&book_blocks(&f, 1, blocks, 1.5)).expect("the plain book uploads");
+        let plain = ev.alloc_report().live_bytes;
+        ev.set_pnl_book(&masked(&f, &spec(1), blocks, &[], &on)).expect("the masked book uploads");
+        let mask = ev.alloc_report().live_bytes;
+        assert_eq!(mask, plain, "{blocks} blocks");
+        live.push(mask);
+    }
+    assert_eq!(live[1] - live[0], f.n as u64, "the 64-block book adds one id byte per row");
+}
+
+/// Search level: a pipelined search and a synchronous device-fit search of a
+/// masked book run on the device, every in-run archive value is the device
+/// score of its tree, and the reported front is the exact CPU masked regret.
+fn assert_masked_searches(hold: usize) {
+    if !device_present() {
+        return;
+    }
+    let (sample, _) = search_fixture();
+    let f = fixture(&[0, 600, 1200, 1800], 2_400, 17);
+    let sp = band_spec(1, 0.0, BandUnits::Score, hold);
+    let b = Arc::new(masked(&f, &sp, 1, &[], &alternate_mask(f.n)));
+    let plain = FitnessBook::with_blocks(&f.slice, &sp, 900.0, 1, 1.0).expect("a profitable book");
+    for synchronous in [false, true] {
+        let seen: Archived = Arc::default();
+        let cfg = if synchronous {
+            Config { fit_strategy: rcsr::fit::FitStrategy::Gpu, pipeline_depth: 0, ..config(&b, &seen) }
+        } else {
+            config(&b, &seen)
+        };
+        let out = search::run(&cfg, &sample, &sample);
+        assert_device_scored(&out);
+        if synchronous {
+            let gpu = out.gpu.as_ref().unwrap();
+            assert!(gpu.fit_gpu > 0 && gpu.fit_screened > 0, "screened and fitted on the device");
+        }
+        assert_archived_values_are_device_scores(&sample, &b, &seen);
+        let mut mask_matters = 0usize;
+        for (tree, _) in seen.lock().unwrap().iter() {
+            let pred: Vec<f64> = sample.x.iter().map(|r| rcsr::expr::eval(tree, r)).collect();
+            mask_matters += (b.regret(&pred).to_bits() != plain.regret(&pred).to_bits()) as usize;
+        }
+        assert!(mask_matters > 0, "hold {hold}: the mask changes no archived value");
+        for s in &out.archive.items {
+            let pred: Vec<f64> = sample.x.iter().map(|r| rcsr::expr::eval(&s.tree, r)).collect();
+            assert_eq!(s.error.to_bits(), b.regret(&pred).to_bits(), "{}", show(&s.tree));
+        }
+    }
+}
+
+#[test]
+fn masked_pipelined_search_archives_device_scores() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    assert_masked_searches(1);
+}
+
+#[test]
+fn masked_band_search_archives_device_scores() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    assert_masked_searches(12);
+}
+
+/// The CLI fixture with `g`, +1 in alternate 60-row runs and -1 between them.
+fn write_gate_fixture() -> (Scratch, String, String) {
+    let (scratch, data, spec) = write_cli_fixture();
+    let text = std::fs::read_to_string(&data).unwrap();
+    let mut out = String::new();
+    for (i, line) in text.lines().enumerate() {
+        let g = match i {
+            0 => "g",
+            _ if ((i - 1) / 60) % 2 == 0 => "1",
+            _ => "-1",
+        };
+        out.push_str(&format!("{line},{g}\n"));
+    }
+    std::fs::write(&data, out).unwrap();
+    (scratch, data, spec)
+}
+
+/// `--pnl-mask` with `--gpu`, with and without `--dispatch device`, runs on the
+/// device: the book hash of the `--cpu` run, and every front member's
+/// `train_regret` is the CPU masked regret of its expression on the training
+/// rows. With `--band-units sd` it exits 2 naming the reason, before any
+/// fitness is computed.
+#[test]
+fn device_mask_cli_runs_on_the_gpu() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    if !device_present() {
+        return;
+    }
+    let (scratch, data, spec) = write_gate_fixture();
+    let args = [
+        "--data", &data, "--target", "y", "--vars", "x1,x2", "--time", "t", "--split", "temporal", "--target-spec",
+        &spec, "--no-dev-log", "--seed", "3", "--generations", "10", "--pop", "48", "--metric", "squared", "--json",
+        "--quiet", "--objective", "pnl", "--cost-bps", "5", "--validation-frac", "0.3", "--fitness", "pnl",
+        "--pnl-mask", "g",
+    ];
+    let run = |cmd: &mut std::process::Command| {
+        let out = cmd.args(args).output().expect("run rcsr");
+        assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+        let text = String::from_utf8_lossy(&out.stdout);
+        rcsr::devlog::Json::parse(text.trim()).unwrap_or_else(|| panic!("stdout is not json: {text}"))
+    };
+    fn field<'a>(j: &'a rcsr::devlog::Json, path: &[&str]) -> Option<&'a rcsr::devlog::Json> {
+        path.iter().try_fold(j, |j, k| j.get(k))
+    }
+    let text = |j: &rcsr::devlog::Json, path: &[&str]| field(j, path).and_then(|v| v.as_str().map(str::to_string));
+    let number = |j: &rcsr::devlog::Json, path: &[&str]| field(j, path).and_then(|v| v.as_f64());
+    let cpu = run(rcsr_cmd::rcsr().arg("--cpu"));
+    assert_eq!(text(&cpu, &["search_fitness", "scorer_backend"]).as_deref(), Some("cpu"));
+
+    // The training book of the run: the first `rows` rows, the gate on where g > 0.
+    let rows = number(&cpu, &["search_fitness", "rows"]).expect("search_fitness.rows") as usize;
+    let x = |i: usize| {
+        let f = i as f64;
+        [frac(f * 0.618_033_988_749_894_9) - 0.5, frac(f * 0.754_877_666_246_692_7) - 0.5]
+    };
+    let mut slice = TradingSlice { rows: TradingRows::default(), ret: Vec::new() };
+    for i in 0..rows {
+        let r = 0.01 * x(i)[0] + 0.0005 * (frac(i as f64 * 0.324_717_957_244_746) - 0.5);
+        slice.rows.group.push(0);
+        slice.rows.time.push(1_600_000_000.0 + 900.0 * i as f64);
+        slice.ret.push(r.exp_m1());
+    }
+    let on: Vec<bool> = (0..rows).map(|i| (i / 60) % 2 == 0).collect();
+    let sp = TradingSpec {
+        cost_bps: 5.0,
+        threshold: number(&cpu, &["search_fitness", "threshold"]).expect("threshold"),
+        min_trades: number(&cpu, &["search_fitness", "min_trades"]).expect("min_trades") as usize,
+        ..Default::default()
+    };
+    let mask = BookMask { on: &on, identity: "g" };
+    let book = FitnessBook::with_segments(&slice, &sp, 900.0, 1, 1.0, &[], Some(mask)).expect("the run's masked book");
+    assert_eq!(Some(book.side()), number(&cpu, &["search_fitness", "cost_per_side"]));
+    assert_eq!(number(&cpu, &["search_fitness", "bound"]).map(f64::to_bits), Some(book.bound().to_bits()), "the rebuilt book");
+    assert_eq!(number(&cpu, &["search_fitness", "mask", "off_rows"]), Some(book.masked_rows() as f64));
+    let vars = ["x1".to_string(), "x2".to_string()];
+    let assert_members = |j: &rcsr::devlog::Json, what: &str| {
+        let Some(rcsr::devlog::Json::Arr(front)) = j.get("pareto") else { panic!("{what}: no pareto") };
+        assert!(!front.is_empty(), "{what}");
+        for m in front {
+            let exact = m.get("expression_exact").and_then(|e| e.as_str()).expect("expression_exact");
+            let tree = rcsr::parse::parse(exact, &vars).unwrap_or_else(|e| panic!("{exact}: {e:?}"));
+            let pred: Vec<f64> = (0..rows).map(|i| rcsr::expr::eval(&tree, &x(i))).collect();
+            let regret = number(m, &["fitness", "train_regret"]).unwrap_or(f64::INFINITY);
+            assert_eq!(regret.to_bits(), book.regret(&pred).to_bits(), "{what}: {exact}");
+        }
+    };
+    assert_members(&cpu, "cpu");
+    for device in [&["--gpu"][..], &["--gpu", "--dispatch", "device"]] {
+        let gpu = run(rcsr_cmd::rcsr_on_device().args(device));
+        assert_eq!(text(&gpu, &["backend"]).as_deref(), Some("gpu"), "{device:?}");
+        assert_eq!(text(&gpu, &["search_fitness", "scorer_backend"]).as_deref(), Some("cuda"), "{device:?}");
+        assert_eq!(text(&gpu, &["search_fitness", "scorer_values"]).as_deref(), Some("screening_f32_predictions"), "{device:?}");
+        assert_eq!(number(&gpu, &["search_fitness", "mask", "off_rows"]), Some(book.masked_rows() as f64), "{device:?}");
+        assert_eq!(text(&gpu, &["search_fitness", "book_hash"]), text(&cpu, &["search_fitness", "book_hash"]), "{device:?}");
+        assert_members(&gpu, &format!("{device:?}"));
+    }
+
+    let save = scratch.path().join("refused.rcsr");
+    let out = rcsr_cmd::rcsr_on_device()
+        .arg("--gpu")
+        .args(args)
+        .args(["--band", "0.5", "--band-units", "sd", "--save", &save.to_string_lossy()])
+        .output()
+        .expect("run rcsr");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(err.contains("--pnl-mask with --band-units sd and --gpu"), "{err}");
+    assert!(out.stdout.is_empty(), "no run JSON, so no fitness");
+    assert!(!save.exists(), "no checkpoint");
+}
+
+/// CPU (4 threads) against device generations per second of a masked
+/// `--fitness pnl` search with 8 blocks and minimum hold `hold`: 16 groups of
+/// 12,500 hourly rows, 8 variables, the gate of `regime_gate::hysteresis_states`
+/// (band 0.02, dwell 168) on a slow series. Three runs: the CPU, the device with
+/// the default CPU constant fit, and the device with the device fit arm. Each
+/// run has two warm-up generations, then the timed ones. Prints the numbers;
+/// asserts no time.
+fn mask_search_throughput(hold: usize) {
+    const GROUPS: usize = 16;
+    const ROWS: usize = 12_500;
+    const NVARS: usize = 8;
+    let n = GROUPS * ROWS;
+    let mut rng = Lcg(43);
+    let mut rows = TradingRows::default();
+    let (mut ret, mut x, mut gate) = (Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n));
+    for g in 0..GROUPS {
+        for t in 0..ROWS {
+            rows.group.push(g as u64);
+            rows.time.push(1.6e9 + 3600.0 * t as f64);
+            let signal = rng.unit() - 0.5;
+            let mut row = vec![signal];
+            row.extend((1..NVARS).map(|_| rng.unit() * 4.0 - 2.0));
+            x.push(row);
+            ret.push(0.004 * signal + 0.003 * (rng.unit() - 0.5));
+            gate.push((std::f64::consts::TAU * t as f64 / 2_000.0 + 0.4 * g as f64).sin() + 0.05 * (rng.unit() - 0.5));
+        }
+    }
+    let on = rcsr::regime_gate::hysteresis_states(&gate, &rows.group, 0.02, 168);
+    let share = on.iter().filter(|&&o| o).count() as f64 / n as f64;
+    let slice = TradingSlice { rows, ret };
+    let sample = Sample { x, y: slice.ret.clone(), w: Vec::new(), ys: Vec::new(), pairs: None };
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let cpus = status.lines().find(|l| l.starts_with("Cpus_allowed_list:")).map_or("unknown", |l| l.split_whitespace().last().unwrap_or("unknown"));
+    println!("rows {n} ({GROUPS} groups x {ROWS} hourly), {NVARS} vars, gate on share {share:.3}, cpus allowed {cpus}, fit_stream_source none");
+    let sp = band_spec(1, 0.0, BandUnits::Score, hold);
+    let mask = BookMask { on: &on, identity: "throughput" };
+    let b = Arc::new(FitnessBook::with_segments(&slice, &sp, 3600.0, 8, 1.0, &[], Some(mask)).expect("a profitable masked book"));
+    let arms = [
+        ("cpu, 4 threads", false, rcsr::fit::FitStrategy::Exact),
+        ("device, cpu fit", true, rcsr::fit::FitStrategy::Exact),
+        ("device, device fit", true, rcsr::fit::FitStrategy::Gpu),
+    ];
+    for (name, gpu, fit_strategy) in arms {
+        let marks: Arc<Mutex<Vec<(usize, f64)>>> = Arc::default();
+        let m = marks.clone();
+        let cfg = Config {
+            generations: 12,
+            pop: 64,
+            islands: 8,
+            seed: 7,
+            metric: Metric::Squared,
+            fitness: Fitness::LongPnl(b.clone()),
+            gpu,
+            gpu_required: gpu,
+            gpu_notes: false,
+            dispatch: if gpu { rcsr::dispatch::DispatchMode::Device } else { rcsr::dispatch::DispatchMode::Auto },
+            fit_strategy,
+            threads: 4,
+            threads_explicit: true,
+            front_observer: Some(Arc::new(move |g, secs, _: &rcsr::pareto::Archive| m.lock().unwrap().push((g, secs)))),
+            ..Default::default()
+        };
+        let out = search::run(&cfg, &sample, &sample);
+        let marks = marks.lock().unwrap();
+        let warm = marks.iter().find(|(g, _)| *g == 2).map(|(_, s)| *s).expect("two warm-up generations");
+        let &(last_gen, last) = marks.last().expect("generations ran");
+        let timed = (last_gen - 2) as f64;
+        println!(
+            "hold {hold} {name}: backend {:?} ({:?}), {timed} timed generations in {:.3} s, {:.4} generations/s; {} programs scored in {last:.3} s ({:.1} programs/s)",
+            out.backend,
+            out.backend_reason,
+            last - warm,
+            timed / (last - warm),
+            out.candidates_evaluated,
+            out.candidates_evaluated as f64 / last
+        );
+        if let Some(g) = &out.gpu {
+            let gens = &g.generations;
+            println!(
+                "hold {hold} {name}: device programs {}, kernel {:.3} s, accounting wall {:.3} s, host {:.3} s; fits on the device {}, on the cpu {}, fallback seconds {:.3}, fit fallback seconds {:.3}, full +inf checks {}",
+                g.accounting.programs,
+                g.accounting.kernel_s,
+                g.accounting.wall_s,
+                g.accounting.host_s,
+                g.fit_gpu,
+                g.fit_fallback,
+                gens.iter().map(|s| s.fallback_seconds).sum::<f64>(),
+                gens.iter().map(|s| s.fit_fallback_seconds).sum::<f64>(),
+                gens.iter().map(|s| s.nonfinite_full).sum::<usize>()
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn long_pnl_mask_search_throughput_cpu_against_device() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    if device_present() {
+        mask_search_throughput(1);
+    }
+}
+
+#[test]
+#[ignore]
+fn long_pnl_mask_search_throughput_cpu_against_device_with_a_hold() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    if device_present() {
+        mask_search_throughput(12);
+    }
+}
+
+fn masked_sd_search_book() -> (Sample, Arc<FitnessBook>) {
+    let (sample, _) = search_fixture();
+    let g = fixture(&[0, 600, 1200, 1800], 2_400, 17);
+    let b = Arc::new(masked(&g, &band_spec(1, 0.5, BandUnits::Sd, 3), 1, &[], &alternate_mask(g.n)));
+    (sample, b)
+}
+
+#[test]
+fn a_masked_book_fails_a_required_gpu_run() {
+    if !device_present() {
+        return;
+    }
+    let (sample, b) = masked_sd_search_book();
+    let err = search::run_seeded_checked(&required_config(&b, true), &sample, &sample, &[])
+        .err()
+        .expect("a required GPU run of a masked sd book must fail");
+    assert!(err.starts_with(search::GPU_REQUIRED_PREFIX), "{err}");
+    assert!(err.contains("--pnl-mask"), "{err}");
+}
+
+#[test]
+fn a_masked_book_falls_back_labelled_in_auto_mode() {
+    if !device_present() {
+        return;
+    }
+    let (sample, b) = masked_sd_search_book();
+    let out = search::run_seeded_checked(&required_config(&b, false), &sample, &sample, &[]).expect("auto mode runs on the CPU");
+    assert_eq!(out.backend, rcsr::backend::Kind::Cpu);
+    assert!(out.backend_reason.expect("labelled").contains("--pnl-mask"));
+    assert!(!out.archive.items.is_empty());
+}
+
+#[test]
+fn lexicase_fails_a_required_gpu_run() {
+    if !device_present() {
+        return;
+    }
+    let (sample, b) = search_fixture();
+    let cfg = Config { selection: search::Selection::Lexicase, ..required_config(&b, true) };
+    let err = search::run_seeded_checked(&cfg, &sample, &sample, &[]).err().expect("a required lexicase run must fail");
+    assert!(err.contains("lexicase") && err.contains("--gpu"), "{err}");
+}
+
+#[test]
+fn lexicase_falls_back_labelled_in_auto_mode() {
+    if !device_present() {
+        return;
+    }
+    let (sample, b) = search_fixture();
+    let cfg = Config { selection: search::Selection::Lexicase, ..required_config(&b, false) };
+    let out = search::run_seeded_checked(&cfg, &sample, &sample, &[]).expect("auto mode runs on the CPU");
+    assert_eq!(out.backend, rcsr::backend::Kind::Cpu);
+    assert!(out.backend_reason.expect("labelled").contains("lexicase"));
+    assert!(!out.archive.items.is_empty());
+}
+
+#[test]
+fn a_kept_long_pnl_refusal_stays_labelled_under_gpu_required() {
+    if !device_present() {
+        return;
+    }
+    let (sample, b) = search_fixture();
+    let cfg = Config { fit_rows: 500, fit_strategy: rcsr::fit::FitStrategy::Exact, ..required_config(&b, true) };
+    let out = search::run_seeded_checked(&cfg, &sample, &sample, &[]).expect("a kept refusal stays on the CPU");
+    assert_eq!(out.backend, rcsr::backend::Kind::Cpu);
+    assert!(out.backend_reason.expect("labelled").contains("--fit-samples/--fit-rows"));
+}
+
+#[derive(Debug)]
+struct ThresholdLayer;
+
+impl rcsr::trading::PositionLayer for ThresholdLayer {
+    fn positions(&self, pred: &[f64]) -> Vec<f64> {
+        pred.iter().map(|&p| if p > 0.0 { f64::MAX } else { f64::MIN }).collect()
+    }
+    fn identity(&self) -> String {
+        "threshold-layer".to_string()
+    }
+}
+
+#[test]
+fn a_layered_book_is_refused_by_the_device_upload() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    let f = fixture(&STARTS_SMALL, 16_401, 11);
+    let layered = book(&f, 1).with_layer(Arc::new(ThresholdLayer)).expect("a plain book takes a layer");
+    assert!(layered.has_layer());
+    if !device_present() {
+        return;
+    }
+    let Some(mut ev) = GpuEvaluator::new(&f.cols, f.n, VARS, &f.y) else {
+        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
+        return;
+    };
+    assert_eq!(ev.set_pnl_book(&layered).unwrap_err(), rcsr::gpu::LONG_PNL_LAYERED);
+    ev.set_pnl_book(&book(&f, 1)).expect("a plain book still uploads");
 }

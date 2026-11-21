@@ -462,7 +462,7 @@ fn walkforward_front_of_a_real_run_guards_the_seen_rows() {
         rcsr_cmd::rcsr()
             .args([
                 "walkforward", "--data", &data, "--time", "t", "--front", &run_path, "--window", &window,
-                "--horizon", "900", "--periods-per-year", "365", "--validation-frac", "0.3", "--json",
+                "--horizon", "900", "--validation-frac", "0.3", "--json",
             ])
             .output()
             .unwrap()
@@ -574,7 +574,7 @@ fn walk_from_run(data: &str, run_path: &str, test_start: f64, purge: f64, extra:
     rcsr_cmd::rcsr()
         .args([
             "walkforward", "--data", data, "--time", "t", "--from-run", run_path, "--window", &window,
-            "--horizon", "900", "--periods-per-year", "365", "--json",
+            "--horizon", "900", "--json",
         ])
         .args(extra)
         .output()
@@ -621,7 +621,7 @@ fn walk_table(extra: &[&str]) -> Output {
         .args([
             "walkforward", "--data", &data, "--time", "t", "--target", "r", "--vars", "x1,x2",
             "--windows", &table_path.to_string_lossy(), "--windows-scheme", "expanding", "--horizon", "900",
-            "--periods-per-year", "365", "--json",
+            "--json",
         ])
         .args(extra)
         .output()
@@ -663,7 +663,7 @@ fn windows_table_still_refuses_validation_frac_and_missing_slice() {
         .args([
             "walkforward", "--data", &data, "--time", "t", "--target", "r", "--vars", "x1,x2", "--expr", "x1",
             "--expr", "x2", "--window", &format!("w,{},{},{},{}", T0, T0 + 900 * 250, T0 + 900 * 260, T0 + 900 * 399),
-            "--horizon", "900", "--periods-per-year", "365",
+            "--horizon", "900",
         ])
         .output()
         .unwrap();
@@ -876,4 +876,61 @@ fn a_declared_lockbox_is_never_part_of_a_member_book() {
     let first = at(&pareto(&j)[0], &["expression"]).as_str().unwrap().to_string();
     let want = rescore(&first, validation_window(&j).0, to);
     assert_eq!(validation_rows, want.rows);
+}
+
+#[test]
+fn search_objective_period_width_follows_the_stride() {
+    let (_scratch, dir) = scratch();
+    let mut text = String::from("t,x1,x2,r,y\n");
+    for i in 0..N {
+        let (x1, x2, r) = row(i);
+        text.push_str(&format!("{},{},{},{},{}\n", T0 + 86_400 * i as i64, x1, x2, r, r));
+    }
+    let data = dir.join("daily.csv");
+    std::fs::write(&data, text).unwrap();
+    let data = data.to_string_lossy().into_owned();
+    let plain = write_spec_horizon(&dir, "h.json", 0.0, "null", false, 3600);
+    let wide = std::fs::read_to_string(&plain).unwrap().replace("\"note\":null", "\"note\":null,\"stride_seconds\":86400");
+    let wide_path = dir.join("s.json");
+    std::fs::write(&wide_path, wide).unwrap();
+    let wide_path = wide_path.to_string_lossy().into_owned();
+    let o = run(&data, &wide_path, PNL);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(num(&json(&o), &["objective", "validation", "periods_per_year"]), 365.0);
+    let o = run(&data, &plain, PNL);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).starts_with("error: missing stride_seconds"), "{}", stderr(&o));
+}
+
+#[test]
+fn search_stride_unknown_above_horizon() {
+    let (_scratch, dir) = scratch();
+    let mut text = String::from("t,x1,x2,r,y\n");
+    for i in 0..N {
+        let (x1, x2, r) = row(i);
+        text.push_str(&format!("{},{},{},{},{}\n", T0 + 86_400 * i as i64, x1, x2, r, r));
+    }
+    let data = dir.join("daily.csv");
+    std::fs::write(&data, text).unwrap();
+    let data = data.to_string_lossy().into_owned();
+    let plain = write_spec_horizon(&dir, "h.json", 0.0, "null", false, 3600);
+    let o = run(&data, &plain, PNL);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    let msg = stderr(&o);
+    assert!(msg.starts_with("error: missing stride_seconds") && msg.contains("86400"), "{msg}");
+}
+
+#[test]
+fn search_stride_wider_than_step_refused() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, "a.csv", None);
+    let plain = write_spec_horizon(&dir, "h.json", 0.0, "null", false, 900);
+    let wide = std::fs::read_to_string(&plain).unwrap().replace("\"note\":null", "\"note\":null,\"stride_seconds\":86400");
+    let wide_path = dir.join("s.json");
+    std::fs::write(&wide_path, wide).unwrap();
+    let wide_path = wide_path.to_string_lossy().into_owned();
+    let o = run(&data, &wide_path, PNL);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    let msg = stderr(&o);
+    assert!(msg.starts_with("error: stride_seconds 86400") && msg.contains("900"), "{msg}");
 }

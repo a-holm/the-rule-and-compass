@@ -275,7 +275,7 @@ pub const CROSS_ETH_NAMES: &[&str] = &[
 ];
 
 /// Equal-weight market state, breadth, dispersion and ex-self relative
-/// columns. They require at least [`MIN_CROSS_MEMBERS`] valid point-in-time
+/// columns. They require at least `--min-cross-members` (default [`MIN_CROSS_MEMBERS`]) valid point-in-time
 /// members at the timestamp, otherwise every value at that timestamp is `NaN`.
 pub const CROSS_MARKET_NAMES: &[&str] = &[
     "mkt_r16",
@@ -362,6 +362,27 @@ pub const MARKET_STATE_NAMES: &[&str] = &[
     "cs_rank_r60",
 ];
 
+/// Market-level gate columns of the regime-gate menu (#1270). The three `btc_`
+/// names join one BTC series by exact timestamp; the three `mkt_` names use the
+/// member rule and the member floor of `mkt_r96`. The daily ones read closed
+/// UTC days only.
+pub const CROSS_GATE_NAMES: &[&str] = &[
+    "btc_r168",
+    "mkt_r672",
+    "btc_trend_ma100_ratio",
+    "mkt_trend_ma100_ratio",
+    "btc_vol_ratio_168_2160",
+    "mkt_trend_hi90_dist",
+];
+
+fn is_gate_market(name: &str) -> bool {
+    matches!(name, "mkt_r672" | "mkt_trend_ma100_ratio" | "mkt_trend_hi90_dist")
+}
+
+fn is_gate_daily(name: &str) -> bool {
+    matches!(name, "btc_trend_ma100_ratio" | "mkt_trend_ma100_ratio" | "mkt_trend_hi90_dist")
+}
+
 /// The complete #273 cross-asset inventory in stable emission order.
 pub fn cross_names() -> Vec<String> {
     CROSS_BTC_NAMES
@@ -370,12 +391,13 @@ pub fn cross_names() -> Vec<String> {
         .chain(CROSS_MARKET_NAMES)
         .chain(CROSS_RANK_NAMES)
         .chain(MARKET_STATE_NAMES)
+        .chain(CROSS_GATE_NAMES)
         .map(|s| s.to_string())
         .collect()
 }
 
 /// Minimum point-in-time members for a cross-sectional statistic.
-pub const MIN_CROSS_MEMBERS: usize = 20;
+pub const MIN_CROSS_MEMBERS: usize = crate::cross_floor::DEFAULT;
 
 /// Source column a cross-family member is computed from.
 pub fn cross_source(name: &str) -> Option<&'static str> {
@@ -387,6 +409,7 @@ pub fn cross_source(name: &str) -> Option<&'static str> {
         "xs_rank_vol20" => "vol20",
         "xs_rank_amihud96" => "amihud96",
         "mkt_r96" | "rel_mkt96" => "r96",
+        "mkt_r672" => "r672",
         "mkt_vol96" => "vol96",
         "cs_rank_r60" => "r60",
         "btc_volume_share" => "volume",
@@ -416,6 +439,20 @@ fn cross_formula(name: &str) -> &'static str {
         "beta_eth_60" | "beta_eth_384" => "clip(cov(r_i,r_ETH,w)/var(r_ETH,w),-5,5)",
         "mkt_r16" | "mkt_ew_ret16" => "equal-weight mean of PIT member r16 at t",
         "mkt_r96" => "equal-weight mean of PIT member r96 at t",
+        "mkt_r672" => "equal-weight mean of PIT member r672 at t",
+        "btc_r168" => "ln(C_BTC,t/C_BTC,t-168) at the same timestamp",
+        "btc_trend_ma100_ratio" => {
+            "BTC trend_ma100_ratio (D/SMA100 - 1 on closed UTC daily bars) at the same timestamp"
+        }
+        "mkt_trend_ma100_ratio" => {
+            "I/SMA100(I) - 1 on the closed daily equal-weight index I; I_d = I_(d-1) exp(m_d), m_d the equal-weight mean of PIT member daily log returns, N>=20 by default (--min-cross-members)"
+        }
+        "btc_vol_ratio_168_2160" => {
+            "population sd of BTC one-bar log returns over 168 bars / the same over 2160 bars"
+        }
+        "mkt_trend_hi90_dist" => {
+            "I/max(I over the last 90 closed days) - 1 on the closed daily equal-weight index I"
+        }
         "mkt_vol96" => "equal-weight mean of PIT member vol96 at t",
         "breadth" | "mkt_breadth" => "share of PIT members with r16 > 0",
         "dispersion" | "mkt_dispersion" => "population sd of PIT member r16 at t",
@@ -428,7 +465,7 @@ fn cross_formula(name: &str) -> &'static str {
         "btc_volume_share" => "BTC volume / total PIT member volume at t",
         "xs_rank_r1" | "xs_rank_r16" | "xs_rank_r20" | "xs_rank_vol20"
         | "xs_rank_amihud96" | "cs_rank_r60" => {
-            "2*(rank-1)/(n-1)-1 per timestamp; PIT finite, N>=20, ties symbol then row, -0==+0; one device (time,symbol,row) permutation reused"
+            "2*(rank-1)/(n-1)-1 per timestamp; PIT finite, N>=20 by default (--min-cross-members-rank), ties symbol then row, -0==+0; one device (time,symbol,row) permutation reused"
         }
         _ => "see docs/ohlcv.md",
     }
@@ -447,6 +484,12 @@ fn cross_warmup(name: &str) -> usize {
         | "eth_vol96" | "mkt_r96" | "mkt_vol96" | "rel_mkt96" | "avg_corr"
         | "xs_rank_amihud96" => 96,
         "btc_r672" | "eth_r672" => 672,
+        "btc_r168" => 168,
+        "mkt_r672" => 672,
+        "btc_vol_ratio_168_2160" => 2160,
+        "btc_trend_ma100_ratio" => 99,
+        "mkt_trend_ma100_ratio" => 100,
+        "mkt_trend_hi90_dist" => 90,
         "beta_btc_60" | "beta_eth_60" => 59,
         "beta_btc_384" | "beta_eth_384" => 383,
         "xs_rank_r1" => 1,
@@ -738,7 +781,7 @@ pub fn default_registry() -> Vec<RegistryEntry> {
         push_unique(&mut out, RegistryEntry {
             name: name.clone(),
             family: "cross",
-            timeframe: "15m",
+            timeframe: if is_gate_daily(&name) { "1d" } else { "15m" },
             warmup,
             available: true,
             derived: false,
@@ -746,18 +789,27 @@ pub fn default_registry() -> Vec<RegistryEntry> {
             formula,
             source: match cross_source(&name) {
                 Some("volume") => "raw volume + all PIT members",
-                Some("r1") | Some("r16") | Some("r20") | Some("r96") | Some("vol20")
+                Some("r1") | Some("r16") | Some("r20") | Some("r96") | Some("r672") | Some("vol20")
                 | Some("vol96") | Some("r60") | Some("amihud96") => {
                     "all PIT members at the same timestamp"
                 }
+                _ if matches!(name.as_str(), "mkt_trend_ma100_ratio" | "mkt_trend_hi90_dist") => {
+                    "daily closes of all PIT members"
+                }
                 _ => "benchmark series by exact timestamp",
             },
-            pit: if CROSS_BTC_NAMES.contains(&name.as_str()) {
+            pit: if name == "btc_trend_ma100_ratio" {
+                crate::trend::PIT_RULE
+            } else if matches!(name.as_str(), "mkt_trend_ma100_ratio" | "mkt_trend_hi90_dist") {
+                "closed UTC daily bars only (the running day is never used); the index uses member_asof <= t at the last bar of each day, N>=20 members per day by default (--min-cross-members), a day below the floor or a missing day is NaN, a window holding it is NaN; no forward fill"
+            } else if matches!(name.as_str(), "btc_r168" | "btc_vol_ratio_168_2160") {
+                "same timestamp only; a missing benchmark row is NaN, never forward-filled"
+            } else if CROSS_BTC_NAMES.contains(&name.as_str()) {
                 "same timestamp only; a missing benchmark row is NaN, never forward-filled"
             } else if CROSS_ETH_NAMES.contains(&name.as_str()) {
                 "same timestamp only; a missing ETH row is NaN, never forward-filled"
             } else {
-                "rows present at t with member_asof <= t; N>=20; no forward fill; gaps are NaN"
+                "rows present at t with member_asof <= t; N>=20 by default (--min-cross-members, --min-cross-members-rank); no forward fill; gaps are NaN"
             },
             reason: None,
         });
@@ -1608,6 +1660,9 @@ pub fn lookback_seconds(name: &str, bar_seconds: i64) -> Option<i64> {
     if let Some(l) = crate::trend::lookback_seconds(name) {
         return Some(l);
     }
+    if let Some(l) = crate::trend::gate_lookback_seconds(name) {
+        return Some(l);
+    }
     if let Some((_, kind)) = crate::labels::parse_column(name) {
         let scaled = crate::labels::COLUMN_KINDS.iter().any(|(k, s)| *k == kind && *s);
         let w = if scaled { crate::labels::LongLabelSpec::new("", 1, 1).sigma_window as i64 } else { 0 };
@@ -1689,6 +1744,10 @@ pub struct Options {
     pub locked_also: Option<crate::lockbox::Lockbox>,
     /// Where `locked_test` came from when the command line resolved it; `None` for a library caller.
     pub locked_source: Option<crate::lockbox::Source>,
+    /// The campaign lock record whose range `locked_test` or `locked_also` carries (#1130).
+    pub lock_record: Option<crate::lockrec::LockRecord>,
+    /// Member floors of the cross-section columns (#1274).
+    pub cross_floor: crate::cross_floor::CrossFloor,
     pub dry_run: bool,
     pub json: bool,
 }
@@ -1724,6 +1783,8 @@ impl Default for Options {
             locked_test: None,
             locked_also: None,
             locked_source: None,
+            lock_record: None,
+            cross_floor: crate::cross_floor::CrossFloor::default(),
             dry_run: false,
             json: false,
         }
@@ -1746,6 +1807,8 @@ pub struct FeatureReport {
     pub label: bool,
     /// Seconds of bars before a row that the column reads (rule `rcsr-lookback/1`).
     pub lookback_seconds: Option<i64>,
+    /// Member floor a cross-section column was built with (#1274); `None` for every other column.
+    pub min_members: Option<usize>,
 }
 
 /// One long-only label family written to the store.
@@ -1777,6 +1840,10 @@ pub struct Report {
     pub bar_seconds: i64,
     /// Store-wide lookback embargo and the column that sets it.
     pub lockbox_embargo: (i64, String),
+    /// Floors this run built its cross-section columns with, or the input store's when it built none (#1274).
+    pub cross_floor: Option<crate::cross_floor::CrossFloor>,
+    /// Floors of the cross columns the input holds and this run keeps; the sidecar lists them as `cross_columns` (#1274).
+    pub carried_floors: Vec<(String, usize)>,
     pub features: Vec<FeatureReport>,
     pub plans: Vec<GroupPlan>,
     /// Long-only label families written by this run (#262).
@@ -1824,6 +1891,10 @@ pub struct Report {
     pub feature_other_seconds: f64,
     pub xs_seconds: f64,
     pub write_seconds: f64,
+    /// Partition of `write_seconds` (#1037): temp-column and source reads, file writes, and time blocked on the hash thread.
+    pub write_read_seconds: f64,
+    pub write_write_seconds: f64,
+    pub write_hash_wait_seconds: f64,
     pub total_seconds: f64,
     /// #284: run-scoped phase ledger: stage seconds (`features`, `io`, `host_other`) and device-busy intervals on one clock.
     pub ledger: crate::gpu_stats::RunLedger,
@@ -1886,6 +1957,10 @@ impl Report {
                 self.gpu_write_seconds,
                 self.feature_cpu_seconds,
                 self.feature_other_seconds
+            ),
+            format!(
+                "# enrich: write_parts read={:.3}s write={:.3}s hash_wait={:.3}s",
+                self.write_read_seconds, self.write_write_seconds, self.write_hash_wait_seconds
             ),
         ];
         if let Some(hash) = &self.projection_hash {
@@ -1974,7 +2049,7 @@ impl Report {
                 format!(
                     "{{\"name\":{},\"warmup\":{},\"nan_rows\":{},\"prevalence\":{:.12},\
                      \"first_finite_row\":{},\"first_finite_time\":{},\"first_finite_iso\":{},\
-                     \"label\":{},\"lookback_seconds\":{},\"sha256\":{}{}}}",
+                     \"label\":{},\"lookback_seconds\":{},\"sha256\":{}{}{}}}",
                     jstr(&f.name),
                     f.warmup,
                     f.nan_rows,
@@ -1993,7 +2068,8 @@ impl Report {
                     jstr(&f.hash),
                     f.rows_left_out
                         .map(|n| format!(",\"rows_left_out\":{},\"sha256_scope\":\"all_rows\"", n))
-                        .unwrap_or_default()
+                        .unwrap_or_default(),
+                    f.min_members.map(|k| format!(",\"min_members\":{}", k)).unwrap_or_default()
                 )
             })
             .collect();
@@ -2015,13 +2091,14 @@ impl Report {
             .iter()
             .map(|p| {
                 format!(
-                    "{{\"group\":{},\"rows\":{},\"columns\":{},\"gpu_columns\":{},\"cpu_columns\":{},\"op\":{},\"cpu_ms\":{:.3},\"gpu_ms\":{:.3},\"pass_shared\":{},\"pass_cpu_ms\":{:.3},\"benchmark_present\":{},\"backend\":{},\"reason\":{}}}",
+                    "{{\"group\":{},\"rows\":{},\"columns\":{},\"gpu_columns\":{},\"cpu_columns\":{},\"op\":{},\"classes\":{},\"cpu_ms\":{:.3},\"gpu_ms\":{:.3},\"pass_shared\":{},\"pass_cpu_ms\":{:.3},\"benchmark_present\":{},\"backend\":{},\"reason\":{}}}",
                     jstr(&p.group),
                     p.rows,
                     p.cols,
                     p.gpu_cols,
                     p.cpu_cols,
                     jstr(&p.op),
+                    classes_json(&p.classes),
                     p.cpu_ms,
                     p.gpu_ms,
                     p.pass_shared,
@@ -2033,7 +2110,7 @@ impl Report {
             })
             .collect();
         format!(
-            "{{\n  \"tool\":\"rcsr enrich\",\n  \"input\":{},\"output\":{},\n  \
+            "{{\n  \"tool\":\"rcsr enrich\",\n{}  \"input\":{},\"output\":{},\n  \
              \"input_sha256\":{},\"output_sha256\":{},\"output_bytes\":{},\n  \
              \"rows\":{},\"columns_in\":{},\"columns_out\":{},\"groups\":{},\"symbols\":{},\n  \
              \"group_rows\":{},\"chunk_rows\":{},\"threads\":{},\"bar_seconds\":{},\n  \
@@ -2041,8 +2118,10 @@ impl Report {
              \"backend\":{},\"gpu_requested\":{},\"gpu_probed\":{},\"gpu_available\":{},\"gpu_device\":{},\n  \
              \"gpu\":{{\"columns\":{},\"cpu_columns\":{},\"share\":{:.6},\"fallback\":{},\"kernel_s\":{:.6},\"h2d_s\":{:.6},\"d2h_s\":{:.6},\"write_s\":{:.6},\"transfer_bytes\":{},\"write_bw\":{:.0},\"fallback_columns\":[{}]}},\n  \
              \"plan_rates\":{},\n  \"projection\":{{\"hash\":{},\"columns\":[{}]}},\n  \
-             \"timing\":{{\"read_s\":{:.6},\"feature_s\":{:.6},\"feature_read_s\":{:.6},\"feature_context_s\":{:.6},\"feature_gpu_s\":{:.6},\"feature_cpu_s\":{:.6},\"feature_other_s\":{:.6},\"xs_s\":{:.6},\"write_s\":{:.6},\"total_s\":{:.6}}},\n  \"ledger\":{},\n  \
+             \"timing\":{{\"read_s\":{:.6},\"feature_s\":{:.6},\"feature_read_s\":{:.6},\"feature_context_s\":{:.6},\"feature_gpu_s\":{:.6},\"feature_cpu_s\":{:.6},\"feature_other_s\":{:.6},\"xs_s\":{:.6},\"write_s\":{:.6},\"write_read_s\":{:.6},\"write_write_s\":{:.6},\"write_hash_wait_s\":{:.6},\"total_s\":{:.6}}},\n  \"ledger\":{},\n  \
              \"peak_rss_bytes\":{},\n  \"features\":[{}],\n  \"long_labels\":[{}],\n  \"plan\":[{}]\n}}\n",
+            self.cross_floor.map(|c| format!("  \"cross_floor\":{},\n", c.json())).unwrap_or_default()
+                + &cross_columns_json(&self.carried_floors),
             jstr(&self.input),
             jstr(&self.output),
             jstr(&self.input_sha256),
@@ -2101,6 +2180,9 @@ impl Report {
             self.feature_other_seconds,
             self.xs_seconds,
             self.write_seconds,
+            self.write_read_seconds,
+            self.write_write_seconds,
+            self.write_hash_wait_seconds,
             self.total_seconds,
             self.ledger.phase_json("enrich", ENRICH_ZERO_STAGES),
             self.peak_rss_bytes,
@@ -2379,6 +2461,8 @@ pub struct GroupPlan {
     /// Columns that stay on the CPU (unsupported names or a CPU dispatch).
     pub cpu_cols: usize,
     pub op: String,
+    /// The columns of the family by operation class, so a plan can be recomputed.
+    pub classes: Vec<ClassCount>,
     /// CPU estimate of this family with the whole run on the CPU: a shared pass
     /// is split equally among the families of its class, so the families sum to
     /// the run estimate.
@@ -3171,6 +3255,7 @@ pub fn plan_groups_full(
 /// One family's inputs to the dispatch decision. Seconds.
 struct FamilyCost {
     group: &'static str,
+    classes: Vec<ClassCount>,
     cols: usize,
     supported: usize,
     op: OpClass,
@@ -3182,6 +3267,10 @@ struct FamilyCost {
     cpu_cols_s: f64,
     /// CPU time of the columns that have a kernel, without any fixed part.
     cpu_supported_s: f64,
+    /// CPU estimate of the whole family with every column on the CPU.
+    cpu_report_s: f64,
+    /// Every supported column is bit-identical across backends.
+    exact: bool,
     gpu_s: f64,
     /// Part of `gpu_s` that another family on the device already pays: the
     /// context and fixed setup. Zero for the fused families.
@@ -3208,30 +3297,143 @@ pub fn plan_groups_rated(
     benchmark_present: bool,
     rates: &EnrichRates,
 ) -> Vec<GroupPlan> {
+    let mix: BTreeMap<&'static str, Vec<ClassCount>> = counts
+        .iter()
+        .map(|(group, (cols, op))| {
+            let supported = (*gpu_cols.get(group).unwrap_or(&0)).min(*cols);
+            let one = ClassCount { op: *op, cols: *cols, supported, exact: supported };
+            (*group, vec![one])
+        })
+        .collect();
+    plan_groups_mixed(
+        &mix,
+        n_rows,
+        n_segments,
+        1,
+        gpu_requested,
+        gpu_available,
+        benchmark_present,
+        rates,
+    )
+}
+
+/// Columns of one family that share an operation class.
+///
+/// `supported` counts the columns with a device kernel. `exact` counts the
+/// supported columns whose declared parity tier is `bitwise`: a family moves
+/// by its mixed price only when every supported column is exact, so no
+/// column changes its bytes by changing backend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClassCount {
+    pub op: OpClass,
+    pub cols: usize,
+    pub supported: usize,
+    pub exact: usize,
+}
+
+/// The `plan[].classes` sidecar value of one family.
+fn classes_json(classes: &[ClassCount]) -> String {
+    let items: Vec<String> = classes
+        .iter()
+        .map(|c| {
+            format!(
+                "{{\"op\":{},\"columns\":{},\"gpu_supported\":{},\"bit_identical\":{}}}",
+                jstr(c.op.name()),
+                c.cols,
+                c.supported,
+                c.exact
+            )
+        })
+        .collect();
+    format!("[{}]", items.join(","))
+}
+
+/// [`plan_groups_rated`] with the class of every column of a family and the
+/// number of CPU workers of the feature pass.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_groups_mixed(
+    mix: &BTreeMap<&'static str, Vec<ClassCount>>,
+    n_rows: usize,
+    n_segments: usize,
+    threads: usize,
+    gpu_requested: GpuMode,
+    gpu_available: bool,
+    benchmark_present: bool,
+    rates: &EnrichRates,
+) -> Vec<GroupPlan> {
     let mrow = n_rows as f64 / 1_000_000.0;
     let write_bps = rates.write_bps;
     let mut fams: Vec<FamilyCost> = Vec::new();
-    for (group, (cols, op)) in counts {
-        let (group, cols, op) = (*group, *cols, *op);
+    let workers = if threads > 1 { threads.min(n_segments).max(1) } else { 1 } as f64;
+    for (group, classes) in mix {
+        let group = *group;
+        let cols: usize = classes.iter().map(|c| c.cols).sum();
+        let supported: usize = classes.iter().map(|c| c.supported.min(c.cols)).sum();
+        let mut op = classes.first().map_or(OpClass::Elementwise, |c| c.op);
+        for c in classes {
+            if c.op.pass_rank() > op.pass_rank() {
+                op = c.op;
+            }
+        }
         let rate = rates.class(op);
         let fused = crate::features_gpu::fused_cost(group);
         let in_pass = fused.is_none() && op.is_shared_pass();
-        let supported = (*gpu_cols.get(group).unwrap_or(&0)).min(cols);
-        let (cpu_fixed_s, cpu_cols_s, cpu_supported_s) = match fused {
-            Some(cost) => (
-                0.0,
-                cost.cpu_ms_per_mrow_column * mrow * (cols as f64) / 1000.0,
-                cost.cpu_ms_per_mrow_column * mrow * (supported as f64) / 1000.0,
-            ),
-            None => (
-                if in_pass { 0.0 } else { mrow * rate.cpu_fixed_ms / 1000.0 },
-                mrow * rate.cpu_col_ms * cols as f64 / 1000.0,
-                mrow * rate.cpu_col_ms * supported as f64 / 1000.0,
-            ),
+        let sup_of = |c: &ClassCount| c.supported.min(c.cols);
+        let exact = classes.iter().all(|c| c.exact >= sup_of(c));
+        // A family whose supported columns are not all bit-identical across
+        // backends keeps the one-class price of its family class and one
+        // worker in the decision, so no such column changes backend.
+        let decide_workers = if exact { workers } else { 1.0 };
+        let (cpu_fixed_s, cpu_cols_s, cpu_supported_s, cpu_report_s) = match fused {
+            Some(cost) => {
+                let cols_s = cost.cpu_ms_per_mrow_column * mrow * (cols as f64) / 1000.0;
+                (
+                    0.0,
+                    cols_s / decide_workers,
+                    cost.cpu_ms_per_mrow_column * mrow * (supported as f64) / 1000.0 / decide_workers,
+                    cols_s / workers,
+                )
+            }
+            None => {
+                let mixed_cols_ms: f64 =
+                    classes.iter().map(|c| rates.class(c.op).cpu_col_ms * c.cols as f64).sum();
+                let mixed_fixed_ms = if in_pass {
+                    0.0
+                } else {
+                    classes.iter().map(|c| rates.class(c.op).cpu_fixed_ms).fold(0.0, f64::max)
+                };
+                let report_s = mrow * (mixed_fixed_ms + mixed_cols_ms) / 1000.0 / workers;
+                if exact {
+                    let mixed_supported_ms: f64 = classes
+                        .iter()
+                        .map(|c| rates.class(c.op).cpu_col_ms * sup_of(c) as f64)
+                        .sum();
+                    (
+                        mrow * mixed_fixed_ms / 1000.0 / workers,
+                        mrow * mixed_cols_ms / 1000.0 / workers,
+                        mrow * mixed_supported_ms / 1000.0 / workers,
+                        report_s,
+                    )
+                } else {
+                    (
+                        if in_pass { 0.0 } else { mrow * rate.cpu_fixed_ms / 1000.0 },
+                        mrow * rate.cpu_col_ms * cols as f64 / 1000.0,
+                        mrow * rate.cpu_col_ms * supported as f64 / 1000.0,
+                        report_s,
+                    )
+                }
+            }
         };
         let gpu_cells_n = n_rows.saturating_mul(supported).max(1);
-        let gpu_cells = gpu_cells_n as f64;
         let transfer_bytes = gpu_cells_n as f64 * 8.0;
+        let kernel_s = if exact {
+            classes
+                .iter()
+                .map(|c| n_rows as f64 * sup_of(c) as f64 / rates.class(c.op).gpu_cells_per_s)
+                .sum::<f64>()
+        } else {
+            gpu_cells_n as f64 / rate.gpu_cells_per_s
+        };
         let context_ms_per_mrow = fused.map_or(rates.context_ms_per_mrow, |c| c.context_ms_per_mrow);
         let context_ms = rates.fixed_overhead_ms + context_ms_per_mrow * mrow;
         let gpu_s = if let Some(fused_ms) =
@@ -3247,7 +3449,7 @@ pub fn plan_groups_rated(
         } else {
             context_ms / 1000.0
                 + transfer_bytes / GPU_TRANSFER_BYTES_PER_SECOND
-                + gpu_cells / rate.gpu_cells_per_s
+                + kernel_s
                 + transfer_bytes / GPU_D2H_BYTES_PER_SECOND
                 + transfer_bytes / write_bps
         };
@@ -3289,6 +3491,7 @@ pub fn plan_groups_rated(
         };
         fams.push(FamilyCost {
             group,
+            classes: classes.clone(),
             cols,
             supported,
             op,
@@ -3296,6 +3499,8 @@ pub fn plan_groups_rated(
             cpu_fixed_s,
             cpu_cols_s,
             cpu_supported_s,
+            cpu_report_s,
+            exact,
             gpu_s,
             ctx_s: if fused.is_some() { 0.0 } else { context_ms / 1000.0 },
             forced,
@@ -3333,7 +3538,8 @@ pub fn plan_groups_rated(
             if members.is_empty() {
                 continue;
             }
-            let pass_s = mrow * rates.pass_fixed_ms(pass_op, benchmark_present) / 1000.0;
+            let pass_workers = if members.iter().all(|&i| fams[i].exact) { workers } else { 1.0 };
+            let pass_s = mrow * rates.pass_fixed_ms(pass_op, benchmark_present) / 1000.0 / pass_workers;
             let mut free: Vec<usize> = members
                 .iter()
                 .copied()
@@ -3408,7 +3614,7 @@ pub fn plan_groups_rated(
         };
         let (mut pass_cpu_ms, mut pass_share_ms, mut pass_shared) = (0.0, 0.0, false);
         if f.in_pass {
-            let pass_ms = mrow * rates.pass_fixed_ms(f.op, benchmark_present);
+            let pass_ms = mrow * rates.pass_fixed_ms(f.op, benchmark_present) / workers;
             let cpu_n = cpu_members.get(&f.op.index()).copied().unwrap_or(0);
             let all_n = all_members.get(&f.op.index()).copied().unwrap_or(1);
             pass_shared = all_n > 1;
@@ -3425,7 +3631,8 @@ pub fn plan_groups_rated(
             gpu_cols: if dispatched { f.supported } else { 0 },
             cpu_cols: if dispatched { f.cols - f.supported } else { f.cols },
             op: f.op.name().to_string(),
-            cpu_ms: (f.cpu_fixed_s + f.cpu_cols_s) * 1000.0 + pass_share_ms,
+            classes: f.classes.clone(),
+            cpu_ms: f.cpu_report_s * 1000.0 + pass_share_ms,
             gpu_ms: f.gpu_s * 1000.0,
             pass_shared,
             pass_cpu_ms,
@@ -4481,19 +4688,24 @@ struct Cross {
     r20: BTreeMap<i64, f64>,
     r96: BTreeMap<i64, f64>,
     r672: BTreeMap<i64, f64>,
+    r168: BTreeMap<i64, f64>,
     vol20: BTreeMap<i64, f64>,
     vol96: BTreeMap<i64, f64>,
     volume: BTreeMap<i64, f64>,
+    /// `btc_vol_ratio_168_2160` and `btc_trend_ma100_ratio`, filled only when requested.
+    vol_ratio: BTreeMap<i64, f64>,
+    trend_ma100: BTreeMap<i64, f64>,
 }
 
 impl Cross {
-    fn from_series(s: &Series) -> Self {
+    fn from_series(s: &Series, gates: bool) -> Result<Self, String> {
         let b = Base::new(s);
         let r1 = ret_k(s, 1);
         let r16 = ret_k(s, 16);
         let r20 = ret_k(s, 20);
         let r96 = ret_k(s, 96);
         let r672 = ret_k(s, 672);
+        let r168 = ret_k(s, 168);
         let vol20 = vol_w(s, &b, 20);
         let vol96 = vol_w(s, &b, 96);
         let map = |v: &[f64]| {
@@ -4503,17 +4715,37 @@ impl Cross {
             }
             m
         };
-        Cross {
+        let (vol_ratio, trend_ma100) = if gates {
+            let (v168, v2160) = (vol_w(s, &b, 168), vol_w(s, &b, 2160));
+            let ratio: Vec<f64> = (0..s.len())
+                .map(|i| {
+                    if v168[i].is_finite() && v2160[i].is_finite() && v2160[i] > 0.0 {
+                        v168[i] / v2160[i]
+                    } else {
+                        f64::NAN
+                    }
+                })
+                .collect();
+            let name = "trend_ma100_ratio".to_string();
+            let mut trend = crate::trend::compute(&s.bars(), s.step, std::slice::from_ref(&name))?;
+            (map(&ratio), map(&trend.remove(&name).unwrap_or_default()))
+        } else {
+            (BTreeMap::new(), BTreeMap::new())
+        };
+        Ok(Cross {
             symbol: s.symbol.clone(),
             r1: map(&r1),
             r16: map(&r16),
             r20: map(&r20),
             r96: map(&r96),
             r672: map(&r672),
+            r168: map(&r168),
             vol20: map(&vol20),
             vol96: map(&vol96),
             volume: map(&s.volume),
-        }
+            vol_ratio,
+            trend_ma100,
+        })
     }
     fn at(map: &BTreeMap<i64, f64>, t: i64) -> f64 {
         map.get(&t).copied().unwrap_or(f64::NAN)
@@ -4590,9 +4822,10 @@ fn load_benchmark(
     step: i64,
     symbol: &str,
     external: Option<&str>,
+    gates: bool,
 ) -> Result<Cross, String> {
     if let Some(seg) = segs.iter().find(|s| s.symbol == symbol) {
-        return Ok(Cross::from_series(&load_series(store, seg, cols, step)?));
+        return Cross::from_series(&load_series(store, seg, cols, step)?, gates);
     }
     let Some(path) = external else {
         return Ok(Cross::default());
@@ -4631,7 +4864,7 @@ fn load_benchmark(
         .find(|s| s.symbol == symbol)
         .or_else(|| csegs.first())
         .ok_or_else(|| format!("{}: benchmark store has no rows", path))?;
-    Ok(Cross::from_series(&load_series(&cs, cseg, &ccols, step)?))
+    Cross::from_series(&load_series(&cs, cseg, &ccols, step)?, gates)
 }
 
 // ---------------------------------------------------------------------------
@@ -6162,6 +6395,7 @@ impl TempColumn {
             hash,
             label: self.label,
             lookback_seconds: None,
+            min_members: None,
         })
     }
 }
@@ -6430,6 +6664,7 @@ fn benchmark_return(s: &Series, b: &Base, cross: &Cross, k: usize, relative: boo
         20 => &cross.r20,
         96 => &cross.r96,
         672 => &cross.r672,
+        168 => &cross.r168,
         _ => return vec![f64::NAN; s.len()],
     };
     (0..s.len())
@@ -6536,6 +6771,13 @@ fn compute_own(
                 benchmark_return(s, b, ctx.cross, 96, name == "rel_btc_r96")
             }
             "btc_r672" => benchmark_return(s, b, ctx.cross, 672, false),
+            "btc_r168" => benchmark_return(s, b, ctx.cross, 168, false),
+            "btc_vol_ratio_168_2160" => {
+                (0..n).map(|i| Cross::at(&ctx.cross.vol_ratio, s.times[i])).collect()
+            }
+            "btc_trend_ma100_ratio" => {
+                (0..n).map(|i| Cross::at(&ctx.cross.trend_ma100, s.times[i])).collect()
+            }
             "btc_vol20" => benchmark_vol(s, ctx.cross, 20),
             "btc_vol96" => benchmark_vol(s, ctx.cross, 96),
             "beta_btc_60" | "cross_beta20" => {
@@ -6631,7 +6873,7 @@ pub fn xs_rank(
     sym_key: &[u32],
     rows: usize,
 ) -> Result<Vec<f64>, String> {
-    rank_with_membership(src, times, sym_key, None, rows)
+    rank_with_membership(src, times, sym_key, None, rows, MIN_CROSS_MEMBERS)
 }
 
 /// Point-in-time form of [`xs_rank`]. Rows with `member[r] == false` are
@@ -6642,6 +6884,7 @@ fn rank_with_membership(
     sym_key: &[u32],
     member: Option<&[bool]>,
     rows: usize,
+    floor: usize,
 ) -> Result<Vec<f64>, String> {
     if src.len() != rows || times.len() != rows || sym_key.len() != rows {
         return Err("cross-sectional inputs have inconsistent lengths".to_string());
@@ -6673,7 +6916,7 @@ fn rank_with_membership(
             .then(sym_key[a].cmp(&sym_key[b]))
             .then(a.cmp(&b))
     });
-    Ok(rank_in_order(src, times, &order, sym_key, member, rows))
+    Ok(rank_in_order(src, times, &order, sym_key, member, rows, floor))
 }
 
 /// Rank against an order already sorted by `(time, symbol, row)`.
@@ -6684,6 +6927,7 @@ fn rank_in_order(
     sym_key: &[u32],
     member: Option<&[bool]>,
     rows: usize,
+    floor: usize,
 ) -> Vec<f64> {
     let mut out = vec![f64::NAN; rows];
     let mut i = 0usize;
@@ -6703,7 +6947,7 @@ fn rank_in_order(
                 .then(a.cmp(&b))
         });
         let m = group.len();
-        if m >= MIN_CROSS_MEMBERS {
+        if m >= floor {
             for (rank, &r) in group.iter().enumerate() {
                 out[r] = 2.0 * rank as f64 / (m - 1) as f64 - 1.0;
             }
@@ -6831,7 +7075,9 @@ fn source_values(
 /// True when the market-state pass owns any requested column.
 fn wants_market_state(requested: &[String]) -> bool {
     requested.iter().any(|n| {
-        CROSS_MARKET_NAMES.contains(&n.as_str()) || MARKET_STATE_NAMES.contains(&n.as_str())
+        CROSS_MARKET_NAMES.contains(&n.as_str())
+            || MARKET_STATE_NAMES.contains(&n.as_str())
+            || is_gate_market(n)
     })
 }
 
@@ -6862,6 +7108,7 @@ fn market_state_pass(
     cross: &Cross,
     step: i64,
     mut dev: Option<&mut dyn crate::bench_gpu::MarketDevice>,
+    floor: crate::cross_floor::CrossFloor,
 ) -> Result<BTreeSet<String>, String> {
     use crate::bench_gpu::{WANT_BREADTH, WANT_DISPERSION, WANT_MEAN, WANT_REL};
     let rows = panel.times.len();
@@ -6891,7 +7138,7 @@ fn market_state_pass(
         if wants("rel_mkt16") {
             mask |= WANT_REL;
         }
-        let device = dev.as_mut().and_then(|d| d.group_stats(&src, mask));
+        let device = dev.as_mut().and_then(|d| d.group_stats(&src, mask, floor.members));
         let on_device = device.is_some();
         let (mkt, breadth, dispersion, rel) = if let Some(st) = device {
             (st.mean, st.breadth, st.dispersion, st.rel)
@@ -6911,7 +7158,7 @@ fn market_state_pass(
                 }
             }
             let n = vals.len();
-            if n < MIN_CROSS_MEMBERS {
+            if n < floor.members {
                 continue;
             }
             let nf = n as f64;
@@ -6961,7 +7208,7 @@ fn market_state_pass(
     if wants_r96 {
         let src = source_values(temp, "r96", rows)?;
         let mask = WANT_MEAN | if wants("rel_mkt96") { WANT_REL } else { 0 };
-        let device = dev.as_mut().and_then(|d| d.group_stats(&src, mask));
+        let device = dev.as_mut().and_then(|d| d.group_stats(&src, mask, floor.members));
         let on_device = device.is_some();
         let (mkt, rel) = if let Some(st) = device {
             (st.mean, st.rel)
@@ -6979,7 +7226,7 @@ fn market_state_pass(
                 }
             }
             let n = vals.len();
-            if n < MIN_CROSS_MEMBERS {
+            if n < floor.members {
                 continue;
             }
             let mean = sum / n as f64;
@@ -7009,7 +7256,7 @@ fn market_state_pass(
 
     if wants_vol96 {
         let src = source_values(temp, "vol96", rows)?;
-        let device = dev.as_mut().and_then(|d| d.group_stats(&src, WANT_MEAN));
+        let device = dev.as_mut().and_then(|d| d.group_stats(&src, WANT_MEAN, floor.members));
         let on_device = device.is_some();
         let mkt = if let Some(st) = device {
             st.mean
@@ -7025,7 +7272,7 @@ fn market_state_pass(
                     sum += src[r];
                 }
             }
-            if vals.len() < MIN_CROSS_MEMBERS {
+            if vals.len() < floor.members {
                 continue;
             }
             let mean = sum / vals.len() as f64;
@@ -7048,7 +7295,7 @@ fn market_state_pass(
         let r1 = source_values(temp, "r1", rows)?;
         // The CPU equal-weight mean per timestamp, also the `by_time` lookup the
         // CPU correlation proxy needs.
-        let cpu_means = || {
+        let cpu_means = |fl: usize| {
             let mut mkt = vec![f64::NAN; rows];
             let mut by_time = BTreeMap::new();
             for group in panel.groups() {
@@ -7061,7 +7308,7 @@ fn market_state_pass(
                         sum += r1[r];
                     }
                 }
-                if vals.len() < MIN_CROSS_MEMBERS {
+                if vals.len() < fl {
                     continue;
                 }
                 let mean = sum / vals.len() as f64;
@@ -7078,15 +7325,15 @@ fn market_state_pass(
         };
         let mut cpu_by_time = None;
         if wants("mkt_ew_ret1") {
-            let device = dev.as_mut().and_then(|d| d.group_stats(&r1, WANT_MEAN));
+            let device = dev.as_mut().and_then(|d| d.group_stats(&r1, WANT_MEAN, floor.members));
             let mkt = match device {
                 Some(st) => {
                     done.insert("mkt_ew_ret1".to_string());
                     st.mean
                 }
                 None => {
-                    let (mkt, by_time) = cpu_means();
-                    cpu_by_time = Some(by_time);
+                    let (mkt, by_time) = cpu_means(floor.members);
+                    cpu_by_time = Some(by_time).filter(|_| floor.members == floor.rank_members);
                     mkt
                 }
             };
@@ -7094,13 +7341,13 @@ fn market_state_pass(
         }
 
         if wants_corr {
-            if let Some(avg) = dev.as_mut().and_then(|d| d.avg_corr(&r1)) {
+            if let Some(avg) = dev.as_mut().and_then(|d| d.avg_corr(&r1, floor.rank_members)) {
                 done.insert("avg_corr".to_string());
                 write_cross_output(temp, requested, &["avg_corr"], &avg)?;
             } else {
             let by_time = match cpu_by_time.take() {
                 Some(b) => b,
-                None => cpu_means().1,
+                None => cpu_means(floor.rank_members).1,
             };
             // Average correlation proxy: mean over members of the trailing
             // 96-bar correlation between the member's one-bar return and the
@@ -7167,7 +7414,7 @@ fn market_state_pass(
                         sum += member_corr[r];
                     }
                 }
-                if vals.len() < MIN_CROSS_MEMBERS {
+                if vals.len() < floor.rank_members {
                     continue;
                 }
                 let mean = sum / vals.len() as f64;
@@ -7199,7 +7446,7 @@ fn market_state_pass(
             }
         };
         let bench = cross.bench_series();
-        let device = dev.as_mut().and_then(|d| d.volume_share(&vol, &bench));
+        let device = dev.as_mut().and_then(|d| d.volume_share(&vol, &bench, floor.members));
         let on_device = device.is_some();
         let share = if let Some(share) = device {
             share
@@ -7215,7 +7462,7 @@ fn market_state_pass(
                     count += 1;
                 }
             }
-            if count < MIN_CROSS_MEMBERS || !(total > 0.0) {
+            if count < floor.members || !(total > 0.0) {
                 continue;
             }
             let t = panel.times[group[0] as usize];
@@ -7239,7 +7486,114 @@ fn market_state_pass(
         write_cross_output(temp, requested, &["btc_volume_share"], &share)?;
     }
 
+    // Gate columns (#1270): CPU only, never a device kernel.
+    if wants("mkt_r672") {
+        let src = source_values(temp, "r672", rows)?;
+        write_cross_output(temp, requested, &["mkt_r672"], &equal_weight_mean(panel, &src, floor.members))?;
+    }
+    if wants("mkt_trend_ma100_ratio") || wants("mkt_trend_hi90_dist") {
+        let (ratio, high) = market_daily_gate(panel, segs, store, cols, floor.members)?;
+        write_cross_output(temp, requested, &["mkt_trend_ma100_ratio"], &ratio)?;
+        write_cross_output(temp, requested, &["mkt_trend_hi90_dist"], &high)?;
+    }
+
     Ok(done)
+}
+
+/// Equal-weight mean of the finite PIT member values per timestamp, `NaN` below
+/// `floor` members and on non-member rows.
+fn equal_weight_mean(panel: &CrossPanel, src: &[f64], floor: usize) -> Vec<f64> {
+    let mut mkt = vec![f64::NAN; panel.times.len()];
+    for group in panel.groups() {
+        let mut n = 0usize;
+        let mut sum = 0.0;
+        for &r in group {
+            let r = r as usize;
+            if panel.member[r] && src[r].is_finite() {
+                n += 1;
+                sum += src[r];
+            }
+        }
+        if n < floor {
+            continue;
+        }
+        let mean = sum / n as f64;
+        for &r in group {
+            if panel.member[r as usize] {
+                mkt[r as usize] = mean;
+            }
+        }
+    }
+    mkt
+}
+
+/// `mkt_trend_ma100_ratio` and `mkt_trend_hi90_dist` per row.
+///
+/// A symbol's daily bar is its last base bar of the UTC day. Its daily log
+/// return needs the bar of the day before; the symbol counts on a day when it
+/// is a PIT member at that last bar. A day with fewer than
+/// `floor` returns has no level, and the index restarts at 1
+/// after it. A base row at time `t` reads the day before the day of `t`.
+fn market_daily_gate(
+    panel: &CrossPanel,
+    segs: &[Segment],
+    store: &FileStore,
+    cols: &Cols,
+    floor: usize,
+) -> Result<(Vec<f64>, Vec<f64>), String> {
+    const DAY: i64 = crate::trend::DAY;
+    let rows = panel.times.len();
+    let mut out = (vec![f64::NAN; rows], vec![f64::NAN; rows]);
+    let Some(first) = panel.times.iter().min().map(|t| t.div_euclid(DAY)) else {
+        return Ok(out);
+    };
+    let last = panel.times.iter().max().map(|t| t.div_euclid(DAY)).unwrap_or(first);
+    let days = (last - first + 1) as usize;
+    let mut sum = vec![0.0f64; days];
+    let mut count = vec![0usize; days];
+    let mut order: Vec<&Segment> = segs.iter().collect();
+    order.sort_by_key(|s| s.key);
+    for seg in order {
+        let close = segment_column(store, seg, cols.close)?;
+        let mut prev: Option<(i64, f64)> = None;
+        let mut i = 0usize;
+        while i < seg.len {
+            let day = panel.times[seg.start + i].div_euclid(DAY);
+            let mut j = i;
+            while j + 1 < seg.len && panel.times[seg.start + j + 1].div_euclid(DAY) == day {
+                j += 1;
+            }
+            let c = close[j];
+            if let Some((pd, pc)) = prev {
+                if pd + 1 == day && panel.member[seg.start + j] && c > 0.0 && pc > 0.0 && c.is_finite() && pc.is_finite() {
+                    let d = (day - first) as usize;
+                    sum[d] += (c / pc).ln();
+                    count[d] += 1;
+                }
+            }
+            prev = Some((day, c));
+            i = j + 1;
+        }
+    }
+    let mut index = vec![f64::NAN; days];
+    for d in 0..days {
+        if count[d] >= floor {
+            let before = if d > 0 && index[d - 1].is_finite() { index[d - 1] } else { 1.0 };
+            index[d] = before * (sum[d] / count[d] as f64).exp();
+        }
+    }
+    let (ratio, high) = crate::trend::index_gate_leaves(&index);
+    for r in 0..rows {
+        if !panel.member[r] {
+            continue;
+        }
+        let d = panel.times[r].div_euclid(DAY) - 1 - first;
+        if d >= 0 && (d as usize) < days {
+            out.0[r] = ratio[d as usize];
+            out.1[r] = high[d as usize];
+        }
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -7397,6 +7751,93 @@ pub fn build(opts: &Options) -> Result<Report, String> {
     enrich(opts)
 }
 
+/// Start of the error of a run whose floors differ from the ones its input store was built with; the CLI exits 2.
+pub const CROSS_FLOOR_REFUSAL: &str = "cross-section member floors differ";
+
+/// Validate the floors of `opts` and refuse mixing them with the floors the input store's cross
+/// columns were built with. Every kept cross column resolves to one floor
+/// ([`crate::cross_floor::resolved_columns`]); a run that builds a floored column must ask for the same floor
+/// for each of them. Returns the floors the output records at the top level (only when every cross column of
+/// the output agrees) and the floors of the kept cross columns, which the sidecar carries (#1274).
+fn check_cross_floor(
+    opts: &Options,
+    requested: &[String],
+    names: &[String],
+    data_is_store: bool,
+) -> Result<(Option<crate::cross_floor::CrossFloor>, Vec<(String, usize)>), String> {
+    use crate::cross_floor as cf;
+    for (flag, v) in [("--min-cross-members", opts.cross_floor.members), ("--min-cross-members-rank", opts.cross_floor.rank_members)] {
+        if !(cf::MIN..=cf::MAX).contains(&v) {
+            return Err(format!("{}: {} needs an integer in {}..={}, got '{}'", CROSS_FLOOR_REFUSAL, flag, cf::MIN, cf::MAX, v));
+        }
+    }
+    let kept: Vec<String> = names
+        .iter()
+        .filter(|n| cf::is_floored(n) && !(opts.replace && requested.contains(n)))
+        .cloned()
+        .collect();
+    let resolved = if data_is_store { cf::resolved_columns(&opts.data, &kept) } else { Default::default() };
+    let carried: Vec<(String, usize)> = kept.iter().map(|n| (n.clone(), resolved.get(n).copied().unwrap_or(cf::DEFAULT))).collect();
+    let builds = requested.iter().any(|n| cf::is_floored(n));
+    if builds {
+        for (n, have) in &carried {
+            let want = opts.cross_floor.of(n).unwrap_or(cf::DEFAULT);
+            if *have != want {
+                return Err(format!(
+                    "{}: column '{}' of {} was built with {}; this run asks for {}",
+                    CROSS_FLOOR_REFUSAL,
+                    n,
+                    opts.data,
+                    cf::flag_text(n, *have),
+                    cf::flag_text(n, want)
+                ));
+            }
+        }
+    }
+    let mut market: Vec<usize> = Vec::new();
+    let mut rank: Vec<usize> = Vec::new();
+    for (n, k) in carried.iter().cloned().chain(requested.iter().filter(|n| cf::is_floored(n)).map(|n| (n.clone(), opts.cross_floor.of(n).unwrap_or(cf::DEFAULT)))) {
+        let set = if cf::MARKET_COLUMNS.contains(&n.as_str()) { &mut market } else { &mut rank };
+        if !set.contains(&k) {
+            set.push(k);
+        }
+    }
+    let top = if market.len() > 1 || rank.len() > 1 || (market.is_empty() && rank.is_empty()) {
+        None
+    } else {
+        let input = if data_is_store { cf::recorded_floor(&opts.data) } else { None }.unwrap_or_default();
+        Some(cf::CrossFloor {
+            members: market.first().copied().unwrap_or(if builds { opts.cross_floor.members } else { input.members }),
+            rank_members: rank.first().copied().unwrap_or(if builds { opts.cross_floor.rank_members } else { input.rank_members }),
+        })
+    };
+    Ok((top, carried))
+}
+
+/// `"cross_columns":[...]` sidecar lines for the cross columns this run keeps from its input.
+fn cross_columns_json(carried: &[(String, usize)]) -> String {
+    if carried.is_empty() {
+        return String::new();
+    }
+    let items: Vec<String> = carried.iter().map(|(n, k)| format!("{{\"name\":{},\"min_members\":{}}}", jstr(n), k)).collect();
+    format!("  \"cross_columns\":[{}],\n", items.join(","))
+}
+
+/// `<out>.schema.json` describes the store that was at `out` before this run. Keep it as `<out>.schema.json.prev`, the
+/// way `<out>.enrich.json` keeps its previous generation, so no schema outlives the columns it hashes and no floor
+/// is read from it (#1274). `rcsr panel schema` writes the schema of the new store.
+fn retire_stale_schema(out: &str) {
+    let schema = crate::registry::schema_path(out);
+    if !Path::new(&schema).exists() {
+        return;
+    }
+    let prev = format!("{}.prev", schema);
+    let _ = std::fs::remove_file(&prev);
+    if let Err(e) = std::fs::rename(&schema, &prev) {
+        eprintln!("warning: could not retire {}: {}", schema, e);
+    }
+}
+
 /// Run an enrichment into a temporary output file.
 fn enrich(opts: &Options) -> Result<Report, String> {
     let started = Instant::now();
@@ -7421,6 +7862,100 @@ fn enrich(opts: &Options) -> Result<Report, String> {
 fn temp_dir_for(out: &str) -> PathBuf {
     let pid = std::process::id();
     PathBuf::from(format!("{}.enrich-tmp-{}", out, pid))
+}
+
+/// Operation class a column is costed as. `compact_requested` and
+/// `py15m_requested` are the names the run computes in the shared passes.
+pub fn class_of(name: &str, compact_requested: &[String], py15m_requested: &[String]) -> OpClass {
+    if compact_requested.iter().any(|c| c == name) {
+        OpClass::CompactPass
+    } else if py15m_requested.iter().any(|c| c == name) {
+        OpClass::Py15mPass
+    } else if name.starts_with("xs_") {
+        OpClass::Rank
+    } else if crate::features_gpu::is_device_flow(name) {
+        OpClass::RollingStd
+    } else if crate::features_gpu::is_device_price_action(name) {
+        OpClass::WilderScan
+    } else if FLOW_NAMES.contains(&name) {
+        OpClass::RollingStd
+    } else if name.starts_with("vol")
+        || name.starts_with("bb")
+        || name == "vz96"
+        || name.starts_with("macd")
+        || name.starts_with("skew")
+        || name.starts_with("kurt")
+        || name.starts_with("park")
+        || name.starts_with("gk")
+    {
+        OpClass::RollingStd
+    } else if name.starts_with("dow_")
+        || name.starts_with("hour_")
+        || name.starts_with("month_")
+        || name.starts_with("dom_")
+        || name.starts_with("tod_")
+    {
+        OpClass::Calendar
+    } else if name.starts_with("don") {
+        OpClass::RollingExtrema
+    } else if name.starts_with("ma") || name.starts_with("ema") {
+        OpClass::RollingSum
+    } else if name.starts_with("rsi")
+        || name.starts_with("atr")
+        || name.starts_with("natr")
+        || name.starts_with("adx")
+        || name.starts_with("di_")
+        || name == "stoch_k"
+        || name == "stoch_d"
+    {
+        OpClass::WilderScan
+    } else if name.starts_with("btc")
+        || name.starts_with("rel_btc")
+        || name.starts_with("beta_btc")
+        || name.starts_with("eth_")
+        || name.starts_with("rel_eth")
+        || name.starts_with("beta_eth")
+        || name.starts_with("mkt_")
+        || name.starts_with("cross_")
+    {
+        OpClass::Join
+    } else if is_mtf(name) {
+        OpClass::Mtf
+    } else if crate::trend::is_trend(name) {
+        OpClass::Trend
+    } else {
+        OpClass::Elementwise
+    }
+}
+
+/// A column has an exact device kernel whose declared parity tier is
+/// `bitwise`: it keeps its bytes when its family changes backend.
+fn device_bit_identical(name: &str) -> bool {
+    gpu_supports(name) && declared_parity_tier(name, "") == "bitwise"
+}
+
+/// The columns of every family by operation class, in first-seen order.
+pub fn class_mix(
+    requested: &[String],
+    compact_requested: &[String],
+    py15m_requested: &[String],
+) -> BTreeMap<&'static str, Vec<ClassCount>> {
+    let mut mix: BTreeMap<&'static str, Vec<ClassCount>> = BTreeMap::new();
+    for n in requested {
+        let op = class_of(n, compact_requested, py15m_requested);
+        let classes = mix.entry(family_of(n)).or_default();
+        let i = match classes.iter().position(|c| c.op == op) {
+            Some(i) => i,
+            None => {
+                classes.push(ClassCount { op, cols: 0, supported: 0, exact: 0 });
+                classes.len() - 1
+            }
+        };
+        classes[i].cols += 1;
+        classes[i].supported += gpu_supports(n) as usize;
+        classes[i].exact += device_bit_identical(n) as usize;
+    }
+    mix
 }
 
 fn enrich_inner(
@@ -7508,9 +8043,10 @@ fn enrich_inner(
     if requested.is_empty() && opts.labels.is_empty() {
         return Err("enrich needs --features and/or --label".to_string());
     }
-    if requested.iter().any(|n| crate::trend::is_trend(n)) {
+    if requested.iter().any(|n| crate::trend::is_trend(n) || is_gate_daily(n)) {
         crate::trend::check_bar(step)?;
     }
+    let (cross_floor_out, carried_floors) = check_cross_floor(opts, &requested, &names, data_is_store)?;
     // The target spec names `vol<W>` as the scale column, so the store carries it.
     for src in opts.labels.iter().filter(|l| l.trim_start().starts_with("long:")) {
         let scale = format!("vol{}", crate::labels::LongLabelSpec::declared_sigma_window(src));
@@ -7559,7 +8095,8 @@ fn enrich_inner(
             // Computed in the cross-sectional rank pass, which needs every
             // symbol and point-in-time membership.
         } else if (CROSS_MARKET_NAMES.contains(&n.as_str())
-            || MARKET_STATE_NAMES.contains(&n.as_str()))
+            || MARKET_STATE_NAMES.contains(&n.as_str())
+            || is_gate_market(n))
             && !py15m_names().contains(n)
         {
             // Computed in the whole-panel market-state pass. The five py15m
@@ -7670,6 +8207,9 @@ fn enrich_inner(
         step,
         &opts.cross_symbol,
         opts.cross_data.as_deref(),
+        requested
+            .iter()
+            .any(|n| matches!(n.as_str(), "btc_vol_ratio_168_2160" | "btc_trend_ma100_ratio")),
     )?;
     let needs_eth = requested
         .iter()
@@ -7682,6 +8222,7 @@ fn enrich_inner(
             step,
             &opts.eth_symbol,
             opts.eth_data.as_deref(),
+            false,
         )?
     } else {
         Cross::default()
@@ -7717,98 +8258,26 @@ fn enrich_inner(
         crate::backend::probe()
     };
     let (gpu_available, gpu_device, gpu_probed) = (gpu.available(), gpu.device.clone(), gpu.probed);
-    let mut fam_counts: BTreeMap<&'static str, (usize, OpClass)> = BTreeMap::new();
-    let classify = |name: &str| -> OpClass {
-        if compact_requested.iter().any(|c| c == name) {
-            OpClass::CompactPass
-        } else if py15m_requested.iter().any(|c| c == name) {
-            OpClass::Py15mPass
-        } else if name.starts_with("xs_") {
-            OpClass::Rank
-        } else if crate::features_gpu::is_device_flow(name) {
-            OpClass::RollingStd
-        } else if crate::features_gpu::is_device_price_action(name) {
-            OpClass::WilderScan
-        } else if FLOW_NAMES.contains(&name) {
-            OpClass::RollingStd
-        } else if name.starts_with("vol")
-            || name.starts_with("bb")
-            || name == "vz96"
-            || name.starts_with("macd")
-            || name.starts_with("skew")
-            || name.starts_with("kurt")
-            || name.starts_with("park")
-            || name.starts_with("gk")
-        {
-            OpClass::RollingStd
-        } else if name.starts_with("dow_")
-            || name.starts_with("hour_")
-            || name.starts_with("month_")
-            || name.starts_with("dom_")
-            || name.starts_with("tod_")
-        {
-            OpClass::Calendar
-        } else if name.starts_with("don") {
-            OpClass::RollingExtrema
-        } else if name.starts_with("ma") || name.starts_with("ema") {
-            OpClass::RollingSum
-        } else if name.starts_with("rsi")
-            || name.starts_with("atr")
-            || name.starts_with("natr")
-            || name.starts_with("adx")
-            || name.starts_with("di_")
-            || name == "stoch_k"
-            || name == "stoch_d"
-        {
-            OpClass::WilderScan
-        } else if name.starts_with("btc")
-            || name.starts_with("rel_btc")
-            || name.starts_with("beta_btc")
-            || name.starts_with("eth_")
-            || name.starts_with("rel_eth")
-            || name.starts_with("beta_eth")
-            || name.starts_with("mkt_")
-            || name.starts_with("cross_")
-        {
-            OpClass::Join
-        } else if is_mtf(name) {
-            OpClass::Mtf
-        } else if crate::trend::is_trend(name) {
-            OpClass::Trend
-        } else {
-            OpClass::Elementwise
-        }
-    };
-    let mut gpu_cols: BTreeMap<&'static str, usize> = BTreeMap::new();
-    for n in requested.iter() {
-        let fam = family_of(n);
-        let class = classify(n);
-        let e = fam_counts.entry(fam).or_insert((0, class));
-        if class.pass_rank() > e.1.pass_rank() {
-            e.1 = class;
-        }
-        e.0 += 1;
-        if gpu_supports(n) {
-            *gpu_cols.entry(fam).or_insert(0) += 1;
-        }
-    }
+    let mut mix = class_mix(&requested, &compact_requested, &py15m_requested);
     if !labels.is_empty() {
-        let e = fam_counts.entry("labels").or_insert((0, OpClass::Elementwise));
-        e.0 += labels.len();
-        if gpu_kernels_compiled() {
-            *gpu_cols.entry("labels").or_insert(0) += labels.len();
-        }
+        let supported = if gpu_kernels_compiled() { labels.len() } else { 0 };
+        mix.entry("labels").or_default().push(ClassCount {
+            op: OpClass::Elementwise,
+            cols: labels.len(),
+            supported,
+            exact: supported,
+        });
     }
     let (mut rates, plan_rates) = resolve_rates(&opts.calibration, gpu_device.as_deref())?;
     if let Some(bw) = opts.write_bw {
         rates.write_bps = bw;
     }
     let write_bw = rates.write_bps;
-    let plans = plan_groups_rated(
-        &fam_counts,
-        &gpu_cols,
+    let plans = plan_groups_mixed(
+        &mix,
         store.n_rows(),
         segs.len(),
+        opts.threads.max(1),
         opts.gpu,
         gpu_available,
         !cross.symbol.is_empty(),
@@ -7919,7 +8388,14 @@ fn enrich_inner(
     }
     let mut long_acc: Vec<crate::labels::LabelAccumulator> = long_specs
         .iter()
-        .map(|sp| crate::labels::LabelAccumulator::with_range(sp, label_range).with_also(label_also).with_embargo(embargo_l.0))
+        .map(|sp| {
+            let acc = crate::labels::LabelAccumulator::with_range(sp, label_range).with_also(label_also).with_embargo(embargo_l.0);
+            if opts.lock_record.is_some() {
+                acc.with_also_reported()
+            } else {
+                acc
+            }
+        })
         .collect();
 
     // Cross-sectional source columns are computed even when the user did not
@@ -8622,7 +9098,7 @@ fn enrich_inner(
     // Point-in-time cross-section pass: market state, then ranks. The two
     // passes share one `(time, symbol, row)` order and one membership mask.
     let t_xs = Instant::now();
-    if !cross_sources.is_empty() {
+    if !cross_sources.is_empty() || wants_market_state(&requested) {
         let panel = CrossPanel::new(
             &store,
             &segs,
@@ -8737,6 +9213,7 @@ fn enrich_inner(
                 &cross,
                 step,
                 device,
+                opts.cross_floor,
             )?;
             #[cfg(feature = "cuda")]
             if market_gpu {
@@ -8798,7 +9275,7 @@ fn enrich_inner(
                             xs_prepared = true;
                         }
                         if xs_prepared {
-                            ranks = gpu.rank(&values);
+                            ranks = gpu.rank(&values, opts.cross_floor.rank_members);
                             let stats = gpu.stats();
                             gpu_kernel_seconds = stats.kernel_s + side_kernel_seconds;
                             gpu_d2h_seconds = stats.d2h_s + side_d2h_seconds;
@@ -8821,6 +9298,7 @@ fn enrich_inner(
                                 &panel.sym_key,
                                 Some(&panel.member),
                                 store.n_rows(),
+                                opts.cross_floor.rank_members,
                             )?,
                             false,
                         )
@@ -8914,6 +9392,7 @@ fn enrich_inner(
     // offset into the store.
     for r in &mut reports {
         r.lookback_seconds = column_lookback.get(&r.name).copied();
+        r.min_members = opts.cross_floor.of(&r.name);
         let rows_total = store.n_rows().saturating_sub(r.rows_left_out.unwrap_or(0));
         r.prevalence = if rows_total == 0 {
             0.0
@@ -8946,6 +9425,8 @@ fn enrich_inner(
             threads: opts.threads.max(1),
             bar_seconds: step,
             lockbox_embargo: embargo_l.clone(),
+            cross_floor: cross_floor_out,
+            carried_floors: carried_floors.clone(),
             features: reports,
             plans,
             long_labels: long_outputs,
@@ -8980,6 +9461,9 @@ fn enrich_inner(
             feature_other_seconds,
             xs_seconds,
             write_seconds: 0.0,
+            write_read_seconds: 0.0,
+            write_write_seconds: 0.0,
+            write_hash_wait_seconds: 0.0,
             ledger: phase_ledger(dev.ledger, started, read_seconds, feature_read_seconds, gpu_write_seconds, 0.0, feature_context_seconds, feature_gpu_seconds, feature_cpu_seconds, feature_other_seconds, xs_seconds),
             total_seconds: started.elapsed().as_secs_f64(),
             peak_rss_bytes: peak_rss_bytes(),
@@ -8987,12 +9471,16 @@ fn enrich_inner(
         return Ok(report);
     }
 
+    if let Some(rec) = &opts.lock_record {
+        refuse_carried_labels(&opts.data, out, &long_outputs, rec)?;
+    }
     // Append pass: copy existing blocks and write the new columns. The writer
     // hashes the bytes as they stream out, so the report gets the output
     // checksum without a second multi-gigabyte read.
     let t_write = Instant::now();
     let tmp_out = work_dir.join("out.rcsb").to_string_lossy().into_owned();
-    let output_sha = store::write_store_appending_hashed(&tmp_out, &store, &extras)?;
+    let null_store = crate::permute_labels::marker(&opts.data);
+    let (output_sha, append) = store::write_store_appending_hashed_stats_marked(&tmp_out, &store, &extras, null_store.as_deref())?;
     std::fs::rename(&tmp_out, out).map_err(|e| format!("{}: {}", out, e))?;
     let write_seconds = t_write.elapsed().as_secs_f64();
     let bytes = std::fs::metadata(out).map(|m| m.len()).unwrap_or(0);
@@ -9016,6 +9504,8 @@ fn enrich_inner(
         threads: opts.threads.max(1),
         bar_seconds: step,
         lockbox_embargo: embargo_l.clone(),
+        cross_floor: cross_floor_out,
+        carried_floors,
         features: reports,
         plans,
         long_labels: long_outputs,
@@ -9050,6 +9540,9 @@ fn enrich_inner(
         feature_other_seconds,
         xs_seconds,
         write_seconds,
+        write_read_seconds: append.read_s,
+        write_write_seconds: append.write_s,
+        write_hash_wait_seconds: append.hash_wait_s,
         ledger: phase_ledger(dev.ledger, started, read_seconds, feature_read_seconds, gpu_write_seconds, write_seconds, feature_context_seconds, feature_gpu_seconds, feature_cpu_seconds, feature_other_seconds, xs_seconds),
         total_seconds: started.elapsed().as_secs_f64(),
         peak_rss_bytes: peak_rss_bytes(),
@@ -9066,6 +9559,32 @@ fn label_sidecar_entries(path: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Under a lock record a label sidecar entry this run does not recompute may only carry over when it was
+/// computed under the same record; any other entry holds range information, so the run is refused.
+fn refuse_carried_labels(data: &str, out: &str, outputs: &[LongLabelOutput], rec: &crate::lockrec::LockRecord) -> Result<(), String> {
+    if outputs.is_empty() {
+        return Ok(());
+    }
+    let Some(labels_path) = crate::target::label_sidecar_path(out) else { return Ok(()) };
+    let from = if Path::new(&labels_path).is_file() {
+        Some(labels_path)
+    } else {
+        crate::target::label_sidecar_path(data).filter(|p| Path::new(p).is_file())
+    };
+    let Some(from) = from else { return Ok(()) };
+    for line in label_sidecar_entries(&from) {
+        let recomputed = outputs.iter().any(|o| line.starts_with(&format!("{{\"target\":{},", jstr(&o.target))));
+        if !recomputed && !rec.computed_entry(&line) {
+            let target = crate::manifest::string_field(&line, "target").unwrap_or_default();
+            return Err(format!(
+                "{}: carries the label report of {} computed without this lock record; it would hold locked-range information. Rebuild that label with --lock-record or remove it from the sidecar",
+                from, target
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Write `<out>.labels.json` (the label reports) and add the `y` target specs
@@ -9161,6 +9680,9 @@ pub fn run(args: &[String]) -> ! {
     };
     let mut locked_test: Option<String> = None;
     let mut retired: Option<String> = None;
+    let mut floor_members: Option<usize> = None;
+    let mut floor_rank: Option<usize> = None;
+    let mut lock_record: Option<String> = None;
     let mut i = 0usize;
     macro_rules! val {
         () => {{
@@ -9270,13 +9792,26 @@ pub fn run(args: &[String]) -> ! {
                 locked_test = Some(val!())
             }
             "--retired" => retired = Some(val!()),
+            "--lock-record" => lock_record = Some(val!()),
             "--allow-lockbox" => opts.allow_lockbox = true,
+            "--min-cross-members" => {
+                let v = val!();
+                floor_members = Some(crate::cross_floor::parse_flag("--min-cross-members", &v).unwrap_or_else(|e| fail_usage(&e)));
+            }
+            "--min-cross-members-rank" => {
+                let v = val!();
+                floor_rank = Some(crate::cross_floor::parse_flag("--min-cross-members-rank", &v).unwrap_or_else(|e| fail_usage(&e)));
+            }
             "--dry-run" => opts.dry_run = true,
             "--json" => opts.json = true,
             other => fail(&format!("unknown enrich option '{}'\n\n{}", other, usage())),
         }
         i += 1;
     }
+    opts.cross_floor = crate::cross_floor::CrossFloor {
+        members: floor_members.unwrap_or(crate::cross_floor::DEFAULT),
+        rank_members: floor_rank.or(floor_members).unwrap_or(crate::cross_floor::DEFAULT),
+    };
     if opts.data.is_empty() {
         fail("enrich needs --data <store.rcsb|CSV>");
     }
@@ -9299,11 +9834,33 @@ pub fn run(args: &[String]) -> ! {
     opts.locked_test = resolved.sidecar_range();
     opts.locked_also = resolved.sidecar_also();
     opts.locked_source = Some(resolved.source);
+    if let Some(path) = &lock_record {
+        let record = crate::lockrec::LockRecord::load(path).unwrap_or_else(|e| {
+            eprintln!("error: {}", e.message);
+            std::process::exit(e.exit);
+        });
+        let (range, also) = crate::lockrec::with_record(opts.locked_test, opts.locked_also, &record.range).unwrap_or_else(|e| {
+            eprintln!("error: {}", e.message);
+            std::process::exit(e.exit);
+        });
+        opts.locked_test = range;
+        opts.locked_also = also;
+        if opts.locked_source == Some(crate::lockbox::Source::ProtocolDefault) {
+            opts.locked_source = Some(crate::lockbox::Source::Flag);
+        }
+        opts.lock_record = Some(record);
+    }
     if let (Some(out), false) = (&opts.out, opts.dry_run) {
         let keep = opts.locked_test.map_or(crate::lockbox::Keep::Remove, crate::lockbox::Keep::Range);
         if let Err(e) = crate::lockbox::output_declaration(out, Some(&opts.data), keep) {
             eprintln!("error: {}", e.message.replacen("--lockbox", "--locked-test", 2));
             std::process::exit(e.exit);
+        }
+        if opts.lock_record.is_some() {
+            if let Err(e) = crate::lockbox::check_also_carriers(out, opts.locked_test.as_ref(), opts.locked_also.as_ref()) {
+                eprintln!("error: {}", e.message);
+                std::process::exit(e.exit);
+            }
         }
     }
     let rates_device = if opts.gpu == GpuMode::Off { None } else { crate::backend::probe().device };
@@ -9313,6 +9870,7 @@ pub fn run(args: &[String]) -> ! {
     }
     let report = match enrich(&opts) {
         Ok(r) => r,
+        Err(e) if e.starts_with(CROSS_FLOOR_REFUSAL) => fail_usage(&e),
         Err(e) if e.starts_with(crate::trend::BAR_REFUSAL) => {
             eprintln!("error: {}", e);
             std::process::exit(EXIT_USAGE);
@@ -9321,17 +9879,19 @@ pub fn run(args: &[String]) -> ! {
     };
     if !opts.dry_run {
         if let Some(out) = &opts.out {
+            retire_stale_schema(out);
             let sidecar = format!("{}.enrich.json", out);
             let mut text = report.json();
-            if let Some(lb) = resolved.sidecar_range() {
+            if let Some(lb) = opts.locked_test {
                 let at = text.find('{').map_or(0, |i| i + 1);
                 let source = format!("rcsr enrich ({})", resolved.source.as_str());
-                text.insert_str(
-                    at,
-                    &format!("\"locked_test\":{}{}{},", lb.declaration_json(&source), crate::lockbox::also_json(resolved.sidecar_also().as_ref(), &source), resolved.retired_member()),
-                );
+                let also = match (&opts.lock_record, opts.locked_also) {
+                    (Some(r), Some(a)) if a == r.range => crate::lockbox::also_json(Some(&a), crate::lockrec::SOURCE),
+                    (_, a) => crate::lockbox::also_json(a.as_ref(), &source),
+                };
+                text.insert_str(at, &format!("\"locked_test\":{}{}{},", lb.declaration_json(&source), also, resolved.retired_member()));
             }
-            let declared = resolved.sidecar_range();
+            let declared = opts.locked_test;
             if let Err(e) = crate::atomic::write_text_atomic(&sidecar, &text) {
                 if declared.is_some() {
                     if out != &opts.data {
@@ -9377,6 +9937,11 @@ fn fail(msg: &str) -> ! {
     std::process::exit(EXIT_INPUT);
 }
 
+fn fail_usage(msg: &str) -> ! {
+    eprintln!("error: {}", msg);
+    std::process::exit(EXIT_USAGE);
+}
+
 pub fn usage() -> String {
     "rcsr enrich — append causal, gap-aware OHLCV features to an existing store
 
@@ -9394,7 +9959,8 @@ INPUT / OUTPUT:
                           and output hashes are identical for every size
   --threads <n>           feature-pass workers (default: available CPUs); at most 2 x n
                           segment outputs are held at once; arithmetic and output
-                          hashes are identical for every n
+                          hashes are identical for every n; the planner divides its
+                          CPU estimates by min(n, symbols)
   --group-rows <n>        group size for a CSV input store (store input keeps
                           its own layout)
   --bar-seconds <n>       expected bar spacing; inferred from the modal spacing
@@ -9404,6 +9970,18 @@ INPUT / OUTPUT:
   --cross-data <store>    benchmark store when --data does not contain it
   --eth-symbol <name>     ETH benchmark symbol (default ETHUSDT)
   --eth-data <store>      ETH benchmark store when --data does not contain it
+  --min-cross-members <n>
+                          member floor of the cross-section mean, share, sd and sum-ratio
+                          columns (mkt_*, breadth, dispersion, rel_mkt*, btc_volume_share,
+                          mkt_trend_*): a timestamp with fewer finite PIT members is NaN.
+                          Integer in 5..=200 (default 20; exit 2 otherwise)
+  --min-cross-members-rank <m>
+                          the same floor for the rank columns (xs_rank_*, cs_rank_r60) and
+                          avg_corr; default is the value of --min-cross-members. Both
+                          values are recorded as cross_floor and min_members in
+                          <out>.enrich.json. A run whose floors differ from the ones the
+                          input store's cross columns were built with exits 2 (a store
+                          without the record counts as 20)
   --label <spec>          fwd:<tf|bars>,cost=<bp>,volnorm=<bars>,stride=<n>
                           (repeatable; labels are targets, not features)
   --label long:<tf|bars>[,name=<id>][,delay=<bars>],fee=<bp>[,spread=<bp>]
@@ -9443,6 +10021,17 @@ INPUT / OUTPUT:
                           prevalence, first finite row) leaves out rows inside the range
                           (label columns also the purge) and counts them as
                           rows_left_out; sha256 covers all rows
+  --lock-record <PATH>    a campaign lock record (range.start_epoch, range.end_epoch,
+                          range.end_exclusive true; #1130). Its range takes the second-range
+                          slot next to the resolved locked test and is left out of the label
+                          report (top moves, statistics, locked_test_also.rows_left_out) and
+                          of every per-feature statistic, like --locked-test. A data
+                          declaration that already uses the second slot with another range,
+                          or a record that does not parse, exits 2 (also undeclared data with --locked-test X, where the protocol default fills the slot). The output declares the
+                          range as locked_test_also. A label sidecar entry that was not
+                          recomputed here and not computed under this record is refused
+                          (exit 3); so is an output whose other carriers lack the range.
+                          Check sidecars with `rcsr lock check`
   --gpu [auto|on|off]     auto (default) dispatches a registered exact kernel
                           only when the cost model estimates it faster; on
                           forces every registered kernel above the 1M-row floor;
@@ -9487,14 +10076,18 @@ FEATURE GROUPS (the default financial feature set; see `rcsr schema`):
   calendar   dow_sin dow_cos hour_sin hour_cos month_sin month_cos dom_sin dom_cos
   lags       lag_r1_1 .. lag_r1_10
   xs         xs_rank_r1 xs_rank_r20 xs_rank_vol20 (per-timestamp cross-section;
-             finite PIT members only, ties by symbol then row, N>=20, and the
+             finite PIT members only, ties by symbol then row, N>=20 by default (--min-cross-members-rank), and the
              CUDA path reuses one device (time,symbol,row) permutation)
   btc        btc_r1 btc_r20 btc_vol20 rel_btc_r1 rel_btc_r20 beta_btc_60
   cross      complete #273 family: btc/eth returns, vol and beta; equal-weight
              market mkt_r16 mkt_r96 mkt_vol96; breadth dispersion avg_corr;
              rel_mkt16 rel_mkt96; xs_rank_r1/r16/r20/vol20/amihud96 and the
              legacy mkt_ew_* / cs_rank_r60 aliases. Ranks are [-1,1] and need
-             >=20 point-in-time members; a smaller cross-section is NaN.
+             >=20 point-in-time members by default (--min-cross-members-rank); a smaller cross-section is NaN.
+             Gate-menu columns (#1270, CPU only): btc_r168 btc_vol_ratio_168_2160
+             btc_trend_ma100_ratio mkt_r672 mkt_trend_ma100_ratio
+             mkt_trend_hi90_dist; the daily ones read closed UTC days, need a base
+             bar that divides one day, and carry registered lookbacks.
   py15m      the 35 columns added by the Python enrich_panel_15m.py step
   mtf        the 36 multi-timeframe columns: mtf_<1h|4h|1d>_<leaf> for the
              twelve leaves ret1 ret4 ret24 ma_ratio vol atr_pct rsi close_pos

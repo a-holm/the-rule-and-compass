@@ -34,10 +34,10 @@ fn parse(text: &str) -> Result<Vec<Line>, String> {
             _ => return Err(format!("line {no}: need <binary> <test> <mode> <reason>")),
         };
         let reason = it.collect::<Vec<_>>().join(" ");
-        if !["skip", "api-errors-no", "no-cuda", "no-cuda-app-only", "app-only", "run-bin"].contains(&mode) {
+        if !["skip", "api-errors-no", "no-cuda", "no-cuda-app-only", "app-only", "device", "run-bin"].contains(&mode) {
             return Err(format!("line {no}: unknown mode '{mode}'"));
         }
-        if (mode.starts_with("no-cuda") || mode == "app-only" || mode == "run-bin") && test != "*" {
+        if (mode.starts_with("no-cuda") || mode == "app-only" || mode == "device" || mode == "run-bin") && test != "*" {
             return Err(format!("line {no}: {mode} needs '*' as the test"));
         }
         if reason.is_empty() {
@@ -133,7 +133,7 @@ fn check(plan: &str, root: &Path) -> Vec<String> {
             }
         };
         if l.test == "*" {
-            if lines.iter().any(|o| o.binary == l.binary && o.test != "*" && !(l.mode == "app-only" && (o.mode == "skip" || o.mode == "api-errors-no"))) {
+            if lines.iter().any(|o| o.binary == l.binary && o.test != "*" && !((l.mode == "app-only" || l.mode == "device") && (o.mode == "skip" || o.mode == "api-errors-no"))) {
                 errors.push(format!("line {}: '{}' has both '*' and named lines", l.no, l.binary));
             }
             continue;
@@ -335,6 +335,20 @@ fn spawns_a_process(text: &str) -> bool {
     })
 }
 
+/// The `[[bin]] name` whose `path` is `src/bin/<stem>.rs`, when Cargo.toml declares one.
+fn cargo_bin_name(root: &Path, stem: &str) -> Option<String> {
+    let manifest = fs::read_to_string(root.join("Cargo.toml")).unwrap_or_default();
+    let mut name = None;
+    for line in manifest.lines().map(str::trim) {
+        if let Some(n) = line.strip_prefix("name = \"").and_then(|r| r.strip_suffix('"')) {
+            name = Some(n.to_string());
+        } else if line == format!("path = \"src/bin/{stem}.rs\"") {
+            return name;
+        }
+    }
+    None
+}
+
 /// Test executables and the source text that decides whether they spawn: each `tests/<name>.rs` with its `#[path]` modules,
 /// `lib` (every file of src/ outside src/bin and main.rs), `bin-<name>` (src/main.rs is `bin-rcsr`, src/bin/<x>.rs is `bin-<x>`).
 fn spawn_units(root: &Path) -> Vec<(Vec<String>, String)> {
@@ -359,7 +373,11 @@ fn spawn_units(root: &Path) -> Vec<(Vec<String>, String)> {
             units.push((vec!["bin-rcsr".to_string()], text));
         } else if f.parent() == Some(&src.join("bin")) {
             let stem = f.file_stem().expect("stem").to_string_lossy().to_string();
-            units.push((vec![format!("bin-{stem}"), format!("bin-{}", stem.replace('_', "-"))], text));
+            let mut names = vec![format!("bin-{stem}"), format!("bin-{}", stem.replace('_', "-"))];
+            if let Some(declared) = cargo_bin_name(root, &stem) {
+                names.push(format!("bin-{declared}"));
+            }
+            units.push((names, text));
         } else if !f.starts_with(src.join("bin")) {
             lib.push_str(&text);
         }
@@ -435,4 +453,172 @@ fn src_unit_tests_that_spawn_need_an_application_only_line() {
     assert_eq!(spawners_not_app_only("", &dir), vec!["bin-tool_x".to_string(), "lib".to_string()]);
     assert!(spawners_not_app_only("lib * app-only why\nbin-tool-x * no-cuda-app-only why\n", &dir).is_empty());
     assert!(spawners_not_app_only("lib * skip why\nbin-tool_x * app-only why\n", &dir).is_empty());
+}
+
+/// Test executables with no `*` plan line, or with more than one: `(name, count)`.
+fn star_line_counts(plan: &str, root: &Path) -> Vec<(String, usize)> {
+    let lines = parse(plan).expect("plan parses");
+    spawn_units(root)
+        .into_iter()
+        .map(|(names, _)| {
+            let n = lines.iter().filter(|l| l.test == "*" && l.mode != "run-bin" && names.contains(&l.binary)).count();
+            (names[0].clone(), n)
+        })
+        .collect()
+}
+
+/// Names of test executables that have no `*` plan line.
+fn unplanned(plan: &str, root: &Path) -> Vec<String> {
+    star_line_counts(plan, root).into_iter().filter(|(_, n)| *n == 0).map(|(b, _)| b).collect()
+}
+
+/// Names of test executables with more than one `*` plan line.
+fn duplicated(plan: &str, root: &Path) -> Vec<String> {
+    star_line_counts(plan, root).into_iter().filter(|(_, n)| *n > 1).map(|(b, _)| b).collect()
+}
+
+fn presence_errors(plan: &str, root: &Path) -> Vec<String> {
+    let mut errors = Vec::new();
+    let missing = unplanned(plan, root);
+    if !missing.is_empty() {
+        errors.push(format!(
+            "no plan line: {}. Add `<binary> * device <reason>` to tests/sanitizer.plan when the binary calls CUDA, or `<binary> * no-cuda <reason>` when it makes no CUDA call (`no-cuda-app-only` or `app-only` when it spawns processes)",
+            missing.join(", ")
+        ));
+    }
+    let twice = duplicated(plan, root);
+    if !twice.is_empty() {
+        errors.push(format!("more than one star line: {}. Keep exactly one `*` line per binary in tests/sanitizer.plan", twice.join(", ")));
+    }
+    errors
+}
+
+/// A device entry point in a test source. A `no-cuda*` plan line that names a binary containing one needs `ok-token: <token>` in its reason.
+const DEVICE_TOKENS: &[&str] = &[
+    "DispatchMode::Device",
+    "device_pnl: true",
+    ".device_pnl = true",
+    "\"--device-pnl\"",
+    "gpu: true",
+    "\"--gpu\"",
+    "\"--dispatch\"",
+    "RCSR_GPU=1",
+    "rcsr_on_device",
+    "skip_without_device",
+    "rcsr::gpu::",
+    "rcsr::backend::probe",
+];
+
+/// `binary: token` for every device token in a `no-cuda*` test binary whose plan reason lacks `ok-token: <token>`.
+fn undeclared_device_tokens(plan: &str, root: &Path) -> Vec<String> {
+    let lines = parse(plan).expect("plan parses");
+    let mut bad = Vec::new();
+    for (names, text) in spawn_units(root) {
+        if names[0] == "lib" || names[0].starts_with("bin-") {
+            continue;
+        }
+        let code: String = text.lines().filter(|l| !l.trim_start().starts_with("//")).flat_map(|l| [l, "\n"]).collect();
+        for l in lines.iter().filter(|l| l.test == "*" && l.mode.starts_with("no-cuda") && names.contains(&l.binary)) {
+            for token in DEVICE_TOKENS {
+                if code.contains(token) && !l.args.contains(&format!("ok-token: {token}")) {
+                    bad.push(format!("{}: {token}", l.binary));
+                }
+            }
+        }
+    }
+    bad
+}
+
+#[test]
+fn the_checked_in_plan_has_one_star_line_per_test_executable() {
+    let errors = presence_errors(PLAN, &root());
+    assert!(errors.is_empty(), "{errors:#?}");
+}
+
+#[test]
+fn no_cuda_lines_name_their_device_tokens() {
+    let bad = undeclared_device_tokens(PLAN, &root());
+    assert!(
+        bad.is_empty(),
+        "these no-cuda binaries name a device entry point; add `ok-token: <token>` with the reason to the plan line, or make the binary a `device` line: {bad:#?}"
+    );
+}
+
+fn scratch_tests(tag: &str, files: &[(&str, &str)]) -> Scratch {
+    let scratch = Scratch::new(tag);
+    fs::create_dir_all(scratch.path().join("tests")).unwrap();
+    for (name, text) in files {
+        fs::write(scratch.path().join("tests").join(name), text).unwrap();
+    }
+    scratch
+}
+
+#[test]
+fn a_test_binary_without_a_plan_line_fails() {
+    let plan: String = PLAN.lines().filter(|l| !l.starts_with("occam_code ")).map(|l| format!("{l}\n")).collect();
+    assert!(PLAN.lines().any(|l| l.starts_with("occam_code ")), "the plan lists occam_code");
+    assert_eq!(unplanned(&plan, &root()), vec!["occam_code".to_string()]);
+    let errors = presence_errors(&plan, &root());
+    assert!(errors.iter().any(|e| e.contains("no plan line: occam_code")), "{errors:?}");
+    assert!(errors.iter().any(|e| e.contains("<binary> * device <reason>")), "the message names the fix: {errors:?}");
+}
+
+#[test]
+fn two_star_lines_for_one_binary_fail() {
+    let scratch = scratch_tests("sandup", &[("dup.rs", "fn t() {}\n")]);
+    let plan = "dup * no-cuda why\ndup * device why\n";
+    assert_eq!(duplicated(plan, &scratch.path()), vec!["dup".to_string()]);
+    let errors = presence_errors(plan, &scratch.path());
+    assert!(errors.iter().any(|e| e.contains("more than one star line: dup")), "{errors:?}");
+    assert!(duplicated("dup * no-cuda why\n", &scratch.path()).is_empty());
+}
+
+#[test]
+fn a_no_cuda_line_with_a_device_token_needs_its_marker() {
+    let scratch = scratch_tests("santok", &[("dev.rs", "fn t() { let c = Cfg { gpu: true }; }\n")]);
+    let flagged = undeclared_device_tokens("dev * no-cuda why\n", &scratch.path());
+    assert_eq!(flagged, vec!["dev: gpu: true".to_string()]);
+    assert!(undeclared_device_tokens("dev * no-cuda why; ok-token: gpu: true (a refusal test)\n", &scratch.path()).is_empty());
+    assert_eq!(undeclared_device_tokens("dev * no-cuda-app-only why\n", &scratch.path()), flagged);
+    assert!(undeclared_device_tokens("dev * device why\n", &scratch.path()).is_empty());
+    assert!(undeclared_device_tokens("dev * app-only why\n", &scratch.path()).is_empty());
+}
+
+#[test]
+fn a_marker_covers_only_its_own_token() {
+    let scratch = scratch_tests("sanmark", &[("dev.rs", "fn t() { let c = Cfg { gpu: true }; run(\"--gpu\"); }\n// DispatchMode::Device in a comment\n")]);
+    let plan = "dev * no-cuda why; ok-token: gpu: true\n";
+    assert_eq!(undeclared_device_tokens(plan, &scratch.path()), vec!["dev: \"--gpu\"".to_string()]);
+    let plan = "dev * no-cuda why; ok-token: gpu: true; ok-token: \"--gpu\"\n";
+    assert!(undeclared_device_tokens(plan, &scratch.path()).is_empty());
+}
+
+#[test]
+fn a_walkforward_line_set_to_no_cuda_app_only_is_flagged() {
+    let plan: String = PLAN
+        .lines()
+        .map(|l| if l.starts_with("walkforward ") { "walkforward * no-cuda-app-only why\n".to_string() } else { format!("{l}\n") })
+        .collect();
+    let flagged = undeclared_device_tokens(&plan, &root());
+    assert!(flagged.contains(&"walkforward: .device_pnl = true".to_string()), "{flagged:?}");
+    assert!(flagged.contains(&"walkforward: \"--device-pnl\"".to_string()), "{flagged:?}");
+}
+
+#[test]
+fn device_mode_takes_only_a_star_line() {
+    assert!(parse("gpu_ring * device reason\n").is_ok());
+    assert!(parse("gpu_ring some_test device reason\n").is_err());
+    assert!(parse("gpu_ring * device\n").is_err());
+}
+
+#[test]
+fn a_device_binary_may_name_api_errors_no_tests() {
+    let ok = "gpu_ring * device reason\ngpu_ring stale_cuda_error_does_not_fail_the_transport api-errors-no reason\n";
+    assert_eq!(check(ok, &root()), Vec::<String>::new());
+}
+
+#[test]
+fn a_spawning_binary_cannot_be_device() {
+    let scratch = scratch_tests("sandev", &[("runs.rs", "fn t() { std::process::Command::new(\"true\").output().unwrap(); }\n")]);
+    assert_eq!(spawners_not_app_only("runs * device why\n", &scratch.path()), vec!["runs".to_string()]);
 }
