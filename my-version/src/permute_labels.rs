@@ -608,8 +608,9 @@ pub fn usage_text() -> &'static str {
   order per_symbol, source_sha256, columns, pools per symbol: label_rows, gap_rows} and carries the
   locked-test declaration and the lock record of the source (--lock-record, or the lock_record object of
   a source sidecar). The store header carries the same null object as null_store, so a copy of the store
-  bytes stays marked, as does a store appended from it (rcsr enrich, rcsr panel append and rank); every
-  other store writer starts unmarked. A source row inside a locked range exits 3;
+  bytes stays marked, as does a store that takes columns from it (rcsr enrich, rcsr panel rank, and rcsr panel
+  append with it as --data or --family; also from a null store marked by its manifest only); every other store
+  writer starts unmarked. A source row inside a locked range exits 3;
   rows in a label purge or an embargo neither move nor give a value. A walkforward report priced on the
   output carries null_store; walkforward --ledger (and so --locked-test), ladder --locked-test and
   protocol regimes --after-read on the output exit 2, and rcsr trials reads the report only with --table

@@ -327,11 +327,15 @@ The header is self-describing and deterministic:
   Relative offsets keep the header independent of its own length. A `u32`
   column has no value bytes, so its value offsets do not advance.
 * `null_store` (optional, #1304): the last member of the header of a null store
-  written by `rcsr panel permute-labels`, and of a store appended from one
-  (`rcsr enrich`, `rcsr panel append`, `rcsr panel rank`): the `null` object of
-  its manifest (`docs/panel.md`). A store without it has no such member, so
-  every other store keeps its bytes. The reader skips header members it does
-  not know.
+  written by `rcsr panel permute-labels`, and of a store that takes columns from
+  one (#1313): `rcsr enrich` and `rcsr panel rank` from their input, `rcsr panel
+  append` from its target (`--data`) or its family store (`--family`); when both
+  are marked, the markers must be equal (different ones exit 2 before any
+  write). A null store written before #1304 is marked by its
+  `rcsr-null-store/1` manifest only; these writers put that marker into the
+  header. The member is the `null` object of the manifest (`docs/panel.md`). A
+  store without it has no such member, so every other store keeps its bytes.
+  The reader skips header members it does not know.
 
 Blocks are written in this order, for every group `g`:
 
@@ -418,7 +422,7 @@ When the sidecar exists, a `--vars` name that it does not list exits 3 with the 
 
 `store::write_store_grouped` writes a store one group at a time from a producer closure, so peak memory is one group of every column and not the table. `write_store_with_time` is a producer over an in-memory table, so both paths write identical bytes (`tests/registry.rs`).
 
-`rcsr panel append --data panel.rcsb --family base_enriched.rcsb --columns a,b --out out.rcsb` appends registered columns computed on a symbol-major store to the time-major panel by `(symbol, ts)` key. `--columns` is checked before any column is read: every name must be a numeric column of the family store and a registry column, and must not exist in the panel, and all problems are reported in one message (exit 2). `--skip-existing` drops names that exist in the panel when the family value is bitwise equal on every matched row (NaN equals NaN) and exits 3 naming the first differing row otherwise. `--columns @all` is every numeric family column that is available in the registry and not in the panel. The output is written to `<out>.tmp-<pid>` and renamed, so a failed append leaves no `--out` file and no `rcsr-append-*` scratch file. Existing blocks are copied verbatim through `write_store_appending`, the input file is never opened for writing, a panel row without a family row is NaN and the output gets its own schema file. `rcsr panel rank --data panel.rcsb --column lbl_h1_fwd --name lbl_h1_xs --out out.rcsb` appends the per-timestamp rank of a column in `[-1, 1]` the same way and adds an `xs_rank` entry to `<out stem>.targets.json` (`docs/time-series.md`).
+`rcsr panel append --data panel.rcsb --family base_enriched.rcsb --columns a,b --out out.rcsb` appends registered columns computed on a symbol-major store to the time-major panel by `(symbol, ts)` key. `--columns` is checked before any column is read: every name must be a numeric column of the family store and a registry column, and must not exist in the panel, and all problems are reported in one message (exit 2). `--skip-existing` drops names that exist in the panel when the family value is bitwise equal on every matched row (NaN equals NaN) and exits 3 naming the first differing row otherwise. `--columns @all` is every numeric family column that is available in the registry and not in the panel. The output is written to `<out>.tmp-<pid>` and renamed, so a failed append leaves no `--out` file and no `rcsr-append-*` scratch file. Existing blocks are copied verbatim through `write_store_appending`, the input file is never opened for writing, a panel row without a family row is NaN and the output gets its own schema file. The `null_store` header member of a null store (`docs/panel.md`) among the panel and the family store carries into the output header; two different markers exit 2 before any write (#1313). `rcsr panel rank --data panel.rcsb --column lbl_h1_fwd --name lbl_h1_xs --out out.rcsb` appends the per-timestamp rank of a column in `[-1, 1]` the same way and adds an `xs_rank` entry to `<out stem>.targets.json` (`docs/time-series.md`).
 
 ## Measured
 

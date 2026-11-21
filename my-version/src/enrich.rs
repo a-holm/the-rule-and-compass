@@ -9479,7 +9479,8 @@ fn enrich_inner(
     // checksum without a second multi-gigabyte read.
     let t_write = Instant::now();
     let tmp_out = work_dir.join("out.rcsb").to_string_lossy().into_owned();
-    let (output_sha, append) = store::write_store_appending_hashed_stats(&tmp_out, &store, &extras)?;
+    let null_store = crate::permute_labels::marker(&opts.data);
+    let (output_sha, append) = store::write_store_appending_hashed_stats_marked(&tmp_out, &store, &extras, null_store.as_deref())?;
     std::fs::rename(&tmp_out, out).map_err(|e| format!("{}: {}", out, e))?;
     let write_seconds = t_write.elapsed().as_secs_f64();
     let bytes = std::fs::metadata(out).map(|m| m.len()).unwrap_or(0);
