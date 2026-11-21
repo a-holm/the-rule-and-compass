@@ -976,3 +976,59 @@ fn every_protocol_subcommand_help_prints_its_own_usage() {
         }
     }
 }
+
+/// Every `"--flag"` string literal in the body of `fn <name>(` of `src`.
+fn parser_flags(src: &str, name: &str) -> std::collections::BTreeSet<String> {
+    let start = src.find(&format!("fn {name}(")).unwrap_or_else(|| panic!("no fn {name}"));
+    let body = &src[start..];
+    let body = &body[..body.find("\n}\n").expect("end of fn")];
+    body.split('"')
+        .skip(1)
+        .step_by(2)
+        .filter(|s| s.starts_with("--") && s.len() > 2 && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'))
+        .filter(|s| *s != "--help")
+        .map(str::to_string)
+        .collect()
+}
+
+fn help_of(sub: &str) -> String {
+    let o = rcsr_cmd::rcsr().args(["protocol", sub, "--help"]).output().expect("run rcsr");
+    assert_eq!(o.status.code(), Some(0), "protocol {sub} --help");
+    String::from_utf8_lossy(&o.stdout).into_owned()
+}
+
+#[test]
+fn every_flag_a_protocol_subcommand_accepts_is_in_its_help() {
+    let protocol_src = include_str!("../src/protocol.rs");
+    // windows, seal, verify, retire, candidates and selectors share one parser in
+    // `protocol::run`; the table says which flags belong to which subcommand.
+    let shared: [(&str, &[&str]); 6] = [
+        ("windows", &["--purge-seconds", "--out"]),
+        ("seal", &["--ledger", "--out", "--id", "--final", "--max-reads", "--report-candidates"]),
+        ("verify", &["--ledger", "--data", "--sealed", "--expect-reads"]),
+        ("retire", &["--ledger", "--range", "--out"]),
+        ("candidates", &["--ledger"]),
+        ("selectors", &["--windows", "--label", "--time-col", "--scheme", "--gap-seconds"]),
+    ];
+    let table: std::collections::BTreeSet<String> = shared.iter().flat_map(|(_, f)| f.iter().map(|s| s.to_string())).collect();
+    assert_eq!(table, parser_flags(protocol_src, "run"), "the table lists every flag of the shared parser");
+    for (sub, flags) in shared {
+        let help = help_of(sub);
+        for f in flags {
+            assert!(help.contains(f), "protocol {sub} --help lacks {f}");
+        }
+    }
+    let own: [(&str, std::collections::BTreeSet<String>); 4] = [
+        ("freeze", parser_flags(protocol_src, "freeze_cli")),
+        ("regimes", parser_flags(include_str!("../src/regime_dating.rs"), "run")),
+        ("verdict", parser_flags(include_str!("../src/verdict.rs"), "run")),
+        ("cpcv", parser_flags(include_str!("../src/cpcv.rs"), "protocol_inner")),
+    ];
+    for (sub, flags) in own {
+        assert!(!flags.is_empty(), "no flags found for {sub}");
+        let help = help_of(sub);
+        for f in &flags {
+            assert!(help.contains(f.as_str()), "protocol {sub} --help lacks {f}");
+        }
+    }
+}
