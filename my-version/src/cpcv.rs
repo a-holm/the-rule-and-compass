@@ -831,6 +831,8 @@ struct SplitReport {
     entry_times: Option<f64>,
     /// #1237: `selection.composite.type` of a report of a composed run.
     composite: Option<String>,
+    /// #1253: `selection.run_sha256` of the run the split picked from; `None` without it.
+    run_sha256: Option<String>,
     /// #1272: the `null_store` marker of a report priced on a null store.
     null_store: Option<String>,
 }
@@ -905,7 +907,8 @@ fn load_report(path: &str) -> Result<SplitReport, Fail> {
         },
     };
     let null_store = json.get("null_store").map(to_json);
-    Ok(SplitReport { path: path.to_string(), sha256: crate::manifest::sha256_hex(text.as_bytes()), json, windows, time, net, rows, extra, entry_times, composite, null_store })
+    let run_sha256 = at(&json, &["selection", "run_sha256"]).and_then(Json::as_str).map(str::to_string);
+    Ok(SplitReport { path: path.to_string(), sha256: crate::manifest::sha256_hex(text.as_bytes()), json, windows, time, net, rows, extra, entry_times, composite, run_sha256, null_store })
 }
 
 /// #1236: `pooled.entry_times` of a report. A report with it gives every window its count
@@ -1017,6 +1020,15 @@ fn path_series_json(p: &BuiltPath) -> String {
         s.push_str(&format!(",\"entry_times\":{}", jnum(n)));
     }
     s
+}
+
+/// #1253: the run sha256 every split of the path shares, as JSON; `null` when a split has none or two differ.
+fn common_run_sha256(reports: &[SplitReport], p: &BuiltPath) -> String {
+    let shas: Vec<Option<&str>> = p.splits.iter().map(|&s| reports[s].run_sha256.as_deref()).collect();
+    match shas.first() {
+        Some(Some(first)) if shas.iter().all(|s| s == &Some(*first)) => jstr(first),
+        _ => "null".to_string(),
+    }
 }
 
 /// #1237: the composite marker of a path of composed split reports, the type of every group
@@ -1257,13 +1269,14 @@ in every split or in none",
                     .filter_map(|w| w.expression.as_deref().map(jstr))
                     .collect();
                 format!(
-                    "{{\"group\":{},\"start\":{},\"end\":{},\"split\":{},\"report\":{},\"report_sha256\":{},\"expression\":[{}],\"periods\":{},\"net\":{}{}{}}}",
+                    "{{\"group\":{},\"start\":{},\"end\":{},\"split\":{},\"report\":{},\"report_sha256\":{},\"run_sha256\":{},\"expression\":[{}],\"periods\":{},\"net\":{}{}{}}}",
                     jstr(&label(g)),
                     scheme.groups[g].start(),
                     scheme.groups[g].end(),
                     jstr(&scheme.ids[s]),
                     jstr(&r.path),
                     jstr(&r.sha256),
+                    r.run_sha256.as_deref().map_or("null".to_string(), jstr),
                     exprs.join(","),
                     p.group_periods[g],
                     jnum(p.group_net[g]),
@@ -1288,7 +1301,7 @@ in every split or in none",
 \"purge\":{},\"cost_model\":{},\"cost\":{},\"annualization\":{},\"threshold\":{},\"policy\":{},\"book\":{{\"missing_score\":{}}},\
 \"pooled_seam\":{{\"reset_flat\":true,\"seam_cost\":0,\"seam_trades\":0}},{}\
 \"cpcv\":{{\"scheme_sha256\":{},\"splits_sha256\":{},\"groups\":{},\"test_groups\":{},\"splits\":{},\"paths\":{},\"path\":{},\
-\"seam_rule\":{},\"segments\":[{}]}},\
+\"seam_rule\":{},\"run_sha256\":{},\"segments\":[{}]}},\
 \"pooled\":{{\"sharpe\":{},\"max_drawdown\":{},\"net\":{},\"mean_return\":{},\"periods\":{},\"periods_per_year\":{},\
 \"entries\":{},\"active_rows\":{},\"period_net\":[{}],\"period_time\":[{}]{}{}}}}}\n",
             jstr(env!("CARGO_PKG_VERSION")),
@@ -1310,6 +1323,7 @@ in every split or in none",
             phi,
             j + 1,
             jstr(SEAM_RULE),
+            common_run_sha256(&reports, p),
             segments.join(","),
             jnum(crate::inference::sharpe_per_period(&p.net) * ann),
             jnum(max_drawdown(&p.net)),
