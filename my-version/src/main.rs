@@ -355,8 +355,10 @@ INPUT:
                              the band book of walkforward --policy band (the
                              device holds at most 32 rows; above that --gpu
                              exits 2 and auto falls back to the CPU scorer).
-                             Resume needs the same cost, threshold, band,
-                             band units, minimum hold and rows
+                             Resume needs every input of the book hash: the
+                             message lists the flags (cost, cash, funding,
+                             threshold, band, hold, blocks, statistic, mask,
+                             split table, rows)
   --pnl-blocks K          1 to 64 time blocks for --fitness pnl (default 1 =
                              off, the plain regret). The training timestamps
                              are cut into K equal runs, each block is its own
@@ -6279,9 +6281,10 @@ fn main() {
                 )
             });
             trading_usage(&format!(
-                "--resume conflicts with the saved search settings: fitness {} (saved {}); the book depends on the cost, threshold, band, band units, minimum hold, min-trades, pnl excess and training rows{}",
+                "--resume conflicts with the saved search settings: fitness {} (saved {}); {}{}",
                 cfg.fitness.key(),
                 cp.config.fitness.key(),
+                rcsr::trading::book_conflict_text(&args),
                 mask
             ));
         }
