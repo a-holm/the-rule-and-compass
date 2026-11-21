@@ -1099,6 +1099,7 @@ mod tests {
             migrants: 0,
             migrants_skipped: 0,
             lexicase_cases: None,
+            books: None,
         }
         .json()
     }

@@ -124,6 +124,7 @@ pub fn outcome(
         fixed_position_fallback: false,
         interim: false,
         fit_accept: None,
+        books: None,
     }
 }
 

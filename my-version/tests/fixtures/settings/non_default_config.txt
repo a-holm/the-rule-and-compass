@@ -25,6 +25,7 @@ config patience 7
 config predictor_samples none
 config selection lexicase
 config lexicase_cases 64
+config same_book_guard true
 config restart_policy island
 config restart_isolation 7
 config explore_islands 1
@@ -39,4 +40,4 @@ config reject_fixed_position true
 config fit_thresholds true
 config fit_accept fitness
 config qd_descriptor book
-config_hash c38e92807b3d32c9
+config_hash 5201467ca54bbe81
