@@ -128,8 +128,8 @@ pub struct ProtocolOptions {
     /// `split.fit_label`: the label report facts of the target (see
     /// [`crate::labels::fit_label_json`]).
     pub fit_label: Option<String>,
-    /// #1291: the rows that count as labelled.
-    pub labelled_rows: LabelledRows,
+    /// #1291: the rows that count as labelled, with the inputs the procedure spec binds (#1312).
+    pub row_rule: RowRule,
     /// #1291: data without the fit label column is refused (the books of `--from-run` and
     /// `--front` need it); otherwise the return alone labels a row.
     pub fit_label_required: bool,
@@ -334,12 +334,73 @@ impl LabelledRows {
         }
     }
 
+    /// `split.labelled_rows.rule`.
+    pub fn rule(&self) -> &'static str {
+        match self {
+            LabelledRows::Return => "return",
+            LabelledRows::FitLabel(_) => "fit_label",
+            LabelledRows::BookTarget(_) => "book_target",
+        }
+    }
+
     pub fn json(&self) -> String {
         match self {
-            LabelledRows::Return => "{\"rule\":\"return\"}".to_string(),
-            LabelledRows::FitLabel(c) => format!("{{\"rule\":\"fit_label\",\"column\":{}}}", jstr(c)),
-            LabelledRows::BookTarget(c) => format!("{{\"rule\":\"book_target\",\"column\":{}}}", jstr(c)),
+            LabelledRows::Return => format!("{{\"rule\":\"{}\"}}", self.rule()),
+            LabelledRows::FitLabel(c) | LabelledRows::BookTarget(c) => format!("{{\"rule\":\"{}\",\"column\":{}}}", self.rule(), jstr(c)),
         }
+    }
+}
+
+/// #1312: the row rule of a walk-forward with every input of [`LabelledRows::of_search`] it
+/// came from. The procedure spec writes [`RowRule::binding`], so the candidate id binds the
+/// fit label column, the run's `preparation.fill` and the book label along with the rule.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RowRule {
+    rows: LabelledRows,
+    fit: Option<String>,
+    return_column: Option<String>,
+    fill: Option<String>,
+    top_tercile: bool,
+    book: Option<String>,
+}
+
+impl Default for RowRule {
+    fn default() -> Self {
+        RowRule { rows: LabelledRows::Return, fit: None, return_column: None, fill: None, top_tercile: false, book: None }
+    }
+}
+
+impl RowRule {
+    /// [`LabelledRows::of_search`] of the fit label `spec` priced on `return_column`. `run` is the
+    /// `--from-run` or `--front` run: its `preparation.fill` says whether its books filled missing labels.
+    pub fn of_search(spec: Option<&crate::target::TargetSpec>, return_column: &str, top_tercile: bool, run: Option<&crate::run_json::RunFile>, book_target: Option<String>) -> RowRule {
+        let fills_labels = run.is_some_and(crate::run_json::RunFile::fills_labels);
+        RowRule {
+            rows: LabelledRows::of_search(spec, return_column, top_tercile, fills_labels, book_target.clone()),
+            fit: spec.map(|s| s.column.clone()),
+            return_column: Some(return_column.to_string()),
+            fill: run.and_then(|r| r.fill.clone()),
+            top_tercile,
+            book: book_target,
+        }
+    }
+
+    pub fn rows(&self) -> &LabelledRows {
+        &self.rows
+    }
+
+    /// The `rows=` line of the procedure spec: the rule and every input, `-` for an absent one.
+    pub fn binding(&self) -> String {
+        let col = |c: &Option<String>| c.as_deref().map_or_else(|| "-".to_string(), jstr);
+        format!(
+            "rows=rule={}|fit={}|return={}|fill={}|top_tercile={}|book={}",
+            self.rows.rule(),
+            col(&self.fit),
+            col(&self.return_column),
+            col(&self.fill),
+            self.top_tercile,
+            col(&self.book)
+        )
     }
 }
 
@@ -449,7 +510,7 @@ impl Default for ProtocolOptions {
             run_bands: None,
             quorum: None,
             fit_label: None,
-            labelled_rows: LabelledRows::Return,
+            row_rule: RowRule::default(),
             fit_label_required: false,
             book_label: None,
             horizon_from_spec: false,
@@ -1655,7 +1716,7 @@ fn resolve_layout(spec: &EvalSpec, opts: &ProtocolOptions, names: &[String], num
         }
     }
     let var_names = vars.iter().map(|&j| names[j].clone()).collect();
-    let fit_label = match opts.labelled_rows.fit_label() {
+    let fit_label = match opts.row_rule.rows().fit_label() {
         Some(name) => match names.iter().position(|n| n == name) {
             Some(j) if numeric.get(j).copied().unwrap_or(false) => Some(j),
             _ if opts.fit_label_required => return Err(format!("{} '{}' (the target spec's label column) is not a numeric column of the data: the run's books hold the rows whose fit label and return are finite", FIT_LABEL_REFUSAL, name)),
@@ -3057,7 +3118,7 @@ impl Accum {
             min_group_step,
             min_purge_seconds: min_gap,
             fit_label: opts.fit_label.clone(),
-            labelled_rows: if layout.fit_label.is_none() && opts.labelled_rows.fit_label().is_some() { LabelledRows::Return } else { opts.labelled_rows.clone() },
+            labelled_rows: if layout.fit_label.is_none() && opts.row_rule.rows().fit_label().is_some() { LabelledRows::Return } else { opts.row_rule.rows().clone() },
             book_label: opts.book_label.as_ref().map(BookLabel::json),
             economics,
             inference: inference_report,
