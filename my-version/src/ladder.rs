@@ -34,7 +34,7 @@ use crate::risk::{risk_stats, BetaAlpha, DEFAULT_SORTINO_MAR};
 use crate::target::TargetSpec;
 use crate::target_structure;
 use crate::trading_gpu::{band_positions, BandParams};
-use crate::walkforward::{quantile, BookLabel, LabelledRows, PeriodSource, SECONDS_PER_YEAR};
+use crate::walkforward::{quantile, BookLabel, LabelledRows, PeriodSource, RowRule, SECONDS_PER_YEAR};
 use std::time::Instant;
 
 pub const SCHEMA: &str = "rcsr-ladder/1";
@@ -2469,23 +2469,18 @@ pub fn return_name(inp: &Input, opts: &Options) -> String {
 }
 
 /// #1291: the rows the ladder prices, by the rule of the search's books
-/// ([`LabelledRows::of_search`]). The search prices an `xs_rank` label only as
+/// ([`RowRule::of_search`]). The search prices an `xs_rank` label only as
 /// the top-tercile book, so a `--target` spec of that kind keeps every finite
 /// return; without a target spec there is no fit label apart from the return.
 pub fn labelled_rows(inp: &Input, opts: &Options) -> LabelledRows {
     search_rows(opts.spec.as_ref(), &return_name(inp, opts), opts.sr_run.as_ref().map(|s| &s.run))
 }
 
-/// [`labelled_rows`] from its parts, shared with `rcsr ablation score`.
+/// [`labelled_rows`] from its parts, shared with `rcsr ablation score`; built by
+/// [`RowRule::of_search`], the walk-forward's constructor.
 pub fn search_rows(spec: Option<&crate::target::TargetSpec>, return_column: &str, run: Option<&crate::run_json::RunFile>) -> LabelledRows {
     let top_tercile = spec.is_some_and(|s| s.kind == crate::target::KIND_XS_RANK);
-    LabelledRows::of_search(
-        spec,
-        return_column,
-        top_tercile,
-        run.is_some_and(|r| r.fills_labels()),
-        run.and_then(|r| r.book_target.as_ref()).map(|b| b.column.clone()),
-    )
+    RowRule::of_search(spec, return_column, top_tercile, run, run.and_then(|r| r.book_target.as_ref()).map(|b| b.column.clone())).rows().clone()
 }
 
 /// #1311: the purge the labels require, shared with `rcsr ablation score`: the target spec's
