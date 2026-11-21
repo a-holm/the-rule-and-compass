@@ -749,11 +749,11 @@ fn assert_from_run_reproduces(j: &Json, data: &str, run: &str, days: &[i64], rul
         let want = at(j, &["objective", slot]);
         assert!(num(want, &["trades"]) > 0.0 && num(want, &["entries"]) > 0.0, "{slot}: the book must trade");
         let report = json(&walk(data, "--from-run", run, &window));
-        assert_eq!((s(&report, &["split", "labelled_rows", "rule"]), s(&report, &["split", "labelled_rows", "column"])), rule);
         let m = window_metrics(&report);
         for key in ["rows", "trades", "entries"] {
             assert_eq!(num(&m, &[key]), num(want, &[key]), "{slot} {key}");
         }
+        assert_eq!((s(&report, &["split", "labelled_rows", "rule"]), s(&report, &["split", "labelled_rows", "column"])), rule);
         let net: f64 = one
             .iter()
             .map(|d| {
@@ -814,7 +814,9 @@ fn dense_return_strided_label_walkforward_reproduces_objective() {
         "--objective", "pnl", "--cost-bps", "5", "--validation-frac", "0.3", "--test-frac", "0.2", "--no-dev-log", "--quiet", "--json", "--json-out", run.as_str(),
     ];
     args.extend_from_slice(&SHORT);
-    let j = json(&rcsr(&args));
+    let o = rcsr(&args);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let j = Json::parse(std::fs::read_to_string(&run).unwrap().trim()).expect("run.json");
     assert_eq!(s(&j, &["objective", "book_target"]), "yd");
     assert_eq!(s(&j, &["objective", "book_target_spec", "column"]), "yd");
     assert_from_run_reproduces(&j, &data, &run, &all_days, ("book_target", "yd"));
