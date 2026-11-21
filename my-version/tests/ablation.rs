@@ -982,18 +982,29 @@ fn ablation_score_prices_search_rows() {
 }
 
 /// #1305: a run searched with `--book-target` prices every finite return of its book label, so a
-/// row without a fit label stays priced.
+/// row without a fit label stays priced. #1311: the book label's spec prices it; a run that records
+/// only the book label's name exits 2.
 #[test]
 fn ablation_score_keeps_every_return_for_book_target() {
     let (_scratch, dir) = scratch("book_rows");
     let (data, run, windows) = scored_fixture(&dir, 900);
     let text = std::fs::read_to_string(&run).unwrap();
-    let edited = text.replacen("\"objective\":{", "\"objective\":{\"book_target\":\"y\",", 1);
-    assert_ne!(edited, text, "the run holds an objective block");
-    let book_run = dir.join("book.run.json");
-    std::fs::write(&book_run, edited).unwrap();
+    let spec = std::fs::read_to_string(write_spec_with(&dir, "book_spec.json", 900, None)).unwrap();
+    let entry = &spec[spec.find("[{").unwrap() + 1..spec.rfind("}]").unwrap() + 1];
+    let book_spec = entry.replacen("\"column\":\"y\",\"name\":\"raw_target\"", "\"column\":\"r\",\"name\":\"r\"", 1);
+    assert_ne!(book_spec, entry);
     let sparse = blank_every_third_label(&data);
-    let out = score_cli(&sparse, &windows, 900, &dir.join("book.json"), &["--from-run", book_run.to_str().unwrap()]);
+    let price = |name: &str, objective: String| {
+        let edited = text.replacen("\"objective\":{", &objective, 1);
+        assert_ne!(edited, text, "the run holds an objective block");
+        let book_run = dir.join(format!("{name}.run.json"));
+        std::fs::write(&book_run, edited).unwrap();
+        score_cli(&sparse, &windows, 900, &dir.join(format!("{name}.json")), &["--from-run", book_run.to_str().unwrap()])
+    };
+    let named = price("named", "\"objective\":{\"book_target\":\"r\",".to_string());
+    assert_eq!(named.status.code(), Some(2), "{}", String::from_utf8_lossy(&named.stderr));
+    assert!(String::from_utf8_lossy(&named.stderr).contains("records no objective.book_target_spec"));
+    let out = price("book", format!("\"objective\":{{\"book_target\":\"r\",\"book_target_spec\":{book_spec},"));
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
     let report = Json::parse(std::fs::read_to_string(dir.join("book.json")).unwrap().trim()).unwrap();
     assert_eq!(period_count(&report), 100, "every finite return is priced");
