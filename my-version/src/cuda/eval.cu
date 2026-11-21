@@ -8928,3 +8928,6 @@ const char *rc_last_pnl_book_error(void)
 }
 
 } /* extern "C" */
+
+/* #1258: the device arm of rcsr enumerate. */
+#include "enumerate.h"

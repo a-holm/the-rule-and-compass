@@ -595,7 +595,18 @@ fn push_unique(cuts: &mut Vec<Cut>, c: Cut) {
 /// (below). With fewer than `q` distinct values, every midpoint between
 /// neighbouring distinct values on both sides. Reads predictions only.
 pub fn grid(values: &[f64], q: usize, scratch: &mut Vec<f64>) -> Vec<Cut> {
-    let n = values.len();
+    let distinct = distinct_probe(values, q);
+    if distinct.len() < q {
+        return midpoint_grid(distinct);
+    }
+    let found = select_ranks(values, &grid_ranks(values.len(), q), scratch);
+    rank_grid(values.len(), q, &found)
+}
+
+/// #1258: the distinct values of `values` in row order up to the first `q`,
+/// each as its first occurrence: [`grid`] takes [`midpoint_grid`] when there
+/// are fewer than `q`.
+pub fn distinct_probe(values: &[f64], q: usize) -> Vec<f64> {
     let mut distinct: Vec<f64> = Vec::with_capacity(q);
     for &v in values {
         if !distinct.iter().any(|&d| d == v) {
@@ -605,19 +616,34 @@ pub fn grid(values: &[f64], q: usize, scratch: &mut Vec<f64>) -> Vec<Cut> {
             }
         }
     }
-    let mut cuts = Vec::with_capacity(q);
-    if distinct.len() < q {
-        distinct.sort_by(|a, b| a.total_cmp(b));
-        for w in distinct.windows(2) {
-            cuts.push(Cut { side: Side::Above, value: above_between(w[0], w[1]), share: None });
-        }
-        for w in distinct.windows(2) {
-            cuts.push(Cut { side: Side::Below, value: below_between(w[0], w[1]), share: None });
-        }
-        return cuts;
+    distinct
+}
+
+/// #1258: the grid of a vector with fewer distinct values than cuts: every
+/// midpoint between neighbouring distinct values, above then below.
+pub fn midpoint_grid(mut distinct: Vec<f64>) -> Vec<Cut> {
+    let mut cuts = Vec::with_capacity(2 * distinct.len());
+    distinct.sort_by(|a, b| a.total_cmp(b));
+    for w in distinct.windows(2) {
+        cuts.push(Cut { side: Side::Above, value: above_between(w[0], w[1]), share: None });
     }
-    let sh = shares(q);
+    for w in distinct.windows(2) {
+        cuts.push(Cut { side: Side::Below, value: below_between(w[0], w[1]), share: None });
+    }
+    cuts
+}
+
+/// #1258: the most cuts [`grid`] gives with `q` cuts: `q` on the share grid,
+/// `2 (q - 2)` midpoints for `q - 1` distinct values.
+pub fn grid_capacity(q: usize) -> usize {
+    q.max(2 * q.saturating_sub(2))
+}
+
+/// #1258: the positions (ascending, distinct) of the order statistics the
+/// share grid of `n` values with `q` cuts reads; `n` is at least 2.
+pub fn grid_ranks(n: usize, q: usize) -> Vec<usize> {
     let k_of = |s: f64| ((s * n as f64).round() as usize).clamp(1, n - 1);
+    let sh = shares(q);
     let mut ranks: Vec<usize> = Vec::with_capacity(4 * sh.len());
     for &s in &sh {
         let k = k_of(s);
@@ -628,7 +654,15 @@ pub fn grid(values: &[f64], q: usize, scratch: &mut Vec<f64>) -> Vec<Cut> {
     }
     ranks.sort_unstable();
     ranks.dedup();
-    let found = select_ranks(values, &ranks, scratch);
+    ranks
+}
+
+/// #1258: the share grid of `n` values with `q` cuts from `found`, the
+/// `(rank, value)` of every rank of [`grid_ranks`] in the order of `total_cmp`.
+pub fn rank_grid(n: usize, q: usize, found: &[(usize, f64)]) -> Vec<Cut> {
+    let sh = shares(q);
+    let k_of = |s: f64| ((s * n as f64).round() as usize).clamp(1, n - 1);
+    let mut cuts = Vec::with_capacity(q);
     let at = |r: usize| found[found.binary_search_by_key(&r, |p| p.0).expect("every needed rank is selected")].1;
     for &s in &sh {
         let t = n - k_of(s);
@@ -639,6 +673,64 @@ pub fn grid(values: &[f64], q: usize, scratch: &mut Vec<f64>) -> Vec<Cut> {
         push_unique(&mut cuts, Cut { side: Side::Below, value: below_between(at(t - 1), at(t)), share: Some(s) });
     }
     cuts
+}
+
+/// #1258: the u32 key whose order is the total order of the f32 bits; the
+/// device arm selects and cuts on it.
+pub fn f32_key(bits: u32) -> u32 {
+    bits ^ if bits >> 31 == 1 { u32::MAX } else { 1 << 31 }
+}
+
+/// The f32 bits of a key of [`f32_key`].
+pub fn f32_of_key(key: u32) -> u32 {
+    if key >> 31 == 1 {
+        key ^ (1 << 31)
+    } else {
+        !key
+    }
+}
+
+/// The key of `-f32::MAX` and of `f32::MAX`: every finite f32 key lies between.
+pub const KEY_MIN: u32 = 0x0080_0000;
+pub const KEY_MAX: u32 = 0xFF7F_FFFF;
+
+/// The first key in `[lo, hi]` where `f` holds, for `f` false then true; `hi + 1` when it never holds.
+fn first_true(lo: u32, hi: u32, f: impl Fn(u32) -> bool) -> u64 {
+    let (mut a, mut z) = (lo as u64, hi as u64 + 1);
+    while a < z {
+        let mid = a + (z - a) / 2;
+        if f(mid as u32) {
+            z = mid;
+        } else {
+            a = mid + 1;
+        }
+    }
+    a
+}
+
+/// The keys `[lo, hi]` of the finite f32 predictions that are long at a cut
+/// with constant `c`: `p.is_finite() && p > threshold` for the f64
+/// `p = pred - c` above or `c - pred` below, the long bit of
+/// `FitnessBook::block_totals` on the widened prediction. `p` is monotone in
+/// the prediction, so the long predictions are one interval of the key order
+/// (both zeros give the same `p` up to its sign). `(1, 0)` when none is long.
+pub fn long_interval(side: Side, c: f64, threshold: f64) -> (u32, u32) {
+    let p = |k: u32| {
+        let v = f32::from_bits(f32_of_key(k)) as f64;
+        match side {
+            Side::Above => v - c,
+            Side::Below => c - v,
+        }
+    };
+    let (lo, hi) = match side {
+        Side::Above => (first_true(KEY_MIN, KEY_MAX, |k| p(k) > threshold), first_true(KEY_MIN, KEY_MAX, |k| !(p(k) < f64::INFINITY)).wrapping_sub(1)),
+        Side::Below => (first_true(KEY_MIN, KEY_MAX, |k| p(k) < f64::INFINITY), first_true(KEY_MIN, KEY_MAX, |k| !(p(k) > threshold)).wrapping_sub(1)),
+    };
+    if lo > hi || hi > KEY_MAX as u64 {
+        (1, 0)
+    } else {
+        (lo as u32, hi as u32)
+    }
 }
 
 #[cfg(test)]
@@ -774,31 +866,40 @@ impl Pricer {
         self.consts.clear();
         self.consts.extend(cuts.iter().map(|c| (c.side == Side::Above, c.constant(threshold))));
         family.cut_totals(vals, &self.consts, &mut self.scratch, &mut self.totals);
-        let (q, nb) = (cuts.len(), books[0].blocks());
-        self.fit.clear();
-        let (mut own, mut own_cut) = (f64::INFINITY, cuts[0]);
-        for (k, cut) in cuts.iter().enumerate() {
-            for (b, book) in books.iter().enumerate() {
-                let at = (b * q + k) * nb;
-                let totals = &self.totals[at..at + nb];
-                let f = book.fitness_of(totals);
-                if b == 0 {
-                    if detail {
-                        part.books.insert(book_key(totals));
-                    }
-                    self.fit.push(f);
-                    if f < own {
-                        own = f;
-                        own_cut = *cut;
-                    }
+        settle(books, 0, cuts, &self.totals, detail, part, &mut self.fit).expect("the family holds book 0")
+    }
+}
+
+/// The per-book minima of one tree from its totals over `books`, which are
+/// books `first..` of the pass, `totals[(b * cuts.len() + k) * blocks + block]`
+/// as [`BookFamily::cut_totals`] lays them out. With book 0 among them, its
+/// outcome (the earliest cut on a tie), the fitness of every cut on book 0 in
+/// `fit` and, with `detail`, its books.
+fn settle(books: &[&FitnessBook], first: usize, cuts: &[Cut], totals: &[FitnessTotals], detail: bool, part: &mut Part, fit: &mut Vec<f64>) -> Option<Outcome> {
+    let (q, nb) = (cuts.len(), books[0].blocks());
+    fit.clear();
+    let (mut own, mut own_cut) = (f64::INFINITY, cuts[0]);
+    for (k, cut) in cuts.iter().enumerate() {
+        for (b, book) in books.iter().enumerate() {
+            let at = (b * q + k) * nb;
+            let totals = &totals[at..at + nb];
+            let f = book.fitness_of(totals);
+            if first + b == 0 {
+                if detail {
+                    part.books.insert(book_key(totals));
                 }
-                if f < part.best[b] {
-                    part.best[b] = f;
+                fit.push(f);
+                if f < own {
+                    own = f;
+                    own_cut = *cut;
                 }
             }
+            if f < part.best[first + b] {
+                part.best[first + b] = f;
+            }
         }
-        Outcome::Scored { fitness: own, cut: own_cut, cuts: q }
     }
+    (first == 0).then_some(Outcome::Scored { fitness: own, cut: own_cut, cuts: q })
 }
 
 /// #1257: the outcome of the root mirror `sub(b, a)` from its twin `sub(a, b)`;
@@ -990,6 +1091,71 @@ fn pass_with(scan: &Scan, plan: &Plan, books: &[&FitnessBook], detail: bool, kno
     work.priced = trees as u64 - work.reused.iter().sum::<u64>();
     out.work = work;
     out
+}
+
+/// #1258: [`pass`] on the device (`crate::enumerate_gpu`): every scored tree
+/// evaluated in f32 in batches, cut on the grid of its widened predictions
+/// and priced on every book; the fitness of every cut is
+/// [`FitnessBook::fitness_of`] of the device totals. A refusal or device
+/// failure is an error, never a CPU fallback.
+#[cfg(feature = "cuda")]
+pub(crate) fn device_pass(
+    class: &Class,
+    cols: &[Vec<f64>],
+    rows: usize,
+    q: usize,
+    books: &[&FitnessBook],
+    opts: &crate::enumerate_gpu::DeviceOptions,
+    detail: bool,
+) -> Result<(Pass, crate::enumerate_gpu::DeviceReport), String> {
+    use crate::enumerate_gpu::{DeviceReport, Enumerator, TreeGrid};
+    let trees = class.scored();
+    let mut en = Enumerator::new(cols, rows, books, q, class.max_size(), trees.len(), opts)?;
+    let (batch, bb) = (en.batch(), en.book_batch());
+    let chunks: Vec<(usize, usize)> = (0..books.len()).step_by(bb).map(|s| (s, bb.min(books.len() - s))).collect();
+    if chunks.len() == 1 {
+        en.set_books(books)?;
+    }
+    let mut part = Part { best: vec![f64::INFINITY; books.len()], ..Part::default() };
+    let mut outcomes = if detail { vec![Outcome::Constant; trees.len()] } else { Vec::new() };
+    let mut fit = Vec::new();
+    let mut host_grids = 0u64;
+    for start in (0..trees.len()).step_by(batch) {
+        let end = (start + batch).min(trees.len());
+        let nodes: Vec<Node> = trees[start..end].iter().map(|&e| class.node(e as usize)).collect();
+        let grids = en.eval(&nodes)?;
+        host_grids += grids.iter().filter(|g| matches!(g, TreeGrid::Cuts { host: true, .. })).count() as u64;
+        for (ci, &(b0, bn)) in chunks.iter().enumerate() {
+            if chunks.len() > 1 {
+                en.set_books(&books[b0..b0 + bn])?;
+            }
+            let totals = en.score(&grids, bn)?;
+            for (i, g) in grids.iter().enumerate() {
+                let outcome = match g {
+                    TreeGrid::NonFinite => Some(Outcome::NonFinite),
+                    TreeGrid::Cuts { cuts, .. } if cuts.is_empty() => Some(Outcome::Constant),
+                    TreeGrid::Cuts { cuts, .. } => settle(&books[b0..b0 + bn], b0, cuts, &totals[i], detail, &mut part, &mut fit),
+                };
+                if let (true, 0, Some(o)) = (detail, ci, outcome) {
+                    outcomes[start + i] = o;
+                }
+            }
+        }
+    }
+    let report = DeviceReport {
+        name: crate::gpu::GpuEvaluator::device_name(),
+        batch,
+        book_batch: bb,
+        book_batches: chunks.len(),
+        bytes: en.peak_bytes(),
+        reserve: en.reserve(),
+        host_grids,
+        eval_ms: en.kernel_ms().0,
+        score_ms: en.kernel_ms().1,
+    };
+    let work = Work { priced: trees.len() as u64, book_batches: chunks.len() as u64, ..Work::default() };
+    let pass = Pass { best: part.best, outcomes, books: part.books, derived: vec![false; trees.len()], work };
+    Ok((pass, report))
 }
 
 /// The #1183 pass: every tree evaluated from its leaves and every cut priced by
@@ -1219,6 +1385,8 @@ pub struct Member {
     pub expression: String,
     /// The same expression over normalised inputs.
     pub node: Node,
+    /// #1258: the fitness the device arm ranked this member by (its f32 predictions); `None` on the CPU arm.
+    pub device_fitness: Option<f64>,
 }
 
 /// What [`member`] reads.
@@ -1278,6 +1446,7 @@ pub fn member(ctx: &MemberCtx, position: usize, cut: Cut) -> Member {
         tree: expr::to_string(&tree, ctx.vars),
         expression: expr::to_string_exact(&printed, ctx.vars),
         node,
+        device_fitness: None,
     }
 }
 
@@ -1306,6 +1475,46 @@ pub fn members(ctx: &MemberCtx, outcomes: &[Outcome], top: usize) -> (Vec<Option
     (best.split_off(1), top)
 }
 
+/// #1258: the members of the device arm. The device fitness ranks the class;
+/// the CPU prices again in f64, with [`member`], the `max(4 top, 200)` best
+/// trees at their device cut and the device best of each size. `best[]` and
+/// `top[]` rank by that CPU fitness (ties in class order); each member keeps
+/// its `device_fitness`, and `top[]` holds members with a finite CPU fitness.
+pub fn device_members(ctx: &MemberCtx, outcomes: &[Outcome], top: usize) -> (Vec<Option<Member>>, Vec<Member>) {
+    let trees = ctx.class.scored();
+    let mut ranked: Vec<(f64, usize, Cut)> = Vec::new();
+    for (pos, o) in outcomes.iter().enumerate() {
+        if let Outcome::Scored { fitness, cut, .. } = o {
+            if fitness.is_finite() {
+                ranked.push((*fitness, pos, *cut));
+            }
+        }
+    }
+    ranked.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    let keep = (4 * top).max(200);
+    let mut seen = vec![false; ctx.class.max_size() + 1];
+    let mut chosen: Vec<Member> = Vec::new();
+    for (j, &(f, pos, cut)) in ranked.iter().enumerate() {
+        let s = ctx.class.size_of(trees[pos] as usize);
+        let first_of_size = !seen[s];
+        seen[s] = true;
+        if j < keep || first_of_size {
+            let mut m = member(ctx, pos, cut);
+            m.device_fitness = Some(f);
+            chosen.push(m);
+        }
+    }
+    chosen.sort_by(|a, b| a.fitness.total_cmp(&b.fitness).then(a.position.cmp(&b.position)));
+    let mut best: Vec<Option<Member>> = vec![None; ctx.class.max_size() + 1];
+    for m in &chosen {
+        if best[m.size].is_none() {
+            best[m.size] = Some(m.clone());
+        }
+    }
+    let top = chosen.into_iter().filter(|m| m.fitness.is_finite()).take(top).collect();
+    (best.split_off(1), top)
+}
+
 /// The flags of `rcsr enumerate` that the search parser does not read.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Request {
@@ -1314,6 +1523,8 @@ pub struct Request {
     pub top: usize,
     pub null_shifts: usize,
     pub allow_large: bool,
+    /// #1258: `--gpu`, the device arm.
+    pub gpu: bool,
     pub compare_run: Option<String>,
     pub emit_seeds: Option<String>,
     pub json: bool,
@@ -1333,7 +1544,7 @@ pub fn usage_text() -> &'static str {
 USAGE:
   rcsr enumerate <--fitness pnl run flags> --vars <v1,v2,...> --ops <op,...>
                  [--max-size N] [--cuts Q] [--top K] [--null-shifts R] [--seed S]
-                 [--compare-run <run.json>] [--emit-seeds <file>] [--json] [--out <file>]
+                 [--compare-run <run.json>] [--emit-seeds <file>] [--json] [--out <file>] [--gpu]
 
   Takes the data, target, split, objective, cost, threshold and block flags of a
   --fitness pnl run (--fitness pnl and --cpu are implied), builds that run's
@@ -1353,6 +1564,14 @@ USAGE:
   copies its outcome, a root sub(b, a) takes the outcome of sub(a, b) when their
   cut grids are exact negations, and the report counts both in work.
 
+  With --gpu (#1258) the device evaluates every scored tree in f32 in batches,
+  cuts it on the grid of its own f32 predictions and prices every cut on every
+  book of a batch in one kernel, bit for bit the CPU book on those predictions.
+  The device fitness ranks the class and gives the family null; the CPU prices
+  again in f64 the max(4 K, 200) best trees and the best of each size, and best[]
+  and top[] rank by that fitness (each member also reports device_fitness). A
+  device refusal or failure exits 1 with its cause; there is no CPU fallback.
+
 OPTIONS:
   --max-size <N>        largest tree, in nodes (default 3; above 4 needs --allow-large; at most 6)
   --allow-large         run a class above 4 nodes
@@ -1371,18 +1590,36 @@ OPTIONS:
   --json                print the rcsr-enumerate/1 report instead of text
   --out <path>          also write the JSON report to this file
   --threads <T>         worker threads (the search flag); the report does not depend on it
+  --gpu                 the device arm (a --features cuda build and a usable device, else exit 2;
+                        a finite --threshold); the report adds arm \"device\", device and
+                        device_fitness
 
-REFUSED (exit 2): --gpu, --pnl-mask, --pnl-mask-band, --pnl-mask-dwell, --band, --band-units,
+REFUSED (exit 2): --pnl-mask, --pnl-mask-band, --pnl-mask-dwell, --band, --band-units,
   --min-holding, --sample-rows, a non-zero --cash-return, --missing-score, --seed-expr, --seed-file,
   --eval-expr, --resume, --save, --reselect, --reselect-run, --gate-search, --branch-on,
   --branch-off, --gate-band, --gate-dwell, an operator that is not unary or binary,
   --null-shifts 1 to 18, fewer distinct shifts than R. A class with no finite member exits 1.
-See docs/optimisation.md (exhaustive enumeration) and docs/overfitting.md 3.12."
+See docs/optimisation.md (exhaustive enumeration) and docs/overfitting.md 3.12. The device arm:
+docs/gpu-backend.md (enumerate device arm)."
 }
 
 fn fail(msg: &str) -> ! {
     eprintln!("error: rcsr enumerate: {}", msg);
     std::process::exit(2);
+}
+
+/// #1258: `--gpu` needs a CUDA build and a usable device; either refusal exits 2.
+#[cfg(feature = "cuda")]
+fn device_check() {
+    let probe = crate::gpu::probe();
+    if !probe.available() {
+        fail(&format!("--gpu was requested but no GPU is available ({})", probe.reason.as_deref().unwrap_or("no usable CUDA device")));
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+fn device_check() {
+    fail("--gpu: this build has no device arm (built without --features cuda); rebuild with --features cuda or drop --gpu");
 }
 
 fn parse_usize(flag: &str, v: &str) -> usize {
@@ -1405,6 +1642,7 @@ pub fn claim(args: &[String]) -> Vec<String> {
         top: DEFAULT_TOP,
         null_shifts: 0,
         allow_large: false,
+        gpu: false,
         compare_run: None,
         emit_seeds: None,
         json: false,
@@ -1424,11 +1662,11 @@ pub fn claim(args: &[String]) -> Vec<String> {
             "--compare-run" => req.compare_run = Some(value()),
             "--emit-seeds" => req.emit_seeds = Some(value()),
             "--out" => req.out = Some(value()),
-            "--allow-large" | "--json" => {
-                if flag == "--json" {
-                    req.json = true;
-                } else {
-                    req.allow_large = true;
+            "--allow-large" | "--json" | "--gpu" => {
+                match flag {
+                    "--json" => req.json = true,
+                    "--gpu" => req.gpu = true,
+                    _ => req.allow_large = true,
                 }
                 i += 1;
                 continue;
@@ -1439,7 +1677,6 @@ pub fn claim(args: &[String]) -> Vec<String> {
                 }
                 rest.extend([flag.to_string(), "pnl".to_string()]);
             }
-            "--gpu" => fail("--gpu: rcsr enumerate runs on the CPU and has no device arm"),
             "--pnl-mask" | "--pnl-mask-band" | "--pnl-mask-dwell" => {
                 fail(&format!("{}: the class is priced on the unmasked training book", flag))
             }
@@ -1503,7 +1740,7 @@ pub fn claim(args: &[String]) -> Vec<String> {
         let raw: u64 = c.iter().map(|s| s.raw).fold(0, u64::saturating_add);
         let passes = (canonical as u128) * (req.cuts as u128) * (1 + req.null_shifts as u128);
         fail(&format!(
-            "--max-size {}: the class holds {} canonical trees ({} raw) over {} variables and {} operators; with --cuts {} and --null-shifts {} that is {} book passes over the training rows; add --allow-large to run it",
+            "--max-size {}: the class holds {} canonical trees ({} raw) over {} variables and {} operators; with --cuts {} and --null-shifts {} that is {} book passes over the training rows; add --allow-large to run it (--gpu runs it on the device arm)",
             req.max_size,
             canonical,
             raw,
@@ -1513,6 +1750,12 @@ pub fn claim(args: &[String]) -> Vec<String> {
             req.null_shifts,
             passes
         ));
+    }
+    if req.gpu {
+        if rest.iter().any(|a| a == "--cpu" || a == "--no-gpu") {
+            fail("--gpu with --cpu or --no-gpu: the class runs on one arm");
+        }
+        device_check();
     }
     if !rest.iter().any(|a| a == "--fitness") {
         rest.extend(["--fitness".to_string(), "pnl".to_string()]);
@@ -1662,10 +1905,12 @@ fn opt_num(v: Option<f64>) -> String {
 }
 
 fn member_json(m: &Member) -> String {
+    let device = m.device_fitness.map_or_else(String::new, |f| format!(",\"device_fitness\":{}", num(f)));
     format!(
-        "\"size\":{},\"fitness\":{},\"net\":{},\"exposure\":{},\"long_rows\":{},\"entries\":{},\"entry_times\":{},\"tree\":{},\"side\":{},\"cut\":{},\"share\":{},\"constant\":{},\"expression\":{}",
+        "\"size\":{},\"fitness\":{}{},\"net\":{},\"exposure\":{},\"long_rows\":{},\"entries\":{},\"entry_times\":{},\"tree\":{},\"side\":{},\"cut\":{},\"share\":{},\"constant\":{},\"expression\":{}",
         m.size,
         num(m.fitness),
+        device,
         num(m.net),
         num(m.long_rows as f64 / m.rows.max(1) as f64),
         m.long_rows,
@@ -1701,6 +1946,33 @@ fn validation_json(m: &Member, cols: &[Vec<f64>], slice: &TradingSlice, spec: &T
     }
 }
 
+/// #1258: the device pass over the observed and every shifted book: the pass,
+/// the `device` member of the report and its summary line. Any device
+/// refusal or failure exits 1.
+#[cfg(feature = "cuda")]
+pub(crate) fn run_device(class: &Class, cols: &[Vec<f64>], rows: usize, q: usize, books: &[&FitnessBook]) -> Result<(Pass, String, String), Fail> {
+    let (pass, r) = device_pass(class, cols, rows, q, books, &crate::enumerate_gpu::DeviceOptions::default(), true).map_err(|e| (1, format!("the device arm failed: {}", e)))?;
+    let line = format!(
+        "device: {}, {} trees per batch, {} of {} books resident, {} device bytes at peak, {} kept free, {} host grids, {:.1} kernel ms ({:.1} evaluation and grid, {:.1} scoring)\n",
+        r.name,
+        r.batch,
+        r.book_batch,
+        books.len(),
+        r.bytes,
+        r.reserve,
+        r.host_grids,
+        r.eval_ms + r.score_ms,
+        r.eval_ms,
+        r.score_ms
+    );
+    Ok((pass, r.json(), line))
+}
+
+#[cfg(not(feature = "cuda"))]
+fn run_device(_: &Class, _: &[Vec<f64>], _: usize, _: usize, _: &[&FitnessBook]) -> Result<(Pass, String, String), Fail> {
+    usage("--gpu: this build has no device arm (built without --features cuda)")
+}
+
 fn run(req: &Request, inp: &Inputs) -> Result<(String, String, Vec<String>), Fail> {
     let started = std::time::Instant::now();
     let Some(book) = inp.book else {
@@ -1717,6 +1989,9 @@ fn run(req: &Request, inp: &Inputs) -> Result<(String, String, Vec<String>), Fai
     }
     if spec.cash_return != 0.0 || spec.cash_mode != crate::trading::CashMode::Constant {
         return usage("--cash-return: the book benchmarks against cash at 0 (no interest input)");
+    }
+    if req.gpu && !book.threshold().is_finite() {
+        return usage(format!("--gpu: the device arm needs a finite --threshold, got {}", book.threshold()));
     }
     let class = Class::build(inp.vars.len(), inp.ops, req.max_size, true).map_err(|e| (2, e))?;
     let n = inp.train.len();
@@ -1744,28 +2019,42 @@ fn run(req: &Request, inp: &Inputs) -> Result<(String, String, Vec<String>), Fai
             .map(|&k| shifted_slice(slice, k, den).and_then(|s| book_of(&s, &params)).map_err(|e| (1, format!("null shift {}: {}", k, e))))
             .collect()
     };
-    let first = nums.len().min(BOOK_BATCH - 1);
-    let extra = shifted_books(&nums[..first])?;
-    let mut books: Vec<&FitnessBook> = vec![book];
-    books.extend(extra.iter());
-    let p1 = pass(&scan, &books, true);
-    drop(books);
-    drop(extra);
-    let class_seconds = started.elapsed().as_secs_f64();
-    let mut null_best: Vec<f64> = p1.best[1..].to_vec();
-    let mut work = p1.work;
-    for chunk in nums[first..].chunks(BOOK_BATCH) {
-        let batch = shifted_books(chunk)?;
-        let refs: Vec<&FitnessBook> = batch.iter().collect();
-        null_best.extend(pass_with(&scan, &class.plan, &refs, false, Some(&p1.derived)).best);
-        work.book_batches += 1;
-    }
+    // #1258: the device arm prices the observed and every shifted book in one pass over the class.
+    let mut device: Option<(String, String)> = None;
+    let (p1, null_best, work, class_seconds) = if req.gpu {
+        let extra = shifted_books(nums)?;
+        let mut books: Vec<&FitnessBook> = vec![book];
+        books.extend(extra.iter());
+        let (p, json, line) = run_device(&class, &cols, n, req.cuts, &books)?;
+        device = Some((json, line));
+        let null_best = p.best[1..].to_vec();
+        let work = p.work;
+        (p, null_best, work, started.elapsed().as_secs_f64())
+    } else {
+        let first = nums.len().min(BOOK_BATCH - 1);
+        let extra = shifted_books(&nums[..first])?;
+        let mut books: Vec<&FitnessBook> = vec![book];
+        books.extend(extra.iter());
+        let p1 = pass(&scan, &books, true);
+        drop(books);
+        drop(extra);
+        let class_seconds = started.elapsed().as_secs_f64();
+        let mut null_best: Vec<f64> = p1.best[1..].to_vec();
+        let mut work = p1.work;
+        for chunk in nums[first..].chunks(BOOK_BATCH) {
+            let batch = shifted_books(chunk)?;
+            let refs: Vec<&FitnessBook> = batch.iter().collect();
+            null_best.extend(pass_with(&scan, &class.plan, &refs, false, Some(&p1.derived)).best);
+            work.book_batches += 1;
+        }
+        (p1, null_best, work, class_seconds)
+    };
     let observed = p1.best[0];
     if !observed.is_finite() {
         return Err((1, "no tree of the class has a finite fitness on the training book".to_string()));
     }
     let ctx = MemberCtx { class: &class, cols: &cols, rows: n, time: &slice.rows.time, book, means: inp.means, stds: inp.stds, vars: inp.vars };
-    let (best, top) = members(&ctx, &p1.outcomes, req.top);
+    let (best, top) = if device.is_some() { device_members(&ctx, &p1.outcomes, req.top) } else { members(&ctx, &p1.outcomes, req.top) };
     let compared = match &req.compare_run {
         Some(path) => Some(compare(path, book, &best)?),
         None => None,
@@ -1845,7 +2134,7 @@ fn run(req: &Request, inp: &Inputs) -> Result<(String, String, Vec<String>), Fai
                 (Some(c), Some(s)) => validation_json(m, c, s, &validation_spec, inp.objective),
                 _ => "null".to_string(),
             };
-            let p = if plan.is_some() { num(p_family(m.fitness, &null_best)) } else { "null".to_string() };
+            let p = if plan.is_some() { num(p_family(m.device_fitness.unwrap_or(m.fitness), &null_best)) } else { "null".to_string() };
             format!("{{\"rank\":{},{},\"validation\":{},\"p_family\":{}}}", k + 1, member_json(m), validation, p)
         })
         .collect();
@@ -1882,7 +2171,7 @@ fn run(req: &Request, inp: &Inputs) -> Result<(String, String, Vec<String>), Fai
     );
     let seconds = started.elapsed().as_secs_f64();
     let json = format!(
-        "{{\"schema\":{},\"tool\":\"rcsr\",\"version\":{},\"target\":{},\"book\":{},\"split\":{},\"class\":{},\"best\":[{}],\"top\":[{}],\"null\":{},\"compare\":{},\"work\":{},\"timing\":{{\"threads\":{},\"seconds\":{},\"class_seconds\":{},\"null_seconds\":{}}}}}",
+        "{{\"schema\":{},\"tool\":\"rcsr\",\"version\":{},\"target\":{},\"book\":{},\"split\":{},\"class\":{},\"best\":[{}],\"top\":[{}],\"null\":{},\"compare\":{},\"arm\":{}{},\"work\":{},\"timing\":{{\"threads\":{},\"seconds\":{},\"class_seconds\":{},\"null_seconds\":{}}}}}",
         text(SCHEMA),
         text(env!("CARGO_PKG_VERSION")),
         text(inp.target),
@@ -1893,6 +2182,8 @@ fn run(req: &Request, inp: &Inputs) -> Result<(String, String, Vec<String>), Fai
         top_json.join(","),
         null_json,
         compared.as_ref().map_or_else(|| "null".to_string(), |c| c.0.clone()),
+        text(if device.is_some() { "device" } else { "cpu" }),
+        device.as_ref().map_or_else(String::new, |d| format!(",\"device\":{}", d.0)),
         work.json(),
         scan.threads,
         num(seconds),
@@ -1980,6 +2271,9 @@ fn run(req: &Request, inp: &Inputs) -> Result<(String, String, Vec<String>), Fai
         work.mirror_priced,
         work.book_batches
     ));
+    if let Some((_, line)) = &device {
+        s.push_str(line);
+    }
     s.push_str(&format!("{:.2} s on {} thread(s)\n", seconds, scan.threads));
     let seeds = top.iter().map(|m| m.expression.clone()).collect();
     Ok((json, s, seeds))
@@ -2780,6 +3074,7 @@ mod tests {
     /// score the 504 trees of the class over the first 3 variables (the ten
     /// operators, max size 4) on `k` books; `S<k>` scores every 64th tree of the
     /// 32-variable class on `k` books, one unit per tree, so it reuses nothing.
+    /// `P<k>` (#1258) scores every 4,096th tree of the max size 5 class the same way.
     /// Prints CPU seconds and the load average and asserts no time.
     #[test]
     #[ignore]
@@ -2799,6 +3094,8 @@ mod tests {
         let small = Class::build(3, &ops(OPS10), 4, true).unwrap();
         let full = Class::build(32, &ops(OPS10), 4, true).unwrap();
         let stride = stride_plan(&full, 64);
+        let five = arms.iter().any(|a| a.0 == 'P').then(|| Class::build(32, &ops(OPS10), 5, true).unwrap());
+        let stride5 = five.as_ref().map(|c| stride_plan(c, 4_096));
         let (small_scan, full_scan) =
             (Scan { class: &small, cols: &cols, rows: n, cuts: 16, threads: 4 }, Scan { class: &full, cols: &cols, rows: n, cuts: 16, threads: 4 });
         let load = || std::fs::read_to_string("/proc/loadavg").unwrap().split_whitespace().take(3).collect::<Vec<_>>().join(" ");
@@ -2818,6 +3115,11 @@ mod tests {
                     pass_with(&full_scan, &stride, &books[..k], false, None);
                     stride.units.len()
                 }
+                'P' => {
+                    let (class, plan) = (five.as_ref().unwrap(), stride5.as_ref().unwrap());
+                    pass_with(&Scan { class, cols: &cols, rows: n, cuts: 16, threads: 4 }, plan, &books[..k], false, None);
+                    plan.units.len()
+                }
                 other => panic!("unknown arm {other}"),
             };
             let (wall, used) = (start.elapsed().as_secs_f64(), cpu_seconds() - cpu);
@@ -2826,6 +3128,186 @@ mod tests {
                 used / trees as f64,
                 load()
             );
+        }
+    }
+
+    #[test]
+    fn f32_keys_order_like_total_cmp() {
+        let vals = [f32::NEG_INFINITY, -f32::MAX, -1.5, -f32::MIN_POSITIVE, -1e-45, -0.0, 0.0, 1e-45, f32::MIN_POSITIVE, 2.0, f32::MAX, f32::INFINITY];
+        for w in vals.windows(2) {
+            assert!(f32_key(w[0].to_bits()) < f32_key(w[1].to_bits()), "{} {}", w[0], w[1]);
+            assert_eq!((w[0] as f64).total_cmp(&(w[1] as f64)), std::cmp::Ordering::Less);
+        }
+        for v in vals {
+            assert_eq!(f32_of_key(f32_key(v.to_bits())), v.to_bits());
+        }
+        assert_eq!(f32_key((-f32::MAX).to_bits()), KEY_MIN);
+        assert_eq!(f32_key(f32::MAX.to_bits()), KEY_MAX);
+    }
+
+    /// f32 prediction vectors of `n` rows: noise, ties with both zeros, few
+    /// distinct values, one value, and values next to each other in f32.
+    fn f32_vectors(n: usize) -> Vec<Vec<f32>> {
+        let mut rng = Rng(1258);
+        vec![
+            (0..n).map(|_| (rng.gauss() * 2.0) as f32).collect(),
+            (0..n).map(|i| if i % 7 == 0 { [0.0, -0.0][i % 2] } else { ((rng.gauss() * 4.0).round() / 4.0) as f32 }).collect(),
+            (0..n).map(|i| [3.5f32, -1.25, 0.0][i % 3]).collect(),
+            vec![0.75f32; n],
+            (0..n).map(|i| f32::from_bits(1.0f32.to_bits() + (i % 37) as u32)).collect(),
+            (0..n).map(|i| if i % 5 == 0 { [f32::MAX, -f32::MAX, 1e-45, -1e-45][i % 4] } else { (rng.gauss() * 1e30) as f32 }).collect(),
+        ]
+    }
+
+    /// #1258: the key interval of a cut holds exactly the f32 predictions whose
+    /// widened `p = pred - c` (or `c - pred`) is finite and above the threshold,
+    /// at every key of the vector and at the keys next to both ends.
+    #[test]
+    fn long_interval_is_the_long_bit_of_the_widened_prediction() {
+        let vectors = f32_vectors(3_001);
+        for (vi, vals) in vectors.iter().enumerate() {
+            let wide: Vec<f64> = vals.iter().map(|&v| v as f64).collect();
+            let mut values: Vec<f64> = grid(&wide, 16, &mut Vec::new()).iter().map(|c| c.value).collect();
+            values.extend([0.0, -0.0, 1.0, 1.0 + 1e-12, -3.4e38, 3.4e38, 1e-300, -1e-300]);
+            for t in [0.0, 1e-30, -1e-30, 0.25, -2.0, 1e300, -1e300, f64::MAX, -f64::MAX] {
+                for side in [Side::Above, Side::Below] {
+                    for &v in &values {
+                        let c = Cut { side, value: v, share: None }.constant(t);
+                        let (lo, hi) = long_interval(side, c, t);
+                        let long = |x: f32| {
+                            let p = if side == Side::Above { x as f64 - c } else { c - x as f64 };
+                            p.is_finite() && p > t
+                        };
+                        let mut probe: Vec<u32> = vals.iter().map(|x| f32_key(x.to_bits())).collect();
+                        for k in [lo, hi] {
+                            for d in -3i64..=3 {
+                                let kk = k as i64 + d;
+                                if kk >= KEY_MIN as i64 && kk <= KEY_MAX as i64 {
+                                    probe.push(kk as u32);
+                                }
+                            }
+                        }
+                        for k in probe {
+                            let x = f32::from_bits(f32_of_key(k));
+                            assert_eq!(lo <= k && k <= hi, long(x), "vector {vi}, {side:?}, cut {v}, c {c}, threshold {t}, x {x}");
+                        }
+                    }
+                }
+            }
+        }
+        // A NaN or infinite constant or threshold holds no long prediction.
+        for (c, t) in [(f64::NAN, 0.0), (0.0, f64::NAN), (f64::INFINITY, 0.0), (f64::NEG_INFINITY, 0.0), (0.0, f64::INFINITY)] {
+            for side in [Side::Above, Side::Below] {
+                let (lo, hi) = long_interval(side, c, t);
+                assert!(lo > hi, "{side:?} c {c} t {t}: [{lo}, {hi}]");
+            }
+        }
+    }
+
+    /// #1258: the host side of the device arm on one tree. The split grid
+    /// (probe, ranks from a full sort of the f32 keys, midpoints) is `grid` of
+    /// the widened predictions; a row inside the key interval of a cut is long
+    /// in `FitnessBook::block_totals`; and `settle` over the books in two
+    /// batches gives the outcome, the per-book minima and the books of one batch.
+    #[test]
+    fn host_assembly_of_device_totals_equals_the_cpu_book() {
+        let p = panel(1258, 3, 1_000, 1, noise);
+        let n = p.slice.ret.len();
+        let mut compared = 0;
+        for (threshold, blocks) in [(0.0, 1usize), (1e-30, 4), (0.5, 9)] {
+            let books = family(&p.slice, 3, threshold, blocks, BlockStat::MeanSd, 1);
+            let refs: Vec<&FitnessBook> = books.iter().collect();
+            let fam = BookFamily::new(refs.clone()).unwrap();
+            for vals in f32_vectors(n) {
+                let wide: Vec<f64> = vals.iter().map(|&v| v as f64).collect();
+                let want = grid(&wide, 16, &mut Vec::new());
+                let distinct = distinct_probe(&wide, 16);
+                let cuts = if distinct.len() < 16 {
+                    midpoint_grid(distinct)
+                } else {
+                    let mut keys: Vec<u32> = vals.iter().map(|v| f32_key(v.to_bits())).collect();
+                    keys.sort_unstable();
+                    let found: Vec<(usize, f64)> = grid_ranks(n, 16).iter().map(|&r| (r, f32::from_bits(f32_of_key(keys[r])) as f64)).collect();
+                    rank_grid(n, 16, &found)
+                };
+                assert_eq!(cuts.len(), want.len());
+                assert!(cuts.len() <= grid_capacity(16), "{} cuts", cuts.len());
+                for (a, b) in cuts.iter().zip(&want) {
+                    assert!(a.side == b.side && a.value.to_bits() == b.value.to_bits() && a.share.map(f64::to_bits) == b.share.map(f64::to_bits), "{a:?} vs {b:?}");
+                }
+                if cuts.is_empty() {
+                    continue;
+                }
+                let consts: Vec<(bool, f64)> = cuts.iter().map(|c| (c.side == Side::Above, c.constant(threshold))).collect();
+                let mut reference = Vec::new();
+                fam.cut_totals(&wide, &consts, &mut CutScratch::default(), &mut reference);
+                let nb = refs[0].blocks();
+                let mut device = Vec::new();
+                for book in &refs {
+                    for cut in &cuts {
+                        let (lo, hi) = long_interval(cut.side, cut.constant(threshold), threshold);
+                        let pred: Vec<f64> = vals.iter().map(|v| if (lo..=hi).contains(&f32_key(v.to_bits())) { f64::MAX } else { f64::MIN }).collect();
+                        device.extend(book.block_totals(&pred));
+                    }
+                }
+                assert_eq!(device.len(), reference.len());
+                for (d, r) in device.iter().zip(&reference) {
+                    assert_eq!((d.gross.to_bits(), d.flips, d.exits, d.long_rows, d.nonfinite), (r.gross.to_bits(), r.flips, r.exits, r.long_rows, r.nonfinite));
+                }
+                let one = {
+                    let mut part = Part { best: vec![f64::INFINITY; 3], ..Part::default() };
+                    let o = settle(&refs, 0, &cuts, &reference, true, &mut part, &mut Vec::new());
+                    (o, part.best, part.books)
+                };
+                let two = {
+                    let mut part = Part { best: vec![f64::INFINITY; 3], ..Part::default() };
+                    let per = 2 * cuts.len() * nb;
+                    let o = settle(&refs[..2], 0, &cuts, &reference[..per], true, &mut part, &mut Vec::new());
+                    assert!(settle(&refs[2..], 2, &cuts, &reference[per..], true, &mut part, &mut Vec::new()).is_none());
+                    (o, part.best, part.books)
+                };
+                assert!(same_outcome(&one.0.unwrap(), &two.0.unwrap()));
+                assert_eq!(bits(&one.1), bits(&two.1));
+                assert_eq!(one.2, two.2);
+                compared += 1;
+            }
+        }
+        assert_eq!(compared, 3 * 5, "every vector but the constant one has cuts");
+    }
+
+    /// #1258: the device members are priced again by the CPU: their fitness is
+    /// `member`'s, `best[]` and `top[]` rank by it, and every member keeps the
+    /// device fitness it was chosen by.
+    #[test]
+    fn device_members_rank_by_the_cpu_price() {
+        let p = panel(1183, 4, 500, 3, |x, rng| if x[0] - x[1] < -0.3 { 0.003 } else { -0.002 } + 0.004 * rng.gauss());
+        let b = book(&p, 1);
+        let class = Class::build(3, &ops(OPS10), 3, true).unwrap();
+        let pass = pass(&Scan { class: &class, cols: &p.cols, rows: 2000, cuts: 16, threads: 2 }, &[&b], true);
+        // Device fitness: the CPU fitness nudged by the class position, so the device order differs.
+        let outcomes: Vec<Outcome> = pass
+            .outcomes
+            .iter()
+            .enumerate()
+            .map(|(pos, o)| match *o {
+                Outcome::Scored { fitness, cut, cuts } => Outcome::Scored { fitness: fitness + 1e-3 * (pos % 5) as f64, cut, cuts },
+                other => other,
+            })
+            .collect();
+        let ctx = ctx(&class, &p, &b);
+        let (best, top) = device_members(&ctx, &outcomes, 10);
+        assert_eq!(top.len(), 10);
+        assert!(top.windows(2).all(|w| w[0].fitness.total_cmp(&w[1].fitness).then(w[0].position.cmp(&w[1].position)).is_lt()));
+        for m in best.iter().flatten().chain(&top) {
+            let again = member(&ctx, m.position, m.cut);
+            assert_eq!(again.fitness.to_bits(), m.fitness.to_bits());
+            let Outcome::Scored { fitness, .. } = outcomes[m.position] else { panic!("member {} was not scored", m.position) };
+            assert_eq!(m.device_fitness.map(f64::to_bits), Some(fitness.to_bits()));
+        }
+        let (cpu_best, cpu_top) = members(&ctx, &pass.outcomes, 10);
+        assert_eq!(top[0].fitness.to_bits(), cpu_top[0].fitness.to_bits(), "the class best is among the re-priced trees");
+        for (d, c) in best.iter().zip(&cpu_best) {
+            assert_eq!(d.as_ref().map(|m| m.fitness.to_bits()), c.as_ref().map(|m| m.fitness.to_bits()));
         }
     }
 }

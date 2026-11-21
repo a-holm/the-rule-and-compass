@@ -1832,6 +1832,12 @@ impl GpuEvaluator {
         self.n_rows as usize
     }
 
+    /// #1258: the context the enumerate device arm (`src/cuda/enumerate.h`)
+    /// evaluates on and allocates through.
+    pub(crate) fn raw_context(&mut self) -> *mut std::ffi::c_void {
+        self.ctx as *mut std::ffi::c_void
+    }
+
     /// #265: rows and bytes of the f64 fit twin uploaded by [`Self::set_fit_data`].
     pub fn fit_twin(&self) -> (u64, u64) {
         (self.fit_twin_rows, self.fit_twin_bytes)

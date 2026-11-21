@@ -27,8 +27,12 @@
 extern "C" {
 #endif
 int rc_launch_check_enabled(void);
-/* Test hook: non-zero when RCSR_FORCE_LAUNCH_REFUSAL (read once) is set and is a prefix of the kernel name. */
+/* Test hook: non-zero when RCSR_FORCE_LAUNCH_REFUSAL (read once) or this thread's
+ * rc_launch_force_for_tests prefix is set and is a prefix of the kernel name. */
 int rc_launch_forced(const char *kernel);
+/* Test hook: refuse the launches of this thread whose kernel name starts with
+ * `prefix`, as RCSR_FORCE_LAUNCH_REFUSAL does for the process; NULL or "" clears it. */
+void rc_launch_force_for_tests(const char *prefix);
 void rc_launch_refused(const char *kernel, int arg);
 /* Kernel name of this thread's last refusal into buf; returns its argument
  * index, or -1 when there is none. */

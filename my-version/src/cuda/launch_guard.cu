@@ -25,9 +25,19 @@ extern "C" int rc_launch_check_enabled(void)
     return enabled;
 }
 
+namespace {
+thread_local char g_force[96] = "";
+}
+
+extern "C" void rc_launch_force_for_tests(const char *prefix)
+{
+    snprintf(g_force, sizeof(g_force), "%s", prefix ? prefix : "");
+}
+
 extern "C" int rc_launch_forced(const char *kernel)
 {
     static const char *const prefix = getenv("RCSR_FORCE_LAUNCH_REFUSAL");
+    if (g_force[0] && strncmp(kernel, g_force, strlen(g_force)) == 0) return 1;
     return prefix && prefix[0] && strncmp(kernel, prefix, strlen(prefix)) == 0;
 }
 
