@@ -238,7 +238,7 @@ USAGE:
                               regime-switching composites of the pools from a
                               pre-registered gate menu, chosen on validation rows
   rcsr enumerate <--fitness pnl run flags> --vars <v,...> --ops <op,...> [--max-size N]
-                 [--null-shifts R] [--compare-run <run.json>] [--emit-seeds <file>]
+                 [--null-shifts R] [--compare-run <run.json>] [--emit-seeds <file>] [--gpu]
                               every expression up to N nodes scored exactly on the
                               training book: class optimum, gap, family null
   rcsr <--fitness pnl run flags> --gate-search --branch-on <run.json|expr|cash>

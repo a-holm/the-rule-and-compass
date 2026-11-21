@@ -469,3 +469,20 @@ fn enumerate_refuses_a_gate_search_before_the_subcommand() {
     assert!(err.contains("--gate-search") && err.contains("rcsr enumerate"), "{err}");
     assert!(stdout(&o).is_empty());
 }
+
+/// #1258: `--gpu` exits 2 before reading a row when the build has no device
+/// arm, naming the build, or when no device is usable (`RCSR_GPU=0` here).
+#[test]
+fn enumerate_gpu_needs_a_cuda_build_and_a_device() {
+    let (_s, dir) = scratch();
+    let (data, spec) = (write_csv(&dir, Panel::Planted), write_spec(&dir));
+    let o = enumerate(&data, &spec, &["--ops", OPS10, "--gpu", "--json"]);
+    let err = stderr(&o);
+    assert_eq!(code(&o), 2, "{err}");
+    assert!(stdout(&o).is_empty());
+    if cfg!(feature = "cuda") {
+        assert!(err.contains("--gpu was requested but no GPU is available") && err.contains("RCSR_GPU=0"), "{err}");
+    } else {
+        assert!(err.contains("--gpu") && err.contains("built without --features cuda"), "{err}");
+    }
+}
