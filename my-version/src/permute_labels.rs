@@ -10,10 +10,12 @@
 //! priced rows and the search, walk-forward and trials flags of the source store
 //! stay the same.
 //!
-//! The output is an ordinary store with another data hash. Its manifest marks it
-//! as a null store; a walk-forward report priced on it carries the marker as
-//! `null_store`, CPCV paths of such reports carry it on, and `rcsr trials
-//! --table` reads a marked report only through `--null-wf`.
+//! The output is an ordinary store with another data hash. Its store header (the
+//! `null_store` member, #1304) and its manifest mark it as a null store, so a copy of
+//! the store bytes stays marked; a walk-forward report priced on it carries the marker
+//! as `null_store`, CPCV paths of such reports carry it on, `walkforward --ledger`
+//! (like `ladder --locked-test` and `protocol regimes --after-read`) refuses it, and
+//! `rcsr trials` reads a marked report only through `--table --null-wf`.
 //!
 //! A source with a row inside a locked range is refused. A row in the label
 //! purge before a range or in its embargo after it neither moves nor gives a
@@ -403,21 +405,7 @@ pub fn permute(o: &Options) -> Result<Summary, Fail> {
             Ok(Some(from.iter().map(|&s| all[s]).collect()))
         })
         .collect::<Result<_, Fail>>()?;
-    if let Some(dir) = Path::new(&o.out).parent().filter(|d| !d.as_os_str().is_empty()) {
-        std::fs::create_dir_all(dir).map_err(|e| (3, format!("{}: {}", dir.display(), e)))?;
-    }
-    let output_sha256 = write_store(&o.out, &src, &keep, &moved, &permuted, &codes)?;
     let source_sha256 = manifest::sha256_file(&o.data).map_err(|e| (3, e))?;
-
-    let (declared, also) = match resolved.source {
-        Source::Store | Source::Flag | Source::FlagAndDefault => (resolved.range, resolved.also),
-        Source::ProtocolDefault | Source::None => (None, None),
-    };
-    let (declared, also) = match &record {
-        Some(r) => crate::lockrec::with_record(declared, also, &r.range).map_err(|e| (e.exit, e.message))?,
-        None => (declared, also),
-    };
-    let floor = lockbox::declared_embargo(&o.data).map_err(|e| (e.exit, e.message))?.map(|(_, s)| s);
     let columns: Vec<String> = moved.iter().map(|&c| names[c].clone()).collect();
     let null = format!(
         "{{\"label\":{},\"block\":{},\"seed\":{},\"order\":\"{}\",\"source_sha256\":{},\"target_spec_sha256\":{},\"columns\":[{}],\"return_columns\":[{}],\"symbols\":{},\"moved_rows\":{},\"gap_rows\":{},\"guarded_rows\":{},\"pools\":[{}],\"purge_seconds\":{},\"embargo_seconds\":{}}}",
@@ -442,6 +430,20 @@ pub fn permute(o: &Options) -> Result<Summary, Fail> {
         purge,
         embargo
     );
+    if let Some(dir) = Path::new(&o.out).parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).map_err(|e| (3, format!("{}: {}", dir.display(), e)))?;
+    }
+    let output_sha256 = write_store(&o.out, &src, &keep, &moved, &permuted, &codes, &null)?;
+
+    let (declared, also) = match resolved.source {
+        Source::Store | Source::Flag | Source::FlagAndDefault => (resolved.range, resolved.also),
+        Source::ProtocolDefault | Source::None => (None, None),
+    };
+    let (declared, also) = match &record {
+        Some(r) => crate::lockrec::with_record(declared, also, &r.range).map_err(|e| (e.exit, e.message))?,
+        None => (declared, also),
+    };
+    let floor = lockbox::declared_embargo(&o.data).map_err(|e| (e.exit, e.message))?.map(|(_, s)| s);
     let mut text = format!(
         "{{\"schema\":\"{}\",\"tool\":\"{}\",\"version\":{},\"source\":{},\"target_spec\":{},\"null\":{},\"output_sha256\":{}}}\n",
         SCHEMA,
@@ -493,8 +495,9 @@ pub fn permute(o: &Options) -> Result<Summary, Fail> {
 }
 
 /// Copy the `keep` columns of `src` to `out` group by group; the `moved` columns take
-/// `values` (and `codes` when they carry a dictionary). Returns the SHA-256 of the file.
-fn write_store(out: &str, src: &FileStore, keep: &[usize], moved: &[usize], values: &[Vec<f64>], codes: &[Option<Vec<u32>>]) -> Result<String, Fail> {
+/// `values` (and `codes` when they carry a dictionary), and the header carries `null` as
+/// `null_store`. Returns the SHA-256 of the file.
+fn write_store(out: &str, src: &FileStore, keep: &[usize], moved: &[usize], values: &[Vec<f64>], codes: &[Option<Vec<u32>>], null: &str) -> Result<String, Fail> {
     let h = src.header();
     let plans: Vec<ColumnPlan> = keep
         .iter()
@@ -505,7 +508,7 @@ fn write_store(out: &str, src: &FileStore, keep: &[usize], moved: &[usize], valu
         .collect();
     let tmp = format!("{}.tmp-{}", out, std::process::id());
     let group_rows = h.group_rows;
-    let written = store::write_store_grouped(&tmp, &plans, h.n_rows, group_rows, |lo, hi, cols| {
+    let written = store::write_store_grouped_marked(&tmp, &plans, h.n_rows, group_rows, Some(null), |lo, hi, cols| {
         let g = lo / group_rows;
         for (k, &c) in keep.iter().enumerate() {
             if let Some(m) = moved.iter().position(|&x| x == c) {
@@ -534,11 +537,15 @@ fn write_store(out: &str, src: &FileStore, keep: &[usize], moved: &[usize], valu
     manifest::sha256_file(out).map_err(|e| (3, e))
 }
 
-/// The `null` object of the manifest of a null store at `data`, as JSON text; `None`
-/// for any other data.
+/// The `null` object of a null store at `data`, as JSON text: the `null_store` member of
+/// its store header (#1304), else the `null` object of `<data>.manifest.json` (a null
+/// store written before #1304); `None` for any other data.
 pub fn marker(data: &str) -> Option<String> {
     if data.is_empty() || data == "-" {
         return None;
+    }
+    if let Some(m) = FileStore::open(data).ok().and_then(|s| s.header().null_store().map(str::to_string)) {
+        return Some(m);
     }
     let text = std::fs::read_to_string(format!("{}.manifest.json", data)).ok()?;
     let j = Json::parse(text.trim())?;
@@ -546,6 +553,36 @@ pub fn marker(data: &str) -> Option<String> {
         return None;
     }
     j.get("null").map(crate::cpcv::to_json)
+}
+
+/// `null_store label L, seed S` of a parsed marker.
+pub fn describe(m: &Json) -> String {
+    format!(
+        "null_store label {}, seed {}",
+        m.get("label").and_then(Json::as_str).unwrap_or("?"),
+        m.get("seed").and_then(Json::as_f64).map_or("?".to_string(), crate::walkforward::jnum)
+    )
+}
+
+/// #1304: why `walkforward --ledger` (and so `--locked-test`) refuses the null store `data`
+/// with marker `m`.
+pub fn ledger_refusal(data: &str, m: &str, locked_test: bool) -> String {
+    refusal(
+        data,
+        m,
+        if locked_test {
+            "a null store is never a protocol candidate, and a sealed read of it would spend a lockbox read"
+        } else {
+            "a null store is never a protocol candidate: drop --ledger"
+        },
+    )
+}
+
+/// `<data> is a null store (null_store label L, seed S); <why>` for the null store `data`
+/// with marker `m`.
+pub fn refusal(data: &str, m: &str, why: &str) -> String {
+    let what = Json::parse(m).map_or_else(|| "null_store".to_string(), |j| describe(&j));
+    format!("{} is a null store ({}); {}", data, what, why)
 }
 
 /// A report JSON text with a `null_store` member holding `marker`; unchanged without one.
@@ -570,9 +607,13 @@ pub fn usage_text() -> &'static str {
   spec file unchanged; <out>.manifest.json (schema rcsr-null-store/1) records null {label, block, seed,
   order per_symbol, source_sha256, columns, pools per symbol: label_rows, gap_rows} and carries the
   locked-test declaration and the lock record of the source (--lock-record, or the lock_record object of
-  a source sidecar). A source row inside a locked range exits 3; rows in a label purge or an embargo
-  neither move nor give a value. A walkforward report priced on the output carries null_store, and rcsr
-  trials --table reads it only with --null-wf. --out and its sidecars must not exist (exit 2).
+  a source sidecar). The store header carries the same null object as null_store, so a copy of the store
+  bytes stays marked, as does a store appended from it (rcsr enrich, rcsr panel append and rank); every
+  other store writer starts unmarked. A source row inside a locked range exits 3;
+  rows in a label purge or an embargo neither move nor give a value. A walkforward report priced on the
+  output carries null_store; walkforward --ledger (and so --locked-test), ladder --locked-test and
+  protocol regimes --after-read on the output exit 2, and rcsr trials reads the report only with --table
+  --null-wf. --out and its sidecars must not exist (exit 2).
 "
 }
 
@@ -707,6 +748,41 @@ mod tests {
         let label = source_rows(&[0; 40], &[symbol_key("A")], &time, &[Some((Pool::Label, 0)); 40], 4, 3);
         let gap = source_rows(&[0; 40], &[symbol_key("A")], &time, &[Some((Pool::Gap, 0)); 40], 4, 3);
         assert_ne!(label, gap);
+    }
+
+    /// #1304: the header member first, the manifest of a null store written before #1304
+    /// second, nothing for real data or stdin.
+    #[test]
+    fn the_marker_comes_from_the_header_then_the_manifest() {
+        let dir = std::env::temp_dir().join(format!("rcsr-1304-marker-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let plans = [ColumnPlan { name: "x".to_string(), numeric: true, dtype: DType::F64, levels: vec![], has_codes: false }];
+        let write = |name: &str, m: Option<&str>| -> String {
+            let p = dir.join(name).to_string_lossy().into_owned();
+            store::write_store_grouped_marked(&p, &plans, 3, 2, m, |lo, hi, cols| {
+                cols[0].f64s.extend((lo..hi).map(|r| r as f64));
+                Ok(())
+            })
+            .unwrap();
+            p
+        };
+        let header = "{\"label\":\"h24\",\"seed\":3}";
+        let (marked, plain) = (write("marked.rcsb", Some(header)), write("plain.rcsb", None));
+        assert_eq!(marker(&marked).as_deref(), Some(header));
+        assert_eq!(marker(&plain), None);
+        let legacy = format!("{{\"schema\":\"{}\",\"null\":{{\"label\":\"h1\",\"seed\":9}}}}\n", SCHEMA);
+        std::fs::write(format!("{}.manifest.json", plain), &legacy).unwrap();
+        assert_eq!(marker(&plain).as_deref(), Some("{\"label\":\"h1\",\"seed\":9}"));
+        std::fs::write(format!("{}.manifest.json", marked), &legacy).unwrap();
+        assert_eq!(marker(&marked).as_deref(), Some(header), "the header member wins: it is in the hashed bytes");
+        std::fs::write(format!("{}.manifest.json", plain), "{\"schema\":\"rcsr-panel/1\",\"null\":{}}\n").unwrap();
+        assert_eq!(marker(&plain), None, "a manifest of another schema marks nothing");
+        assert_eq!(marker("-"), None);
+        assert_eq!(marker(""), None);
+        let e = ledger_refusal("n.rcsb", header, true);
+        assert!(e.contains("n.rcsb is a null store (null_store label h24, seed 3)") && e.contains("lockbox read"), "{e}");
+        assert!(ledger_refusal("n.rcsb", header, false).ends_with("drop --ledger"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

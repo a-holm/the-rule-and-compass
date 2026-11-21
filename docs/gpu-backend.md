@@ -608,8 +608,17 @@ Fallback and the flags:
   how the fallback test runs on a machine that has one.
   Tests build their `rcsr` and `rcsr-bench` children through `my-version/tests/common/rcsr.rs`: `rcsr()` sets `RCSR_GPU=0`, so the child makes no CUDA call, and `rcsr_on_device()` keeps the environment for a test whose purpose is the device (`rcsr_for(args)` picks by the device flags `--gpu`, `--dispatch`, `--batch-pnl`, `--device-pnl`, `--gpu-memory`). `tests/rcsr_command_lint.rs` fails on any other use of `CARGO_BIN_EXE_rcsr` or `CARGO_BIN_EXE_rcsr-bench` in `tests/`.
 * Any CUDA error during a batch prints the same `# gpu: unavailable (...)`
-  note, re-scores the pending generation on the CPU and disables the GPU for the
-  rest of the run. There is no panic and no stale result.
+  note and disables the GPU for the rest of the run. There is no panic and no
+  stale result: every candidate that was still pending when the failing stage
+  began, in the synchronous batch and in the overlap pipeline, is fitted by the
+  exact CPU arm (when the fit was deferred to the device) and scored by the exact
+  CPU scorer on the generation's rows. Device scores of those candidates,
+  including a screening score written before the failure, are dropped; a fitted
+  tree only seeds the CPU fit (`search::finish_on_cpu`, #1089). Scores that the
+  overlap pipeline merged before its leftover batch failed stay. The fault sites
+  `RCSR_FAULT=rescore` (after the fit, before the re-score) and
+  `RCSR_FAULT=pipeline_fit` (before the device fit of the overlap queue) reach
+  these paths.
 
 ### Exact order-statistic and rank scoring (issue #288)
 
@@ -2645,7 +2654,7 @@ A non-finite prediction scores `+inf` with status 2; fewer flips than `--min-tra
 
 ## Enumerate device arm (issue #1258)
 
-`rcsr enumerate --gpu` scores the class of `rcsr enumerate` (`docs/optimisation.md` 3.6) on the device. Without `--gpu` the CPU arm runs as before. A build without `--features cuda`, a missing device or a non-finite `--threshold` exits 2 before any row is read; any device refusal or failure after the start exits 1 with its cause. There is no CPU fallback: a silent fallback hides device faults (#381), and the CPU arm at size 5 costs CPU days. The report states `arm` (`cpu` or `device`); the device report adds `device` and `device_fitness` per member. Above 4 nodes `--allow-large` is still required.
+`rcsr enumerate --gpu` scores the class of `rcsr enumerate` (`docs/optimisation.md` 3.6) on the device. Without `--gpu` the CPU arm runs as before. A build without `--features cuda` or a missing device exits 2 while the arguments are parsed, before any row is read; a non-finite `--threshold` exits 2 after the training rows are loaded, before any tree is scored; any device refusal or failure after the start exits 1 with its cause. There is no CPU fallback: a silent fallback hides device faults (#381), and the CPU arm at size 5 costs CPU days. The report states `arm` (`cpu` or `device`); the device report adds `device` and `device_fitness` per member. Above 4 nodes `--allow-large` is still required.
 
 **Pipeline.** The kernels live in `src/cuda/enumerate.h`, included at the end of `eval.cu`, so they run the interpreter `rc_exec_row` on the resident `f32` training columns of an `RcCtx` and allocate through its ledger (`rc_dev_alloc`). One batch of `T` trees:
 

@@ -3035,7 +3035,12 @@ pub struct CutScratch {
     warps: Vec<f64>,
     counts: Vec<u64>,
     nonfinite: Vec<u64>,
+    /// The totals of one chunk of cuts when a call has more than [`CUT_CHUNK`].
+    chunk: Vec<FitnessTotals>,
 }
+
+/// The most cuts one pass of the family kernel prices.
+const CUT_CHUNK: usize = 64;
 
 /// Byte `i` of entry `m` is bit `i` of `m`: eight cut counters in one word.
 static BYTE_SPREAD: [u64; 256] = {
@@ -3135,7 +3140,9 @@ impl<'a> BookFamily<'a> {
 
     /// `out[(b * cuts.len() + q) * nb + k]` equals `books[b].block_totals(&pred_q)[k]`
     /// bit for bit, `pred_q[i]` being `v[i] - c` for an above cut `(true, c)` and
-    /// `c - v[i]` for a below cut `(false, c)`; 1 to 64 cuts. One walk over each
+    /// `c - v[i]` for a below cut `(false, c)`; at least one cut. More than
+    /// [`CUT_CHUNK`] cuts are priced in chunks in cut order, each cut independently
+    /// of the others. One walk over each
     /// segment finds the long bits of every cut (one `u64` per row) and the
     /// integer counts; then each book adds its `excess` into the lanes of
     /// [`FitnessBook::block_totals`], every lane in ascending row order. A short
@@ -3146,7 +3153,28 @@ impl<'a> BookFamily<'a> {
         let avx = is_x86_feature_detected!("avx");
         #[cfg(not(target_arch = "x86_64"))]
         let avx = false;
-        family_totals(self, v, cuts, scratch, out, avx);
+        if cuts.len() <= CUT_CHUNK {
+            family_totals(self, v, cuts, scratch, out, avx);
+            return;
+        }
+        assert!(!cuts.is_empty(), "book family: at least one cut");
+        let (nb, q) = (self.books[0].blocks(), cuts.len());
+        let mut chunk = std::mem::take(&mut scratch.chunk);
+        let mut base = 0;
+        for part in cuts.chunks(CUT_CHUNK) {
+            family_totals(self, v, part, scratch, &mut chunk, avx);
+            if base == 0 {
+                out.clear();
+                out.resize(self.books.len() * q * nb, chunk[0]);
+            }
+            let qc = part.len();
+            for b in 0..self.books.len() {
+                let dst = (b * q + base) * nb;
+                out[dst..dst + qc * nb].copy_from_slice(&chunk[b * qc * nb..(b + 1) * qc * nb]);
+            }
+            base += qc;
+        }
+        scratch.chunk = chunk;
     }
 }
 
@@ -3292,7 +3320,7 @@ fn family_totals(f: &BookFamily, v: &[f64], cuts: &[(bool, f64)], s: &mut CutScr
     let n = first.len();
     assert_eq!(v.len(), n, "book family: {} values for {} rows", v.len(), n);
     let q = cuts.len();
-    assert!((1..=64).contains(&q), "book family: 1 to 64 cuts, got {}", q);
+    assert!((1..=CUT_CHUNK).contains(&q), "book family: 1 to {} cuts, got {}", CUT_CHUNK, q);
     let qp = q.div_ceil(16) * 16;
     let (qw, groups) = (q.div_ceil(8), q.div_ceil(4));
     let nb = first.blocks();
@@ -4973,6 +5001,35 @@ mod book_family_tests {
         }
         assert!(nonfinite > 0 && long > 0 && checked > nonfinite, "{checked} totals, {nonfinite} non-finite, {long} with long rows");
         assert!(mismatches.is_empty(), "{} of {checked} totals differ:\n{}", mismatches.len(), mismatches[..mismatches.len().min(8)].join("\n"));
+    }
+
+    #[test]
+    fn book_family_cut_totals_beyond_64_cuts_equal_block_totals() {
+        let s = slice(1308, &[3_000, 2_500, 3_200]);
+        let n = s.ret.len();
+        let mut rng = Mix(11);
+        let v = values(0, n, &mut rng);
+        let (mut scratch, mut out) = (CutScratch::default(), Vec::new());
+        for blocks in [1usize, 4] {
+            let books = family_books(&s, blocks, 0.0, 2);
+            let refs: Vec<&FitnessBook> = books.iter().collect();
+            let family = BookFamily::new(refs.clone()).unwrap();
+            for count in [65usize, 124] {
+                let cuts = cut_list(&v, count, false);
+                family.cut_totals(&v, &cuts, &mut scratch, &mut out);
+                assert_eq!(out.len(), refs.len() * count * blocks);
+                for (b, book) in refs.iter().enumerate() {
+                    for (j, &(above, c)) in cuts.iter().enumerate() {
+                        let pred: Vec<f64> = v.iter().map(|&x| if above { x - c } else { c - x }).collect();
+                        let want = book.block_totals(&pred);
+                        for k in 0..blocks {
+                            let got = &out[(b * count + j) * blocks + k];
+                            assert!(same(got, &want[k]), "blocks {blocks}, {count} cuts, book {b}, cut {j}, block {k}: {got:?} vs {:?}", want[k]);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[derive(Debug)]

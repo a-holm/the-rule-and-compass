@@ -629,7 +629,8 @@ pub fn usage() -> &'static str {
   and only when the ledger holds exactly --expect-reads locked reads under one
   final seal (the `protocol verify --expect-reads` check, with --data and
   --sealed); it appends a regime_dating line with the calendar hash to the ledger.
-  The calendar then covers the locked range only.
+  The calendar then covers the locked range only. A null store (rcsr panel
+  permute-labels) with --after-read exits 2 before the ledger is read (#1304).
 "
 }
 
@@ -708,6 +709,9 @@ pub fn run(args: &[String]) -> ! {
     let (mut opened, mut keep): (Vec<crate::lockbox::Lockbox>, Option<(f64, f64)>) = (Vec::new(), None);
     let mut after: Option<(Ledger, LockedRange)> = None;
     if after_read {
+        if let Some(m) = crate::permute_labels::marker(&data) {
+            fail(crate::permute_labels::refusal(&data, &m, "--after-read dates the lock calendar of the protocol ledger from real data only"), 2);
+        }
         let ledger = Ledger::new(need("--ledger"));
         let sealed = need("--sealed");
         let expect: u64 = need("--expect-reads").parse().unwrap_or_else(|_| fail("--expect-reads needs a non-negative integer".to_string(), 2));

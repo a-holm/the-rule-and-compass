@@ -670,10 +670,9 @@ pub(crate) fn refuse_locked(j: &Json, path: &str, locked: &[(f64, f64)]) -> Res<
 pub(crate) fn refuse_null_store(j: &Json, path: &str) -> Res<()> {
     match j.get("null_store") {
         Some(m) => usage(format!(
-            "{} is priced on a null store (null_store label {}, seed {}); a null store is never a candidate: pass it with --null-wf",
+            "{} is priced on a null store ({}); a null store is never a candidate: pass it to rcsr trials --table with --null-wf",
             path,
-            m.get("label").and_then(Json::as_str).unwrap_or("?"),
-            m.get("seed").and_then(Json::as_f64).map_or("?".to_string(), jnum)
+            crate::permute_labels::describe(m)
         )),
         None => Ok(()),
     }

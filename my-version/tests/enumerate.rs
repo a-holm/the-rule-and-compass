@@ -40,6 +40,8 @@ enum Panel {
     Discrete,
     /// The return does not depend on the features.
     Flat,
+    /// x3 takes 35 distinct values; the return does not depend on the features.
+    Few,
 }
 
 /// Four symbols on an hourly grid.
@@ -49,7 +51,7 @@ fn write_csv(dir: &Path, panel: Panel) -> String {
         for (j, sym) in SYMBOLS.iter().enumerate() {
             let i = (k + 40) as f64 * 4.0 + j as f64;
             let (mut x1, mut x2) = (frac(i * 0.618_033_988_749_894_9) - 0.5, frac(i * 0.754_877_666_246_692_7) - 0.5);
-            let x3 = frac(i * 0.414_213_562_373_095) - 0.5;
+            let x3 = if panel == Panel::Few { (i as i64 % 35) as f64 / 35.0 - 0.5 } else { frac(i * 0.414_213_562_373_095) - 0.5 };
             let noise = frac(i * 0.324_717_957_244_746) - 0.5;
             if panel == Panel::Discrete {
                 x1 = ((x1 + 0.5) * 5.0).floor() - 2.0;
@@ -58,7 +60,7 @@ fn write_csv(dir: &Path, panel: Panel) -> String {
             let pays = match panel {
                 Panel::Planted => x1 - x2 < Q,
                 Panel::Discrete => x1 - x2 <= -1.0,
-                Panel::Flat => frac(i * 0.281_718_171_540_954_8) < 0.5,
+                Panel::Flat | Panel::Few => frac(i * 0.281_718_171_540_954_8) < 0.5,
             };
             let r = (if pays { 0.004 } else { -0.004 }) + 0.002 * noise;
             text.push_str(&format!("{},{},{},{},{},{},{}\n", T0 + STEP * k, sym, x1, x2, x3, r, r));
@@ -68,6 +70,7 @@ fn write_csv(dir: &Path, panel: Panel) -> String {
         Panel::Planted => "planted.csv",
         Panel::Discrete => "discrete.csv",
         Panel::Flat => "flat.csv",
+        Panel::Few => "few.csv",
     };
     let path = dir.join(name);
     std::fs::write(&path, text).unwrap();
@@ -485,4 +488,13 @@ fn enumerate_gpu_needs_a_cuda_build_and_a_device() {
     } else {
         assert!(err.contains("--gpu") && err.contains("built without --features cuda"), "{err}");
     }
+}
+
+#[test]
+fn enumerate_prices_more_than_64_midpoint_cuts() {
+    let (_s, dir) = scratch();
+    let (data, spec) = (write_csv(&dir, Panel::Few), write_spec(&dir));
+    let o = enumerate(&data, &spec, &["--vars", "x3", "--ops", "abs", "--max-size", "1", "--cuts", "36", "--json"]);
+    let j = json(&o);
+    assert_eq!(num(&j, &["class", "cuts_scored"]), 68.0);
 }
