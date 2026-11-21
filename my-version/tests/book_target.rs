@@ -973,3 +973,212 @@ fn wf_book_target_binds_the_sealed_candidate() {
     }
     ok(&read(books[0]));
 }
+
+/// One expanding ladder fold: fit from day 0, validation from day 200, test days 300..364 (the test
+/// window of `wf_from_run_honours_book_target`).
+fn ladder_windows(dir: &std::path::Path) -> String {
+    let iso = |d: i64| rcsr::protocol::iso((WF_T0 + WF_DAY * d) as f64);
+    let path = dir.join("ladder-windows.csv");
+    std::fs::write(
+        &path,
+        format!(
+            "scheme,label,train_start,train_end,validation_start,test_start,test_end\nexpanding,t,{},{},{},{},{}\n",
+            iso(0),
+            iso(293),
+            iso(200),
+            iso(300),
+            iso(WF_DAYS)
+        ),
+    )
+    .unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+fn ladder_sr(data: &str, windows: &str, run: &str, extra: &[&str]) -> Output {
+    let mut a = vec![
+        "ladder", "--data", data, "--time", "t", "--group", "s", "--features", "x1,x2", "--windows", windows, "--sr-run", run, "--draws", "50",
+        "--gbm-trees", "10", "--json",
+    ];
+    a.extend_from_slice(extra);
+    rcsr_cmd::rcsr().args(&a).output().expect("run rcsr ladder")
+}
+
+/// The printed ladder report without what differs between two runs of one build: the phase ledger,
+/// the rungs' wall seconds, the run file's path and hash (the run records its own wall) and the
+/// search's wall.
+fn ladder_stable(o: &Output) -> String {
+    assert_eq!(code(o), 0, "{}", stderr(o));
+    let mut t = String::from_utf8_lossy(&o.stdout).trim().to_string();
+    for path in [&["ledger"][..], &["sr_run", "run"], &["sr_run", "run_sha256"], &["equal_cost", "sr_wall_seconds"]] {
+        t = rcsr::verdict::remove_member(&t, path).unwrap();
+    }
+    let key = "\"wall_seconds\":";
+    while let Some(k) = t.find(key) {
+        let end = t[k..].find(',').map_or(t.len(), |e| k + e + 1);
+        t.replace_range(k..end, "");
+    }
+    t
+}
+
+/// The walk-forward of the run on the ladder's test days, the reference book.
+fn wf_reference(data: &str, run: &str) -> Json {
+    let window = wf_window("t", 293, 300, WF_DAYS);
+    ok(&wf(data, &["--from-run", run, "--window", &window, "--allow-in-sample-windows"]))
+}
+
+/// The run without `objective.book_target_spec`, as a run written before #1291.
+fn without_book_spec(dir: &std::path::Path, run: &str) -> String {
+    let text = std::fs::read_to_string(run).unwrap();
+    let bare = rcsr::verdict::remove_member(text.trim(), &["objective", "book_target_spec"]).unwrap();
+    assert!(bare.contains("\"book_target\":") && !bare.contains("book_target_spec"));
+    let path = dir.join("no-book-spec.run.json");
+    std::fs::write(&path, bare).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+fn sr_rung(j: &Json) -> &Json {
+    let Json::Arr(rungs) = at(j, &["rungs"]) else { panic!("rungs is not an array") };
+    rungs.iter().find(|r| r.get("name").and_then(Json::as_str) == Some("symbolic_regression")).expect("symbolic_regression rung")
+}
+
+/// #1311 criteria 1 and 5: `ladder --sr-run` of a run searched with `--book-target` prices the daily
+/// book label whichever of the two labels `--target` names, as `walkforward --from-run` does.
+#[test]
+fn ladder_sr_run_prices_book_label() {
+    let scratch = Scratch::new("ladder_book_label");
+    let dir = scratch.path();
+    let (data, spec) = (wf_csv(dir), wf_spec(dir));
+    let run = wf_search(dir, &data, &spec, "book-run.json", &["--book-target", "lbl_h24_y"]);
+    let windows = ladder_windows(dir);
+    let fit = ladder_sr(&data, &windows, &run, &["--target-spec", &spec, "--target", "lbl_h168_y"]);
+    let j = ok(&fit);
+    assert_eq!(num(&j, &["annualization", "period_seconds"]), 86400.0, "the daily book label sets the period");
+    assert_eq!(num(&j, &["periods"]), 64.0, "one period per test day");
+    assert_eq!(num(&j, &["rows_scored"]), 128.0, "both symbols on every test day");
+    assert_eq!(text_at(sr_rung(&j), &["status"]), "ok");
+    assert_eq!(text_at(&j, &["book", "target", "column"]), "lbl_h24_y");
+    assert_eq!(text_at(&j, &["book", "target", "return_column"]), "lbl_h24_fwd");
+    assert_eq!(text_at(&j, &["book", "fit_target", "column"]), "lbl_h168_y");
+    assert_eq!(text_at(&j, &["book", "source"]), "run");
+    assert_eq!(text_at(&j, &["split", "fit_label", "name"]), "h168");
+    assert_eq!(text_at(&j, &["split", "labelled_rows", "rule"]), "book_target");
+    assert_eq!(text_at(&j, &["split", "labelled_rows", "column"]), "lbl_h24_y");
+    let r = wf_reference(&data, &run);
+    assert_eq!(num(&j, &["periods"]), num(&r, &["pooled", "periods"]));
+    assert_eq!(num(&j, &["annualization", "period_seconds"]), num(&r, &["annualization", "period_seconds"]));
+    assert_eq!(num(&j, &["purge_seconds"]), num(&r, &["split", "required_purge_seconds"]));
+    // The book label by name or return column, with or without the spec file, is the same report.
+    let want = ladder_stable(&fit);
+    for target in [&["--target", "lbl_h24_y"][..], &["--target", "lbl_h24_fwd"], &["--target-spec", &spec, "--target", "lbl_h24_y"]] {
+        assert_eq!(ladder_stable(&ladder_sr(&data, &windows, &run, target)), want, "{target:?}");
+    }
+}
+
+/// #1311 criterion 2: the purge covers the weekly fit label although the book label is daily.
+#[test]
+fn ladder_sr_run_book_label_purge() {
+    let scratch = Scratch::new("ladder_book_purge");
+    let dir = scratch.path();
+    let (data, spec) = (wf_csv(dir), wf_spec(dir));
+    let run = wf_search(dir, &data, &spec, "book-run.json", &["--book-target", "lbl_h24_y"]);
+    let windows = ladder_windows(dir);
+    let j = ok(&ladder_sr(&data, &windows, &run, &["--target", "lbl_h24_y"]));
+    assert_eq!(num(&j, &["purge_seconds"]), WF_WEEK as f64);
+    assert_eq!(text_at(&j, &["purge_source"]), "target_spec");
+    let wide = ok(&ladder_sr(&data, &windows, &run, &["--target", "lbl_h24_y", "--purge-seconds", "700000"]));
+    assert_eq!(num(&wide, &["purge_seconds"]), 700000.0, "a wider flag still wins");
+    assert_eq!(text_at(&wide, &["purge_source"]), "flag");
+}
+
+/// #1311 criterion 3: a third label, another return column and a run without the book label's spec exit 2.
+#[test]
+fn ladder_sr_run_book_label_refusals() {
+    let scratch = Scratch::new("ladder_book_refusals");
+    let dir = scratch.path();
+    let (data, spec) = (wf_csv(dir), wf_spec(dir));
+    let run = wf_search(dir, &data, &spec, "book-run.json", &["--book-target", "lbl_h24_y"]);
+    let windows = ladder_windows(dir);
+    let third = "is neither the fit label 'lbl_h168_y' nor the book label 'lbl_h24_y'";
+    usage_error(&ladder_sr(&data, &windows, &run, &["--target", "lbl_d1_y"]), third);
+    usage_error(&ladder_sr(&data, &windows, &run, &["--target-spec", &spec, "--target", "lbl_d1_y"]), third);
+    usage_error(&ladder_sr(&data, &windows, &run, &["--target", "lbl_h24_y", "--return-col", "lbl_h168_fwd"]), "--return-col lbl_h168_fwd differs from the book label");
+    let bare = without_book_spec(dir, &run);
+    usage_error(&ladder_sr(&data, &windows, &bare, &["--target", "lbl_h24_y"]), "records no objective.book_target_spec");
+}
+
+/// #1311 criterion 4: `ladder --sr-run` of a run without `--book-target` keeps the report of the
+/// build before #1311, byte for byte (without what differs between two runs of one build).
+#[test]
+fn ladder_sr_run_plain_unchanged() {
+    let scratch = Scratch::new("ladder_plain_run");
+    let dir = scratch.path();
+    let (data, spec) = (wf_csv(dir), wf_spec(dir));
+    let run = wf_search(dir, &data, &spec, "fit-run.json", &[]);
+    let windows = ladder_windows(dir);
+    let o = ladder_sr(&data, &windows, &run, &["--target-spec", &spec, "--target", "lbl_h168_y"]);
+    let text = ladder_stable(&o);
+    assert_eq!(rcsr::manifest::sha256_hex(text.as_bytes()), PINNED_FIT_LABEL_LADDER, "{text}");
+    assert!(json(&o).get("book").is_none());
+}
+
+const PINNED_FIT_LABEL_LADDER: &str = "2efe5dc3e3a654c0c7c6c4dd226a4ccacd94f80e30b44180f30041fbefe549d5";
+
+fn ablation_score(dir: &std::path::Path, name: &str, data: &str, windows: &str, extra: &[&str]) -> (Output, Option<Json>) {
+    let out = dir.join(name).to_string_lossy().into_owned();
+    let mut a = vec!["ablation", "score", "--data", data, "--time", "t", "--group", "s", "--windows", windows, "--out", out.as_str()];
+    a.extend_from_slice(extra);
+    let o = rcsr_cmd::rcsr().args(&a).output().expect("run rcsr ablation score");
+    let j = (code(&o) == 0).then(|| Json::parse(std::fs::read_to_string(&out).unwrap().trim()).expect("ablation result"));
+    (o, j)
+}
+
+fn net_periods(j: &Json) -> usize {
+    match at(j, &["net_period"]) {
+        Json::Arr(a) => a.len(),
+        _ => panic!("net_period is not an array"),
+    }
+}
+
+/// #1311: `ablation score` of a run searched with `--book-target` prices the daily book label with the
+/// weekly fit label's purge, from `--from-run` and from `--run`, as `walkforward --from-run` does.
+#[test]
+fn ablation_score_prices_book_label() {
+    let scratch = Scratch::new("ablation_book_label");
+    let dir = scratch.path();
+    let (data, spec) = (wf_csv(dir), wf_spec(dir));
+    let run = wf_search(dir, &data, &spec, "book-run.json", &["--book-target", "lbl_h24_y", "--arm", "A0"]);
+    let windows = ladder_windows(dir);
+    let r = wf_reference(&data, &run);
+    let runs: [&[&str]; 2] = [&["--from-run", &run], &["--run", &run, "--target", "lbl_h168_y"]];
+    for (k, args) in runs.iter().enumerate() {
+        let (o, j) = ablation_score(dir, &format!("score{k}.json"), &data, &windows, args);
+        let j = j.unwrap_or_else(|| panic!("{args:?}: {}", stderr(&o)));
+        assert_eq!(net_periods(&j), 64, "{args:?}: one period per test day");
+        assert_eq!(net_periods(&j) as f64, num(&r, &["pooled", "periods"]), "{args:?}");
+        assert_eq!(num(&j, &["purge_seconds"]), num(&r, &["split", "required_purge_seconds"]), "{args:?}");
+        assert_eq!(text_at(&j, &["purge_source"]), "target_spec", "{args:?}");
+        assert_eq!(text_at(&j, &["labelled_rows", "column"]), "lbl_h24_y", "{args:?}");
+        assert_eq!(text_at(&j, &["book", "target", "column"]), "lbl_h24_y", "{args:?}");
+        assert_eq!(text_at(&j, &["book", "fit_target", "column"]), "lbl_h168_y", "{args:?}");
+        assert_eq!(text_at(&j, &["book", "source"]), "run", "{args:?}");
+    }
+}
+
+/// #1311: a run without the book label's spec, a third label and another return column exit 2.
+#[test]
+fn ablation_score_book_label_refusals() {
+    let scratch = Scratch::new("ablation_book_refusals");
+    let dir = scratch.path();
+    let (data, spec) = (wf_csv(dir), wf_spec(dir));
+    let run = wf_search(dir, &data, &spec, "book-run.json", &["--book-target", "lbl_h24_y", "--arm", "A0"]);
+    let windows = ladder_windows(dir);
+    let bare = without_book_spec(dir, &run);
+    for mode in ["--from-run", "--run"] {
+        let (o, _) = ablation_score(dir, "bare.json", &data, &windows, &[mode, &bare, "--target", "lbl_h24_y"]);
+        usage_error(&o, "records no objective.book_target_spec");
+    }
+    let (o, _) = ablation_score(dir, "third.json", &data, &windows, &["--from-run", &run, "--target", "lbl_d1_y"]);
+    usage_error(&o, "is neither the fit label 'lbl_h168_y' nor the book label 'lbl_h24_y'");
+    let (o, _) = ablation_score(dir, "ret.json", &data, &windows, &["--from-run", &run, "--return-col", "lbl_h168_fwd"]);
+    usage_error(&o, "--return-col lbl_h168_fwd differs from the book label");
+}

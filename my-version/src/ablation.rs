@@ -1776,6 +1776,10 @@ fn usage() -> &'static str {
             scores the run's finalist (objective.finalist.expression_exact, else the rounded expression; the result carries expression_source) on every fold. Test rows of one group closer than the target spec horizon overlap and are refused (exit 2); a spec without stride_seconds over rows 2 horizons or more apart, or a stride_seconds wider than the smallest per-group step, is refused too (exit 2); a declared width makes one equal-weight period per floor(t / width) bucket; the result carries min_group_step_seconds. --target-spec sets the per-side cost\n\
             (cost_bps / 2), the return units (log is converted with exp_m1) and the return column; a --cost-bps that differs is refused.\n\
             the rows priced are the search's rows (#1291, the rule of walkforward and the ladder): with a target spec whose label differs from the return column, a row needs a finite return and a finite fit label; a run with --book-target or a filled --fill, and a spec of kind xs_rank, keep every finite return; result labelled_rows names the rule\n\
+            #1311: under rule fit_label the fit label column (the --from-run target_spec column, or the --target-spec entry column) is read whatever --target names; a --target that is not the fit label (column, name or return column) exits 2\n\
+            #1311: a run searched with --book-target (--run and --from-run) is priced on its book label as walkforward --from-run prices it: objective.book_target_spec gives the return column, horizon, stride and cost\n\
+            (replacing the run's or the --target-spec entry), --target names the fit label or the book label (column, name or return column; another label exits 2), a --return-col other than the book label's exits 2,\n\
+            the purge is the larger of the two labels' entry offset + horizon + delay (purge_source target_spec), a run without objective.book_target_spec exits 2; the result adds book {target, fit_target, source run}\n\
             --from-run prices the book the search selected: the run's target spec, per-side cost and fixed threshold\n\
             (objective.spec.threshold); it refuses --thresholds, --headline-threshold and --target-spec, and a run without an objective block\n
             A run that priced a band or a minimum hold is priced with it: half-width objective.spec.band_resolved as recorded, objective.spec.min_holding,\n
@@ -2004,6 +2008,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
                 let exit = if e == crate::run_json::INTERIM_REFUSAL { 2 } else { 3 };
                 (exit, format!("{}: {}", run_path, e))
             })?;
+            let run_file = crate::run_json::RunFile::parse(&run_text).map_err(|e| (3, format!("{}: {}", run_path, e)))?;
             let book = match from_run {
                 Some(_) => {
                     for flag in ["--thresholds", "--headline-threshold", "--target-spec"] {
@@ -2011,7 +2016,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
                             return Err((2, format!("{} cannot be combined with --from-run: the run fixes the threshold rule and the target spec", flag)));
                         }
                     }
-                    let book = crate::run_json::RunFile::parse(&run_text).and_then(|r| r.band_book()).map_err(|e| (3, format!("{}: {}", run_path, e)))?;
+                    let book = run_file.band_book().map_err(|e| (3, format!("{}: {}", run_path, e)))?;
                     if book.position != crate::trading::PositionMap::Threshold {
                         return Err((2, format!("{}: the run priced the top_tercile book; the ablation prices the threshold rule only", run_path)));
                     }
@@ -2019,6 +2024,8 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
                 }
                 None => None,
             };
+            // #1311: a run searched with --book-target is priced on its book label, as by the ladder.
+            let book_label = crate::walkforward::BookLabel::of_run(&run_file, run_path, run_file.target_spec().as_ref()).map_err(|e| (2, e))?;
             let mut opts = Options::default();
             let num_flag = |name: &str| -> Result<Option<f64>, (i32, String)> {
                 fl.opt(name).map(|c| c.parse().map_err(|_| (2, format!("{}: invalid number", name)))).transpose()
@@ -2046,6 +2053,9 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
                 let target = fl.need("--target")?;
                 opts.spec = crate::target::entry_for(&specs, target).cloned();
             }
+            if let Some(l) = &book_label {
+                opts.spec = Some(l.book.clone());
+            }
             let (cost, source) = match &book {
                 Some(b) => match (cost_flag, cost_override) {
                     (Some(_), Some(_)) => return Err((2, "--cost-bps and --cost-override are alternatives; pass one of them".to_string())),
@@ -2066,7 +2076,14 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
                 (Some(b), None) => b.spec.return_column.clone().unwrap_or_else(|| b.spec.column.clone()),
                 _ => fl.need("--target")?.to_string(),
             };
-            let inp = Input {
+            let target = match &book_label {
+                Some(l) => {
+                    l.check_flags(run_path, &target, fl.opt("--return-col")).map_err(|e| (2, e))?;
+                    l.book.return_column.clone().unwrap_or_else(|| l.book.column.clone())
+                }
+                None => target,
+            };
+            let mut inp = Input {
                 data: fl.need("--data")?.to_string(),
                 target,
                 ret: fl.opt("--return-col").map(str::to_string),
@@ -2077,20 +2094,35 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             let windows_path = fl.need("--windows")?;
             let wtext = std::fs::read_to_string(windows_path).map_err(|e| io_err(windows_path, e))?;
             let rows = protocol::parse_windows_csv(&wtext, Some(fl.opt("--scheme").unwrap_or("expanding"))).map_err(|e| (3, e))?;
-            let run_file = crate::run_json::RunFile::parse(&run_text).map_err(|e| (3, format!("{}: {}", run_path, e)))?;
             let run_band = RunBand::of(&run_file.band, run_file.min_holding);
             let labelled: Vec<(String, f64, f64)> = rows.iter().map(|r| (r.window.label.clone(), r.window.test_start, r.window.test_end)).collect();
             let oof = run_file
                 .oof_flags_windows(&labelled, fl.has("--allow-in-sample"))
                 .map_err(|e| (3, format!("{}: {}", run_path, e)))?;
-            let mut panel = ladder::load_panel(&inp, &opts).map_err(|e| (3, e))?;
             let rows_rule = ladder::search_rows(opts.spec.as_ref(), &ladder::return_name(&inp, &opts), Some(&run_file));
+            // #1311: the fit_label rule reads the fit label, so it is the panel target whatever --target names.
+            if let (Some(col), Some(s)) = (rows_rule.fit_label(), &opts.spec) {
+                if let Some(given) = fl.opt("--target") {
+                    if crate::target::entry_for(std::slice::from_ref(s), given).is_none() {
+                        return Err((
+                            2,
+                            format!(
+                                "--target {} is not the fit label '{}' of {} (its column, name or return column): a priced row needs a finite '{}' (labelled_rows rule fit_label)",
+                                given, col, run_path, col
+                            ),
+                        ));
+                    }
+                }
+                inp.ret = Some(ladder::return_name(&inp, &opts));
+                inp.target = col.to_string();
+            }
+            let mut panel = ladder::load_panel(&inp, &opts).map_err(|e| (3, e))?;
             ladder::keep_labelled_rows(&mut panel, &rows_rule);
             let resolved = crate::lockbox::resolve_retired(fl.opt("--lockbox"), fl.opt("--lockbox-embargo"), fl.need("--data")?, fl.opt("--retired")).map_err(|e| (e.exit, e.message))?;
             let mut purge_source = if fl.opt("--purge-seconds").is_some() { "flag" } else { "protocol_default" };
-            if let Some(s) = &opts.spec {
-                if s.required_purge_seconds() > opts.purge_seconds {
-                    opts.purge_seconds = s.required_purge_seconds();
+            if let Some(need) = ladder::label_purge(opts.spec.as_ref(), book_label.as_ref()) {
+                if need > opts.purge_seconds {
+                    opts.purge_seconds = need;
                     purge_source = "target_spec";
                 }
             }
@@ -2135,11 +2167,12 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
                 fold_oof
             );
             json = format!(
-                "{},\"purge_seconds\":{},\"purge_source\":\"{}\",\"labelled_rows\":{}}}",
+                "{},\"purge_seconds\":{},\"purge_source\":\"{}\",\"labelled_rows\":{}{}}}",
                 json.trim_end().strip_suffix('}').unwrap_or(json.trim_end()),
                 jnum(opts.purge_seconds),
                 purge_source,
-                rows_rule.json()
+                rows_rule.json(),
+                book_label.as_ref().map_or_else(String::new, crate::walkforward::BookLabel::report_member)
             );
             json = resolved.splice_report(&json, 0, false, true);
             let out = fl.need("--out")?;

@@ -436,9 +436,56 @@ impl BookLabel {
         }
     }
 
+    /// #1311: the book label of a run searched with `--book-target`, against its fit label `fit`
+    /// (the run's `target_spec`); `None` for a run without `objective.book_target`. One reading for
+    /// `walkforward --from-run` and `--front`, `ladder --sr-run` and `ablation score`, which exit 2
+    /// on the refusal.
+    pub fn of_run(run: &crate::run_json::RunFile, path: &str, fit: Option<&crate::target::TargetSpec>) -> Result<Option<BookLabel>, String> {
+        let Some(b) = &run.book_target else { return Ok(None) };
+        let Some(book) = &b.spec else {
+            return Err(format!(
+                "{}: the run priced --book-target {} (objective.book_target) and records no objective.book_target_spec, \
+                 so the return column, horizon and rows of its books are unknown here; search again with this build",
+                path, b.column
+            ));
+        };
+        let fit = fit.ok_or_else(|| BookLabel::no_fit_label(path))?;
+        BookLabel::pair(fit, book, BookSource::Run)
+    }
+
+    /// The refusal of a run whose fit label is unknown.
+    pub fn no_fit_label(path: &str) -> String {
+        format!("{}: the run records no target_spec, so its fit label is unknown here", path)
+    }
+
+    /// #1311: `--target` of a tool that prices the run's book names the fit label or the book label
+    /// (column, name or return column), and `--return-col` is the book label's.
+    pub fn check_flags(&self, path: &str, target: &str, return_col: Option<&str>) -> Result<(), String> {
+        if crate::target::entry_for(&[self.fit.clone(), self.book.clone()], target).is_none() {
+            return Err(format!(
+                "--target {} is neither the fit label '{}' nor the book label '{}' of {}: the run priced its books on '{}' (objective.book_target_spec)",
+                target, self.fit.column, self.book.column, path, self.book.column
+            ));
+        }
+        match return_col {
+            Some(r) if Some(r) != self.book.return_column.as_deref() => Err(format!(
+                "--return-col {} differs from the book label's return column {} (objective.book_target_spec of {}); remove the flag",
+                r,
+                self.book.return_column.as_deref().unwrap_or("null"),
+                path
+            )),
+            _ => Ok(()),
+        }
+    }
+
     /// The fit label's `entry_offset + horizon + delay`, the purge floor of every window.
     pub fn fit_purge_seconds(&self) -> f64 {
         self.fit.required_purge_seconds()
+    }
+
+    /// #1311: the `book` member of a ladder or ablation report, with a leading comma.
+    pub fn report_member(&self) -> String {
+        format!(",\"book\":{{{}}}", &self.json()[1..])
     }
 
     /// The members the label adds to the report's `book` object, with a leading comma.

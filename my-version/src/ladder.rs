@@ -34,7 +34,7 @@ use crate::risk::{risk_stats, BetaAlpha, DEFAULT_SORTINO_MAR};
 use crate::target::TargetSpec;
 use crate::target_structure;
 use crate::trading_gpu::{band_positions, BandParams};
-use crate::walkforward::{quantile, LabelledRows, PeriodSource, SECONDS_PER_YEAR};
+use crate::walkforward::{quantile, BookLabel, LabelledRows, PeriodSource, RowRule, SECONDS_PER_YEAR};
 use std::time::Instant;
 
 pub const SCHEMA: &str = "rcsr-ladder/1";
@@ -2469,23 +2469,28 @@ pub fn return_name(inp: &Input, opts: &Options) -> String {
 }
 
 /// #1291: the rows the ladder prices, by the rule of the search's books
-/// ([`LabelledRows::of_search`]). The search prices an `xs_rank` label only as
+/// ([`RowRule::of_search`]). The search prices an `xs_rank` label only as
 /// the top-tercile book, so a `--target` spec of that kind keeps every finite
 /// return; without a target spec there is no fit label apart from the return.
 pub fn labelled_rows(inp: &Input, opts: &Options) -> LabelledRows {
     search_rows(opts.spec.as_ref(), &return_name(inp, opts), opts.sr_run.as_ref().map(|s| &s.run))
 }
 
-/// [`labelled_rows`] from its parts, shared with `rcsr ablation score`.
+/// [`labelled_rows`] from its parts, shared with `rcsr ablation score`; built by
+/// [`RowRule::of_search`], the walk-forward's constructor.
 pub fn search_rows(spec: Option<&crate::target::TargetSpec>, return_column: &str, run: Option<&crate::run_json::RunFile>) -> LabelledRows {
     let top_tercile = spec.is_some_and(|s| s.kind == crate::target::KIND_XS_RANK);
-    LabelledRows::of_search(
-        spec,
-        return_column,
-        top_tercile,
-        run.is_some_and(|r| r.fills_labels()),
-        run.and_then(|r| r.book_target.as_ref()).map(|b| b.column.clone()),
-    )
+    RowRule::of_search(spec, return_column, top_tercile, run, run.and_then(|r| r.book_target.as_ref()).map(|b| b.column.clone())).rows().clone()
+}
+
+/// #1311: the purge the labels require, shared with `rcsr ablation score`: the target spec's
+/// `entry_offset + horizon + delay`, with the run's book label (#1212) at least the fit label's.
+pub fn label_purge(spec: Option<&TargetSpec>, book: Option<&BookLabel>) -> Option<f64> {
+    let own = spec.map(TargetSpec::required_purge_seconds);
+    match book.map(BookLabel::fit_purge_seconds) {
+        Some(fit) => Some(own.map_or(fit, |o| o.max(fit))),
+        None => own,
+    }
 }
 
 /// #1291: under [`LabelledRows::FitLabel`] a row without a finite `y` gets a NaN
@@ -2638,6 +2643,10 @@ Long-only baseline ladder on one panel, one set of folds and one cost model.\n\
                             prices objective.finalist.expression_exact, else the rounded expression (sr_run.expression_source);\n\
                             --locked-test refuses a rounded source (exit 3)\n\
                             a run that priced --pnl-mask (objective.spec.pnl_mask) is refused (exit 2): the rung prices the raw formula; walkforward --from-run prices the mask\n\
+                            #1311: a run searched with --book-target is priced on its book label as walkforward --from-run prices it: objective.book_target_spec replaces the --target-spec entry and gives every rung its return column, horizon, stride and cost;\n\
+                            --target names the fit label or the book label (column, name or return column; the panel target is the book label), another label exits 2; a --return-col other than the book label's exits 2;\n\
+                            the purge is the larger of the two labels' entry offset + horizon + delay (purge_source target_spec); a run without objective.book_target_spec exits 2;\n\
+                            the JSON adds book {target, fit_target, source run} and split.fit_label is the fit label's\n\
   --allow-in-sample         with --sr-run: drop in-sample folds from every rung and label them oof:false\n\
   --sr-score <col>          out-of-fold symbolic-regression score column from the caller (labelled oof=caller)\n\
   --sr-evals <n>            candidate evaluations of the symbolic-regression run\n\
@@ -2852,6 +2861,24 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             return Err(input_err(format!("{}: no entry for target '{}'", path, target)));
         }
     }
+    // #1311: a run searched with --book-target is priced on its book label; --target names either label.
+    let book_label = match (&opts.sr_run, &sr_run_path) {
+        (Some(sr), Some(path)) => {
+            let label = BookLabel::of_run(&sr.run, path, sr.run.target_spec().as_ref()).map_err(|e| usage_err(format!("--sr-run {}", e)))?;
+            if let Some(b) = &label {
+                b.check_flags(path, &target, ret.as_deref()).map_err(usage_err)?;
+            }
+            label
+        }
+        _ => None,
+    };
+    let target = match &book_label {
+        Some(b) => {
+            opts.spec = Some(b.book.clone());
+            b.book.column.clone()
+        }
+        None => target,
+    };
     let (cost, source) = crate::target::resolve_cost(opts.spec.as_ref(), cost_flag, cost_override, DEFAULT_COST_BPS).map_err(usage_err)?;
     opts.cost_bps = cost;
     if let Some(s) = &opts.spec {
@@ -2874,10 +2901,10 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
     }
     // #1214: a switch gate column of the label family, the target, its return column or a construction column exits 5.
     if let Some(sw) = opts.sr_run.as_ref().and_then(|s| s.switch.as_ref()) {
-        let specs: Vec<&TargetSpec> = opts.spec.iter().collect();
+        let specs: Vec<&TargetSpec> = opts.spec.iter().chain(book_label.as_ref().map(|b| &b.fit)).collect();
         let mut names: Vec<String> = vec![target.clone()];
         names.extend(ret.iter().cloned());
-        names.extend(opts.spec.iter().flat_map(|s| [Some(s.column.clone()), s.return_column.clone()]).flatten());
+        names.extend(specs.iter().flat_map(|s| [Some(s.column.clone()), s.return_column.clone()]).flatten());
         if let Some(why) = crate::regime_gate::gate_column_leak(&sw.gate.columns, &specs, &names, false) {
             return Err((5, format!("--sr-run objective.finalist.switch: {}", why)));
         }
@@ -2887,9 +2914,9 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
     let resolved = crate::lockbox::resolve_retired(lockbox_arg.as_deref(), lockbox_embargo_arg.as_deref(), &data_path, retired_arg.as_deref()).map_err(|e| (e.exit, e.message))?;
     let declared = resolved.declared();
     let mut purge_source = if purge_given { "flag" } else { "protocol_default" };
-    if let Some(s) = &opts.spec {
-        if s.required_purge_seconds() > opts.purge_seconds {
-            opts.purge_seconds = s.required_purge_seconds();
+    if let Some(need) = label_purge(opts.spec.as_ref(), book_label.as_ref()) {
+        if need > opts.purge_seconds {
+            opts.purge_seconds = need;
             purge_source = "target_spec";
         }
     }
@@ -2999,20 +3026,23 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
     ledger.set_wall(wall);
     report.ledger = ledger;
     let in_scope = if locked_test { folds.iter().map(|f| f.test.len()).sum() } else { 0 };
-    let fit_label = opts
-        .spec
+    let fit_label = book_label
         .as_ref()
+        .map(|b| &b.fit)
+        .or(opts.spec.as_ref())
         .and_then(|s| crate::target::label_report_for(&data_path, &s.column))
         .and_then(|r| crate::labels::fit_label_json(&r))
         .map(|f| format!("\"fit_label\":{},", f))
         .unwrap_or_default();
     let split = format!(",\"split\":{{{}\"labelled_rows\":{}}}", fit_label, rows_rule.json());
+    let book = book_label.as_ref().map_or_else(String::new, BookLabel::report_member);
     let finish = |json: String, hashed: bool| {
         let json = format!(
-            "{},\"purge_seconds\":{},\"purge_source\":\"{}\"{}}}",
+            "{},\"purge_seconds\":{},\"purge_source\":\"{}\"{}{}}}",
             json.trim_end().strip_suffix('}').unwrap_or(json.trim_end()),
             opts.purge_seconds,
             purge_source,
+            book,
             if hashed { "" } else { split.as_str() }
         );
         if hashed {

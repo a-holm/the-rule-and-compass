@@ -982,18 +982,29 @@ fn ablation_score_prices_search_rows() {
 }
 
 /// #1305: a run searched with `--book-target` prices every finite return of its book label, so a
-/// row without a fit label stays priced.
+/// row without a fit label stays priced. #1311: the book label's spec prices it; a run that records
+/// only the book label's name exits 2.
 #[test]
 fn ablation_score_keeps_every_return_for_book_target() {
     let (_scratch, dir) = scratch("book_rows");
     let (data, run, windows) = scored_fixture(&dir, 900);
     let text = std::fs::read_to_string(&run).unwrap();
-    let edited = text.replacen("\"objective\":{", "\"objective\":{\"book_target\":\"y\",", 1);
-    assert_ne!(edited, text, "the run holds an objective block");
-    let book_run = dir.join("book.run.json");
-    std::fs::write(&book_run, edited).unwrap();
+    let spec = std::fs::read_to_string(write_spec_with(&dir, "book_spec.json", 900, None)).unwrap();
+    let entry = &spec[spec.find("[{").unwrap() + 1..spec.rfind("}]").unwrap() + 1];
+    let book_spec = entry.replacen("\"column\":\"y\",\"name\":\"raw_target\"", "\"column\":\"r\",\"name\":\"r\"", 1);
+    assert_ne!(book_spec, entry);
     let sparse = blank_every_third_label(&data);
-    let out = score_cli(&sparse, &windows, 900, &dir.join("book.json"), &["--from-run", book_run.to_str().unwrap()]);
+    let price = |name: &str, objective: String| {
+        let edited = text.replacen("\"objective\":{", &objective, 1);
+        assert_ne!(edited, text, "the run holds an objective block");
+        let book_run = dir.join(format!("{name}.run.json"));
+        std::fs::write(&book_run, edited).unwrap();
+        score_cli(&sparse, &windows, 900, &dir.join(format!("{name}.json")), &["--from-run", book_run.to_str().unwrap()])
+    };
+    let named = price("named", "\"objective\":{\"book_target\":\"r\",".to_string());
+    assert_eq!(named.status.code(), Some(2), "{}", String::from_utf8_lossy(&named.stderr));
+    assert!(String::from_utf8_lossy(&named.stderr).contains("records no objective.book_target_spec"));
+    let out = price("book", format!("\"objective\":{{\"book_target\":\"r\",\"book_target_spec\":{book_spec},"));
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
     let report = Json::parse(std::fs::read_to_string(dir.join("book.json")).unwrap().trim()).unwrap();
     assert_eq!(period_count(&report), 100, "every finite return is priced");
@@ -1024,6 +1035,52 @@ fn ablation_score_labelled_rows_matches_walkforward() {
     assert_eq!(rule, "fit_label");
     assert_eq!(Some(rule), want.get("rule").and_then(Json::as_str));
     assert_eq!(col, want.get("column").and_then(Json::as_str));
+}
+
+/// #1311: under rule fit_label a row needs a finite fit label, the run's `target_spec.column`, also
+/// when `--target` is left out (`--from-run` then takes the return column) or names the return
+/// column; the count equals `--target y` and `walkforward --from-run`. A `--target` that is not the
+/// fit label exits 2.
+#[test]
+fn ablation_score_fit_label_rows_whatever_the_target() {
+    let (_scratch, dir) = scratch("fit_label_target");
+    let (data, run, windows) = scored_fixture(&dir, 900);
+    let spec = dir.join("spec_run.json").to_string_lossy().into_owned();
+    let sparse = blank_every_third_label(&data);
+    let score = |name: &str, extra: &[&str]| {
+        let out = dir.join(name);
+        let mut args = vec!["ablation", "score", "--data", sparse.as_str(), "--time", "t", "--windows", windows.as_str(), "--purge-seconds", "900", "--out", out.to_str().unwrap()];
+        args.extend_from_slice(extra);
+        (rcsr_cmd::rcsr().args(&args).output().unwrap(), out)
+    };
+    let at = |i: i64| (T0 as i64 + 900 * i).to_string();
+    let window = format!("w0,{},{},{},{}", at(0), at(280), at(300), at(400));
+    let wf = rcsr_cmd::rcsr()
+        .args(["walkforward", "--data", &sparse, "--time", "t", "--from-run", &run, "--window", &window, "--allow-in-sample-windows", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(wf.status.code(), Some(0), "{}", String::from_utf8_lossy(&wf.stderr));
+    let wf = Json::parse(String::from_utf8_lossy(&wf.stdout).trim()).unwrap();
+    let wf_periods = wf.get("pooled").and_then(|p| p.get("periods")).and_then(Json::as_usize).expect("pooled.periods");
+    let labelled = (300..400).filter(|i| i % 3 != 0).count();
+    assert_eq!(wf_periods, labelled);
+    let cases: [&[&str]; 5] = [
+        &["--from-run", &run, "--target", "y"],
+        &["--from-run", &run],
+        &["--from-run", &run, "--target", "r"],
+        &["--from-run", &run, "--target", "raw_target"],
+        &["--run", &run, "--target", "r", "--target-spec", &spec],
+    ];
+    for (k, extra) in cases.iter().enumerate() {
+        let (o, out) = score(&format!("case{k}.json"), extra);
+        assert_eq!(o.status.code(), Some(0), "{extra:?}: {}", String::from_utf8_lossy(&o.stderr));
+        let report = Json::parse(std::fs::read_to_string(&out).unwrap().trim()).unwrap();
+        assert_eq!(period_count(&report), labelled, "{extra:?}: one period per row with a finite fit label");
+        assert_eq!(report.get("labelled_rows").and_then(|r| r.get("column")).and_then(Json::as_str), Some("y"), "{extra:?}");
+    }
+    let (o, _) = score("other.json", &["--from-run", &run, "--target", "x1"]);
+    assert_eq!(o.status.code(), Some(2), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("is not the fit label 'y'"), "{}", String::from_utf8_lossy(&o.stderr));
 }
 
 // --- verdict ------------------------------------------------------------------------
