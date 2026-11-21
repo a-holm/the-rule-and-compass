@@ -400,5 +400,34 @@ fn switch_none_output_is_unchanged() {
     assert_eq!(got, (PINNED_SWITCH_JSON.to_string(), PINNED_SWITCH_TEXT.to_string()), "the default switch report (JSON, text) changed");
 }
 
-const PINNED_SWITCH_JSON: &str = "f3730568d93d2314a5ae579e2c46f82e3fd0c0dd830349ec1dd740f2cd74dd31";
-const PINNED_SWITCH_TEXT: &str = "66f71ce9c94ea5e5dfb3591156bf77ee46b34b0a069fdb1a7753b3a4b605023f";
+const PINNED_SWITCH_JSON: &str = "e7aebc2bc216490a0e28773cd82b965b78bc36ff5ed89c33fb0a48d1eeedd2a8";
+const PINNED_SWITCH_TEXT: &str = "d2ad87eaa79a0e1b03a04651a45cb04cae3a0f3a7e8ab18a33890e865160f129";
+
+/// #1248: the sweep budget. The table guard refuses a small `--max-memory` first
+/// on any input that fits the test, so the refusal is a unit test of
+/// `gate_sweep_within` in `src/switch.rs`.
+const SWEEP_ARGS: [&str; 8] = ["--a", "x1", "--b", "0 - x1", "--gate", "g", "--pnl-blocks", "64"];
+
+#[test]
+fn switch_reports_sweep_bytes() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, "d.csv", 0, |_| None);
+    let spec = write_spec(&dir);
+    let o = switch(&data, &spec, &[&SWEEP_ARGS[..], &["--max-memory", "1GiB", "--json"]].concat());
+    let j = json(&o);
+    let rows = num(&j, &["train_rows"]) as usize;
+    assert_eq!(num(&j, &["book", "sweep_bytes"]) as u64, rcsr::switch::gate_sweep_bytes(rows, 64));
+    let text = switch(&data, &spec, &[&SWEEP_ARGS[..], &["--max-memory", "1GiB"]].concat());
+    assert_eq!(code(&text), 0, "{}", stderr(&text));
+    assert!(String::from_utf8_lossy(&text.stdout).contains("gate sweep memory: an estimated"));
+}
+
+#[test]
+fn switch_force_skips_sweep_budget() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, "d.csv", 0, |_| None);
+    let spec = write_spec(&dir);
+    let o = switch(&data, &spec, &[&SWEEP_ARGS[..], &["--max-memory", "1GiB", "--force"]].concat());
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+}
+
