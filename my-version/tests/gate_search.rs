@@ -477,7 +477,14 @@ const STRIDED_DAYS: usize = 160;
 /// symbol b. The label `y` and the return `r` are finite at hour 0 of each day only (a stride-24
 /// label), so `--fill drop` keeps one row per symbol and day.
 fn strided_csv(dir: &Path) -> String {
-    let mut text = String::from("t,s,x1,x2,g,r,y\n");
+    hourly_csv(dir, "strided.csv", |_| true, false)
+}
+
+/// The rows of [`strided_csv`] with the fit label `y` at hour 0 of the days `fit_day` keeps. With
+/// `dense` the daily return `r` stays on every day and the column `yd` holds the label of every
+/// day; without it `r` is blank where `y` is.
+fn hourly_csv(dir: &Path, name: &str, fit_day: impl Fn(i64) -> bool, dense: bool) -> String {
+    let mut text = String::from(if dense { "t,s,x1,x2,g,r,y,yd\n" } else { "t,s,x1,x2,g,r,y\n" });
     for h in 0..(STRIDED_DAYS * 24) as i64 {
         for (j, sym) in ["a", "b"].iter().enumerate() {
             let f = (2 * h + j as i64) as f64;
@@ -486,11 +493,18 @@ fn strided_csv(dir: &Path) -> String {
             let noise = frac(f * 0.324_717_957_244_746) - 0.5;
             let g = if ((h + 24 * j as i64) / 72) % 2 == 0 { 1.0 } else { -1.0 };
             let r = g * 0.01 * x1 + 0.0005 * noise;
-            let (r, y) = if h % 24 == 0 { (r.to_string(), (r + 0.05 * x2).to_string()) } else { (String::new(), String::new()) };
-            text.push_str(&format!("{},{},{},{},{},{},{}\n", T0 + HOUR * h, sym, x1, x2, g, r, y));
+            let day = h % 24 == 0;
+            let fit = day && fit_day(h / 24);
+            let cell = |on: bool, v: f64| if on { v.to_string() } else { String::new() };
+            let (r_cell, y) = (cell(fit || (day && dense), r), cell(fit, r + 0.05 * x2));
+            text.push_str(&format!("{},{},{},{},{},{},{}", T0 + HOUR * h, sym, x1, x2, g, r_cell, y));
+            if dense {
+                text.push_str(&format!(",{}", cell(day, r + 0.05 * x2)));
+            }
+            text.push('\n');
         }
     }
-    let path = dir.join("strided.csv");
+    let path = dir.join(name);
     std::fs::write(&path, text).unwrap();
     path.to_string_lossy().into_owned()
 }
@@ -680,4 +694,131 @@ fn strided_gate_search_walkforward_reproduces_objective_validation_and_test() {
             .sum();
         assert!((net - num(want, &["net_pnl"])).abs() <= 1e-12, "{slot}: walkforward net {net} vs objective {}", num(want, &["net_pnl"]));
     }
+}
+
+/// A target spec with the fit label `y` (with `stride_seconds` when given) and the label `yd` of
+/// every day, both on the daily return `r` with a one-day horizon.
+fn dense_spec(dir: &Path, name: &str, stride_seconds: Option<i64>) -> String {
+    let entry = |column: &str, stride: Option<i64>| {
+        format!(
+            "{{\"column\":\"{column}\",\"name\":\"{column}\",\"kind\":\"forward_return\",\"deprecated\":false,\"return_column\":\"r\",\
+             \"return_units\":\"log\",\"horizon_seconds\":86400,{}\"entry_offset_seconds\":0,\"delay_seconds\":0,\"entry_price\":\"open\",\
+             \"exit_price\":\"close\",\"offset\":0.0,\"scale\":{{\"kind\":\"constant\",\"value\":1.0}},\"clip\":null,\"units\":\"log_return\",\
+             \"cost_bps\":null,\"cost_in_label\":false,\"construction_columns\":[],\"note\":null}}",
+            stride.map_or(String::new(), |s| format!("\"stride_seconds\":{s},"))
+        )
+    };
+    let path = dir.join(name);
+    std::fs::write(&path, format!("{{\"schema\":\"rcsr-target-spec/1\",\"targets\":[{},{}]}}", entry("y", stride_seconds), entry("yd", None))).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+/// `rcsr walkforward` of the run `run` (`--from-run` or `--front`) on `data` with one window.
+fn walk(data: &str, source: &str, run: &str, window: &str) -> Output {
+    rcsr(&["walkforward", "--data", data, "--time", "t", "--group-by", "s", source, run, "--window", window, "--allow-in-sample-windows", "--json"])
+}
+
+fn window_metrics(report: &Json) -> Json {
+    at(&arr(report, &["windows"])[0], &["metrics"]).clone()
+}
+
+/// The validation and test blocks of the run `j` as walk-forward windows, each with a training
+/// range that ends two days before it. `days` are the days with a book row, so the test block is
+/// the last `test_rows / 2` of them.
+fn run_blocks(j: &Json, days: &[i64]) -> [(&'static str, String); 2] {
+    let vt = arr(j, &["split", "validation_time"]);
+    let (vlo, vhi) = (num(&vt[0], &[]) as i64, num(&vt[1], &[]) as i64);
+    let test_rows = num(j, &["test_rows"]) as usize;
+    assert_eq!(test_rows % 2, 0, "both symbols hold every book stamp");
+    let test_start = T0 + DAY * days[days.len() - test_rows / 2];
+    let test_end = T0 + DAY * STRIDED_DAYS as i64;
+    [("validation", format!("v,{T0},{},{vlo},{}", vlo - 2 * DAY, vhi + 1)), ("test", format!("t,{T0},{},{test_start},{test_end}", test_start - 2 * DAY))]
+}
+
+/// `walkforward --from-run` on the validation and test blocks of the run `j` (written to `run`)
+/// prices the books of `objective.validation` and `objective.test`: rows, trades and entries, and
+/// the net as the sum of the windows of each symbol alone. The report names the row rule.
+fn assert_from_run_reproduces(j: &Json, data: &str, run: &str, days: &[i64], rule: (&str, &str)) {
+    let one = [symbol_csv(data, "a"), symbol_csv(data, "b")];
+    for (slot, window) in run_blocks(j, days) {
+        let want = at(j, &["objective", slot]);
+        assert!(num(want, &["trades"]) > 0.0 && num(want, &["entries"]) > 0.0, "{slot}: the book must trade");
+        let report = json(&walk(data, "--from-run", run, &window));
+        assert_eq!((s(&report, &["split", "labelled_rows", "rule"]), s(&report, &["split", "labelled_rows", "column"])), rule);
+        let m = window_metrics(&report);
+        for key in ["rows", "trades", "entries"] {
+            assert_eq!(num(&m, &[key]), num(want, &[key]), "{slot} {key}");
+        }
+        let net: f64 = one
+            .iter()
+            .map(|d| {
+                let m = window_metrics(&json(&walk(d, "--from-run", run, &window)));
+                if num(&m, &["rows"]) == 0.0 { 0.0 } else { num(&m, &["mean_return"]) * num(&m, &["periods"]) }
+            })
+            .sum();
+        assert!((net - num(want, &["net_pnl"])).abs() <= 1e-12, "{slot}: walkforward net {net} vs objective {}", num(want, &["net_pnl"]));
+    }
+}
+
+/// `data` without the column `name`, written beside it.
+fn without_column(data: &str, name: &str) -> String {
+    let text = std::fs::read_to_string(data).unwrap();
+    let k = text.lines().next().unwrap().split(',').position(|c| c == name).unwrap();
+    let out: String = text.lines().map(|l| l.split(',').enumerate().filter(|(i, _)| *i != k).map(|(_, c)| c).collect::<Vec<_>>().join(",") + "\n").collect();
+    let path = format!("{data}.no-{name}.csv");
+    std::fs::write(&path, out).unwrap();
+    path
+}
+
+/// #1291: under a daily return on every day, `walkforward --from-run` prices the rows of the run's
+/// books: the rows with a finite fit label `y` (every third day, with the stride the spec declares,
+/// or two days in three, with no stride), and every day for a run searched with `--book-target yd`.
+#[test]
+fn dense_return_strided_label_walkforward_reproduces_objective() {
+    let scratch = Scratch::new("gate-search-dense-return");
+    let dir = scratch.path().to_path_buf();
+    let all_days: Vec<i64> = (0..STRIDED_DAYS as i64).collect();
+    let third = |d: i64| d % 3 == 0;
+    let two_in_three = |d: i64| d % 3 != 2;
+    let cases: [(&str, &dyn Fn(i64) -> bool, Option<i64>); 2] = [("third", &third, Some(3 * DAY)), ("two", &two_in_three, None)];
+    for (tag, fit_day, stride) in cases {
+        let data = hourly_csv(&dir, &format!("{tag}.csv"), fit_day, true);
+        let spec = dense_spec(&dir, &format!("{tag}.json"), stride);
+        let run = dir.join(format!("{tag}-run.json")).to_string_lossy().into_owned();
+        let j = json(&strided_gate_search(&data, &spec, &["--out", run.as_str()]));
+        let days: Vec<i64> = all_days.iter().copied().filter(|&d| fit_day(d)).collect();
+        assert_from_run_reproduces(&j, &data, &run, &days, ("fit_label", "y"));
+        if tag == "third" {
+            // --front prices the front on the same rows.
+            let [_, (_, test)] = run_blocks(&j, &days);
+            let report = json(&walk(&data, "--front", &run, &test));
+            assert_eq!(s(&report, &["split", "labelled_rows", "rule"]), "fit_label");
+            assert_eq!(num(&window_metrics(&report), &["rows"]), num(&j, &["objective", "test", "rows"]));
+            // A data file without the fit label column cannot price those rows.
+            let o = walk(&without_column(&data, "y"), "--from-run", &run, &test);
+            assert_eq!(code(&o), 2, "{}", stderr(&o));
+            assert!(stderr(&o).contains("fit label column 'y'"), "{}", stderr(&o));
+        }
+    }
+    // The run searched with --book-target yd prices every day with a finite return.
+    let data = hourly_csv(&dir, "book.csv", third, true);
+    let spec = dense_spec(&dir, "book.json", Some(3 * DAY));
+    let run = dir.join("book-run.json").to_string_lossy().into_owned();
+    let mut args = vec![
+        "--data", data.as_str(), "--target-spec", spec.as_str(), "--vars", "g,x1", "--target", "y", "--book-target", "yd", "--time", "t", "--group-by", "s", "--fill", "drop", "--split", "temporal",
+        "--objective", "pnl", "--cost-bps", "5", "--validation-frac", "0.3", "--test-frac", "0.2", "--no-dev-log", "--quiet", "--json", "--out", run.as_str(),
+    ];
+    args.extend_from_slice(&SHORT);
+    let j = json(&rcsr(&args));
+    assert_eq!(s(&j, &["objective", "book_target"]), "yd");
+    assert_eq!(s(&j, &["objective", "book_target_spec", "column"]), "yd");
+    assert_from_run_reproduces(&j, &data, &run, &all_days, ("book_target", "yd"));
+    // A run written without objective.book_target_spec cannot name the book's return column and rows.
+    let text = std::fs::read_to_string(&run).unwrap();
+    let old = dir.join("book-run-old.json");
+    std::fs::write(&old, rcsr::verdict::remove_member(&text, &["objective", "book_target_spec"]).unwrap()).unwrap();
+    let [_, (_, test)] = run_blocks(&j, &all_days);
+    let o = walk(&data, "--from-run", old.to_str().unwrap(), &test);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).contains("records no objective.book_target_spec"), "{}", stderr(&o));
 }
