@@ -6254,3 +6254,35 @@ fn min_cross_members_panel_append_floor_is_seen_by_a_later_enrich() {
     let floors = column_floors(&std::fs::read_to_string(format!("{out}.schema.json")).unwrap());
     assert_eq!((floors.get("mkt_r16"), floors.get("mkt_vol96")), (Some(&5), Some(&5)), "{floors:?}");
 }
+
+#[test]
+fn min_cross_members_rebuild_does_not_keep_a_stale_schema_floor() {
+    let (_scratch, dir) = tmp_dir("floor-rebuild");
+    let base = symbol_store(&dir, "base.rcsb", 8, 120, 900);
+    let p = |name: &str| dir.join(name).to_string_lossy().into_owned();
+    let x = p("x.rcsb");
+    cli_enrich_ok(&base, &x, "mkt_r16", &["--min-cross-members", "5"]);
+    let r = rcsr_cmd::rcsr().args(["panel", "schema", "--data", &x]).output().unwrap();
+    assert_eq!(r.status.code(), Some(0), "{}", stderr_of(&r));
+    let schema = format!("{x}.schema.json");
+    assert_eq!(column_floors(&std::fs::read_to_string(&schema).unwrap()).get("mkt_r16"), Some(&5));
+    let stale = std::fs::read_to_string(&schema).unwrap();
+
+    // Rebuild the store into the same path at the default floor.
+    cli_enrich_ok(&base, &x, "mkt_r16", &[]);
+    assert!(!std::path::Path::new(&schema).exists(), "a rebuilt store must not keep the schema of the old one");
+    assert!(std::path::Path::new(&format!("{schema}.prev")).exists());
+    let next = p("next.rcsb");
+    let r = cli_enrich(&x, &next, "mkt_vol96", &["--min-cross-members", "5"]);
+    assert_eq!(r.status.code(), Some(2), "{}", stderr_of(&r));
+    let text = stderr_of(&r);
+    assert!(text.contains("'mkt_r16'") && text.contains("--min-cross-members 20") && text.contains("--min-cross-members 5"), "{text}");
+    cli_enrich_ok(&x, &next, "mkt_vol96", &[]);
+
+    // A stale schema that is put back (its hash no longer matches the column) is ignored by the resolver.
+    std::fs::write(&schema, &stale).unwrap();
+    let again = p("again.rcsb");
+    let r = cli_enrich(&x, &again, "mkt_vol96", &["--min-cross-members", "5"]);
+    assert_eq!(r.status.code(), Some(2), "{}", stderr_of(&r));
+    cli_enrich_ok(&x, &again, "mkt_vol96", &[]);
+}
