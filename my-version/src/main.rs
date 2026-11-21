@@ -12827,25 +12827,15 @@ fn run_walkforward(args: &[String]) -> ! {
     // book return, and its fit label keeps its purge. --book-target names the run's book label.
     let mut book_label: Option<walkforward::BookLabel> = None;
     let run_book_label = |run: &rcsr::run_json::RunFile, path: &str, fit: Option<rcsr::target::TargetSpec>| -> Option<walkforward::BookLabel> {
-        let book = match run.book_target.as_ref() {
-            None => None,
-            Some(b) => match &b.spec {
-                Some(s) => Some(s.clone()),
-                None => usage_fail(&format!(
-                    "{}: the run priced --book-target {} (objective.book_target) and records no objective.book_target_spec, \
-                     so the return column, horizon and rows of its books are unknown here; search again with this build",
-                    path, b.column
-                )),
-            },
-        };
+        let book = walkforward::BookLabel::of_run(run, path, fit.as_ref()).unwrap_or_else(|e| usage_fail(&e));
         let Some(fit) = fit else {
-            if book.is_some() || book_target_arg.is_some() {
-                usage_fail(&format!("{}: the run records no target_spec, so its fit label is unknown here", path));
+            if book_target_arg.is_some() {
+                usage_fail(&walkforward::BookLabel::no_fit_label(path));
             }
             return None;
         };
         if let Some(arg) = &book_target_arg {
-            let label = book.as_ref().unwrap_or(&fit);
+            let label = book.as_ref().map_or(&fit, |b| &b.book);
             if rcsr::target::entry_for(std::slice::from_ref(label), arg).is_none() {
                 usage_fail(&format!(
                     "--book-target {} differs from the book label of {}: the run priced its books on '{}'{}",
@@ -12856,7 +12846,7 @@ fn run_walkforward(args: &[String]) -> ! {
                 ));
             }
         }
-        book.and_then(|b| walkforward::BookLabel::pair(&fit, &b, walkforward::BookSource::Run).unwrap_or_else(|e| usage_fail(&e)))
+        book
     };
     if let Some(path) = &from_run_path {
         if !expressions.is_empty() {
