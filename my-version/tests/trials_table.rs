@@ -1860,3 +1860,49 @@ fn table_occam_top_level_sha_fallback() {
         assert_eq!(num(at(row(&j, k), &["occam"]), &["bits"]), num(m, &["occam", "bits"]));
     }
 }
+
+fn set_at(j: &mut Json, path: &[&str], v: Json) {
+    let (head, rest) = path.split_first().expect("a path");
+    let next = match j {
+        Json::Obj(m) => &mut m.iter_mut().find(|(k, _)| k == head).unwrap_or_else(|| panic!("missing '{head}'")).1,
+        Json::Arr(a) => &mut a[head.parse::<usize>().expect("an index")],
+        other => panic!("cannot descend into {other:?}"),
+    };
+    if rest.is_empty() {
+        *next = v;
+    } else {
+        set_at(next, rest, v);
+    }
+}
+
+/// Two pareto members share a display expression and the finalist is the later one: a `--from-run` row takes
+/// the finalist's cell, not the first member with the same expression string.
+#[test]
+fn table_occam_from_run_prefers_the_finalist_over_a_shared_expression() {
+    let (_s, dir) = scratch("table-occam-finalist");
+    let fx = occam_fx(&dir);
+    let mut run = read_json(&fx.run);
+    let text = |s: &str| Json::Str(s.to_string());
+    for path in [
+        &["pareto", "0", "expression"][..],
+        &["pareto", "0", "occam", "expression_exact"],
+        &["pareto", "1", "expression"],
+        &["pareto", "1", "occam", "expression_exact"],
+        &["objective", "finalist", "expression"],
+        &["objective", "finalist", "expression_exact"],
+    ] {
+        set_at(&mut run, path, text("x1"));
+    }
+    set_at(&mut run, &["objective", "finalist", "archive_rank"], Json::Num(3.0));
+    set_at(&mut run, &["objective", "selection_rule", "chosen_rank"], Json::Num(3.0));
+    let edited = write_text(&dir, "shared.run.json", &format!("{}\n", rcsr::cpcv::to_json(&run)));
+    let fx = OccamFx { run: edited, ..fx };
+    let report = fx.from_run();
+    assert_eq!(at(&read_json(&report), &["expression"]).as_str(), Some("x1"));
+    let pareto = fx.pareto();
+    assert_eq!(at(&pareto[0], &["expression"]), at(&pareto[1], &["expression"]));
+    let j = fx.table(&report, false);
+    let cell = at(row(&j, 0), &["occam"]);
+    assert_eq!(at(cell, &["bits"]), at(&pareto[1], &["occam", "bits"]));
+    assert_ne!(at(cell, &["bits"]), at(&pareto[0], &["occam", "bits"]));
+}
