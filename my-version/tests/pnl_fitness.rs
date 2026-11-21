@@ -434,7 +434,7 @@ fn resume_needs_the_same_book() {
     assert_eq!(key(&straight), key(&resumed));
 
     let other_cost = run(&data, &spec, &["--fitness", "pnl", "--generations", "20", "--resume", &cp, "--cost-bps", "7"]);
-    usage_error(&other_cost, "fitness");
+    usage_error(&other_cost, "--cost-bps");
     let no_flag = run(&data, &spec, &["--generations", "20", "--resume", &cp]);
     usage_error(&no_flag, "--fitness pnl");
 }
@@ -558,7 +558,7 @@ fn resume_needs_the_same_blocks() {
     let resumed = json(&run(&data, &spec, &[&blocked[..], &["--generations", "20", "--resume", &cp]].concat()));
     assert_eq!(members(&straight), members(&resumed));
     let other = run(&data, &spec, &["--fitness", "pnl", "--pnl-blocks", "4", "--generations", "20", "--resume", &cp]);
-    usage_error(&other, "fitness");
+    usage_error(&other, "--pnl-blocks");
 }
 
 // ---- #1178: up to 64 blocks and the block statistic ----
@@ -682,10 +682,10 @@ fn book_hash_covers_block_stat() {
     let resumed = json(&run(&data, &spec, &[&saved[..], &["--generations", "20", "--resume", &cp]].concat()));
     assert_eq!(members(&straight), members(&resumed));
     let resume = |extra: &[&str]| run(&data, &spec, &[&["--fitness", "pnl", "--generations", "20", "--resume", &cp][..], extra].concat());
-    usage_error(&resume(&["--pnl-blocks", "10", "--pnl-stat", "cvar", "--pnl-cvar-q", "0.25"]), "fitness");
-    usage_error(&resume(&["--pnl-blocks", "12", "--pnl-stat", "mean-semi"]), "fitness");
+    usage_error(&resume(&["--pnl-blocks", "10", "--pnl-stat", "cvar", "--pnl-cvar-q", "0.25"]), "--pnl-cvar-q");
+    usage_error(&resume(&["--pnl-blocks", "12", "--pnl-stat", "mean-semi"]), "--pnl-stat");
     usage_error(&resume(&["--pnl-blocks", "12", "--pnl-stat", "cvar", "--pnl-cvar-q", "0.5"]), "fitness");
-    usage_error(&resume(&["--pnl-blocks", "12"]), "fitness");
+    usage_error(&resume(&["--pnl-blocks", "12"]), "--pnl-blocks");
 }
 
 #[test]
@@ -1354,9 +1354,9 @@ fn resume_refuses_changed_band_units() {
     let first = run(&data, &spec, &[&saved[..], &["--generations", "10", "--save", &cp]].concat());
     assert_eq!(code(&first), 0, "{}", stderr(&first));
     let resume = |extra: &[&str]| run(&data, &spec, &[&["--fitness", "pnl", "--generations", "20", "--resume", &cp][..], extra].concat());
-    usage_error(&resume(&["--band", "0.5", "--min-holding", "2", "--band-units", "sd"]), "fitness");
-    usage_error(&resume(&["--band", "0.4", "--min-holding", "2"]), "fitness");
-    usage_error(&resume(&["--band", "0.5", "--min-holding", "3"]), "fitness");
+    usage_error(&resume(&["--band", "0.5", "--min-holding", "2", "--band-units", "sd"]), "--band-units");
+    usage_error(&resume(&["--band", "0.4", "--min-holding", "2"]), "--band");
+    usage_error(&resume(&["--band", "0.5", "--min-holding", "3"]), "--min-holding");
     usage_error(&resume(&[]), "fitness");
     let same = resume(&["--band", "0.5", "--min-holding", "2"]);
     assert_eq!(code(&same), 0, "{}", stderr(&same));
@@ -2179,9 +2179,9 @@ fn resume_needs_the_same_mask() {
     let resumed = json(&run(&data, &spec, &[&saved[..], &["--generations", "20", "--resume", &cp]].concat()));
     assert_eq!(members(&straight), members(&resumed));
     let resume = |extra: &[&str]| run(&data, &spec, &[&["--fitness", "pnl", "--generations", "20", "--resume", &cp][..], extra].concat());
-    usage_error(&resume(&["--pnl-mask", "0 - g", "--pnl-mask-band", "0.5", "--pnl-mask-dwell", "5"]), "fitness");
-    usage_error(&resume(&["--pnl-mask", "g", "--pnl-mask-band", "0.4", "--pnl-mask-dwell", "5"]), "fitness");
-    usage_error(&resume(&["--pnl-mask", "g", "--pnl-mask-band", "0.5", "--pnl-mask-dwell", "6"]), "fitness");
+    usage_error(&resume(&["--pnl-mask", "0 - g", "--pnl-mask-band", "0.5", "--pnl-mask-dwell", "5"]), "--pnl-mask");
+    usage_error(&resume(&["--pnl-mask", "g", "--pnl-mask-band", "0.4", "--pnl-mask-dwell", "5"]), "--pnl-mask-band");
+    usage_error(&resume(&["--pnl-mask", "g", "--pnl-mask-band", "0.5", "--pnl-mask-dwell", "6"]), "--pnl-mask-dwell");
     usage_error(&resume(&[]), "fitness");
 }
 
@@ -2595,7 +2595,7 @@ fn resume_needs_the_same_excess() {
     assert_eq!(members(&straight), members(&resumed));
     let resume = |extra: &[&str]| run_panel(&data, &spec, &[&["--fitness", "pnl", "--generations", "20", "--resume", &cp][..], extra].concat());
     usage_error(&resume(&[]), "fitness");
-    usage_error(&resume(&["--pnl-excess", "none"]), "fitness");
+    usage_error(&resume(&["--pnl-excess", "none"]), "--pnl-excess");
 }
 
 /// An interval split (two training segments, a validation and a test interval)
@@ -3506,5 +3506,152 @@ fn resume_needs_the_same_cash_mode() {
     assert_eq!(members(&straight), members(&resumed));
     let resume = |extra: &[&str]| run_panel(&data, &spec, &[&["--fitness", "pnl", "--generations", "20", "--resume", &cp][..], extra].concat());
     usage_error(&resume(&[]), "fitness");
-    usage_error(&resume(&["--cash-return", &format!("{m:e}")]), "fitness");
+    usage_error(&resume(&["--cash-return", &format!("{m:e}")]), "--cash-return");
+}
+
+// ---- #1229: the resume conflict names the flags of the book hash ----
+
+/// The hash of the base book with the input `id` of [`trading::BOOK_INPUTS`] changed.
+fn hash_with_input_changed(id: &str) -> u64 {
+    let rows = 100;
+    let on: Vec<bool> = (0..rows).map(|i| i % 7 != 0).collect();
+    let mut s = slice(&[50, 50]);
+    s.rows.funding = vec![0.0; rows];
+    let base_spec = TradingSpec { band: trading::BandSpec::score(0.5), ..spec() };
+    let build = |s: &TradingSlice, spec: &TradingSpec, blocks: usize, lambda: f64, segments: &[f64], mask: &str| {
+        FitnessBook::with_segments(s, spec, 900.0, blocks, lambda, segments, Some(trading::BookMask { on: &on, identity: mask })).unwrap()
+    };
+    let base = |s: &TradingSlice, spec: &TradingSpec| build(s, spec, 3, 1.0, &[], "g|0|1");
+    let changed = match id {
+        "cost" => base(&s, &TradingSpec { cost_bps: 6.0, ..base_spec.clone() }),
+        "cash" => base(&s, &TradingSpec { cash_return: 0.0001, ..base_spec.clone() }),
+        "funding" => {
+            let mut f = s.clone();
+            f.rows.funding[5] = 0.0001;
+            base(&f, &base_spec)
+        }
+        "excess" => base(&s, &TradingSpec { pnl_excess: trading::PnlExcess::XsMean, ..base_spec.clone() }),
+        "threshold" => base(&s, &TradingSpec { threshold: 0.1, ..base_spec.clone() }),
+        "min_trades" => base(&s, &TradingSpec { min_trades: 2, ..base_spec.clone() }),
+        "band" => base(&s, &TradingSpec { band: trading::BandSpec::score(0.6), ..base_spec.clone() }),
+        "band_units" => {
+            let mut band = trading::BandSpec::score(0.5);
+            band.units = trading::BandUnits::Sd;
+            base(&s, &TradingSpec { band, ..base_spec.clone() })
+        }
+        "min_hold" => base(&s, &TradingSpec { min_holding: 2, ..base_spec.clone() }),
+        "blocks" => build(&s, &base_spec, 4, 1.0, &[], "g|0|1"),
+        "lambda" => build(&s, &base_spec, 3, 2.0, &[], "g|0|1"),
+        "stat" => base(&s, &base_spec).with_stat(trading::BlockStat::Cvar(0.5)).unwrap(),
+        "mask" => build(&s, &base_spec, 3, 1.0, &[], "g|0.5|1"),
+        "segments" => build(&s, &base_spec, 3, 1.0, &[1.6e9 + 900.0 * 20.0, 1.6e9 + 900.0 * 40.0], "g|0|1"),
+        "rows" => {
+            let mut m = s.clone();
+            m.ret[3] += 1e-6;
+            base(&m, &base_spec)
+        }
+        other => panic!("BOOK_INPUTS has the input '{other}' and this test has no change for it"),
+    };
+    changed.hash()
+}
+
+/// Every row of the table changes the hash, so a flag listed there is a real
+/// resume input. The count pins the hashed inputs: a new `fnv_u64` input needs a
+/// `BOOK_INPUTS` row and a case in `hash_with_input_changed`.
+#[test]
+fn every_book_input_changes_the_hash() {
+    let s = slice(&[50, 50]);
+    let mut with_funding = s.clone();
+    with_funding.rows.funding = vec![0.0; 100];
+    let on: Vec<bool> = (0..100).map(|i| i % 7 != 0).collect();
+    let base = FitnessBook::with_segments(
+        &with_funding,
+        &TradingSpec { band: trading::BandSpec::score(0.5), ..spec() },
+        900.0,
+        3,
+        1.0,
+        &[],
+        Some(trading::BookMask { on: &on, identity: "g|0|1" }),
+    )
+    .unwrap()
+    .hash();
+    for input in trading::BOOK_INPUTS {
+        assert_ne!(base, hash_with_input_changed(input.id), "{}", input.id);
+        assert!(!input.flags.is_empty(), "{}", input.id);
+    }
+    let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/trading.rs")).unwrap();
+    let hashed = source.lines().filter(|l| l.contains("fnv_u64(&mut hash") || l.contains("fnv_u64(&mut self.hash")).count();
+    assert_eq!(hashed, 25, "the hash inputs changed: update BOOK_INPUTS, hash_with_input_changed and this count");
+}
+
+/// Every flag of the table is a flag of `rcsr --help`.
+#[test]
+fn book_input_flags_are_cli_flags() {
+    let help = rcsr_cmd::rcsr().arg("--help").output().unwrap();
+    let help = String::from_utf8_lossy(&help.stdout).into_owned() + &String::from_utf8_lossy(&help.stderr);
+    for input in trading::BOOK_INPUTS {
+        for flag in input.flags {
+            assert!(help.contains(&format!("{flag} ")) || help.contains(&format!("{flag}\n")), "{flag}");
+        }
+    }
+}
+
+/// A conflicting resume names every flag of the table, and those given now.
+#[test]
+fn resume_conflict_names_every_book_flag() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, 900);
+    let spec = write_spec(&dir);
+    let cp = dir.join("cp.rcsr").to_string_lossy().into_owned();
+    let first = run(&data, &spec, &["--fitness", "pnl", "--generations", "10", "--save", &cp]);
+    assert_eq!(code(&first), 0, "{}", stderr(&first));
+    let other = run(&data, &spec, &["--fitness", "pnl", "--generations", "20", "--resume", &cp, "--threshold", "0.1"]);
+    assert_eq!(code(&other), 2, "{}", stderr(&other));
+    let err = stderr(&other);
+    for input in trading::BOOK_INPUTS {
+        for flag in input.flags {
+            assert!(err.contains(flag), "{flag} missing from: {err}");
+        }
+    }
+    let given = err.split("flags given now: ").nth(1).expect("the given flags");
+    assert!(given.contains("--threshold") && !given.contains("--pnl-mask"), "{given}");
+}
+
+#[test]
+fn resume_names_the_block_lambda_and_the_split_table() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, 900);
+    let spec = write_spec(&dir);
+    let cp = dir.join("lambda.rcsr").to_string_lossy().into_owned();
+    let saved = ["--fitness", "pnl", "--pnl-blocks", "3", "--pnl-block-lambda", "1"];
+    let first = run(&data, &spec, &[&saved[..], &["--generations", "10", "--save", &cp]].concat());
+    assert_eq!(code(&first), 0, "{}", stderr(&first));
+    let resume = |extra: &[&str]| run(&data, &spec, &[&["--fitness", "pnl", "--pnl-blocks", "3", "--generations", "20", "--resume", &cp][..], extra].concat());
+    usage_error(&resume(&["--pnl-block-lambda", "2"]), "--pnl-block-lambda");
+
+    let panel = write_panel_csv(&dir);
+    let pspec = write_panel_spec(&dir);
+    let step = |k: i64| T0 + 900 * k;
+    let table = dir.join("splits.csv");
+    let row = |id: &str, role: &str, a: i64, b: i64| format!("{id},{role},{},{}\n", step(a), step(b));
+    std::fs::write(
+        &table,
+        ["split_id,role,start,end\n".to_string(), row("a", "train", 0, 150), row("a", "validation", 150, 200), row("a", "train", 200, 300), row("a", "test", 300, 400),
+         row("b", "train", 0, 120), row("b", "validation", 120, 200), row("b", "train", 200, 300), row("b", "test", 300, 400)]
+        .concat(),
+    )
+    .unwrap();
+    let table = table.to_string_lossy().into_owned();
+    let panel_run = |id: &str, extra: &[&str]| {
+        let args = [
+            "--data", &panel, "--target", "y", "--vars", "x1,x2", "--time", "t", "--group-by", "sym", "--split-table", &table,
+            "--split-id", id, "--target-spec", &pspec, "--cpu", "--no-dev-log", "--seed", "3", "--pop", "32", "--metric", "squared",
+            "--json", "--quiet", "--objective", "pnl", "--cost-bps", "5", "--fitness", "pnl",
+        ];
+        rcsr_cmd::rcsr().args(args).args(extra).output().unwrap()
+    };
+    let scp = dir.join("split.rcsr").to_string_lossy().into_owned();
+    let saved = panel_run("a", &["--generations", "10", "--save", &scp]);
+    assert_eq!(code(&saved), 0, "{}", stderr(&saved));
+    usage_error(&panel_run("b", &["--generations", "20", "--resume", &scp]), "--split-table");
 }
