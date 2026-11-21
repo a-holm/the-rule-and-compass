@@ -563,7 +563,7 @@ fn null_store_runs_search_walkforward_and_the_table() {
         let o = run(&[
             "--data", data, "--target", "lbl_h24_y", "--vars", "r16,r96", "--time", "ts", "--group-by", "symbol", "--target-spec", &spec,
             "--split", "temporal", "--cpu", "--no-dev-log", "--seed", "3", "--generations", "3", "--pop", "16", "--json", "--quiet",
-            "--objective", "pnl", "--fitness", "pnl", "--validation-frac", "0.25", "--test-frac", "0.2",
+            "--objective", "pnl", "--fitness", "pnl", "--validation-frac", "0.25", "--test-frac", "0.2", "--fill", "drop",
         ]);
         assert_eq!(code(&o), 0, "{tag} search: {}", stderr(&o));
         let run_path = p(dir, &format!("{tag}.run.json"));
