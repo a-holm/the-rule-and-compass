@@ -371,8 +371,6 @@ __global__ void __launch_bounds__(RS_THREADS) rc_enum_pick_kernel(
    lane sums of the block being walked stay in registers; the other blocks of
    the segment wait in `sg`, so every (block, lane, cut) sum takes its rows in
    ascending order. */
-__device__ int g_enum_red_atomic = 0;
-
 template <int NBMAX>
 __global__ void __launch_bounds__(RC_MAX_THREADS, 2) rc_enum_score_kernel(
     const unsigned int *__restrict__ pred,
@@ -400,7 +398,6 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 2) rc_enum_score_kernel(
     const int warp = threadIdx.x >> 5;
     __shared__ double sh_w[RC_PNL_WARPS][RC_ENUM_CUTS];
     __shared__ unsigned int sh_c[3][RC_ENUM_CUTS];
-    __shared__ double sh_red[RC_ENUM_CUTS];
     const size_t cbase = (size_t)t * q + k0;
     unsigned int clo[RC_ENUM_CUTS], chi[RC_ENUM_CUTS];
 #pragma unroll
@@ -547,12 +544,10 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 2) rc_enum_score_kernel(
     }
     for (int b = 0; b < nb; ++b) {
         if (threadIdx.x < 3 * RC_ENUM_CUTS) sh_c[threadIdx.x / RC_ENUM_CUTS][threadIdx.x % RC_ENUM_CUTS] = 0u;
-        if (threadIdx.x < RC_ENUM_CUTS) sh_red[threadIdx.x] = 0.0;
         __syncthreads();
         if (lane < nc) {
             const int bb = NBMAX > 1 ? b : 0;
             sh_w[warp][lane] = wsum[bb];
-            if (g_enum_red_atomic) atomicAdd(&sh_red[lane], wsum[bb]);
             atomicAdd(&sh_c[0][lane], cnt[bb][0]);
             atomicAdd(&sh_c[1][lane], cnt[bb][1]);
             atomicAdd(&sh_c[2][lane], cnt[bb][2]);
@@ -568,7 +563,6 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 2) rc_enum_score_kernel(
             }
             RcEnumTotals *o = tot + (((size_t)t * nbooks + bk) * q + k0 + k) * nb + b;
             o->gross = w[0];
-            if (g_enum_red_atomic) o->gross = sh_red[k];
             o->flips = sh_c[0][k];
             o->exits = sh_c[1][k];
             o->longs = sh_c[2][k];
@@ -630,11 +624,6 @@ static size_t rc_enum_local_bytes_for(int nb)
 }
 
 extern "C" {
-
-void rc_enum_red_atomic_for_tests(int on)
-{
-    cudaMemcpyToSymbol(g_enum_red_atomic, &on, sizeof(int));
-}
 
 const char *rc_enum_last_error(void)
 {
