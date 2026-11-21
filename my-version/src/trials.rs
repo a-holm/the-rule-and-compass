@@ -76,6 +76,9 @@ Campaign (--wf):\n\
   --baseline <file>      rcsr ladder --emit-series report; the best of cash, buy_and_hold, constant_long_flat,\n\
                          best_single_feature and any trend rung by mean is the SPA benchmark\n\
   --baseline-rung <name> use this rung as the SPA benchmark instead\n\
+  --baseline-wf <files...> with --table: walk-forward or CPCV path reports (pooled.period_net) as the SPA benchmark rungs;\n\
+                         excludes --baseline. Rungs: cash (zeros), buy_and_hold (pooled.period_bh_net of the first\n\
+                         report), one per report named by its label or file stem; the best by mean is the benchmark\n\
   --cluster-rho <R>      single-linkage threshold on |correlation| (default 0.9); N_eff = clusters\n\
   --pbo-blocks <even n>  CSCV blocks (default 16)\n\
   --regimes <calendar>   per-stratum metrics of every series in its member entry. Calendar rows label,start,end\n\
@@ -91,7 +94,7 @@ the Pareto front ranks the passers, the average rank orders them inside a front,
 average rank, complexity, trades, input order picks rows below the diversity cap. Every picked row gets PSR, DSR\n\
 at N_eff, 10 N_eff and the nominal N (every row of the table, plus --prior-trials), MinBTL, the Harvey-Liu haircut\n\
 (Bonferroni, Holm, BHY over the rows) and its StepM and BH-FDR verdicts; SPA, StepM, BH-FDR and PBO run over the\n\
-distinct varying rows against the --baseline best rung, else cash at 0. With --family-table the deflation also\n\
+distinct varying rows against the --baseline or --baseline-wf best rung, else cash at 0. With --family-table the deflation also\n\
 counts the sibling horizon tables. Output rcsr-trials-table/1.\n\
   --rule <file>          rcsr-trials-rule/1 JSON with cost_multiples, gates, relaxed_gates (apply when no row passes\n\
                          gates), pareto, rank, pick, diversity_rho, min_front, max_composites and freeze; its sha256 is\n\
