@@ -1727,3 +1727,136 @@ fn table_output_without_baseline_wf_is_unchanged() {
     }
     assert_eq!(rcsr::manifest::sha256_hex(&bytes), "7bea7caf3851d6523eec12324de315b2a7326e45bff3339a58f045dd93287d3a");
 }
+
+// ---------------------------------------------------------------------------
+// --occam on real reports (#1253)
+// ---------------------------------------------------------------------------
+
+struct OccamFx {
+    dir: PathBuf,
+    data: String,
+    run: String,
+}
+
+/// A real `--select-rule occam` search, its `--from-run` report and its `--front --all-members` report,
+/// all written by the CLI on synthetic data.
+fn occam_fx(dir: &Path) -> OccamFx {
+    let mut csv = String::from("t,x1,x2,r,y\n");
+    for i in 0..400usize {
+        let f = i as f64;
+        let x1 = frac(f * 0.618_033_988_749_894_9) - 0.5;
+        let x2 = frac(f * 0.754_877_666_246_692_7) - 0.5;
+        let noise = frac(f * 0.324_717_957_244_746) - 0.5;
+        let r = 0.03 * x1 + 0.004 * x2 + 0.0005 * noise;
+        csv.push_str(&format!("{},{x1},{x2},{r},{r}\n", T0 + 900 * i as i64));
+    }
+    let data = write_text(dir, "occam.csv", &csv);
+    let spec = write_text(
+        dir,
+        "occam.spec.json",
+        "{\"schema\":\"rcsr-target-spec/1\",\"targets\":[{\"column\":\"y\",\"name\":\"raw_target\",\"kind\":\"forward_return\",\"deprecated\":false,\
+         \"return_column\":\"r\",\"return_units\":\"log\",\"horizon_seconds\":900,\"entry_offset_seconds\":900,\"delay_seconds\":0,\
+         \"entry_price\":\"next open\",\"exit_price\":\"close\",\"offset\":0.0,\"scale\":{\"kind\":\"constant\",\"value\":1.0},\"clip\":null,\
+         \"units\":\"log_return\",\"cost_bps\":null,\"cost_in_label\":false,\"construction_columns\":[],\"note\":null}]}",
+    );
+    let run = dir.join("occam.run.json").to_string_lossy().into_owned();
+    let o = run(&[
+        "--data", &data, "--target", "y", "--vars", "x1,x2", "--time", "t", "--split", "temporal", "--target-spec", &spec, "--cpu", "--seed", "3",
+        "--metric", "squared", "--quiet", "--objective", "pnl", "--cost-bps", "5", "--validation-frac", "0.3", "--select-rule", "occam",
+        "--select-min-entries", "5", "--select-delta", "0.05", "--generations", "80", "--pop", "128", "--json-out", &run, "--no-dev-log",
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    OccamFx { dir: dir.to_path_buf(), data, run }
+}
+
+impl OccamFx {
+    fn walkforward(&self, name: &str, source: &[&str]) -> String {
+        let out = self.dir.join(name).to_string_lossy().into_owned();
+        let w = format!("v,{},{},{},{}", T0, T0 + 268_200, T0 + 270_000, T0 + 360_000);
+        let mut args = vec!["walkforward", "--data", &self.data, "--time", "t", "--target", "y"];
+        args.extend_from_slice(source);
+        args.extend(["--window", &w, "--periods-per-year", "35040", "--json", "--emit-series", "--out", &out]);
+        let o = run(&args);
+        assert_eq!(code(&o), 0, "{}", stderr(&o));
+        out
+    }
+
+    fn from_run(&self) -> String {
+        self.walkforward("wf_from_run.json", &["--from-run", &self.run])
+    }
+
+    fn all_members(&self) -> String {
+        self.walkforward("wf_all_members.json", &["--front", &self.run, "--all-members"])
+    }
+
+    fn table(&self, report: &str, members: bool) -> Json {
+        let mut args = vec!["trials", "--wf", report, "--table", "--occam", self.run.as_str()];
+        if members {
+            args.extend(["--members", "all"]);
+        }
+        stdout_json(&run(&args))
+    }
+
+    fn pareto(&self) -> Vec<Json> {
+        items(at(&read_json(&self.run), &["pareto"])).to_vec()
+    }
+}
+
+/// A real run's `--from-run` and `--front --all-members` reports carry the run sha under `selection`;
+/// every row of the table gets the `occam` cell of its pareto member.
+#[test]
+fn table_occam_reads_selection_run_sha256() {
+    let (_s, dir) = scratch("table-occam-real");
+    let fx = occam_fx(&dir);
+    let pareto = fx.pareto();
+    assert!(pareto.len() >= 2 && pareto.iter().all(|m| m.get("occam").is_some()));
+    let run_sha = rcsr::manifest::sha256_hex(&std::fs::read(&fx.run).unwrap());
+    let cell_matches = |cell: &Json, m: &Json| {
+        for k in ["bits", "p_occam", "bit_budget"] {
+            assert_eq!(num(cell, &[k]), num(m, &["occam", k]), "{k}");
+        }
+    };
+
+    let from_run = fx.from_run();
+    assert_eq!(at(&read_json(&from_run), &["selection", "run_sha256"]).as_str(), Some(run_sha.as_str()));
+    let j = fx.table(&from_run, false);
+    let finalist = num(&read_json(&fx.run), &["objective", "finalist", "archive_rank"]);
+    let member = pareto.iter().find(|m| num(m, &["archive_rank"]) == finalist).expect("the finalist is a pareto member");
+    assert_eq!(items(at(&j, &["rows"])).len(), 1);
+    cell_matches(at(row(&j, 0), &["occam"]), member);
+
+    let all = fx.all_members();
+    assert_eq!(at(&read_json(&all), &["selection", "run_sha256"]).as_str(), Some(run_sha.as_str()));
+    let j = fx.table(&all, true);
+    assert_eq!(items(at(&j, &["rows"])).len(), pareto.len());
+    for (k, m) in pareto.iter().enumerate() {
+        cell_matches(at(row(&j, k), &["occam"]), m);
+    }
+
+    for (report, members) in [(&from_run, false), (&all, true)] {
+        let text = std::fs::read_to_string(report).unwrap();
+        let other = write_text(&dir, "other.json", &text.replace(&run_sha, &"0".repeat(64)));
+        let j = fx.table(&other, members);
+        assert!(items(at(&j, &["rows"])).iter().all(|r| matches!(at(r, &["occam"]), Json::Null)), "an altered sha matches no run");
+    }
+}
+
+/// A report with a top-level `run_sha256` and none under `selection` still matches.
+#[test]
+fn table_occam_top_level_sha_fallback() {
+    let (_s, dir) = scratch("table-occam-top");
+    let fx = occam_fx(&dir);
+    let run_sha = rcsr::manifest::sha256_hex(&std::fs::read(&fx.run).unwrap());
+    let all = std::fs::read_to_string(fx.all_members()).unwrap();
+    let moved = all.replacen(&format!(",\"run_sha256\":\"{run_sha}\""), "", 1);
+    assert_ne!(moved, all);
+    let moved = moved.replacen("{\"tool\":", &format!("{{\"run_sha256\":\"{run_sha}\",\"tool\":"), 1);
+    assert!(moved.starts_with("{\"run_sha256\""));
+    let report = write_text(&dir, "top.json", &moved);
+    let j = fx.table(&report, true);
+    let pareto = fx.pareto();
+    assert_eq!(items(at(&j, &["rows"])).len(), pareto.len());
+    for (k, m) in pareto.iter().enumerate() {
+        assert_eq!(num(at(row(&j, k), &["occam"]), &["bits"]), num(m, &["occam", "bits"]));
+    }
+}

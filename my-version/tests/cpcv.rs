@@ -396,6 +396,11 @@ fn write_spec(dir: &Path) -> String {
 /// CPCV(4, 2) over 40 days of a 3-symbol panel: one 1-generation search and one walk-forward per
 /// split. Returns the table path and the six walk-forward reports in split order.
 fn real_fixture(s: &Scratch) -> (String, Vec<String>) {
+    real_fixture_with(s, &[])
+}
+
+/// [`real_fixture`] with `walk` appended to every walk-forward call.
+fn real_fixture_with(s: &Scratch, walk: &[&str]) -> (String, Vec<String>) {
     let dir = s.path();
     let data = write_panel(dir, day("2020-09-14"), 40 * 24, 3);
     let spec = write_spec(dir);
@@ -421,10 +426,13 @@ fn real_fixture(s: &Scratch) -> (String, Vec<String>) {
         std::fs::write(&run, &o.stdout).unwrap();
         let windows = out.join(format!("windows_{id}.csv")).to_string_lossy().into_owned();
         let report = dir.join(format!("wf_{id}.json")).to_string_lossy().into_owned();
-        let o = rcsr(&[
-            "walkforward", "--data", &data, "--time", "ts", "--group-by", "sym", "--from-run", &run.to_string_lossy(), "--windows",
+        let run_path = run.to_string_lossy().into_owned();
+        let mut args = vec![
+            "walkforward", "--data", &data, "--time", "ts", "--group-by", "sym", "--from-run", &run_path, "--windows",
             &windows, "--pool-reset-flat", "--json", "--out", &report,
-        ]);
+        ];
+        args.extend_from_slice(walk);
+        let o = rcsr(&args);
         ok(&o);
         reports.push(report);
     }
@@ -437,6 +445,79 @@ fn assemble(table: &str, reports: &[String], out_dir: &Path, summary: &Path) -> 
     args.extend(reports.iter().map(String::as_str));
     args.extend_from_slice(&["--splits", table, "--out-dir", &o, "--summary", &sm]);
     rcsr(&args)
+}
+
+fn run_shas(paths: &Path, count: usize) -> Vec<(Json, Vec<Option<String>>)> {
+    (1..=count)
+        .map(|j| {
+            let p = read_json(&paths.join(format!("path_{j}.json")));
+            let segs = arr(&p, &["cpcv", "segments"]).iter().map(|s| at(s, &["run_sha256"]).as_str().map(str::to_string)).collect();
+            (p, segs)
+        })
+        .collect()
+}
+
+/// #1253: the split reports of one run give every path that run sha, on the path and on every segment.
+#[test]
+fn cpcv_path_carries_single_run_sha() {
+    let s = Scratch::new("cpcv-run-sha-one");
+    let (table, reports) = real_fixture(&s);
+    let shared = "ab".repeat(32);
+    for r in &reports {
+        let text = std::fs::read_to_string(r).unwrap();
+        let own = at(&parse(&text), &["selection", "run_sha256"]).as_str().unwrap().to_string();
+        std::fs::write(r, text.replace(&own, &shared)).unwrap();
+    }
+    let paths = s.path().join("paths");
+    ok(&assemble(&table, &reports, &paths, &s.path().join("summary.json")));
+    for (p, segs) in run_shas(&paths, 3) {
+        assert_eq!(at(&p, &["cpcv", "run_sha256"]).as_str(), Some(shared.as_str()));
+        assert_eq!(segs, vec![Some(shared.clone()); 4]);
+    }
+}
+
+/// #1253: one search per split gives one run sha per split: the path sha is null, the segments list them in order.
+#[test]
+fn cpcv_path_mixed_run_shas_listed() {
+    let s = Scratch::new("cpcv-run-sha-mixed");
+    let (table, reports) = real_fixture(&s);
+    let own: Vec<String> = reports.iter().map(|r| at(&read_json(Path::new(r)), &["selection", "run_sha256"]).as_str().unwrap().to_string()).collect();
+    let paths = s.path().join("paths");
+    ok(&assemble(&table, &reports, &paths, &s.path().join("summary.json")));
+    for (p, segs) in run_shas(&paths, 3) {
+        assert!(matches!(at(&p, &["cpcv", "run_sha256"]), Json::Null));
+        let want: Vec<Option<String>> = arr(&p, &["cpcv", "segments"])
+            .iter()
+            .map(|g| Some(own[at(g, &["split"]).as_str().unwrap()[1..].parse::<usize>().unwrap() - 1].clone()))
+            .collect();
+        assert_eq!(segs, want);
+        assert!(segs.iter().collect::<std::collections::HashSet<_>>().len() > 1);
+    }
+}
+
+/// #1253: a path row has no archive rank and no expression, so `--occam` gives it `null` even when the path
+/// carries the sha of the run.
+#[test]
+fn table_occam_path_row_is_null() {
+    let s = Scratch::new("cpcv-occam-path");
+    let (table, reports) = real_fixture_with(&s, &["--emit-series"]);
+    let run = s.path().join("s01.run.json").to_string_lossy().into_owned();
+    let sha = rcsr::manifest::sha256_hex(&std::fs::read(&run).unwrap());
+    for r in &reports {
+        let text = std::fs::read_to_string(r).unwrap();
+        let own = at(&parse(&text), &["selection", "run_sha256"]).as_str().unwrap().to_string();
+        std::fs::write(r, text.replace(&own, &sha)).unwrap();
+    }
+    let paths = s.path().join("paths");
+    ok(&assemble(&table, &reports, &paths, &s.path().join("summary.json")));
+    let path = paths.join("path_1.json").to_string_lossy().into_owned();
+    assert_eq!(at(&read_json(Path::new(&path)), &["cpcv", "run_sha256"]).as_str(), Some(sha.as_str()));
+    let o = rcsr(&["trials", "--wf", &path, "--table", "--occam", &run]);
+    ok(&o);
+    let j = parse(&String::from_utf8_lossy(&o.stdout));
+    let rows = arr(&j, &["rows"]);
+    assert_eq!(rows.len(), 1);
+    assert!(matches!(at(&rows[0], &["occam"]), Json::Null));
 }
 
 #[test]
