@@ -1669,7 +1669,7 @@ A root `sub(b, a)` is the negation of `sub(a, b)`, not a copy: 6,640 such mirror
 | fused pass, the same 504 trees | 0.109 | 0.157 | 0.341 |
 | fused pass, every 64th tree of the 32-variable class (693 trees), one unit per tree | | | 0.397 |
 
-The stride sample shares no child and reuses no tree, so it bounds the class from above: 32 variables, the ten campaign operators, max size 4 and `--null-shifts 19` (20 books in one pass) cost at most 44,352 x 0.397 = 17,600 CPU seconds (4.9 CPU hours) per cell. A device arm is not part of the command.
+The stride sample shares no child and reuses no tree, so it bounds the class from above: 32 variables, the ten campaign operators, max size 4 and `--null-shifts 19` (20 books in one pass) cost at most 44,352 x 0.397 = 17,600 CPU seconds (4.9 CPU hours) per cell. The device arm (`--gpu`, #1258) takes 0.98 ms per tree on 1 book and 9.64 ms per tree on 20 books at the same shape, 428 s for that cell and 1,001 s for max size 5 on 1 book (`docs/gpu-backend.md`, enumerate device arm).
 
 ## 4. Hardware
 
