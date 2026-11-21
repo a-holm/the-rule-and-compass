@@ -122,6 +122,161 @@ impl PositionMap {
     }
 }
 
+/// #1203: what a long/flat book does on a row with a finite return and no
+/// finite score. Rows absent from the data and rows with no finite return make
+/// no decision under either rule.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MissingScore {
+    /// The row ends the run of its group: the run pays its exit at its last
+    /// priced row and the next priced row starts flat. The row is not priced.
+    #[default]
+    Flat,
+    /// The row keeps the position of the row before it in its group and earns
+    /// its return, with no cost. The position rule keeps its state across it.
+    Hold,
+}
+
+impl MissingScore {
+    pub fn parse(s: &str) -> Result<MissingScore, String> {
+        match s {
+            "flat" => Ok(MissingScore::Flat),
+            "hold" => Ok(MissingScore::Hold),
+            other => Err(format!("--missing-score needs flat or hold, got '{}'", other)),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            MissingScore::Flat => "flat",
+            MissingScore::Hold => "hold",
+        }
+    }
+}
+
+/// #1273: where the fitness book takes the flat-row return. `TrainMean` is the
+/// mean return of the book's training rows (the drift of the assets' own
+/// returns, never an interest rate); only the fitness book reads it, every
+/// reported book keeps `cash_return`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CashMode {
+    #[default]
+    Constant,
+    TrainMean,
+}
+
+/// #1179: the benchmark the `--fitness pnl` book subtracts from every return.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PnlExcess {
+    /// `e = r - funding - cash_return`.
+    #[default]
+    None,
+    /// `e = (r - m_t) - funding`, with `m_t` the equal-weight mean return of
+    /// the book's rows at the row's timestamp ([`timestamp_means`]). Needs
+    /// `cash_return` 0.
+    XsMean,
+}
+
+impl PnlExcess {
+    pub fn parse(s: &str) -> Result<PnlExcess, String> {
+        match s.trim() {
+            "none" => Ok(PnlExcess::None),
+            "xs-mean" | "xs_mean" => Ok(PnlExcess::XsMean),
+            other => Err(format!("--pnl-excess must be none or xs-mean, got '{}'", other)),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            PnlExcess::None => "none",
+            PnlExcess::XsMean => "xs_mean",
+        }
+    }
+}
+
+/// #1179: per row, the equal-weight mean of the returns of the rows `admit`
+/// accepts at the same timestamp, summed in row order. A row whose timestamp
+/// has no admitted row, or whose time is not finite, gets `NaN`.
+pub fn timestamp_means(ret: &[f64], time: &[f64], admit: impl Fn(usize) -> bool) -> Vec<f64> {
+    let n = ret.len().min(time.len());
+    let key = |i: usize| (time[i] + 0.0).to_bits();
+    let mut sums: std::collections::HashMap<u64, (f64, u64)> = std::collections::HashMap::new();
+    for i in 0..n {
+        if time[i].is_finite() && ret[i].is_finite() && admit(i) {
+            let s = sums.entry(key(i)).or_insert((0.0, 0));
+            s.0 += ret[i];
+            s.1 += 1;
+        }
+    }
+    (0..n)
+        .map(|i| match sums.get(&key(i)) {
+            Some(&(sum, count)) if time[i].is_finite() => sum / count as f64,
+            _ => f64::NAN,
+        })
+        .collect()
+}
+
+/// #1203: the runs of rows in book order (each book's rows contiguous and in
+/// time order, every row with a finite return) under a [`MissingScore`] rule.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScoreRuns {
+    /// `None` for a row the book does not price; else the run of the row inside
+    /// its book: 0 continues the position from before the rows, and every
+    /// stretch of rows without a score starts a new run after it.
+    pub run: Vec<Option<u32>>,
+    /// The last priced row of a run that a row without a score ends: its exit
+    /// is a missing-score exit.
+    pub ends_at_missing: Vec<bool>,
+}
+
+/// #1203: the one implementation of the missing-score rule, shared by the
+/// walk-forward book and [`evaluate`]. `books[k]` names the book of row `k`
+/// and `scored[k]` says it has a finite score.
+pub fn score_runs<K: PartialEq>(books: &[K], scored: &[bool], rule: MissingScore) -> ScoreRuns {
+    let n = books.len().min(scored.len());
+    let mut run = vec![Some(0u32); n];
+    let mut ends_at_missing = vec![false; n];
+    if rule == MissingScore::Hold {
+        return ScoreRuns { run, ends_at_missing };
+    }
+    let mut current = 0u32;
+    let mut in_gap = false;
+    let mut last_priced: Option<usize> = None;
+    for k in 0..n {
+        if k == 0 || books[k] != books[k - 1] {
+            current = 0;
+            in_gap = false;
+            last_priced = None;
+        }
+        if scored[k] {
+            run[k] = Some(current);
+            last_priced = Some(k);
+            in_gap = false;
+        } else {
+            run[k] = None;
+            if let Some(j) = last_priced.take() {
+                ends_at_missing[j] = true;
+            }
+            if !in_gap {
+                current += 1;
+                in_gap = true;
+            }
+        }
+    }
+    ScoreRuns { run, ends_at_missing }
+}
+
+/// #1203: under [`MissingScore::Hold`], every row without a score takes the
+/// position of the row before it in its book; a book's leading rows without a
+/// score take `start(book)`. Rows in book order, as for [`score_runs`].
+pub fn hold_positions<K: PartialEq>(books: &[K], scored: &[bool], positions: &mut [f64], mut start: impl FnMut(&K) -> f64) {
+    for k in 0..positions.len().min(books.len()).min(scored.len()) {
+        if scored[k] {
+            continue;
+        }
+        positions[k] = if k > 0 && books[k] == books[k - 1] { positions[k - 1] } else { start(&books[k]) };
+    }
+}
+
 /// #925: how `--band B` is read.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BandUnits {
@@ -254,6 +409,11 @@ fn tree_moments(x: &[f64]) -> Moments {
     warps[0]
 }
 
+/// #1246: the scores of the gate-on rows, in row order; off rows are holes.
+pub fn mask_on_scores(scores: &[f64], flags: &[u8]) -> Vec<f64> {
+    scores.iter().zip(flags).filter(|(_, f)| **f & FITNESS_MASK_OFF == 0).map(|(s, _)| *s).collect()
+}
+
 /// #925, #945: the training-score standard deviation behind `--band-units
 /// sd`, in one pass over the scores: [`tree_moments`] in the fixed device
 /// order, so the device reduction equals it bit for bit on the same `f32`
@@ -321,6 +481,25 @@ impl BandSpec {
         BandSpec::from_sd(units, multiple, score_sd(scores), max_time)
     }
 
+    /// #1246: [`BandSpec::from_training`] over the gate-on rows only; `flags`
+    /// are the training book's [`FitnessBook::flags`], aligned with `scores`
+    /// and `time`.
+    pub fn from_training_masked(units: BandUnits, multiple: f64, scores: &[f64], time: &[f64], flags: &[u8]) -> BandSpec {
+        if units == BandUnits::Score {
+            return BandSpec::score(multiple);
+        }
+        assert_eq!(scores.len(), flags.len(), "scores and mask flags differ in length");
+        let on = mask_on_scores(scores, flags);
+        let max_time = scores
+            .iter()
+            .zip(time)
+            .zip(flags)
+            .filter(|((s, t), f)| *f & FITNESS_MASK_OFF == 0 && s.is_finite() && t.is_finite())
+            .map(|((_, &t), _)| t)
+            .fold(None, |m: Option<f64>, t| Some(m.map_or(t, |m| m.max(t))));
+        BandSpec::from_sd(units, multiple, score_sd(&on), max_time)
+    }
+
     /// The band from a computed training-score sd and the latest time of a
     /// row in it.
     pub fn from_sd(units: BandUnits, multiple: f64, sd: ScoreSd, max_time: Option<f64>) -> BandSpec {
@@ -366,6 +545,9 @@ pub struct TradingSpec {
     pub funding_col: Option<String>,
     /// Return per period earned while flat.
     pub cash_return: f64,
+    /// #1273: `TrainMean` makes the fitness book earn the training mean return
+    /// while flat; the books of `cash_return` (validation, test, reports) are unchanged.
+    pub cash_mode: CashMode,
     pub min_trades: usize,
     /// Minimum consecutive long rows, entry row included, before an exit
     /// (indicator rule only).
@@ -384,6 +566,17 @@ pub struct TradingSpec {
     /// Period width: the label horizon, equal to the label stride. Rows with the
     /// same `floor(t / period_seconds)` form one equal-weight period.
     pub period_seconds: Option<f64>,
+    /// #1189: starts of the book segments. A row stamped from `segment_starts[k]`
+    /// up to the next start belongs to segment `k`; every segment starts every
+    /// group flat, resets the band and minimum-hold state and pays its own final
+    /// exit. Empty is one book over all rows.
+    pub segment_starts: Vec<f64>,
+    /// #1203: a row with a finite return and no finite score ends its run
+    /// (`Flat`) or keeps the position (`Hold`).
+    pub missing_score: MissingScore,
+    /// #1179: the fitness excess; the books also report `xs_excess_net` under
+    /// [`PnlExcess::XsMean`]. Every reported net stays absolute.
+    pub pnl_excess: PnlExcess,
 }
 
 impl Default for TradingSpec {
@@ -395,6 +588,7 @@ impl Default for TradingSpec {
             slippage_bps: 0.0,
             funding_col: None,
             cash_return: 0.0,
+            cash_mode: CashMode::Constant,
             min_trades: 1,
             min_holding: 1,
             band: BandSpec::default(),
@@ -404,6 +598,9 @@ impl Default for TradingSpec {
             position: PositionMap::Threshold,
             periods_per_year: None,
             period_seconds: None,
+            segment_starts: Vec::new(),
+            missing_score: MissingScore::Flat,
+            pnl_excess: PnlExcess::None,
         }
     }
 }
@@ -427,6 +624,15 @@ impl TradingSpec {
         }
         if !self.cash_return.is_finite() {
             return Err("cash_return must be finite".to_string());
+        }
+        if self.pnl_excess == PnlExcess::XsMean && self.cash_mode == CashMode::TrainMean {
+            return Err("--pnl-excess xs-mean needs --cash-return 0, got train-mean: the benchmark is the equal-weight cross-section, not a drift".to_string());
+        }
+        if self.pnl_excess == PnlExcess::XsMean && self.cash_return != 0.0 {
+            return Err(format!(
+                "--pnl-excess xs-mean needs --cash-return 0, got {}: the benchmark is the equal-weight cross-section, not a cash return",
+                self.cash_return
+            ));
         }
         if !self.threshold.is_finite() {
             return Err("threshold must be finite".to_string());
@@ -477,7 +683,7 @@ impl TradingSpec {
             "{{\"position\":\"{}\",\"threshold\":{},\"tau\":{},\"max_position\":{},\
              \"cost_bps\":{},\"fee_bps\":{},\"half_spread_bps\":{},\"slippage_bps\":{},\
              \"per_side_bps\":{},\"funding_col\":{},\"cash_return\":{},\"min_trades\":{},\
-             \"min_holding\":{}{}}}",
+             \"min_holding\":{}{}{}}}",
             self.position.name(),
             num(self.threshold),
             self.tau.map(num).unwrap_or_else(|| "null".to_string()),
@@ -494,7 +700,9 @@ impl TradingSpec {
             num(self.cash_return),
             self.min_trades,
             self.min_holding,
-            self.band.json_fields()
+            self.band.json_fields(),
+            // #1179: omitted under `none`, so the default spec is unchanged.
+            if self.pnl_excess == PnlExcess::None { String::new() } else { format!(",\"pnl_excess\":\"{}\"", self.pnl_excess.name()) }
         )
     }
 }
@@ -586,6 +794,10 @@ pub struct PathStats {
     pub gross_pnl: f64,
     /// Sum over rows of `net_t`, including every exit.
     pub net_pnl: f64,
+    /// #1179: under [`PnlExcess::XsMean`], `net_pnl - sum_t p_t * m_t`: the net
+    /// over the equal-weight mean return of the slice's rows at each row's
+    /// timestamp, the excess the fitness scores. `None` otherwise.
+    pub xs_excess_net: Option<f64>,
     /// `net_pnl / rows * periods_per_year`: the mean net return per row, annualised.
     pub net_per_row_annualised: f64,
     pub total_cost: f64,
@@ -631,7 +843,7 @@ impl PathStats {
             .collect();
         format!(
             "{{\"rows\":{},\"groups\":{},\"periods\":{},\"periods_per_year\":{},\"annualisation\":\"{}\",\
-             \"gross_pnl\":{},\"net_pnl\":{},\"net_per_row_annualised\":{},\"total_cost\":{},\"funding_paid\":{},\"total_return\":{},\
+             \"gross_pnl\":{},\"net_pnl\":{}{},\"net_per_row_annualised\":{},\"total_cost\":{},\"funding_paid\":{},\"total_return\":{},\
              \"log_growth\":{},\"sharpe\":{},\"sortino\":{},\"max_drawdown\":{},\"calmar\":{},\
              \"turnover\":{},\"trades\":{},\"entries\":{},\"exits\":{},\"trades_per_year\":{},\
              \"exposure\":{},\"hit_rate\":{},\"break_even_bps_per_side\":{},\
@@ -643,6 +855,7 @@ impl PathStats {
             self.annualisation,
             num(self.gross_pnl),
             num(self.net_pnl),
+            self.xs_excess_net.map_or_else(String::new, |v| format!(",\"xs_excess_net\":{}", num(v))),
             num(self.net_per_row_annualised),
             num(self.total_cost),
             num(self.funding_paid),
@@ -686,15 +899,60 @@ struct Ctx {
     /// Row indices in `(time, group)` order.
     time_order: Vec<usize>,
     groups: usize,
+    /// Book segment of every row (`0` without segment starts).
+    segment: Vec<usize>,
+    /// #1203: run of every row inside its `(group, segment)` book ([`score_runs`]).
+    run: Vec<u32>,
+    /// #1203: the row has no finite score and holds the position before it.
+    held: Vec<bool>,
+    /// #1179: the [`timestamp_means`] of every usable row of the input, at
+    /// each kept row; `None` unless the spec asks for `xs_excess_net`.
+    xs_mean: Option<Vec<f64>>,
 }
 
 impl Ctx {
+    /// #1203: the book of a prediction vector. The rows with a finite return,
+    /// time and funding follow `spec.missing_score`: under `Flat` a row without
+    /// a finite prediction ends the run of its `(group, segment)` book and is
+    /// not priced; under `Hold` it is priced and holds the position before it.
+    fn scored(pred: &[f64], r: &[f64], rows: &TradingRows, spec: &TradingSpec) -> (Ctx, Vec<usize>) {
+        let segment_starts = &spec.segment_starts;
+        let mut cand: Vec<usize> = (0..pred.len()).filter(|&i| usable(i, r, rows)).collect();
+        cand.sort_by(|&a, &b| {
+            rows.group[a]
+                .cmp(&rows.group[b])
+                .then_with(|| rows.time[a].partial_cmp(&rows.time[b]).unwrap_or(std::cmp::Ordering::Equal))
+                .then_with(|| a.cmp(&b))
+        });
+        let books: Vec<(u64, usize)> = cand.iter().map(|&i| (rows.group[i], segment_of(segment_starts, rows.time[i]))).collect();
+        let scored: Vec<bool> = cand.iter().map(|&i| pred[i].is_finite()).collect();
+        let runs = score_runs(&books, &scored, spec.missing_score);
+        let mut at: Vec<Option<(u32, bool)>> = vec![None; pred.len()];
+        for (k, &i) in cand.iter().enumerate() {
+            at[i] = runs.run[k].map(|run| (run, !scored[k]));
+        }
+        let keep: Vec<usize> = (0..pred.len()).filter(|&i| at[i].is_some()).collect();
+        let mut ctx = Ctx::new(&keep, r, rows, spec.cash_return, spec.period_seconds.unwrap_or(0.0), segment_starts);
+        for (k, &i) in keep.iter().enumerate() {
+            let (run, held) = at[i].expect("a kept row is priced");
+            ctx.run[k] = run;
+            ctx.held[k] = held;
+        }
+        (ctx, keep)
+    }
+
+    /// The book of row `i`: its group, segment and run.
+    fn book_of(&self, i: usize) -> (u64, usize, u32) {
+        (self.group[i], self.segment[i], self.run[i])
+    }
+
     fn new(
         keep: &[usize],
         r: &[f64],
         rows: &TradingRows,
         cash: f64,
         bucket: f64,
+        segment_starts: &[f64],
     ) -> Ctx {
         let time: Vec<f64> = keep.iter().map(|&i| rows.time[i]).collect();
         let group: Vec<u64> = keep.iter().map(|&i| rows.group[i]).collect();
@@ -719,6 +977,7 @@ impl Ctx {
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| group[a].cmp(&group[b]))
         });
+        let segment: Vec<usize> = time.iter().map(|&t| segment_of(segment_starts, t)).collect();
         let mut groups = 0usize;
         let mut prev: Option<u64> = None;
         for &i in &order {
@@ -737,7 +996,21 @@ impl Ctx {
             order,
             time_order,
             groups,
+            segment,
+            run: vec![0; n],
+            held: vec![false; n],
+            xs_mean: None,
         }
+    }
+
+    /// #1179: under [`PnlExcess::XsMean`], the mean of the returns of every
+    /// usable input row (scored or not) at each kept row's timestamp.
+    fn with_xs_mean(mut self, keep: &[usize], r: &[f64], rows: &TradingRows, spec: &TradingSpec) -> Ctx {
+        if spec.pnl_excess == PnlExcess::XsMean {
+            let m = timestamp_means(r, &rows.time, |i| usable(i, r, rows));
+            self.xs_mean = Some(keep.iter().map(|&i| m[i]).collect());
+        }
+        self
     }
 }
 
@@ -750,6 +1023,11 @@ struct Book {
     abs_delta_with_exit: f64,
 }
 
+/// Index of the book segment that holds stamp `t`.
+fn segment_of(starts: &[f64], t: f64) -> usize {
+    starts.partition_point(|s| *s <= t)
+}
+
 fn run_book(ctx: &Ctx, positions: &[f64], cost_side: f64) -> Book {
     let n = ctx.ret.len();
     let mut gross = vec![0.0f64; n];
@@ -758,12 +1036,12 @@ fn run_book(ctx: &Ctx, positions: &[f64], cost_side: f64) -> Book {
         rows: n,
         ..Default::default()
     };
-    let mut previous: BTreeMap<u64, f64> = BTreeMap::new();
+    let mut previous: BTreeMap<(u64, usize, u32), f64> = BTreeMap::new();
     let mut funding_paid = 0.0f64;
     let mut abs_delta_with_exit = 0.0f64;
-    let mut last_of_group: BTreeMap<u64, usize> = BTreeMap::new();
+    let mut last_of_group: BTreeMap<(u64, usize, u32), usize> = BTreeMap::new();
     for &i in &ctx.order {
-        let g = ctx.group[i];
+        let g = ctx.book_of(i);
         let pos = positions[i];
         let r = ctx.ret[i];
         let prev = previous.get(&g).copied().unwrap_or(0.0);
@@ -962,6 +1240,7 @@ fn finish(ctx: &Ctx, positions: &[f64], spec: &TradingSpec) -> Result<PathStats,
         annualisation: series.annualisation,
         gross_pnl,
         net_pnl: main.net_pnl,
+        xs_excess_net: ctx.xs_mean.as_ref().map(|m| (0..n).map(|k| book.net[k] - positions[k] * m[k]).sum::<f64>()),
         net_per_row_annualised: main.net_pnl / n as f64 * series.period_ppy,
         total_cost: book.stats.total_cost,
         funding_paid: book.funding_paid,
@@ -1103,8 +1382,9 @@ pub fn position_of(pred: f64, spec: &TradingSpec) -> f64 {
 
 /// Score a prediction vector against the row returns `r`.
 ///
-/// Rows whose prediction, return or time is non-finite are dropped, the same
-/// shared mask as the walk-forward evaluator.
+/// Rows whose return or time is non-finite are dropped. A row with no finite
+/// prediction follows `spec.missing_score` (#1203), the rule of the
+/// walk-forward evaluator.
 pub fn evaluate(
     pred: &[f64],
     r: &[f64],
@@ -1113,18 +1393,17 @@ pub fn evaluate(
 ) -> Result<PathStats, String> {
     spec.validate()?;
     check_lengths(pred.len(), r, rows)?;
-    let keep: Vec<usize> = (0..pred.len())
-        .filter(|&i| pred[i].is_finite() && usable(i, r, rows))
-        .collect();
-    let ctx = Ctx::new(&keep, r, rows, spec.cash_return, spec.period_seconds.unwrap_or(0.0));
+    let (ctx, keep) = Ctx::scored(pred, r, rows, spec);
     let positions = positions_of(pred, rows, &keep, &ctx, spec);
-    finish(&ctx, &positions, spec)
+    finish(&ctx.with_xs_mean(&keep, r, rows, spec), &positions, spec)
 }
 
-/// Position of every usable row, in `ctx` row order.
+/// Position of every usable row, in `ctx` row order. A held row (#1203) takes
+/// the position before it in its `(group, segment)` book; the band automaton
+/// does not step on it.
 fn positions_of(pred: &[f64], rows: &TradingRows, keep: &[usize], ctx: &Ctx, spec: &TradingSpec) -> Vec<f64> {
     let scores: Vec<f64> = keep.iter().map(|&i| pred[i]).collect();
-    if spec.position == PositionMap::TopTercile {
+    let mut positions: Vec<f64> = if spec.position == PositionMap::TopTercile {
         let all = top_tercile_positions(pred, &rows.time);
         keep.iter().map(|&i| all[i]).collect()
     } else if spec.min_holding > 1 || spec.band.resolved > 0.0 {
@@ -1136,12 +1415,16 @@ fn positions_of(pred: &[f64], rows: &TradingRows, keep: &[usize], ctx: &Ctx, spe
             min_hold: spec.min_holding,
         };
         let mut positions = vec![0.0f64; keep.len()];
-        let mut current: Option<u64> = None;
+        let mut current: Option<(u64, usize, u32)> = None;
         let mut state = trading_gpu::BandState::default();
         for &i in &ctx.order {
-            if current != Some(ctx.group[i]) {
-                current = Some(ctx.group[i]);
+            let key = ctx.book_of(i);
+            if current != Some(key) {
+                current = Some(key);
                 state = trading_gpu::BandState::default();
+            }
+            if ctx.held[i] {
+                continue;
             }
             state = params.next(state, scores[i]);
             positions[i] = if state.long { spec.max_position } else { 0.0 };
@@ -1149,7 +1432,17 @@ fn positions_of(pred: &[f64], rows: &TradingRows, keep: &[usize], ctx: &Ctx, spe
         positions
     } else {
         scores.iter().map(|&s| position_of(s, spec)).collect()
+    };
+    if ctx.held.iter().any(|&h| h) {
+        let books: Vec<(u64, usize)> = ctx.order.iter().map(|&i| (ctx.group[i], ctx.segment[i])).collect();
+        let scored: Vec<bool> = ctx.order.iter().map(|&i| !ctx.held[i]).collect();
+        let mut ordered: Vec<f64> = ctx.order.iter().map(|&i| positions[i]).collect();
+        hold_positions(&books, &scored, &mut ordered, |_| 0.0);
+        for (k, &i) in ctx.order.iter().enumerate() {
+            positions[i] = ordered[k];
+        }
     }
+    positions
 }
 
 /// Per-block alpha of one prediction vector against exposure-matched
@@ -1160,16 +1453,22 @@ pub struct BlockedAlpha {
     pub block_alpha: Vec<f64>,
     /// Mean of `series`.
     pub pooled_alpha: f64,
-    /// Alpha of every distinct timestamp, in time order.
+    /// Alpha of every period bucket (every distinct timestamp without `period_seconds`), in time order.
     pub series: Vec<f64>,
     /// Position changes of the book.
     pub trades: usize,
+    /// Rows held long.
+    pub long_rows: usize,
+    /// Entries into a long position.
+    pub entries: usize,
 }
 
 /// Cut the usable rows into `blocks` runs of distinct timestamps and price the
 /// book against buy-and-hold of the same rows.
 ///
-/// Per timestamp the row means are taken, so every period weighs the same. In
+/// Per period the row means are taken, so every period weighs the same. A
+/// period is one timestamp, or one `floor(t / period_seconds)` bucket when the
+/// spec sets `period_seconds`; a bucket never straddles two blocks. In
 /// block `k`, `net_k` is the mean book net excess over the flat book,
 /// `exposure_k` the mean position and `bh_k` the mean buy-and-hold net excess
 /// (entry and exit costs included). A block without exposure has alpha 0.
@@ -1180,32 +1479,64 @@ pub fn blocked_alpha(
     spec: &TradingSpec,
     blocks: usize,
 ) -> Result<BlockedAlpha, String> {
+    blocked_alpha_with(pred, r, rows, spec, blocks, None)
+}
+
+/// #1173: [`blocked_alpha`] with one block per cut: a row stamped from `cuts[k]` up
+/// to the next cut is in block `k` (`--select-blocks intervals` passes the
+/// validation interval starts). Each block is its own
+/// book: it starts every group flat, resets the band state and pays its final exit.
+pub fn blocked_alpha_cuts(pred: &[f64], r: &[f64], rows: &TradingRows, spec: &TradingSpec, cuts: &[f64]) -> Result<BlockedAlpha, String> {
+    if cuts.is_empty() || cuts.len() > FITNESS_MAX_BLOCKS {
+        return Err(format!("the block count must be 1 to {}, got {}", FITNESS_MAX_BLOCKS, cuts.len()));
+    }
+    blocked_alpha_with(pred, r, rows, spec, cuts.len(), Some(cuts))
+}
+
+fn blocked_alpha_with(
+    pred: &[f64],
+    r: &[f64],
+    rows: &TradingRows,
+    spec: &TradingSpec,
+    blocks: usize,
+    cuts: Option<&[f64]>,
+) -> Result<BlockedAlpha, String> {
     spec.validate()?;
+    // #1189: block k is its own book, started flat and closed at its end.
+    let cut_spec;
+    let spec = match cuts {
+        Some(c) => {
+            cut_spec = TradingSpec { segment_starts: c.to_vec(), ..spec.clone() };
+            &cut_spec
+        }
+        None => spec,
+    };
     check_lengths(pred.len(), r, rows)?;
-    let keep: Vec<usize> = (0..pred.len())
-        .filter(|&i| pred[i].is_finite() && usable(i, r, rows))
-        .collect();
+    let (ctx, keep) = Ctx::scored(pred, r, rows, spec);
     if keep.is_empty() {
         return Err("no usable rows (every prediction or return is non-finite)".to_string());
     }
-    let ctx = Ctx::new(&keep, r, rows, spec.cash_return, spec.period_seconds.unwrap_or(0.0));
     let positions = positions_of(pred, rows, &keep, &ctx, spec);
     let n = ctx.ret.len();
     let cost_side = spec.per_side_bps() * BP;
     let book = run_book(&ctx, &positions, cost_side);
     let flat = run_book(&ctx, &vec![0.0; n], cost_side);
     let held = run_book(&ctx, &vec![1.0; n], cost_side);
-    let ids = block_ids(&ctx.time, blocks)?;
+    let keys: Vec<f64> = if ctx.bucket > 0.0 { ctx.time.iter().map(|t| (t / ctx.bucket).floor()).collect() } else { ctx.time.clone() };
+    let ids = match cuts {
+        None => block_ids(&keys, blocks)?,
+        Some(c) => ctx.time.iter().map(|t| c.partition_point(|s| s <= t).saturating_sub(1) as u8).collect(),
+    };
     let mut series_net: Vec<f64> = Vec::new();
     let mut series_pos: Vec<f64> = Vec::new();
     let mut series_bh: Vec<f64> = Vec::new();
     let mut series_block: Vec<usize> = Vec::new();
     let mut i = 0usize;
     while i < n {
-        let t = ctx.time[ctx.time_order[i]];
+        let t = keys[ctx.time_order[i]];
         let (mut net, mut pos, mut bh, mut count) = (0.0f64, 0.0f64, 0.0f64, 0usize);
         let block = ids[ctx.time_order[i]] as usize;
-        while i < n && ctx.time[ctx.time_order[i]] == t {
+        while i < n && keys[ctx.time_order[i]] == t {
             let row = ctx.time_order[i];
             net += book.net[row] - flat.net[row];
             pos += positions[row];
@@ -1248,6 +1579,8 @@ pub fn blocked_alpha(
         pooled_alpha,
         series,
         trades: book.stats.trades,
+        long_rows: book.stats.active,
+        entries: book.stats.entries,
     })
 }
 
@@ -1261,7 +1594,8 @@ pub fn evaluate_positions(
     spec.validate()?;
     check_lengths(positions.len(), r, rows)?;
     let keep: Vec<usize> = (0..positions.len()).filter(|&i| usable(i, r, rows)).collect();
-    let ctx = Ctx::new(&keep, r, rows, spec.cash_return, spec.period_seconds.unwrap_or(0.0));
+    let ctx = Ctx::new(&keep, r, rows, spec.cash_return, spec.period_seconds.unwrap_or(0.0), &spec.segment_starts)
+        .with_xs_mean(&keep, r, rows, spec);
     let kept: Vec<f64> = keep.iter().map(|&i| positions[i]).collect();
     finish(&ctx, &kept, spec)
 }
@@ -1319,13 +1653,178 @@ pub const FITNESS_WARPS: usize = 8;
 /// training-score sd of [`score_sd`]. The two-pass sd of #925 added no word,
 /// so its checkpoints refuse to resume.
 pub const SCORE_SD_ALGORITHM: u64 = 2;
-/// Most time blocks of the consistency term (`--pnl-blocks`).
+/// #1246: the last word of a masked sd-unit book's hash, naming the masked sd
+/// definition (finite scores of the gate-on training rows, in row order). An
+/// earlier masked sd checkpoint priced the validation and test books with the
+/// sd of every training row, so it refuses to resume.
+pub const MASKED_SD_ALGORITHM: u64 = 1;
+/// Most time blocks whose id fits the flags byte ([`FITNESS_BLOCK_SHIFT`]), and
+/// the limit of `--select-blocks` and `--cut-blocks`. A fitness book with more
+/// blocks keeps its ids in [`FitnessBook::block_ids`] only.
 pub const FITNESS_MAX_BLOCKS: usize = 8;
+/// #1178: most time blocks of the consistency term (`--pnl-blocks`).
+pub const FITNESS_BOOK_MAX_BLOCKS: usize = 64;
+/// #1178: the default share of worst blocks under `--pnl-stat cvar`.
+pub const DEFAULT_CVAR_Q: f64 = 0.25;
 /// #925: most minimum-hold rows the device band scorer carries (`K + 1`
 /// automaton states); a longer hold scores on the CPU.
 pub const FITNESS_DEVICE_MAX_HOLD: usize = 32;
 /// The block id of a row sits in bits 2 to 4 of its [`FitnessBook::flags`] byte.
 pub const FITNESS_BLOCK_SHIFT: u8 = 2;
+/// #1180: bit 5 of a [`FitnessBook::flags`] byte marks a row outside the regime mask.
+pub const FITNESS_MASK_OFF: u8 = 0x20;
+
+/// One input of the fitness book hash ([`FitnessBook::hash`], the `--resume`
+/// guard) with the flags that set it.
+pub struct BookInput {
+    pub id: &'static str,
+    pub what: &'static str,
+    pub flags: &'static [&'static str],
+}
+
+/// Every input of the book hash. The `--resume` conflict message names these
+/// flags; a new hashed input needs a row here.
+pub const BOOK_INPUTS: &[BookInput] = &[
+    BookInput { id: "cost", what: "the per-side cost", flags: &["--cost-bps", "--cost-override", "--slippage-bps"] },
+    BookInput { id: "cash", what: "the cash return", flags: &["--cash-return"] },
+    BookInput { id: "funding", what: "the funding column", flags: &["--funding"] },
+    BookInput { id: "excess", what: "the excess benchmark", flags: &["--pnl-excess"] },
+    BookInput { id: "threshold", what: "the threshold", flags: &["--threshold"] },
+    BookInput { id: "min_trades", what: "the minimum trades", flags: &["--min-trades"] },
+    BookInput { id: "band", what: "the band", flags: &["--band"] },
+    BookInput { id: "band_units", what: "the band units", flags: &["--band-units"] },
+    BookInput { id: "min_hold", what: "the minimum hold", flags: &["--min-holding"] },
+    BookInput { id: "blocks", what: "the time blocks", flags: &["--pnl-blocks"] },
+    BookInput { id: "lambda", what: "the block spread weight", flags: &["--pnl-block-lambda"] },
+    BookInput { id: "stat", what: "the block statistic", flags: &["--pnl-stat", "--pnl-cvar-q"] },
+    BookInput { id: "mask", what: "the regime mask", flags: &["--pnl-mask", "--pnl-mask-band", "--pnl-mask-dwell"] },
+    BookInput { id: "segments", what: "the interval split", flags: &["--split-table", "--split-id", "--embargo"] },
+    BookInput {
+        id: "rows",
+        what: "the training rows",
+        flags: &["--data", "--time", "--group-by", "--split", "--validation-frac", "--test-frac", "--target-spec"],
+    },
+];
+
+/// The `--resume` conflict text: every flag that shapes the book, then the
+/// ones of those given on this command line.
+pub fn book_conflict_text(args: &[String]) -> String {
+    let inputs: Vec<String> = BOOK_INPUTS.iter().map(|i| format!("{} ({})", i.what, i.flags.join(", "))).collect();
+    let given: Vec<&str> = BOOK_INPUTS
+        .iter()
+        .flat_map(|i| i.flags.iter().copied())
+        .filter(|f| args.iter().any(|a| a == f))
+        .collect();
+    format!(
+        "the book hash covers {}; compare them with the original command (flags given now: {})",
+        inputs.join("; "),
+        if given.is_empty() { "none".to_string() } else { given.join(", ") }
+    )
+}
+
+/// #1178: the statistic of the block regrets `r_k = 1 - c_k` that a fitness
+/// book ranks by (`--pnl-stat`); `c_k = net_k / B_k` is the capture of block `k`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum BlockStat {
+    /// `mean(r) + lambda * sd(r)`, sample sd (ddof 1); one block is the plain regret.
+    #[default]
+    MeanSd,
+    /// `mean(r) + lambda * sqrt(mean_k(max(r_k - 1, 0)^2))`: only blocks that
+    /// lose against cash (`c_k < 0`) cost.
+    MeanSemi,
+    /// The mean of the [`BlockStat::cvar_count`] largest `r_k` (the smallest
+    /// captures), ties to the lower block index; `q` in (0, 1].
+    Cvar(f64),
+}
+
+impl BlockStat {
+    /// `--pnl-stat` with `q` from `--pnl-cvar-q` (read under `cvar` only).
+    pub fn parse(name: &str, q: f64) -> Result<BlockStat, String> {
+        match name.trim() {
+            "mean-sd" => Ok(BlockStat::MeanSd),
+            "mean-semi" => Ok(BlockStat::MeanSemi),
+            "cvar" if q > 0.0 && q <= 1.0 => Ok(BlockStat::Cvar(q)),
+            "cvar" => Err(format!("--pnl-cvar-q must be in (0, 1], got {}", q)),
+            other => Err(format!("--pnl-stat must be mean-sd, mean-semi or cvar, got '{}'", other)),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            BlockStat::MeanSd => "mean-sd",
+            BlockStat::MeanSemi => "mean-semi",
+            BlockStat::Cvar(_) => "cvar",
+        }
+    }
+
+    /// The statistic code of the device book (`RC_PNL_STAT_*`, `src/cuda/eval.cu`).
+    pub fn code(self) -> i32 {
+        match self {
+            BlockStat::MeanSd => 0,
+            BlockStat::MeanSemi => 1,
+            BlockStat::Cvar(_) => 2,
+        }
+    }
+
+    /// `ceil(q * blocks)`, at least 1 and at most `blocks`; a product within
+    /// `1e-9` of an integer is that integer, so `q = 0.3` of 10 blocks is 3.
+    pub fn cvar_count(q: f64, blocks: usize) -> usize {
+        let x = q * blocks as f64;
+        let near = x.round();
+        let m = if (x - near).abs() <= 1e-9 { near } else { x.ceil() };
+        (m.max(1.0) as usize).min(blocks.max(1))
+    }
+}
+
+/// #1178: `stat` of the finite block regrets `r` with spread weight `lambda`.
+/// The device finish (`rc_pnl_stat`, `src/cuda/eval.cu`) does the same `f64`
+/// operations in the same order.
+pub fn block_stat(stat: BlockStat, r: &[f64], lambda: f64) -> f64 {
+    let nb = r.len();
+    if let BlockStat::Cvar(q) = stat {
+        let m = BlockStat::cvar_count(q, nb);
+        let mut chosen = vec![false; nb];
+        for _ in 0..m {
+            let mut best = usize::MAX;
+            for b in 0..nb {
+                if !chosen[b] && (best == usize::MAX || r[b] > r[best]) {
+                    best = b;
+                }
+            }
+            chosen[best] = true;
+        }
+        let mut sum = 0.0f64;
+        for b in 0..nb {
+            if chosen[b] {
+                sum += r[b];
+            }
+        }
+        return sum / m as f64;
+    }
+    let mut sum = 0.0f64;
+    for v in r {
+        sum += *v;
+    }
+    let mean = sum / nb as f64;
+    if stat == BlockStat::MeanSemi {
+        let mut ss = 0.0f64;
+        for v in r {
+            let d = if *v > 1.0 { *v - 1.0 } else { 0.0 };
+            ss += d * d;
+        }
+        return mean + lambda * (ss / nb as f64).sqrt();
+    }
+    if nb == 1 {
+        return r[0];
+    }
+    let mut ss = 0.0f64;
+    for v in r {
+        let d = *v - mean;
+        ss += d * d;
+    }
+    let sd = (ss / (nb - 1) as f64).sqrt();
+    mean + lambda * sd
+}
 
 /// Time block of every row: the sorted distinct timestamps are cut into
 /// `blocks` runs of equal count, the last run takes the remainder. Rows with
@@ -1334,8 +1833,8 @@ pub fn block_ids(time: &[f64], blocks: usize) -> Result<Vec<u8>, String> {
     let mut distinct: Vec<f64> = time.to_vec();
     distinct.sort_by(|a, b| a.total_cmp(b));
     distinct.dedup_by(|a, b| a == b);
-    if blocks == 0 || blocks > FITNESS_MAX_BLOCKS {
-        return Err(format!("the block count must be 1 to {}, got {}", FITNESS_MAX_BLOCKS, blocks));
+    if blocks == 0 || blocks > FITNESS_BOOK_MAX_BLOCKS {
+        return Err(format!("the block count must be 1 to {}, got {}", FITNESS_BOOK_MAX_BLOCKS, blocks));
     }
     if distinct.len() < blocks {
         return Err(format!(
@@ -1367,6 +1866,50 @@ pub struct FitnessTotals {
     pub nonfinite: bool,
 }
 
+/// #1084: the counts of one long/flat book that the book descriptor of the
+/// quality-diversity archive reads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BookShape {
+    pub rows: u64,
+    pub long_rows: u64,
+    /// Round trips: every run of the book starts flat, so each entry is closed
+    /// by one flip or by the exit at the run's last row, and
+    /// `flips + exits = 2 * entries`.
+    pub entries: u64,
+}
+
+impl BookShape {
+    /// The shape of a book of `rows` rows from its totals (one per time block).
+    pub fn of(rows: usize, totals: &[FitnessTotals]) -> BookShape {
+        let long_rows = totals.iter().map(|t| t.long_rows).sum();
+        let turns: u64 = totals.iter().map(|t| t.flips + t.exits).sum();
+        BookShape { rows: rows as u64, long_rows, entries: turns / 2 }
+    }
+
+    /// Long rows over rows; 0 for an empty book.
+    pub fn exposure(&self) -> f64 {
+        if self.rows == 0 {
+            0.0
+        } else {
+            self.long_rows as f64 / self.rows as f64
+        }
+    }
+
+    /// Long rows per entry: `long_rows / max(1, entries)`; 0 for a flat book.
+    pub fn mean_holding(&self) -> f64 {
+        self.long_rows as f64 / self.entries.max(1) as f64
+    }
+}
+
+/// #1180: the regime mask of a [`FitnessBook`]: `on[i]` is the gate state of
+/// training row `i`; `identity` names the gate (expression, band and dwell) for
+/// the book hash.
+#[derive(Clone, Copy, Debug)]
+pub struct BookMask<'a> {
+    pub on: &'a [bool],
+    pub identity: &'a str,
+}
+
 /// Exact CPU `f64` long/flat net regret on the canonical training rows.
 ///
 /// `regret = (B - net) / B`, with `net` the excess net over cash and `B` the
@@ -1387,6 +1930,44 @@ pub struct FitnessBook {
     band: f64,
     band_units: BandUnits,
     min_hold: usize,
+    /// #1023: the sub-books of the lexicase cases, built on first use.
+    cases: std::sync::OnceLock<BookCases>,
+    /// #1180: rows with the regime mask off; 0 for an unmasked book.
+    off_rows: usize,
+    /// #1179: what `excess` is measured against.
+    excess_mode: PnlExcess,
+    cash_return: f64,
+    cash_mode: CashMode,
+    /// #1178: the statistic of the block regrets.
+    stat: BlockStat,
+    /// #1178: the time block of every row; empty for a single block.
+    block_id: Vec<u8>,
+    /// #1182: the map from predictions to positions in front of every reduction.
+    layer: Option<std::sync::Arc<dyn PositionLayer>>,
+}
+
+/// #1182: maps a candidate's prediction vector to the positions a
+/// [`FitnessBook`] prices: above the book's threshold is long (`f64::MAX`),
+/// else flat (`f64::MIN`); a non-finite position makes the book `+inf`. A gate
+/// search reads the prediction as the gate value and returns the positions of
+/// the composite of two frozen branches.
+pub trait PositionLayer: Send + Sync + std::fmt::Debug {
+    fn positions(&self, pred: &[f64]) -> Vec<f64>;
+    /// Text that identifies the layer in the book hash.
+    fn identity(&self) -> String;
+}
+
+/// #1023: the `(group, time block)` sub-books of a [`FitnessBook`]: one per run
+/// of its seam flags, in row order. Canonical rows keep each group's rows in
+/// time order, so one group's rows inside one block are one run.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BookCases {
+    /// Row range `[start, end)` of each run.
+    pub ranges: Vec<(usize, usize)>,
+    /// Hindsight bound of each run's rows.
+    pub bounds: Vec<f64>,
+    /// The runs with a positive bound: the lexicase cases, in run order.
+    pub kept: Vec<usize>,
 }
 
 fn fnv_u64(h: &mut u64, v: u64) {
@@ -1400,7 +1981,8 @@ fn fnv_u64(h: &mut u64, v: u64) {
 pub type BookSig = std::num::NonZeroU64;
 
 /// #1082: FNV-1a over the block count, the whole-book long rows and, per time
-/// block, the gross bits, flips and exits. The regret is a function of these
+/// block, the gross bits, flips and exits of the totals the regret reads (a row
+/// outside the regime mask is flat in them). The regret is a function of these
 /// numbers, so two candidates with one signature have one error. `long_rows`
 /// is the whole-book count because the device counts long rows for the whole
 /// book only; the per-block `long_rows` of `blocks` are not read.
@@ -1414,6 +1996,11 @@ pub fn book_signature(long_rows: u64, blocks: &[FitnessTotals]) -> BookSig {
         fnv_u64(&mut h, t.exits);
     }
     BookSig::new(h).unwrap_or(BookSig::MIN)
+}
+
+/// #1082: the [`book_signature`] of the totals of a finite regret.
+fn signature_of(regret: f64, blocks: &[FitnessTotals]) -> Option<BookSig> {
+    regret.is_finite().then(|| book_signature(blocks.iter().map(|t| t.long_rows).sum(), blocks))
 }
 
 impl FitnessBook {
@@ -1435,8 +2022,29 @@ impl FitnessBook {
         blocks: usize,
         lambda: f64,
     ) -> Result<Self, String> {
-        if blocks == 0 || blocks > FITNESS_MAX_BLOCKS {
-            return Err(format!("the block count must be 1 to {}, got {}", FITNESS_MAX_BLOCKS, blocks));
+        Self::with_segments(slice, spec, horizon_seconds, blocks, lambda, &[], None)
+    }
+
+    /// #1173 and #1180: the one constructor. The rows stamped from
+    /// `segment_starts[k]` up to the next start form interval segment `k`; with
+    /// fewer than two starts there are no segments. Under a regime mask, rows
+    /// with the mask off are forced flat and earn and pay nothing. Every
+    /// maximal run of on rows of a `(group, segment)` starts flat and pays its
+    /// exit at its last row, so it is a book segment like a group or a time
+    /// block; the hindsight bounds are computed on those runs. No segments and
+    /// no mask is `with_blocks` exactly, and a mask with every row on is the
+    /// unmasked book, hash included.
+    pub fn with_segments(
+        slice: &crate::data::TradingSlice,
+        spec: &TradingSpec,
+        horizon_seconds: f64,
+        blocks: usize,
+        lambda: f64,
+        segment_starts: &[f64],
+        mask: Option<BookMask>,
+    ) -> Result<Self, String> {
+        if blocks == 0 || blocks > FITNESS_BOOK_MAX_BLOCKS {
+            return Err(format!("the block count must be 1 to {}, got {}", FITNESS_BOOK_MAX_BLOCKS, blocks));
         }
         if !lambda.is_finite() || lambda < 0.0 {
             return Err(format!("the block lambda must be finite and >= 0, got {}", lambda));
@@ -1470,10 +2078,19 @@ impl FitnessBook {
             );
         }
         check_return_spacing(rows, horizon_seconds)?;
+        // #1273: the drift of the rows the book can trade, from this slice only.
+        let cash_return = match spec.cash_mode {
+            CashMode::Constant => spec.cash_return,
+            CashMode::TrainMean => {
+                let tradable = |i: usize| mask.as_ref().map_or(true, |k| k.on.len() != n || k.on[i]);
+                let (sum, count) = (0..n).filter(|&i| tradable(i)).fold((0.0f64, 0usize), |(s, c), i| (s + slice.ret[i], c + 1));
+                if count == 0 { 0.0 } else { sum / count as f64 }
+            }
+        };
         let mut excess = Vec::with_capacity(n);
         for i in 0..n {
             let f = if rows.funding.is_empty() { 0.0 } else { rows.funding[i] };
-            let e = slice.ret[i] - f - spec.cash_return;
+            let e = slice.ret[i] - f - cash_return;
             if !e.is_finite() || !rows.time[i].is_finite() {
                 return Err(format!("training row {} has a non-finite return, funding or time", i));
             }
@@ -1482,15 +2099,71 @@ impl FitnessBook {
         let mut flags = rows.seam_flags();
         let groups = flags.iter().filter(|&&f| f & TradingRows::FIRST != 0).count();
         let side = spec.per_side_bps() * BP;
-        let bound = trading_gpu::dp_bound(&excess, &rows.group, side)?;
+        if let Some(m) = &mask {
+            if m.on.len() != n {
+                return Err(format!("the regime mask has {} rows, the training slice {}", m.on.len(), n));
+            }
+        }
+        let mask = mask.filter(|m| m.on.iter().any(|&o| !o));
+        if segment_starts.len() > 1 {
+            let segment = |t: f64| segment_starts.partition_point(|s| *s <= t);
+            for i in 1..n {
+                if rows.group[i] == rows.group[i - 1] && segment(rows.time[i]) != segment(rows.time[i - 1]) {
+                    flags[i] |= TradingRows::FIRST;
+                    flags[i - 1] |= TradingRows::LAST;
+                }
+            }
+        }
+        let mut off_rows = 0usize;
+        if let Some(m) = &mask {
+            let seam = flags.clone();
+            for i in 0..n {
+                let off = !m.on[i];
+                let first = seam[i] & TradingRows::FIRST != 0 || off || (i > 0 && !m.on[i - 1]);
+                let last = seam[i] & TradingRows::LAST != 0 || off || (i + 1 < n && !m.on[i + 1]);
+                flags[i] = (if first { TradingRows::FIRST } else { 0 })
+                    | (if last { TradingRows::LAST } else { 0 })
+                    | (if off { FITNESS_MASK_OFF } else { 0 });
+                if off {
+                    excess[i] = 0.0;
+                    off_rows += 1;
+                }
+            }
+        }
+        // #1179: the universe of `m_t` is the rows the book can trade: every
+        // training row, or the rows with the regime mask on.
+        if spec.pnl_excess == PnlExcess::XsMean {
+            let m = timestamp_means(&slice.ret, &rows.time, |i| mask.as_ref().map_or(true, |k| k.on[i]));
+            for i in 0..n {
+                if flags[i] & FITNESS_MASK_OFF == 0 {
+                    let f = if rows.funding.is_empty() { 0.0 } else { rows.funding[i] };
+                    excess[i] = (slice.ret[i] - m[i]) - f;
+                }
+            }
+        }
+        let run_key: Option<Vec<u64>> = (segment_starts.len() > 1 || mask.is_some()).then(|| {
+            let mut id = 0u64;
+            (0..n)
+                .map(|i| {
+                    if i > 0 && flags[i] & TradingRows::FIRST != 0 {
+                        id += 1;
+                    }
+                    id
+                })
+                .collect()
+        });
+        let run_of: &[u64] = run_key.as_deref().unwrap_or(&rows.group);
+        let bound = trading_gpu::dp_bound(&excess, run_of, side)?;
         if !(bound > 0.0) {
             return Err(format!(
-                "no profitable long/flat path exists on the training rows at {} bp per side (hindsight bound {})",
+                "no profitable long/flat path exists on the {}training rows at {} bp per side (hindsight bound {})",
+                if mask.is_some() { "masked " } else { "" },
                 spec.per_side_bps(),
                 bound
             ));
         }
         let mut block_bounds = vec![bound];
+        let mut block_id = Vec::new();
         if blocks > 1 {
             let ids = block_ids(&rows.time, blocks)?;
             block_bounds.clear();
@@ -1500,28 +2173,33 @@ impl FitnessBook {
                 for i in 0..n {
                     if ids[i] as usize == b {
                         e.push(excess[i]);
-                        g.push(rows.group[i]);
+                        g.push(run_of[i]);
                     }
                 }
                 let bb = trading_gpu::dp_bound(&e, &g, side)?;
                 if !(bb > 0.0) {
                     return Err(format!(
-                        "no profitable long/flat path exists in time block {} of {} at {} bp per side (hindsight bound {})",
+                        "no profitable long/flat path exists in time block {} of {} at {} bp per side (hindsight bound {}){}",
                         b + 1,
                         blocks,
                         spec.per_side_bps(),
-                        bb
+                        bb,
+                        if mask.is_some() { ": the regime mask has no profitable on row in this block" } else { "" }
                     ));
                 }
                 block_bounds.push(bb);
             }
+            // #1178: more blocks than the flags byte holds keep their ids in `block_id` only.
+            let in_flags = blocks <= FITNESS_MAX_BLOCKS;
             for i in 0..n {
                 let first = flags[i] & TradingRows::FIRST != 0 || (i > 0 && ids[i] != ids[i - 1]);
                 let last = flags[i] & TradingRows::LAST != 0 || (i + 1 < n && ids[i] != ids[i + 1]);
                 flags[i] = (if first { TradingRows::FIRST } else { 0 })
                     | (if last { TradingRows::LAST } else { 0 })
-                    | (ids[i] << FITNESS_BLOCK_SHIFT);
+                    | (flags[i] & FITNESS_MASK_OFF)
+                    | (if in_flags { ids[i] << FITNESS_BLOCK_SHIFT } else { 0 });
             }
+            block_id = ids;
         }
         let mut hash = 0xcbf2_9ce4_8422_2325u64;
         for e in &excess {
@@ -1539,6 +2217,11 @@ impl FitnessBook {
             for b in &block_bounds {
                 fnv_u64(&mut hash, b.to_bits());
             }
+            if blocks > FITNESS_MAX_BLOCKS {
+                for id in &block_id {
+                    fnv_u64(&mut hash, *id as u64);
+                }
+            }
         }
         let band = spec.band.multiple;
         if band != 0.0 || spec.min_holding != 1 || spec.band.units != BandUnits::Score {
@@ -1548,6 +2231,22 @@ impl FitnessBook {
             if spec.band.units == BandUnits::Sd {
                 fnv_u64(&mut hash, SCORE_SD_ALGORITHM);
             }
+        }
+        if let Some(m) = &mask {
+            fnv_u64(&mut hash, 0x6d61_736b_u64);
+            fnv_u64(&mut hash, off_rows as u64);
+            for b in m.identity.bytes() {
+                fnv_u64(&mut hash, b as u64);
+            }
+        }
+        if spec.pnl_excess == PnlExcess::XsMean {
+            fnv_u64(&mut hash, 0x7873_6d65_616e_u64);
+        }
+        if spec.cash_mode == CashMode::TrainMean {
+            fnv_u64(&mut hash, 0x746d_6561_6e_u64);
+        }
+        if mask.is_some() && spec.band.units == BandUnits::Sd {
+            fnv_u64(&mut hash, MASKED_SD_ALGORITHM);
         }
         Ok(FitnessBook {
             excess,
@@ -1563,7 +2262,72 @@ impl FitnessBook {
             band,
             band_units: spec.band.units,
             min_hold: spec.min_holding,
+            cases: std::sync::OnceLock::new(),
+            off_rows,
+            excess_mode: spec.pnl_excess,
+            cash_return,
+            cash_mode: spec.cash_mode,
+            stat: BlockStat::MeanSd,
+            block_id,
+            layer: None,
         })
+    }
+
+    /// #1273: the flat-row return the excess subtracts: `spec.cash_return`, or the
+    /// training mean under [`CashMode::TrainMean`].
+    pub fn cash_return(&self) -> f64 {
+        self.cash_return
+    }
+
+    pub fn cash_mode(&self) -> CashMode {
+        self.cash_mode
+    }
+
+    /// #1179: the benchmark of [`FitnessBook::excess`].
+    pub fn excess_mode(&self) -> PnlExcess {
+        self.excess_mode
+    }
+
+    /// #1178: the book ranked by `stat` over its block regrets. `MeanSd` keeps
+    /// the book and its hash; another statistic folds its code and parameter
+    /// (the lambda under `MeanSemi`, `q` under `Cvar`) into the hash. Refused
+    /// for `q` outside (0, 1] and on a book whose statistic is already set.
+    pub fn with_stat(mut self, stat: BlockStat) -> Result<Self, String> {
+        if let BlockStat::Cvar(q) = stat {
+            if !(q > 0.0 && q <= 1.0) {
+                return Err(format!("the cvar share must be in (0, 1], got {}", q));
+            }
+        }
+        if self.stat != BlockStat::MeanSd {
+            return Err("the block statistic of the book is already set".to_string());
+        }
+        if stat != BlockStat::MeanSd {
+            fnv_u64(&mut self.hash, 0x7374_6174_u64);
+            fnv_u64(&mut self.hash, stat.code() as u64);
+            match stat {
+                BlockStat::Cvar(q) => fnv_u64(&mut self.hash, q.to_bits()),
+                _ => fnv_u64(&mut self.hash, self.lambda.to_bits()),
+            }
+        }
+        self.stat = stat;
+        Ok(self)
+    }
+
+    /// #1178: the statistic of the block regrets.
+    pub fn stat(&self) -> BlockStat {
+        self.stat
+    }
+
+    /// #1178: the time block of every row; empty for a single block. With at
+    /// most [`FITNESS_MAX_BLOCKS`] blocks the flags carry the same ids.
+    pub fn block_ids(&self) -> &[u8] {
+        &self.block_id
+    }
+
+    /// #1178: the time block of row `i`.
+    #[inline]
+    pub fn block_of(&self, i: usize) -> usize {
+        self.block_id.get(i).map_or(0, |&b| b as usize)
     }
 
     pub fn len(&self) -> usize {
@@ -1598,16 +2362,22 @@ impl FitnessBook {
         self.hash
     }
 
-    /// Excess return per row (return minus funding minus cash), the gross term.
+    /// Excess return per row (return minus funding minus cash, or minus the
+    /// timestamp mean under [`PnlExcess::XsMean`]), the gross term.
     pub fn excess(&self) -> &[f64] {
         &self.excess
     }
 
     /// Seam flags per row: [`TradingRows::FIRST`] and [`TradingRows::LAST`]. With
     /// several blocks they mark the seams of every `(group, block)` run, and
-    /// bits 2 to 4 carry the block id ([`FITNESS_BLOCK_SHIFT`]).
+    /// with at most [`FITNESS_MAX_BLOCKS`] blocks bits 2 to 4 carry the block
+    /// id ([`FITNESS_BLOCK_SHIFT`]); more blocks leave those bits 0.
     pub fn flags(&self) -> &[u8] {
         &self.flags
+    }
+
+    fn check_len(&self, pred: &[f64]) {
+        assert_eq!(pred.len(), self.excess.len(), "fitness book: {} predictions for {} rows", pred.len(), self.excess.len());
     }
 
     /// Reduce one prediction vector as a single book (a multi-block book uses
@@ -1615,11 +2385,13 @@ impl FitnessBook {
     /// warp tree documented on [`FITNESS_SEGMENT_ROWS`]; integer counts are
     /// order-free.
     pub fn totals(&self, pred: &[f64]) -> FitnessTotals {
-        debug_assert_eq!(pred.len(), self.excess.len());
+        self.check_len(pred);
+        let forced = self.force_flat(pred);
+        let pred: &[f64] = &forced;
         if !self.is_plain() {
-            return self.band_pass(pred, self.resolve_band(pred), false)[0];
+            return self.band_pass_forced(pred, self.resolve_band(pred), false)[0];
         }
-        let n = self.excess.len().min(pred.len());
+        let n = self.excess.len();
         let mut warps = [0.0f64; FITNESS_WARPS];
         let mut flips = 0u64;
         let mut exits = 0u64;
@@ -1702,28 +2474,39 @@ impl FitnessBook {
     }
 
     pub fn regret(&self, pred: &[f64]) -> f64 {
-        if self.blocks() == 1 {
-            self.regret_of(&self.totals(pred))
-        } else {
-            self.fitness_of(&self.block_totals(pred))
-        }
+        self.regret_and_shape(pred).0
+    }
+
+    /// #1084: [`FitnessBook::regret`] and the [`BookShape`] of the same
+    /// reduction, so the shape follows the position rule the regret prices.
+    pub fn regret_and_shape(&self, pred: &[f64]) -> (f64, BookShape) {
+        self.reduce(pred, |regret, t| (regret, BookShape::of(self.len() - self.off_rows, t)))
     }
 
     /// #1082: [`FitnessBook::regret`] and the [`book_signature`] of the same
     /// totals, from one reduction of `pred`. `None` when the regret is not
     /// finite.
     pub fn regret_signed(&self, pred: &[f64]) -> (f64, Option<BookSig>) {
-        let blocks = if self.blocks() == 1 {
-            vec![self.totals(pred)]
+        self.reduce(pred, |regret, t| (regret, signature_of(regret, t)))
+    }
+
+    /// #1082: [`FitnessBook::regret_and_shape`] and [`FitnessBook::regret_signed`]
+    /// from one reduction of `pred`.
+    pub fn regret_shape_signed(&self, pred: &[f64]) -> (f64, BookShape, Option<BookSig>) {
+        self.reduce(pred, |regret, t| (regret, BookShape::of(self.len() - self.off_rows, t), signature_of(regret, t)))
+    }
+
+    /// The totals [`FitnessBook::regret`] prices `pred` by, after the regime
+    /// mask and the position layer: one for a single mean-sd block, else one
+    /// per time block; `f` gets the regret of those totals and the totals.
+    fn reduce<R>(&self, pred: &[f64], f: impl FnOnce(f64, &[FitnessTotals]) -> R) -> R {
+        if self.blocks() == 1 && self.stat == BlockStat::MeanSd {
+            let t = self.totals(pred);
+            f(self.regret_of(&t), std::slice::from_ref(&t))
         } else {
-            self.block_totals(pred)
-        };
-        let regret = if self.blocks() == 1 { self.regret_of(&blocks[0]) } else { self.fitness_of(&blocks) };
-        if !regret.is_finite() {
-            return (regret, None);
+            let t = self.block_totals(pred);
+            f(self.fitness_of(&t), &t)
         }
-        let long_rows = blocks.iter().map(|t| t.long_rows).sum();
-        (regret, Some(book_signature(long_rows, &blocks)))
     }
 
     /// Time blocks of the consistency term; 1 is the plain regret.
@@ -1747,12 +2530,14 @@ impl FitnessBook {
     /// the lanes of every segment, and spreads the segment sums over the warps
     /// exactly as [`FitnessBook::totals`] does for the whole book.
     pub fn block_totals(&self, pred: &[f64]) -> Vec<FitnessTotals> {
-        debug_assert_eq!(pred.len(), self.excess.len());
+        self.check_len(pred);
+        let forced = self.force_flat(pred);
+        let pred: &[f64] = &forced;
         if !self.is_plain() {
-            return self.band_pass(pred, self.resolve_band(pred), true);
+            return self.band_pass_forced(pred, self.resolve_band(pred), true);
         }
         let nb = self.blocks();
-        let n = self.excess.len().min(pred.len());
+        let n = self.excess.len();
         let mut warps = vec![[0.0f64; FITNESS_WARPS]; nb];
         let mut out = vec![
             FitnessTotals { gross: 0.0, flips: 0, exits: 0, long_rows: 0, nonfinite: false };
@@ -1767,7 +2552,7 @@ impl FitnessBook {
             for k in seg_start..seg_end {
                 let p = pred[k];
                 let flag = self.flags[k];
-                let b = (flag >> FITNESS_BLOCK_SHIFT) as usize & (FITNESS_MAX_BLOCKS - 1);
+                let b = self.block_of(k);
                 let long = if p.is_finite() {
                     p > self.threshold
                 } else {
@@ -1833,14 +2618,15 @@ impl FitnessBook {
         totals.iter().enumerate().map(|(b, t)| self.block_regret_of(b, t)).collect()
     }
 
-    /// The search fitness from per-block totals: `mean + lambda * sd` of the
-    /// block regrets (sample standard deviation, ddof 1); with one block the
+    /// The search fitness from per-block totals: [`block_stat`] of the block
+    /// regrets under the book's [`BlockStat`] (default `mean + lambda * sd`,
+    /// sample standard deviation, ddof 1); with one block and `MeanSd` the
     /// plain regret. `+inf` for a non-finite prediction, fewer than
     /// `min_trades` flips over all blocks, or a non-finite block regret.
     pub fn fitness_of(&self, totals: &[FitnessTotals]) -> f64 {
         let nb = self.blocks();
         debug_assert_eq!(totals.len(), nb);
-        if nb == 1 {
+        if nb == 1 && self.stat == BlockStat::MeanSd {
             return self.regret_of(&totals[0]);
         }
         let flips: u64 = totals.iter().map(|t| t.flips).sum();
@@ -1851,18 +2637,7 @@ impl FitnessBook {
         if r.iter().any(|v| !v.is_finite()) {
             return f64::INFINITY;
         }
-        let mut sum = 0.0f64;
-        for v in &r {
-            sum += *v;
-        }
-        let mean = sum / nb as f64;
-        let mut ss = 0.0f64;
-        for v in &r {
-            let d = *v - mean;
-            ss += d * d;
-        }
-        let sd = (ss / (nb - 1) as f64).sqrt();
-        let f = mean + self.lambda * sd;
+        let f = block_stat(self.stat, &r, self.lambda);
         if f.is_finite() {
             f
         } else {
@@ -1895,8 +2670,58 @@ impl FitnessBook {
     pub fn resolve_band(&self, pred: &[f64]) -> f64 {
         match self.band_units {
             BandUnits::Score => self.band,
+            BandUnits::Sd if self.off_rows > 0 => {
+                score_sd(&mask_on_scores(pred, &self.flags)).sd.map_or(0.0, |s| self.band * s)
+            }
             BandUnits::Sd => score_sd(pred).sd.map_or(0.0, |s| self.band * s),
         }
+    }
+
+    /// #1180: rows outside the regime mask; 0 for an unmasked book.
+    pub fn masked_rows(&self) -> usize {
+        self.off_rows
+    }
+
+    pub fn is_masked(&self) -> bool {
+        self.off_rows > 0
+    }
+
+    /// #1182: the book with `layer` in front of every reduction: a prediction
+    /// vector is priced as the positions the layer maps it to. Refused on a
+    /// masked or non-plain book and on a threshold that `f64::MAX` and
+    /// `f64::MIN` do not straddle. The layer's identity joins the hash.
+    pub fn with_layer(mut self, layer: std::sync::Arc<dyn PositionLayer>) -> Result<Self, String> {
+        if self.is_masked() || !self.is_plain() || self.layer.is_some() {
+            return Err("a position layer needs a plain, unmasked book without a layer".to_string());
+        }
+        if !(self.threshold > f64::MIN && self.threshold < f64::MAX) {
+            return Err(format!("a position layer needs a threshold strictly between f64::MIN and f64::MAX, got {}", self.threshold));
+        }
+        fnv_u64(&mut self.hash, 0x6c61_7965_72u64);
+        for b in layer.identity().bytes() {
+            fnv_u64(&mut self.hash, b as u64);
+        }
+        self.layer = Some(layer);
+        Ok(self)
+    }
+
+    pub fn has_layer(&self) -> bool {
+        self.layer.is_some()
+    }
+
+    /// #1180: the prediction vector with every row outside the regime mask
+    /// replaced by the lowest finite score, so the book holds no position
+    /// there; a non-finite score outside the mask is ignored.
+    fn force_flat<'a>(&self, pred: &'a [f64]) -> std::borrow::Cow<'a, [f64]> {
+        if let Some(layer) = &self.layer {
+            return std::borrow::Cow::Owned(layer.positions(pred));
+        }
+        if self.off_rows == 0 {
+            return std::borrow::Cow::Borrowed(pred);
+        }
+        std::borrow::Cow::Owned(
+            pred.iter().zip(&self.flags).map(|(&p, &f)| if f & FITNESS_MASK_OFF != 0 { f64::MIN } else { p }).collect(),
+        )
     }
 
     /// #925: the band automaton ([`trading_gpu::BandParams::next`]) over the
@@ -1905,8 +2730,13 @@ impl FitnessBook {
     /// one book; each keeps the segment, lane and warp tree of
     /// [`FitnessBook::totals`] for `gross`.
     pub fn band_pass(&self, pred: &[f64], band: f64, per_block: bool) -> Vec<FitnessTotals> {
+        self.check_len(pred);
+        self.band_pass_forced(&self.force_flat(pred), band, per_block)
+    }
+
+    fn band_pass_forced(&self, pred: &[f64], band: f64, per_block: bool) -> Vec<FitnessTotals> {
         let nb = if per_block { self.blocks() } else { 1 };
-        let n = self.excess.len().min(pred.len());
+        let n = self.excess.len();
         let params = trading_gpu::BandParams { threshold: self.threshold, band, min_hold: self.min_hold };
         let mut warps = vec![[0.0f64; FITNESS_WARPS]; nb];
         let mut out = vec![FitnessTotals { gross: 0.0, flips: 0, exits: 0, long_rows: 0, nonfinite: false }; nb];
@@ -1920,7 +2750,7 @@ impl FitnessBook {
             for k in seg_start..seg_end {
                 let p = pred[k];
                 let flag = self.flags[k];
-                let b = if per_block { (flag >> FITNESS_BLOCK_SHIFT) as usize & (FITNESS_MAX_BLOCKS - 1) } else { 0 };
+                let b = if per_block { self.block_of(k) } else { 0 };
                 if !p.is_finite() {
                     out[b].nonfinite = true;
                 }
@@ -1969,6 +2799,872 @@ impl FitnessBook {
         }
         out
     }
+
+    /// #1023: the sub-books of the lexicase cases.
+    pub fn cases(&self) -> &BookCases {
+        self.cases.get_or_init(|| {
+            let n = self.excess.len();
+            let mut ranges = Vec::new();
+            let mut start = 0usize;
+            for i in 1..n {
+                if self.flags[i] & TradingRows::FIRST != 0 {
+                    ranges.push((start, i));
+                    start = i;
+                }
+            }
+            if n > 0 {
+                ranges.push((start, n));
+            }
+            let bounds: Vec<f64> = ranges
+                .iter()
+                .map(|&(s, e)| trading_gpu::dp_bound(&self.excess[s..e], &vec![0; e - s], self.side).unwrap_or(f64::NAN))
+                .collect();
+            let kept = (0..ranges.len()).filter(|&c| bounds[c] > 0.0).collect();
+            BookCases { ranges, bounds, kept }
+        })
+    }
+
+    /// #1023: the totals of every run of [`FitnessBook::cases`] under the
+    /// position rule of the whole book (its band, resolved on all of `pred`, and
+    /// its minimum hold). Each run keeps the segment, lane and warp tree of
+    /// [`FitnessBook::totals`] from its own first row, so a run of a plain book
+    /// or of a score-unit band totals as a separate book of its rows.
+    pub fn case_totals(&self, pred: &[f64]) -> Vec<FitnessTotals> {
+        self.check_len(pred);
+        let band = (!self.is_plain()).then(|| self.resolve_band(pred));
+        let forced = self.force_flat(pred);
+        self.cases().ranges.iter().map(|&(s, e)| self.run_totals(&forced, s, e, band)).collect()
+    }
+
+    /// #1023: the regret `(B_c - net_c) / B_c` of every kept case, from the same
+    /// reduction as [`FitnessBook::case_totals`]; `+inf` for a non-finite
+    /// prediction in the case or a non-finite regret. A case has no trade
+    /// floor: a flat case scores exactly 1.
+    pub fn case_errors(&self, pred: &[f64]) -> Vec<f32> {
+        self.check_len(pred);
+        let band = (!self.is_plain()).then(|| self.resolve_band(pred));
+        let forced = self.force_flat(pred);
+        let pred: &[f64] = &forced;
+        let cases = self.cases();
+        cases
+            .kept
+            .iter()
+            .map(|&c| {
+                let (s, e) = cases.ranges[c];
+                let t = self.run_totals(pred, s, e, band);
+                let r = (cases.bounds[c] - self.net_of(&t)) / cases.bounds[c];
+                if t.nonfinite || !r.is_finite() {
+                    f32::INFINITY
+                } else {
+                    r as f32
+                }
+            })
+            .collect()
+    }
+
+    /// #1023: one run `[start, end)` as one book; `band` is `None` for the
+    /// plain rule, else the band automaton's half-width.
+    fn run_totals(&self, pred: &[f64], start: usize, end: usize, band: Option<f64>) -> FitnessTotals {
+        let params = band.map(|band| trading_gpu::BandParams { threshold: self.threshold, band, min_hold: self.min_hold });
+        let mut state = trading_gpu::BandState::default();
+        let mut t = FitnessTotals { gross: 0.0, flips: 0, exits: 0, long_rows: 0, nonfinite: false };
+        let mut warps = [0.0f64; FITNESS_WARPS];
+        let mut prev = false;
+        let mut seg_start = start;
+        let mut seg = 0usize;
+        while seg_start < end {
+            let seg_end = (seg_start + FITNESS_SEGMENT_ROWS).min(end);
+            let mut lanes = [0.0f64; FITNESS_LANES];
+            for k in seg_start..seg_end {
+                let p = pred[k];
+                let flag = self.flags[k];
+                if !p.is_finite() {
+                    t.nonfinite = true;
+                }
+                if flag & TradingRows::FIRST != 0 {
+                    state = trading_gpu::BandState::default();
+                    prev = false;
+                }
+                let long = match params {
+                    Some(params) => {
+                        state = params.next(state, p);
+                        state.long
+                    }
+                    None => p.is_finite() && p > self.threshold,
+                };
+                if long != prev {
+                    t.flips += 1;
+                }
+                if long {
+                    t.long_rows += 1;
+                    lanes[(k - seg_start) % FITNESS_LANES] += self.excess[k];
+                    if flag & TradingRows::LAST != 0 {
+                        t.exits += 1;
+                    }
+                }
+                prev = long;
+            }
+            let mut half = FITNESS_LANES / 2;
+            while half >= 1 {
+                for i in 0..half {
+                    lanes[i] += lanes[i + half];
+                }
+                half /= 2;
+            }
+            warps[seg % FITNESS_WARPS] += lanes[0];
+            seg += 1;
+            seg_start = seg_end;
+        }
+        let mut half = FITNESS_WARPS / 2;
+        while half >= 1 {
+            for i in 0..half {
+                warps[i] += warps[i + half];
+            }
+            half /= 2;
+        }
+        t.gross = warps[0];
+        t
+    }
+
+    /// #1094: every root cut of `pred` in one sort and one sweep. `time` is the
+    /// row timestamp, aligned with `pred`; it counts distinct entry timestamps.
+    /// Errors: a non-finite prediction or time, a length mismatch, a book that
+    /// is not plain ([`FitnessBook::is_plain`]).
+    pub fn cut_sweep(&self, pred: &[f64], time: &[f64]) -> Result<CutSweep, String> {
+        let n = self.excess.len();
+        if pred.len() != n || time.len() != n {
+            return Err(format!(
+                "cut sweep: length mismatch: {} predictions and {} times for {} rows",
+                pred.len(),
+                time.len(),
+                n
+            ));
+        }
+        if self.layer.is_some() {
+            return Err("cut sweep: the book prices its predictions through a gate layer".to_string());
+        }
+        if self.is_masked() {
+            return Err("cut sweep: the book has a regime mask".to_string());
+        }
+        if !self.is_plain() {
+            return Err("cut sweep: the book is not plain (it has a band or a minimum hold)".to_string());
+        }
+        if n >= u32::MAX as usize {
+            return Err(format!("cut sweep: {} rows do not fit a u32 row index", n));
+        }
+        let mut sorted: Vec<(u64, u32)> = Vec::with_capacity(n);
+        let mut stamps: Vec<u64> = Vec::with_capacity(n);
+        for i in 0..n {
+            let key = trading_gpu::order_key_f64(pred[i]).ok_or_else(|| format!("cut sweep: prediction {} is not finite", i))?;
+            let stamp = trading_gpu::order_key_f64(time[i]).ok_or_else(|| format!("cut sweep: time {} is not finite", i))?;
+            sorted.push((key, i as u32));
+            stamps.push(stamp);
+        }
+        sorted.sort_unstable();
+        let order: Vec<u32> = sorted.iter().map(|&(_, i)| i).collect();
+        let mut rank = vec![0u32; n];
+        for (r, &i) in order.iter().enumerate() {
+            rank[i as usize] = r as u32;
+        }
+        let nb = self.blocks();
+        let block = |i: usize| self.block_of(i);
+        // `diff[b * w + t]`: change of a count of block `b` where the cut reaches `t`.
+        let w = n + 2;
+        let mut flip_diff = vec![0i32; nb * w];
+        let mut exit_diff = vec![0i32; nb * w];
+        let mut entries: Vec<(u64, u32, u32)> = Vec::with_capacity(n);
+        for i in 0..n {
+            let (b, ri, flag) = (block(i), rank[i] as usize, self.flags[i]);
+            if flag & TradingRows::FIRST != 0 {
+                // A run starts flat: an entry while this row is long, `t <= ri`.
+                flip_diff[b * w] += 1;
+                flip_diff[b * w + ri + 1] -= 1;
+                entries.push((stamps[i], 0, ri as u32));
+            } else {
+                let rp = rank[i - 1] as usize;
+                let (lo, hi) = if rp < ri { (rp, ri) } else { (ri, rp) };
+                // Exactly one row of the pair is long: `lo < t <= hi`.
+                flip_diff[b * w + lo + 1] += 1;
+                flip_diff[b * w + hi + 1] -= 1;
+                if rp < ri {
+                    entries.push((stamps[i], rp as u32 + 1, ri as u32));
+                }
+            }
+            if flag & TradingRows::LAST != 0 {
+                exit_diff[b * w] += 1;
+                exit_diff[b * w + ri + 1] -= 1;
+            }
+        }
+        // A timestamp counts once on the union of its rows' entry intervals.
+        entries.sort_unstable();
+        let mut entry_diff = vec![0i32; w];
+        let mut k = 0;
+        while k < entries.len() {
+            let (stamp, mut lo, mut hi) = entries[k];
+            k += 1;
+            while k < entries.len() && entries[k].0 == stamp {
+                let (_, a, c) = entries[k];
+                if a <= hi + 1 {
+                    hi = hi.max(c);
+                } else {
+                    entry_diff[lo as usize] += 1;
+                    entry_diff[hi as usize + 1] -= 1;
+                    lo = a;
+                    hi = c;
+                }
+                k += 1;
+            }
+            entry_diff[lo as usize] += 1;
+            entry_diff[hi as usize + 1] -= 1;
+        }
+        drop(entries);
+        let mut entry_times = vec![0u32; n + 1];
+        let mut running = 0i64;
+        for t in 0..=n {
+            running += entry_diff[t] as i64;
+            entry_times[t] = running as u32;
+        }
+        // Descending `t` adds the row of rank `t` to the long set. Every interval
+        // adds +1 and -1, so the count at `t` is minus the differences above `t`.
+        let mut fitness = vec![f64::INFINITY; n + 1];
+        let mut net = vec![f64::NAN; n + 1];
+        let mut flips = vec![0u32; n + 1];
+        let mut exits = vec![0u32; n + 1];
+        let mut totals = vec![FitnessTotals { gross: 0.0, flips: 0, exits: 0, long_rows: 0, nonfinite: false }; nb];
+        let mut flips_above = vec![0i64; nb];
+        let mut exits_above = vec![0i64; nb];
+        for t in (0..=n).rev() {
+            if t < n {
+                let i = order[t] as usize;
+                let b = block(i);
+                totals[b].gross += self.excess[i];
+                totals[b].long_rows += 1;
+            }
+            let (mut f, mut e) = (0u64, 0u64);
+            for b in 0..nb {
+                totals[b].flips = (-flips_above[b]) as u64;
+                totals[b].exits = (-exits_above[b]) as u64;
+                f += totals[b].flips;
+                e += totals[b].exits;
+            }
+            flips[t] = f as u32;
+            exits[t] = e as u32;
+            if t == 0 || t == n || sorted[t - 1].0 < sorted[t].0 {
+                fitness[t] = self.fitness_of(&totals);
+                net[t] = totals.iter().map(|x| self.net_of(x)).sum();
+            }
+            for b in 0..nb {
+                flips_above[b] += flip_diff[b * w + t] as i64;
+                exits_above[b] += exit_diff[b * w + t] as i64;
+            }
+        }
+        Ok(CutSweep { order, fitness, net, flips, exits, entry_times })
+    }
+}
+
+/// #1257: books on the same rows that differ only in `excess` and the block
+/// bounds: the observed training book and its shifted copies.
+#[derive(Clone, Debug)]
+pub struct BookFamily<'a> {
+    books: Vec<&'a FitnessBook>,
+}
+
+/// #1257: the buffers of [`BookFamily::cut_totals`], kept between calls.
+#[derive(Clone, Debug, Default)]
+pub struct CutScratch {
+    /// The long bits of every row of a segment.
+    masks: Vec<u64>,
+    /// The non-finite bits of every row of a segment that can overflow.
+    bad: Vec<u64>,
+    /// The lanes of two books.
+    lanes: Vec<f64>,
+    warps: Vec<f64>,
+    counts: Vec<u64>,
+    nonfinite: Vec<u64>,
+    /// The totals of one chunk of cuts when a call has more than [`CUT_CHUNK`].
+    chunk: Vec<FitnessTotals>,
+}
+
+/// The most cuts one pass of the family kernel prices.
+const CUT_CHUNK: usize = 64;
+
+/// Byte `i` of entry `m` is bit `i` of `m`: eight cut counters in one word.
+static BYTE_SPREAD: [u64; 256] = {
+    let mut t = [0u64; 256];
+    let mut m = 0;
+    while m < 256 {
+        let mut i = 0;
+        while i < 8 {
+            if (m >> i) & 1 == 1 {
+                t[m] |= 1u64 << (8 * i);
+            }
+            i += 1;
+        }
+        m += 1;
+    }
+    t
+};
+
+/// Word `i` of entry `m` is all ones where bit `i` of the byte `m` is set.
+static BYTE_MASKS: [[u64; 8]; 256] = {
+    let mut t = [[0u64; 8]; 256];
+    let mut m = 0;
+    while m < 256 {
+        let mut i = 0;
+        while i < 8 {
+            if (m >> i) & 1 == 1 {
+                t[m][i] = u64::MAX;
+            }
+            i += 1;
+        }
+        m += 1;
+    }
+    t
+};
+
+/// The block id of every row of a one-block book.
+static NO_BLOCK_IDS: [u8; FITNESS_SEGMENT_ROWS] = [0; FITNESS_SEGMENT_ROWS];
+
+/// Below this magnitude of a value and a cut constant, `v - c` and `c - v` are finite.
+const NO_OVERFLOW: f64 = f64::MAX / 4.0;
+
+/// Adds the byte counters of `acc` into `dst` (one counter per cut) and clears them.
+fn flush_cut_counts(acc: &mut [u64; 8], dst: &mut [u64]) {
+    for (w, a) in acc.iter_mut().enumerate() {
+        if *a == 0 {
+            continue;
+        }
+        for i in 0..8 {
+            if let Some(d) = dst.get_mut(8 * w + i) {
+                *d += (*a >> (8 * i)) & 255;
+            }
+        }
+        *a = 0;
+    }
+}
+
+impl<'a> BookFamily<'a> {
+    /// Refuses an empty family, a band, minimum-hold, masked or layered book,
+    /// and any difference from the first book in length, seam flags, block ids
+    /// or threshold.
+    pub fn new(books: Vec<&'a FitnessBook>) -> Result<Self, String> {
+        let Some(first) = books.first().copied() else {
+            return Err("a book family needs at least one book".to_string());
+        };
+        for (k, b) in books.iter().enumerate() {
+            if b.band != 0.0 {
+                return Err(format!("book {}: a band book prices another position rule", k));
+            }
+            if b.min_hold != 1 {
+                return Err(format!("book {}: a minimum-hold book prices another position rule", k));
+            }
+            if b.is_masked() {
+                return Err(format!("book {}: a masked book forces rows flat", k));
+            }
+            if b.layer.is_some() {
+                return Err(format!("book {}: a position layer maps the predictions", k));
+            }
+            if b.len() != first.len() {
+                return Err(format!("book {} has {} rows, book 0 has {}", k, b.len(), first.len()));
+            }
+            if b.flags != first.flags {
+                return Err(format!("book {} has other seam flags than book 0", k));
+            }
+            if b.block_id != first.block_id || b.blocks() != first.blocks() {
+                return Err(format!("book {} has other block ids than book 0", k));
+            }
+            if b.threshold.to_bits() != first.threshold.to_bits() {
+                return Err(format!("book {} has threshold {}, book 0 has {}", k, b.threshold, first.threshold));
+            }
+        }
+        Ok(BookFamily { books })
+    }
+
+    pub fn books(&self) -> &[&'a FitnessBook] {
+        &self.books
+    }
+
+    /// `out[(b * cuts.len() + q) * nb + k]` equals `books[b].block_totals(&pred_q)[k]`
+    /// bit for bit, `pred_q[i]` being `v[i] - c` for an above cut `(true, c)` and
+    /// `c - v[i]` for a below cut `(false, c)`; at least one cut. More than
+    /// [`CUT_CHUNK`] cuts are priced in chunks in cut order, each cut independently
+    /// of the others. One walk over each
+    /// segment finds the long bits of every cut (one `u64` per row) and the
+    /// integer counts; then each book adds its `excess` into the lanes of
+    /// [`FitnessBook::block_totals`], every lane in ascending row order. A short
+    /// row adds `+0.0`, which leaves a lane unchanged: a sum that starts at
+    /// `+0.0` under round to nearest is never `-0.0`.
+    pub fn cut_totals(&self, v: &[f64], cuts: &[(bool, f64)], scratch: &mut CutScratch, out: &mut Vec<FitnessTotals>) {
+        #[cfg(target_arch = "x86_64")]
+        let avx = is_x86_feature_detected!("avx");
+        #[cfg(not(target_arch = "x86_64"))]
+        let avx = false;
+        if cuts.len() <= CUT_CHUNK {
+            family_totals(self, v, cuts, scratch, out, avx);
+            return;
+        }
+        assert!(!cuts.is_empty(), "book family: at least one cut");
+        let (nb, q) = (self.books[0].blocks(), cuts.len());
+        let mut chunk = std::mem::take(&mut scratch.chunk);
+        let mut base = 0;
+        for part in cuts.chunks(CUT_CHUNK) {
+            family_totals(self, v, part, scratch, &mut chunk, avx);
+            if base == 0 {
+                out.clear();
+                out.resize(self.books.len() * q * nb, chunk[0]);
+            }
+            let qc = part.len();
+            for b in 0..self.books.len() {
+                let dst = (b * q + base) * nb;
+                out[dst..dst + qc * nb].copy_from_slice(&chunk[b * qc * nb..(b + 1) * qc * nb]);
+            }
+            base += qc;
+        }
+        scratch.chunk = chunk;
+    }
+}
+
+/// The long bits of the rows `v` against padded cuts (NaN constants are never
+/// long), and when `bad` is given their non-finite bits.
+fn long_bits(v: &[f64], cs: &[f64; 64], above: &[bool; 64], groups: usize, t: f64, masks: &mut [u64], mut bad: Option<&mut [u64]>) {
+    for (r, &x) in v.iter().enumerate() {
+        let (mut m, mut nf) = (0u64, 0u64);
+        for j in 0..4 * groups {
+            let p = if above[j] { x - cs[j] } else { cs[j] - x };
+            let fin = p.is_finite();
+            m |= ((fin & (p > t)) as u64) << j;
+            nf |= ((!fin) as u64) << j;
+        }
+        masks[r] = m;
+        if let Some(b) = bad.as_deref_mut() {
+            b[r] = nf;
+        }
+    }
+}
+
+/// [`long_bits`] four cuts at a time, for rows and cuts below [`NO_OVERFLOW`],
+/// where every `v - c` and `c - v` is finite: the same subtraction and
+/// comparison per cut.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn long_bits_avx(v: &[f64], cs: &[f64; 64], above: &[bool; 64], groups: usize, t: f64, masks: &mut [u64]) {
+    use std::arch::x86_64::*;
+    let (mut c, mut sel) = ([_mm256_setzero_pd(); 16], [_mm256_setzero_pd(); 16]);
+    for g in 0..groups {
+        c[g] = _mm256_loadu_pd(cs.as_ptr().add(4 * g));
+        let s: [f64; 4] = std::array::from_fn(|i| if above[4 * g + i] { f64::from_bits(u64::MAX) } else { 0.0 });
+        sel[g] = _mm256_loadu_pd(s.as_ptr());
+    }
+    let tv = _mm256_set1_pd(t);
+    for (r, &x) in v.iter().enumerate() {
+        let xv = _mm256_set1_pd(x);
+        let mut m = 0u64;
+        for g in 0..groups {
+            let p = _mm256_blendv_pd(_mm256_sub_pd(c[g], xv), _mm256_sub_pd(xv, c[g]), sel[g]);
+            m |= (_mm256_movemask_pd(_mm256_cmp_pd::<_CMP_GT_OQ>(p, tv)) as u64) << (4 * g);
+        }
+        masks[r] = m;
+    }
+}
+
+/// Adds the excess of one book (`e1` empty) or two books to their lanes, lane by
+/// lane: rows `lane, lane + 32, ...` add into registers in ascending row order,
+/// sixteen cuts at a time, and a change of block moves the registers to the
+/// lanes of the new block.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn add_lanes_avx(e0: &[f64], e1: &[f64], masks: &[u64], ids: &[u8], qp: usize, l0: &mut [f64], l1: &mut [f64]) {
+    use std::arch::x86_64::*;
+    let rows = e0.len();
+    let two = !e1.is_empty();
+    assert!(masks.len() >= rows && ids.len() >= rows && (!two || e1.len() == rows) && l0.len() == l1.len() && qp % 16 == 0);
+    let nb = l0.len() / (FITNESS_LANES * qp);
+    let table = BYTE_MASKS.as_ptr();
+    for chunk in (0..qp).step_by(16) {
+        for lane in 0..FITNESS_LANES.min(rows) {
+            let mut cur = ids[lane] as usize;
+            assert!(cur < nb);
+            let mut at = (cur * FITNESS_LANES + lane) * qp + chunk;
+            let (mut a, mut b) = ([_mm256_setzero_pd(); 4], [_mm256_setzero_pd(); 4]);
+            for g in 0..4 {
+                a[g] = _mm256_loadu_pd(l0.as_ptr().add(at + 4 * g));
+                b[g] = _mm256_loadu_pd(l1.as_ptr().add(at + 4 * g));
+            }
+            let mut r = lane;
+            while r < rows {
+                let blk = *ids.get_unchecked(r) as usize;
+                if blk != cur {
+                    assert!(blk < nb);
+                    for g in 0..4 {
+                        _mm256_storeu_pd(l0.as_mut_ptr().add(at + 4 * g), a[g]);
+                        _mm256_storeu_pd(l1.as_mut_ptr().add(at + 4 * g), b[g]);
+                    }
+                    cur = blk;
+                    at = (cur * FITNESS_LANES + lane) * qp + chunk;
+                    for g in 0..4 {
+                        a[g] = _mm256_loadu_pd(l0.as_ptr().add(at + 4 * g));
+                        b[g] = _mm256_loadu_pd(l1.as_ptr().add(at + 4 * g));
+                    }
+                }
+                let m = *masks.get_unchecked(r) >> chunk;
+                let lo = table.add((m & 255) as usize) as *const f64;
+                let hi = table.add(((m >> 8) & 255) as usize) as *const f64;
+                let s = [_mm256_loadu_pd(lo), _mm256_loadu_pd(lo.add(4)), _mm256_loadu_pd(hi), _mm256_loadu_pd(hi.add(4))];
+                let x0 = _mm256_broadcast_sd(e0.get_unchecked(r));
+                for g in 0..4 {
+                    a[g] = _mm256_add_pd(a[g], _mm256_and_pd(x0, s[g]));
+                }
+                if two {
+                    let x1 = _mm256_broadcast_sd(e1.get_unchecked(r));
+                    for g in 0..4 {
+                        b[g] = _mm256_add_pd(b[g], _mm256_and_pd(x1, s[g]));
+                    }
+                }
+                r += FITNESS_LANES;
+            }
+            for g in 0..4 {
+                _mm256_storeu_pd(l0.as_mut_ptr().add(at + 4 * g), a[g]);
+                _mm256_storeu_pd(l1.as_mut_ptr().add(at + 4 * g), b[g]);
+            }
+        }
+    }
+}
+
+/// [`add_lanes_avx`] for one book, row by row.
+fn add_lanes(excess: &[f64], masks: &[u64], ids: &[u8], qp: usize, lanes: &mut [f64]) {
+    for (r, (&e, &m)) in excess.iter().zip(masks).enumerate() {
+        let base = (ids[r] as usize * FITNESS_LANES + r % FITNESS_LANES) * qp;
+        let e = e.to_bits();
+        for (j, a) in lanes[base..base + qp].iter_mut().enumerate() {
+            *a += f64::from_bits(e & BYTE_MASKS[((m >> (j & !7)) & 255) as usize][j & 7]);
+        }
+    }
+}
+
+/// Folds the lanes of every block of one book (`lanes`) and adds them to the warps of segment `seg`.
+fn fold_lanes(lanes: &mut [f64], warps: &mut [f64], nb: usize, qp: usize, seg: usize) {
+    for b in 0..nb {
+        let l = &mut lanes[b * FITNESS_LANES * qp..(b + 1) * FITNESS_LANES * qp];
+        let mut half = FITNESS_LANES / 2;
+        while half >= 1 {
+            for i in 0..half {
+                for j in 0..qp {
+                    l[i * qp + j] += l[(i + half) * qp + j];
+                }
+            }
+            half /= 2;
+        }
+        let w = &mut warps[(b * FITNESS_WARPS + seg % FITNESS_WARPS) * qp..][..qp];
+        for j in 0..qp {
+            w[j] += l[j];
+        }
+    }
+}
+
+fn family_totals(f: &BookFamily, v: &[f64], cuts: &[(bool, f64)], s: &mut CutScratch, out: &mut Vec<FitnessTotals>, avx: bool) {
+    let first = f.books[0];
+    let n = first.len();
+    assert_eq!(v.len(), n, "book family: {} values for {} rows", v.len(), n);
+    let q = cuts.len();
+    assert!((1..=CUT_CHUNK).contains(&q), "book family: 1 to {} cuts, got {}", CUT_CHUNK, q);
+    let qp = q.div_ceil(16) * 16;
+    let (qw, groups) = (q.div_ceil(8), q.div_ceil(4));
+    let nb = first.blocks();
+    let nbooks = f.books.len();
+    let t = first.threshold;
+    // Padded cuts are NaN: never long, and their non-finite bits are dropped.
+    let mut cs = [f64::NAN; 64];
+    let mut above = [false; 64];
+    for (j, &(a, c)) in cuts.iter().enumerate() {
+        above[j] = a;
+        cs[j] = c;
+    }
+    let valid = if q == 64 { u64::MAX } else { (1u64 << q) - 1 };
+    let cuts_small = cuts.iter().all(|c| c.1.abs() < NO_OVERFLOW);
+    let ids: &[u8] = &first.block_id;
+    let flags: &[u8] = &first.flags;
+    let lanes_len = nb * FITNESS_LANES * qp;
+    s.counts.clear();
+    s.counts.resize(3 * nb * q, 0);
+    s.nonfinite.clear();
+    s.nonfinite.resize(nb, 0);
+    s.warps.clear();
+    s.warps.resize(nbooks * nb * FITNESS_WARPS * qp, 0.0);
+    s.lanes.clear();
+    s.lanes.resize(2 * lanes_len, 0.0);
+    s.masks.clear();
+    s.masks.resize(FITNESS_SEGMENT_ROWS, 0);
+    s.bad.clear();
+    s.bad.resize(FITNESS_SEGMENT_ROWS, 0);
+    let mut prev = 0u64;
+    let mut seg_start = 0usize;
+    let mut seg = 0usize;
+    while seg_start < n {
+        let seg_end = (seg_start + FITNESS_SEGMENT_ROWS).min(n);
+        let rows = seg_end - seg_start;
+        let vs = &v[seg_start..seg_end];
+        let seg_ids: &[u8] = if ids.is_empty() { &NO_BLOCK_IDS[..rows] } else { &ids[seg_start..seg_end] };
+        let finite = cuts_small && vs.iter().all(|x| x.abs() < NO_OVERFLOW);
+        #[cfg(target_arch = "x86_64")]
+        let fast = avx && finite;
+        #[cfg(not(target_arch = "x86_64"))]
+        let fast = false;
+        if fast {
+            #[cfg(target_arch = "x86_64")]
+            // SAFETY: `fast` implies the AVX feature was detected by `cut_totals`.
+            unsafe {
+                long_bits_avx(vs, &cs, &above, groups, t, &mut s.masks[..rows]);
+            }
+        } else {
+            long_bits(vs, &cs, &above, groups, t, &mut s.masks[..rows], (!finite).then_some(&mut s.bad[..rows]));
+        }
+        {
+            let (flips, rest) = s.counts.split_at_mut(nb * q);
+            let (exits, longs) = rest.split_at_mut(nb * q);
+            let (mut acc_long, mut acc_flip) = ([0u64; 8], [0u64; 8]);
+            let mut held = 0u32;
+            let mut cur = seg_ids[0] as usize;
+            let mut nf_cur = 0u64;
+            for r in 0..rows {
+                let m = s.masks[r];
+                let b = seg_ids[r] as usize;
+                if b != cur || held == 255 {
+                    flush_cut_counts(&mut acc_long, &mut longs[cur * q..(cur + 1) * q]);
+                    flush_cut_counts(&mut acc_flip, &mut flips[cur * q..(cur + 1) * q]);
+                    s.nonfinite[cur] |= nf_cur;
+                    nf_cur = 0;
+                    cur = b;
+                    held = 0;
+                }
+                let flag = flags[seg_start + r];
+                if flag & TradingRows::FIRST != 0 {
+                    prev = 0;
+                }
+                let changed = m ^ prev;
+                for w in 0..qw {
+                    acc_long[w] += BYTE_SPREAD[((m >> (8 * w)) & 255) as usize];
+                    acc_flip[w] += BYTE_SPREAD[((changed >> (8 * w)) & 255) as usize];
+                }
+                held += 1;
+                if flag & TradingRows::LAST != 0 {
+                    let mut e = m;
+                    while e != 0 {
+                        exits[b * q + e.trailing_zeros() as usize] += 1;
+                        e &= e - 1;
+                    }
+                }
+                if !finite {
+                    nf_cur |= s.bad[r] & valid;
+                }
+                prev = m;
+            }
+            flush_cut_counts(&mut acc_long, &mut longs[cur * q..(cur + 1) * q]);
+            flush_cut_counts(&mut acc_flip, &mut flips[cur * q..(cur + 1) * q]);
+            s.nonfinite[cur] |= nf_cur;
+        }
+        let masks = &s.masks[..rows];
+        let mut bk = 0;
+        while bk < nbooks {
+            let pair = avx && bk + 1 < nbooks;
+            let (l0, l1) = s.lanes.split_at_mut(lanes_len);
+            l0.fill(0.0);
+            let e0 = &f.books[bk].excess[seg_start..seg_end];
+            if avx {
+                let e1: &[f64] = if pair { &f.books[bk + 1].excess[seg_start..seg_end] } else { &[] };
+                if pair {
+                    l1.fill(0.0);
+                }
+                #[cfg(target_arch = "x86_64")]
+                // SAFETY: `avx` is the feature detected by `cut_totals`.
+                unsafe {
+                    add_lanes_avx(e0, e1, masks, seg_ids, qp, l0, l1);
+                }
+            } else {
+                add_lanes(e0, masks, seg_ids, qp, l0);
+            }
+            let warps = &mut s.warps;
+            fold_lanes(l0, &mut warps[bk * nb * FITNESS_WARPS * qp..(bk + 1) * nb * FITNESS_WARPS * qp], nb, qp, seg);
+            if pair {
+                fold_lanes(l1, &mut warps[(bk + 1) * nb * FITNESS_WARPS * qp..(bk + 2) * nb * FITNESS_WARPS * qp], nb, qp, seg);
+            }
+            bk += if pair { 2 } else { 1 };
+        }
+        seg += 1;
+        seg_start = seg_end;
+    }
+    for bk in 0..nbooks {
+        for b in 0..nb {
+            let w = &mut s.warps[(bk * nb + b) * FITNESS_WARPS * qp..][..FITNESS_WARPS * qp];
+            let mut half = FITNESS_WARPS / 2;
+            while half >= 1 {
+                for i in 0..half {
+                    for j in 0..qp {
+                        w[i * qp + j] += w[(i + half) * qp + j];
+                    }
+                }
+                half /= 2;
+            }
+        }
+    }
+    let (flips, rest) = s.counts.split_at(nb * q);
+    let (exits, longs) = rest.split_at(nb * q);
+    out.clear();
+    out.reserve(nbooks * q * nb);
+    for bk in 0..nbooks {
+        for j in 0..q {
+            for b in 0..nb {
+                out.push(FitnessTotals {
+                    gross: s.warps[(bk * nb + b) * FITNESS_WARPS * qp + j],
+                    flips: flips[b * q + j],
+                    exits: exits[b * q + j],
+                    long_rows: longs[b * q + j],
+                    nonfinite: (s.nonfinite[b] >> j) & 1 == 1,
+                });
+            }
+        }
+    }
+}
+
+/// #1094: the floor of [`CutSweep::best`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CutFloor {
+    /// Fewest distinct timestamps at which at least one row enters.
+    pub min_entry_times: u32,
+}
+
+/// #1094: the books of every root cut of one prediction vector on a plain
+/// [`FitnessBook`]. Cut `t` in `0..=n` is long on the `n - t` rows of highest
+/// prediction. `t` is valid when it does not split equal predictions (`-0.0`
+/// equals `+0.0`); `t = 0` and `t = n` are always valid.
+#[derive(Clone, Debug)]
+pub struct CutSweep {
+    /// Row indices by ascending prediction, ties by row index.
+    order: Vec<u32>,
+    /// `n + 1` values; `+inf` where `t` splits a tie.
+    fitness: Vec<f64>,
+    /// Sum over blocks of `gross - side * (flips + exits)`; NaN where invalid.
+    net: Vec<f64>,
+    flips: Vec<u32>,
+    exits: Vec<u32>,
+    /// Distinct timestamps at which at least one row enters.
+    entry_times: Vec<u32>,
+}
+
+impl CutSweep {
+    /// Rows of the book (`n`); the cuts are `0..=n`.
+    pub fn rows(&self) -> usize {
+        self.order.len()
+    }
+
+    pub fn is_valid(&self, t: usize) -> bool {
+        !self.net[t].is_nan()
+    }
+
+    /// [`FitnessBook::fitness_of`] of cut `t`; `+inf` when `t` is not valid.
+    pub fn fitness(&self, t: usize) -> f64 {
+        self.fitness[t]
+    }
+
+    pub fn net(&self, t: usize) -> f64 {
+        self.net[t]
+    }
+
+    pub fn flips(&self, t: usize) -> u32 {
+        self.flips[t]
+    }
+
+    pub fn exits(&self, t: usize) -> u32 {
+        self.exits[t]
+    }
+
+    pub fn entry_times(&self, t: usize) -> u32 {
+        self.entry_times[t]
+    }
+
+    /// A threshold that realises cut `t` under `pred > threshold`: the midpoint
+    /// of the two neighbouring predictions, or the lower one when the midpoint
+    /// is not strictly below the upper one. `-inf` for `t = 0`, `+inf` for `n`.
+    pub fn value(&self, pred: &[f64], t: usize) -> f64 {
+        let n = self.order.len();
+        if t == 0 {
+            return f64::NEG_INFINITY;
+        }
+        if t >= n {
+            return f64::INFINITY;
+        }
+        let lo = pred[self.order[t - 1] as usize];
+        let hi = pred[self.order[t] as usize];
+        let mid = lo + (hi - lo) * 0.5;
+        if mid < hi {
+            mid
+        } else {
+            lo
+        }
+    }
+
+    /// The cut of threshold `theta`: the number of rows with `pred <= theta`.
+    pub fn index_of(&self, pred: &[f64], theta: f64) -> usize {
+        self.order.partition_point(|&i| pred[i as usize] <= theta)
+    }
+
+    /// The smallest valid cut at or above `t` (`n` at the latest).
+    pub fn snap(&self, t: usize) -> usize {
+        let n = self.order.len();
+        (t.min(n)..n).find(|&k| self.is_valid(k)).unwrap_or(n)
+    }
+
+    /// The fitted cut: among valid `t` with `0 < t < n`, finite fitness and at
+    /// least `floor.min_entry_times` entry timestamps, the lowest fitness; ties
+    /// go to the smallest `|t - reference|`, then to the smaller `t`. `None`
+    /// when no cut passes.
+    pub fn best(&self, floor: &CutFloor, reference: usize) -> Option<usize> {
+        let mut best: Option<usize> = None;
+        for t in 1..self.order.len() {
+            let f = self.fitness[t];
+            if !self.is_valid(t) || !f.is_finite() || self.entry_times[t] < floor.min_entry_times {
+                continue;
+            }
+            best = match best {
+                Some(b) if !(f < self.fitness[b] || (f == self.fitness[b] && t.abs_diff(reference) < b.abs_diff(reference))) => Some(b),
+                _ => Some(t),
+            };
+        }
+        best
+    }
+
+    /// The widest run of valid inner cuts around `best` whose fitness stays
+    /// within `0.1 * (1 - f)` of the best fitness `f`; `(best, best)` when `f`
+    /// is 1 or more. Returns the lowest and the highest cut of the run.
+    pub fn plateau(&self, best: usize) -> (usize, usize) {
+        let n = self.order.len();
+        let f = self.fitness[best];
+        if !(f < 1.0) {
+            return (best, best);
+        }
+        let limit = f + 0.1 * (1.0 - f);
+        let inside = |k: usize| self.fitness[k] <= limit;
+        let mut lo = best;
+        for k in (1..best).rev() {
+            if !self.is_valid(k) {
+                continue;
+            }
+            if !inside(k) {
+                break;
+            }
+            lo = k;
+        }
+        let mut hi = best;
+        for k in best + 1..n {
+            if !self.is_valid(k) {
+                continue;
+            }
+            if !inside(k) {
+                break;
+            }
+            hi = k;
+        }
+        (lo, hi)
+    }
 }
 
 /// The finalist chosen by a trading objective, with both books.
@@ -2012,8 +3708,46 @@ pub struct FinalistReport {
     /// #928: object naming the front a re-selection read.
     pub reselected_from: Option<String>,
     /// #929: the label whose return column prices the book, when it is not the fit label.
-    pub book_target: Option<String>,
+    /// #1291: its spec is written as `book_target_spec`, so walk-forward prices the same book.
+    pub book_target: Option<crate::target::TargetSpec>,
     pub test: Result<PathStats, String>,
+    /// #1180: the regime mask of `--pnl-mask`, when the books were priced under one.
+    pub mask: Option<MaskReport>,
+}
+
+/// #1180: the mask of one validation or test block.
+#[derive(Clone, Debug)]
+pub struct MaskedBlock {
+    /// Rows with the mask on over rows.
+    pub on_share: f64,
+    /// Maximal on-runs over all groups: the segments of the book.
+    pub runs: usize,
+    /// Net P&L of the same formula without the mask, for reference.
+    pub unmasked_net_pnl: Option<f64>,
+}
+
+/// #1180: `objective.validation.mask` and `objective.test.mask`.
+#[derive(Clone, Debug)]
+pub struct MaskReport {
+    pub expr: String,
+    pub band: f64,
+    pub dwell: usize,
+    pub validation: Option<MaskedBlock>,
+    pub test: MaskedBlock,
+}
+
+impl MaskReport {
+    fn json(&self, block: &MaskedBlock) -> String {
+        format!(
+            "\"mask\":{{\"expr\":{},\"band\":{},\"dwell\":{},\"on_share\":{},\"runs\":{}}},\"unmasked_net_pnl\":{}",
+            crate::devlog::text(&self.expr),
+            num(self.band),
+            self.dwell,
+            num(block.on_share),
+            block.runs,
+            block.unmasked_net_pnl.map_or_else(|| "null".to_string(), num)
+        )
+    }
 }
 
 impl FinalistReport {
@@ -2021,17 +3755,36 @@ impl FinalistReport {
         let mut s = self.spec.json();
         s.pop();
         s.push_str(&format!(
-            ",\"min_group_step_seconds\":{},\"horizon_seconds\":{}}}",
+            ",\"min_group_step_seconds\":{},\"horizon_seconds\":{}",
             self.min_group_step.map_or_else(|| "null".to_string(), num),
             num(self.horizon_seconds)
         ));
+        if let Some(m) = &self.mask {
+            s.push_str(&format!(
+                ",\"pnl_mask\":{{\"expr\":{},\"band\":{},\"dwell\":{},\"state_rule\":\"{rule}\",\"train_state_rule\":\"{rule}\"}}",
+                crate::devlog::text(&m.expr),
+                num(m.band),
+                m.dwell,
+                rule = crate::regime_gate::STATE_RULE
+            ));
+        }
+        s.push('}');
         s
     }
 
     pub fn json(&self, backend: &str, backend_reason: Option<&str>) -> String {
-        let block = |r: &Result<PathStats, String>| match r {
-            Ok(s) => s.json(),
-            Err(e) => format!("{{\"unusable\":{}}}", crate::devlog::text(e)),
+        let block = |r: &Result<PathStats, String>, mask: Option<&MaskedBlock>| {
+            let mut out = match r {
+                Ok(s) => s.json(),
+                Err(e) => format!("{{\"unusable\":{}}}", crate::devlog::text(e)),
+            };
+            if let (Some(rep), Some(m)) = (&self.mask, mask) {
+                out.pop();
+                out.push(',');
+                out.push_str(&rep.json(m));
+                out.push('}');
+            }
+            out
         };
         format!(
             "{{\"name\":\"{}\",{}\"position\":\"{}\",\"selection\":\"{}\",\
@@ -2041,7 +3794,7 @@ impl FinalistReport {
              \"validation_error\":{},\"test_error\":{},\"validation_objective\":{}{}}},\
              \"validation\":{},\"test\":{}}}",
             self.objective.name(),
-            self.book_target.as_deref().map(|b| format!("\"book_target\":{},", crate::devlog::text(b))).unwrap_or_default(),
+            self.book_target.as_ref().map(|b| format!("\"book_target\":{},\"book_target_spec\":{{{}}},", crate::devlog::text(&b.column), b.fields_json())).unwrap_or_default(),
             self.spec.position.name(),
             self.selection,
             self.selection_rule,
@@ -2072,8 +3825,8 @@ impl FinalistReport {
             self.search_fitness
                 .map(|k| format!(",\"search_fitness\":\"{}\"", k))
                 .unwrap_or_default(),
-            block(&self.validation),
-            block(&self.test)
+            block(&self.validation, self.mask.as_ref().and_then(|m| m.validation.as_ref())),
+            block(&self.test, self.mask.as_ref().map(|m| &m.test))
         )
     }
 
@@ -2194,7 +3947,7 @@ mod block_tests {
         assert_eq!(block_ids(&t, 4).unwrap(), vec![0, 0, 0, 1, 1, 1, 2, 2, 3, 3, 3]);
         assert_eq!(block_ids(&t, 1).unwrap(), vec![0; 11]);
         assert!(block_ids(&t[..3], 4).unwrap_err().contains("distinct training timestamps"));
-        assert!(block_ids(&t, 9).is_err());
+        assert!(block_ids(&t, 65).is_err());
     }
 
     fn panel(sizes: &[usize]) -> crate::data::TradingSlice {
@@ -2219,6 +3972,34 @@ mod block_tests {
 
     fn pred(n: usize) -> Vec<f64> {
         (0..n).map(|i| if (i * 7 + i / 5) % 3 == 0 { 1.0 } else { -1.0 }).collect()
+    }
+
+    fn short_book() -> (FitnessBook, Vec<f64>) {
+        let s = panel(&[60, 70]);
+        let book = FitnessBook::new(&s, &spec(), 900.0).unwrap();
+        let short = pred(s.ret.len() - 1);
+        (book, short)
+    }
+
+    #[test]
+    #[should_panic(expected = "fitness book")]
+    fn fitness_book_refuses_a_short_prediction_vector_in_totals() {
+        let (b, p) = short_book();
+        b.totals(&p);
+    }
+
+    #[test]
+    #[should_panic(expected = "fitness book")]
+    fn fitness_book_refuses_a_short_prediction_vector_in_block_totals() {
+        let (b, p) = short_book();
+        b.block_totals(&p);
+    }
+
+    #[test]
+    #[should_panic(expected = "fitness book")]
+    fn fitness_book_refuses_a_short_prediction_vector_in_band_pass() {
+        let (b, p) = short_book();
+        b.band_pass(&p, 0.0, false);
     }
 
     #[test]
@@ -2296,6 +4077,327 @@ mod block_tests {
         assert!((flat.regret(&p) - mean).abs() <= 1e-12);
     }
 
+    /// #1178: the hash and fitness bits of mean-sd books with 1 to 8 blocks,
+    /// pinned on the base before the block statistics: that path is unchanged
+    /// bit for bit.
+    #[test]
+    fn mean_sd_books_up_to_8_blocks_are_pinned() {
+        const PINNED: [(usize, u64, u64); 4] = [
+            (1, 0xa2e2_82a5_0092_fdb4, 0x4004_7b2d_c2fd_d2f4),
+            (2, 0x4267_9a39_8749_ebbb, 0x4004_7d77_c5ba_f68c),
+            (4, 0x5998_0622_5b02_0152, 0x4004_981e_29bd_7172),
+            (8, 0xec7f_2e15_4e3e_38a1, 0x4004_aa52_86fb_34c7),
+        ];
+        let s = panel(&[9000, 4000, 1, 7000, 300]);
+        let p = pred(s.ret.len());
+        let got: Vec<(usize, u64, u64)> = PINNED
+            .iter()
+            .map(|&(k, _, _)| {
+                let book = FitnessBook::with_blocks(&s, &spec(), 900.0, k, 1.5).unwrap();
+                (k, book.hash(), book.regret(&p).to_bits())
+            })
+            .collect();
+        let text: Vec<String> = got.iter().map(|(k, h, f)| format!("({}, 0x{:016x}, 0x{:016x})", k, h, f)).collect();
+        assert_eq!(got, PINNED.to_vec(), "got [{}]", text.join(", "));
+    }
+
+    /// #1178: 48 blocks keep their ids out of the flags; every block regret
+    /// equals its rows priced as a separate book.
+    #[test]
+    fn block_regret_k48_equals_separate_books() {
+        let s = panel(&[9000, 4000, 1, 7000, 300]);
+        let k = 48usize;
+        let book = FitnessBook::with_blocks(&s, &spec(), 900.0, k, 1.0).unwrap();
+        let ids = block_ids(&s.rows.time, k).unwrap();
+        assert_eq!(book.blocks(), k);
+        assert_eq!(book.block_ids(), &ids[..]);
+        assert!(book.flags().iter().all(|f| *f & (7u8 << FITNESS_BLOCK_SHIFT) == 0), "no block id in the flags");
+        let p = pred(s.ret.len());
+        let totals = book.block_totals(&p);
+        let regrets = book.block_regrets(&totals);
+        for b in 0..k {
+            let sl = block_slice(&s, &ids, b as u8);
+            let bp: Vec<f64> = (0..ids.len()).filter(|&i| ids[i] as usize == b).map(|i| p[i]).collect();
+            let plain = FitnessBook::new(&sl, &spec(), 900.0).unwrap();
+            assert_eq!(plain.bound().to_bits(), book.block_bounds()[b].to_bits(), "block {b} bound");
+            let r = plain.regret(&bp);
+            assert!((r - regrets[b]).abs() <= 1e-12, "block {b}: {r} vs {}", regrets[b]);
+        }
+        assert_eq!(book.regret(&p).to_bits(), block_stat(BlockStat::MeanSd, &regrets, 1.0).to_bits());
+        assert!(FitnessBook::with_blocks(&s, &spec(), 900.0, 65, 1.0).unwrap_err().contains("1 to 64"));
+    }
+
+    /// Block regrets of the hand fixtures: the captures 0.5, -0.2, 0.1, -0.5,
+    /// 0.3, 0.0, 0.2, -0.1, 0.4 and 0.6 of 10 blocks.
+    const HAND: [f64; 10] = [0.5, 1.2, 0.9, 1.5, 0.7, 1.0, 0.8, 1.1, 0.6, 0.4];
+
+    /// #1178: the mean regret is 0.87; the losing captures -0.2, -0.5 and -0.1
+    /// give the semi-deviation sqrt((0.04 + 0.25 + 0.01) / 10) = sqrt(0.03).
+    #[test]
+    fn mean_semi_matches_hand_value() {
+        let want = 0.87 + 2.0 * 0.03f64.sqrt();
+        let got = block_stat(BlockStat::MeanSemi, &HAND, 2.0);
+        assert!((got - want).abs() <= 1e-12, "{got} vs {want}");
+        // No losing block: the mean exactly, which is mean-sd with lambda 0.
+        let winning = [0.5, 0.9, 1.0, 0.7, 0.2];
+        assert_eq!(
+            block_stat(BlockStat::MeanSemi, &winning, 3.0).to_bits(),
+            block_stat(BlockStat::MeanSd, &winning, 0.0).to_bits()
+        );
+        // A 10-block book ranks by the same statistic of its block regrets.
+        let s = panel(&[3000, 2500, 1]);
+        let p = pred(s.ret.len());
+        let book = FitnessBook::with_blocks(&s, &spec(), 900.0, 10, 2.0).unwrap().with_stat(BlockStat::MeanSemi).unwrap();
+        let r = book.block_regrets(&book.block_totals(&p));
+        assert!(r.iter().any(|&v| v > 1.0), "a block loses: {r:?}");
+        assert_eq!(book.regret(&p).to_bits(), block_stat(BlockStat::MeanSemi, &r, 2.0).to_bits());
+    }
+
+    /// #1178: q = 0.25 of 10 blocks takes ceil(2.5) = 3 worst captures, -0.5,
+    /// -0.2 and -0.1, so the fitness is 1 + 0.8 / 3; q = 0.31 adds the capture
+    /// 0.0 as the fourth.
+    #[test]
+    fn cvar_matches_hand_value() {
+        let got = block_stat(BlockStat::Cvar(0.25), &HAND, 7.0);
+        assert!((got - (1.0 + 0.8 / 3.0)).abs() <= 1e-12, "{got}");
+        assert_eq!(block_stat(BlockStat::Cvar(0.3), &HAND, 0.0).to_bits(), got.to_bits(), "0.3 of 10 is 3 blocks");
+        let four = block_stat(BlockStat::Cvar(0.31), &HAND, 0.0);
+        assert!((four - 1.2).abs() <= 1e-12, "{four}");
+        assert_eq!(BlockStat::cvar_count(0.25, 10), 3);
+        assert_eq!(BlockStat::cvar_count(0.3, 10), 3);
+        assert_eq!(BlockStat::cvar_count(0.31, 10), 4);
+        assert_eq!(BlockStat::cvar_count(1e-6, 10), 1);
+        assert_eq!(BlockStat::cvar_count(1.0, 64), 64);
+        assert_eq!(BlockStat::cvar_count(0.25, 1), 1);
+        let s = panel(&[3000, 2500, 1]);
+        let p = pred(s.ret.len());
+        let book = FitnessBook::with_blocks(&s, &spec(), 900.0, 10, 1.0).unwrap().with_stat(BlockStat::Cvar(0.25)).unwrap();
+        let r = book.block_regrets(&book.block_totals(&p));
+        let mut sorted = r.clone();
+        sorted.sort_by(|a, b| b.total_cmp(a));
+        let fit = book.regret(&p);
+        assert!((fit - (sorted[0] + sorted[1] + sorted[2]) / 3.0).abs() <= 1e-12, "{fit} vs {sorted:?}");
+        assert_eq!(fit.to_bits(), block_stat(BlockStat::Cvar(0.25), &r, 1.0).to_bits());
+    }
+
+    /// #1178: q = 1 takes every block: the mean, bit for bit the mean-sd
+    /// fitness with lambda 0.
+    #[test]
+    fn cvar_q1_is_the_mean() {
+        assert_eq!(block_stat(BlockStat::Cvar(1.0), &HAND, 5.0).to_bits(), block_stat(BlockStat::MeanSd, &HAND, 0.0).to_bits());
+        let s = panel(&[3000, 2500, 1]);
+        let n = s.ret.len();
+        for k in [2usize, 10, 64] {
+            let mean = FitnessBook::with_blocks(&s, &spec(), 900.0, k, 0.0).unwrap();
+            let cvar = FitnessBook::with_blocks(&s, &spec(), 900.0, k, 0.0).unwrap().with_stat(BlockStat::Cvar(1.0)).unwrap();
+            let ramp: Vec<f64> = (0..n).map(|i| (i % 17) as f64 - 8.0).collect();
+            for p in [pred(n), vec![-1.0; n], ramp] {
+                assert_eq!(cvar.regret(&p).to_bits(), mean.regret(&p).to_bits(), "{k} blocks");
+            }
+        }
+    }
+
+    /// #1178: the statistic and its parameter enter the hash; mean-sd keeps it.
+    #[test]
+    fn block_stat_enters_the_hash() {
+        let s = panel(&[3000, 2500, 1]);
+        let base = |k: usize, l: f64| FitnessBook::with_blocks(&s, &spec(), 900.0, k, l).unwrap();
+        let h = |k: usize, l: f64, st: BlockStat| base(k, l).with_stat(st).unwrap().hash();
+        assert_eq!(h(10, 1.0, BlockStat::MeanSd), base(10, 1.0).hash());
+        assert_eq!(h(1, 1.0, BlockStat::MeanSd), FitnessBook::new(&s, &spec(), 900.0).unwrap().hash());
+        let all = [
+            h(10, 1.0, BlockStat::MeanSd),
+            h(10, 1.0, BlockStat::MeanSemi),
+            h(10, 2.0, BlockStat::MeanSemi),
+            h(10, 1.0, BlockStat::Cvar(0.25)),
+            h(10, 1.0, BlockStat::Cvar(0.5)),
+            h(12, 1.0, BlockStat::Cvar(0.25)),
+            h(1, 1.0, BlockStat::MeanSemi),
+            h(1, 2.0, BlockStat::MeanSemi),
+            h(1, 1.0, BlockStat::MeanSd),
+            h(9, 1.0, BlockStat::MeanSd),
+        ];
+        for i in 0..all.len() {
+            for j in 0..i {
+                assert_ne!(all[i], all[j], "{i} vs {j}");
+            }
+        }
+        assert!(base(10, 1.0).with_stat(BlockStat::Cvar(0.0)).is_err());
+        assert!(base(10, 1.0).with_stat(BlockStat::Cvar(1.5)).is_err());
+        assert!(base(10, 1.0).with_stat(BlockStat::MeanSemi).unwrap().with_stat(BlockStat::Cvar(0.5)).is_err());
+    }
+
+    /// #1178: the `+inf` rules hold under every statistic, for 12 blocks and one.
+    #[test]
+    fn inf_rules_hold_under_every_statistic() {
+        let s = panel(&[3000, 2500, 1]);
+        let n = s.ret.len();
+        for k in [1usize, 12] {
+            for st in [BlockStat::MeanSd, BlockStat::MeanSemi, BlockStat::Cvar(0.25)] {
+                let book = FitnessBook::with_blocks(&s, &spec(), 900.0, k, 1.0).unwrap().with_stat(st).unwrap();
+                let mut p = pred(n);
+                assert!(book.regret(&p).is_finite(), "{k} {st:?}");
+                p[n / 2] = f64::NAN;
+                assert_eq!(book.regret(&p), f64::INFINITY, "{k} {st:?}: a non-finite prediction");
+                let floor = FitnessBook::with_blocks(&s, &TradingSpec { min_trades: 1_000_000, ..spec() }, 900.0, k, 1.0)
+                    .unwrap()
+                    .with_stat(st)
+                    .unwrap();
+                assert_eq!(floor.regret(&pred(n)), f64::INFINITY, "{k} {st:?}: the trade floor");
+            }
+        }
+    }
+
+    /// #1178: 12 blocks over interval segments and under a regime mask: block
+    /// `b` equals its rows priced as a separate book with the same segments and
+    /// the mask on those rows, and the mask bit stays in the flags.
+    #[test]
+    fn wide_blocks_compose_with_segments_and_a_mask() {
+        let s = panel(&[3000, 2500, 1]);
+        let n = s.ret.len();
+        let k = 12usize;
+        let segments = [0.0, 900.0 * 1000.0, 900.0 * 2200.0];
+        let on: Vec<bool> = (0..n).map(|i| (i / 37) % 3 != 2).collect();
+        let ids = block_ids(&s.rows.time, k).unwrap();
+        let p = pred(n);
+        for (segs, mask) in [(&segments[..], None), (&[][..], Some(&on)), (&segments[..], Some(&on))] {
+            let m = mask.map(|on| BookMask { on, identity: "m" });
+            let book = FitnessBook::with_segments(&s, &spec(), 900.0, k, 1.0, segs, m).unwrap().with_stat(BlockStat::MeanSemi).unwrap();
+            if let Some(on) = mask {
+                assert!(book.flags().iter().zip(on).all(|(f, o)| (*f & FITNESS_MASK_OFF != 0) == !o));
+            }
+            let r = book.block_regrets(&book.block_totals(&p));
+            for b in 0..k {
+                let rows: Vec<usize> = (0..n).filter(|&i| ids[i] as usize == b).collect();
+                let sl = block_slice(&s, &ids, b as u8);
+                let on_b: Vec<bool> = mask.map_or_else(Vec::new, |on| rows.iter().map(|&i| on[i]).collect());
+                let mb = mask.map(|_| BookMask { on: &on_b, identity: "m" });
+                let alone = FitnessBook::with_segments(&sl, &spec(), 900.0, 1, 1.0, segs, mb).unwrap();
+                let bp: Vec<f64> = rows.iter().map(|&i| p[i]).collect();
+                assert_eq!(alone.bound().to_bits(), book.block_bounds()[b].to_bits(), "block {b} bound");
+                let want = alone.regret(&bp);
+                assert!((want - r[b]).abs() <= 1e-12, "block {b}: {want} vs {}", r[b]);
+            }
+            assert_eq!(book.regret(&p).to_bits(), block_stat(BlockStat::MeanSemi, &r, 1.0).to_bits());
+        }
+    }
+
+    /// #1178: the CPU cost of one fitness evaluation on 25,000 rows for 8 and
+    /// 48 blocks and each statistic. A measurement, run by hand.
+    #[test]
+    #[ignore = "measurement: run by hand with --ignored --nocapture"]
+    fn block_stat_fitness_cost() {
+        let s = panel(&[25_000]);
+        let p = pred(s.ret.len());
+        for (k, st) in [(8usize, BlockStat::MeanSd), (48, BlockStat::MeanSd), (48, BlockStat::MeanSemi), (48, BlockStat::Cvar(0.25))] {
+            let book = FitnessBook::with_blocks(&s, &spec(), 900.0, k, 1.0).unwrap().with_stat(st).unwrap();
+            let mut best = f64::INFINITY;
+            let mut sum = 0.0;
+            for _ in 0..5 {
+                let t = std::time::Instant::now();
+                for _ in 0..200 {
+                    sum += book.regret(&p);
+                }
+                best = best.min(t.elapsed().as_secs_f64() / 200.0);
+            }
+            println!("blocks {} {}: best of 5 {:.1} us per fitness (sum {})", k, st.name(), best * 1e6, sum);
+        }
+    }
+
+    /// #1023: every `(group, block)` run totals as a separate book of its own
+    /// rows, bit for bit, for the plain rule and the minimum-hold automaton;
+    /// the case regret is that book's regret.
+    #[test]
+    fn case_totals_equal_separate_books() {
+        // 20 000 distinct stamps cut into 2 blocks of 10 000: each of the 3
+        // groups has rows in both blocks, and a 10 000-row run spans two
+        // 8 192-row segments.
+        let s = panel(&[20_000, 18_000, 16_000]);
+        let ids = block_ids(&s.rows.time, 2).unwrap();
+        for sp in [spec(), TradingSpec { min_holding: 3, ..spec() }] {
+            let book = FitnessBook::with_blocks(&s, &sp, 900.0, 2, 1.0).unwrap();
+            let cases = book.cases();
+            assert_eq!(cases.ranges.len(), 6, "3 groups x 2 blocks");
+            assert_eq!(cases.kept, (0..6).collect::<Vec<_>>());
+            let p = pred(s.ret.len());
+            let totals = book.case_totals(&p);
+            let errors = book.case_errors(&p);
+            for (c, &(start, end)) in cases.ranges.iter().enumerate() {
+                assert!((start..end).all(|i| s.rows.group[i] == s.rows.group[start] && ids[i] == ids[start]));
+                let mut rows = TradingRows::default();
+                rows.group = s.rows.group[start..end].to_vec();
+                rows.time = s.rows.time[start..end].to_vec();
+                let one = crate::data::TradingSlice { rows, ret: s.ret[start..end].to_vec() };
+                let separate = FitnessBook::new(&one, &sp, 900.0).unwrap();
+                let want = separate.totals(&p[start..end]);
+                let got = totals[c];
+                assert_eq!(got.gross.to_bits(), want.gross.to_bits(), "case {c}: gross");
+                assert_eq!((got.flips, got.exits, got.long_rows), (want.flips, want.exits, want.long_rows), "case {c}");
+                assert_eq!(cases.bounds[c].to_bits(), separate.bound().to_bits(), "case {c}: bound");
+                assert_eq!(errors[c].to_bits(), (separate.regret_of(&want) as f32).to_bits(), "case {c}: regret");
+            }
+            // The runs of one block hold the block's counts.
+            let blocks = book.block_totals(&p);
+            for (b, block) in blocks.iter().enumerate() {
+                let of_block: Vec<&FitnessTotals> =
+                    cases.ranges.iter().zip(&totals).filter(|((s0, _), _)| ids[*s0] as usize == b).map(|(_, t)| t).collect();
+                assert_eq!(of_block.iter().map(|t| t.flips + t.exits).sum::<u64>(), block.flips + block.exits);
+                assert_eq!(of_block.iter().map(|t| t.long_rows).sum::<u64>(), block.long_rows);
+            }
+        }
+        // A non-finite prediction makes its case `+inf` and leaves the others.
+        let book = FitnessBook::with_blocks(&s, &spec(), 900.0, 2, 1.0).unwrap();
+        let mut p = pred(s.ret.len());
+        p[book.cases().ranges[3].0 + 5] = f64::NAN;
+        let errors = book.case_errors(&p);
+        assert_eq!(errors[3], f32::INFINITY);
+        assert!(errors.iter().enumerate().all(|(c, e)| c == 3 || e.is_finite()));
+        // A flat case scores exactly 1.
+        let flat = book.case_errors(&vec![-1.0; s.ret.len()]);
+        assert!(flat.iter().all(|&e| e == 1.0), "{flat:?}");
+    }
+
+    /// `F` flat, `L` long; one character per row.
+    fn positions(rows: &str) -> Vec<f64> {
+        rows.chars().map(|c| if c == 'L' { 1.0 } else { -1.0 }).collect()
+    }
+
+    /// #1084: the shape counts long rows and round trips of the book the
+    /// regret prices, from the same reduction, for the plain rule, block seams
+    /// and the minimum-hold automaton.
+    #[test]
+    fn regret_and_shape_reads_the_book_the_regret_prices() {
+        let mut s = panel(&[10, 10]);
+        s.ret.iter_mut().for_each(|r| *r = 0.01);
+        // Group 0: two round trips closed by flips; group 1: one closed by a
+        // flip, one by the exit at the group's last row.
+        let p = positions("FLLLFFLLFFLLFFFFFLLL");
+        let plain = FitnessBook::new(&s, &spec(), 900.0).unwrap();
+        let (r, shape) = plain.regret_and_shape(&p);
+        assert_eq!(r.to_bits(), plain.regret_of(&plain.totals(&p)).to_bits());
+        assert_eq!(shape, BookShape { rows: 20, long_rows: 10, entries: 4 });
+        assert_eq!((shape.exposure(), shape.mean_holding()), (0.5, 2.5));
+        // A position held across the block seam is two round trips, as the
+        // blocked regret charges it.
+        let seam = positions("FFFLLLLFFFFFFFFFFFFF");
+        assert_eq!(plain.regret_and_shape(&seam).1, BookShape { rows: 20, long_rows: 4, entries: 1 });
+        let blocked = FitnessBook::with_blocks(&s, &spec(), 900.0, 2, 1.0).unwrap();
+        let (r, shape) = blocked.regret_and_shape(&seam);
+        assert_eq!(r.to_bits(), blocked.fitness_of(&blocked.block_totals(&seam)).to_bits());
+        assert_eq!(shape, BookShape { rows: 20, long_rows: 4, entries: 2 });
+        // A minimum hold of 3 keeps a one-row signal long for three rows; the
+        // last group ends long after two rows.
+        let short = positions("FLFFFFFFFFFFFFFFFFLF");
+        assert_eq!(plain.regret_and_shape(&short).1, BookShape { rows: 20, long_rows: 2, entries: 2 });
+        let held = FitnessBook::new(&s, &TradingSpec { min_holding: 3, ..spec() }, 900.0).unwrap();
+        let (r, shape) = held.regret_and_shape(&short);
+        assert_eq!(r.to_bits(), held.regret_of(&held.totals(&short)).to_bits());
+        assert_eq!(shape, BookShape { rows: 20, long_rows: 5, entries: 2 });
+        // A flat book has no entry and no holding.
+        let flat = plain.regret_and_shape(&positions(&"F".repeat(20))).1;
+        assert_eq!((flat.long_rows, flat.entries, flat.mean_holding()), (0, 0, 0.0));
+    }
+
     #[test]
     fn non_finite_and_min_trades_score_infinity() {
         let s = panel(&[40, 40]);
@@ -2312,7 +4414,7 @@ mod block_tests {
     fn refusals_name_the_block_problem() {
         let s = panel(&[40, 40]);
         assert!(FitnessBook::with_blocks(&s, &spec(), 900.0, 0, 1.0).is_err());
-        assert!(FitnessBook::with_blocks(&s, &spec(), 900.0, 9, 1.0).is_err());
+        assert!(FitnessBook::with_blocks(&s, &spec(), 900.0, 65, 1.0).is_err());
         assert!(FitnessBook::with_blocks(&s, &spec(), 900.0, 2, -1.0).is_err());
         assert!(FitnessBook::with_blocks(&s, &spec(), 900.0, 2, f64::NAN).is_err());
         assert!(FitnessBook::with_blocks(&s, &spec(), 900.0, 41, 1.0).is_err());
@@ -2529,5 +4631,552 @@ mod band_tests {
             assert_eq!(book.net_pnl.to_bits(), explicit.net_pnl.to_bits(), "band {band} hold {hold}");
             assert_eq!(book.trades, explicit.trades);
         }
+    }
+
+    /// #1189: the band and minimum-hold automaton restarts at every segment start.
+    #[test]
+    fn band_state_resets_at_interval_start() {
+        let first: Vec<usize> = (300..360).collect();
+        let second: Vec<usize> = (900..960).collect();
+        let positions = |hours: &[usize], seed: usize, starts: &[f64]| -> Vec<f64> {
+            let mut rows = TradingRows::default();
+            let mut pred = Vec::new();
+            for g in 0..2usize {
+                for &h in hours {
+                    rows.group.push(g as u64);
+                    rows.time.push(h as f64 * 3600.0);
+                    // Inside the band at the seams: a carried automaton stays long.
+                    pred.push(match h {
+                        358 | 359 => 0.5,
+                        900 | 901 => 0.05,
+                        _ => ((h + seed + g) % 4) as f64 * 0.2 - 0.3,
+                    });
+                }
+            }
+            let r = vec![0.001; pred.len()];
+            let spec = TradingSpec { band: BandSpec::score(0.1), min_holding: 3, segment_starts: starts.to_vec(), ..TradingSpec::default() };
+            let keep: Vec<usize> = (0..pred.len()).collect();
+            let ctx = Ctx::new(&keep, &r, &rows, 0.0, 0.0, &spec.segment_starts);
+            positions_of(&pred, &rows, &keep, &ctx, &spec)
+        };
+        let all: Vec<usize> = first.iter().chain(&second).copied().collect();
+        let starts = [300.0 * 3600.0, 900.0 * 3600.0];
+        for seed in 0..4 {
+            let joint = positions(&all, seed, &starts);
+            let (a, b) = (positions(&first, seed, &[]), positions(&second, seed, &[]));
+            let mut want = Vec::new();
+            for g in 0..2 {
+                want.extend_from_slice(&a[g * first.len()..(g + 1) * first.len()]);
+                want.extend_from_slice(&b[g * second.len()..(g + 1) * second.len()]);
+            }
+            assert_eq!(joint, want, "seed {seed}");
+            assert_ne!(positions(&all, seed, &[]), want, "seed {seed}: a carried automaton differs at the seam");
+        }
+    }
+}
+
+#[cfg(test)]
+mod cut_sweep_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    struct Mix(u64);
+
+    impl Mix {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn uni(&mut self) -> f64 {
+            ((self.next() >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+        }
+
+        fn gauss(&mut self) -> f64 {
+            let (u, v) = (self.uni(), self.uni());
+            (-2.0 * u.ln()).sqrt() * (2.0 * std::f64::consts::PI * v).cos()
+        }
+    }
+
+    /// `groups` groups of `steps` hourly rows in canonical order. The market
+    /// feature `z` of each stamp is shared by the groups.
+    fn panel(rng: &mut Mix, groups: usize, steps: usize) -> (crate::data::TradingSlice, Vec<f64>) {
+        let z: Vec<f64> = (0..steps).map(|_| rng.gauss()).collect();
+        let (mut time, mut group, mut ret) = (Vec::new(), Vec::new(), Vec::new());
+        for g in 0..groups {
+            for (k, zk) in z.iter().enumerate() {
+                time.push(k as f64 * 3600.0);
+                group.push(g as u64);
+                ret.push(0.004 * rng.gauss() + 0.002 * zk);
+            }
+        }
+        let rows = TradingRows { time, group, funding: Vec::new() };
+        let zs = (0..groups * steps).map(|i| z[i % steps]).collect();
+        (crate::data::TradingSlice { rows, ret }, zs)
+    }
+
+    fn book(slice: &crate::data::TradingSlice, blocks: usize) -> FitnessBook {
+        let spec = TradingSpec { cost_bps: 5.0, min_trades: 1, ..TradingSpec::default() };
+        FitnessBook::with_blocks(slice, &spec, 0.0, blocks, 1.0).unwrap()
+    }
+
+    fn entry_count(book: &FitnessBook, pred: &[f64], time: &[f64], theta: f64) -> u32 {
+        let mut seen = BTreeSet::new();
+        let mut prev = false;
+        for i in 0..pred.len() {
+            if book.flags()[i] & TradingRows::FIRST != 0 {
+                prev = false;
+            }
+            let long = pred[i] > theta;
+            if long && !prev {
+                seen.insert(trading_gpu::order_key_f64(time[i]).unwrap());
+            }
+            prev = long;
+        }
+        seen.len() as u32
+    }
+
+    /// Every cut of the sweep against a book whose threshold is that cut's value.
+    fn check(book: &FitnessBook, pred: &[f64], time: &[f64]) -> usize {
+        let sw = book.cut_sweep(pred, time).unwrap();
+        let n = pred.len();
+        assert_eq!(sw.rows(), n);
+        let mut sorted = pred.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mut checked = 0;
+        for t in 0..=n {
+            let valid = t == 0 || t == n || sorted[t - 1] < sorted[t];
+            assert_eq!(sw.is_valid(t), valid, "validity of cut {t}");
+            if !valid {
+                assert_eq!(sw.fitness(t), f64::INFINITY, "cut {t} inside a tie");
+                continue;
+            }
+            let theta = sw.value(pred, t);
+            assert_eq!(pred.iter().filter(|&&p| p > theta).count(), n - t, "value of cut {t}");
+            assert_eq!(sw.index_of(pred, theta), t);
+            let mut at = book.clone();
+            at.threshold = theta;
+            let want = at.regret(pred);
+            let got = sw.fitness(t);
+            if want.is_finite() || got.is_finite() {
+                assert!((want - got).abs() <= 1e-9 * want.abs().max(1.0), "cut {t}: book {want} sweep {got}");
+            }
+            let totals = at.block_totals(pred);
+            let flips: u64 = totals.iter().map(|x| x.flips).sum();
+            let exits: u64 = totals.iter().map(|x| x.exits).sum();
+            assert_eq!(sw.flips(t) as u64, flips, "flips of cut {t}");
+            assert_eq!(sw.exits(t) as u64, exits, "exits of cut {t}");
+            let net: f64 = totals.iter().map(|x| at.net_of(x)).sum();
+            assert!((net - sw.net(t)).abs() <= 1e-9 * net.abs().max(1.0), "net of cut {t}: {net} vs {}", sw.net(t));
+            assert_eq!(sw.entry_times(t), entry_count(&at, pred, time, theta), "entry timestamps of cut {t}");
+            checked += 1;
+        }
+        checked
+    }
+
+    #[test]
+    fn cut_sweep_equals_the_book_at_every_cut() {
+        let mut rng = Mix(1094);
+        let mut cuts = 0;
+        let mut ties = 0;
+        for blocks in [1usize, 2, 4] {
+            let (slice, z) = panel(&mut rng, 3, 667);
+            let b = book(&slice, blocks);
+            let pred: Vec<f64> = z.iter().map(|zk| zk + 0.5 * rng.gauss()).collect();
+            cuts += check(&b, &pred, &slice.rows.time);
+            let rounded: Vec<f64> = pred.iter().map(|p| (p * 4.0).round() / 4.0).collect();
+            assert!(rounded.iter().any(|p| *p == 0.0 && p.is_sign_negative()), "the rounded panel has -0.0");
+            assert!(rounded.iter().any(|p| *p == 0.0 && p.is_sign_positive()), "the rounded panel has +0.0");
+            let valid = check(&b, &rounded, &slice.rows.time);
+            ties += rounded.len() + 1 - valid;
+            cuts += valid;
+        }
+        assert!(cuts > 6_000, "{cuts} cuts checked");
+        assert!(ties > 4_500, "{ties} cuts inside ties");
+    }
+
+    #[test]
+    fn cut_sweep_refuses_bad_input() {
+        let mut rng = Mix(7);
+        let (slice, z) = panel(&mut rng, 2, 50);
+        let b = book(&slice, 1);
+        let time = &slice.rows.time;
+        let mut bad = z.clone();
+        bad[3] = f64::NAN;
+        assert!(b.cut_sweep(&bad, time).unwrap_err().contains("not finite"));
+        assert!(b.cut_sweep(&z[1..], time).unwrap_err().contains("length"));
+        let spec = TradingSpec { cost_bps: 5.0, min_holding: 2, ..TradingSpec::default() };
+        let held = FitnessBook::with_blocks(&slice, &spec, 0.0, 1, 1.0).unwrap();
+        assert!(held.cut_sweep(&z, time).unwrap_err().contains("plain"));
+    }
+
+    fn hand_sweep(fitness: &[f64], entry_times: &[u32]) -> CutSweep {
+        let n = fitness.len() - 1;
+        CutSweep {
+            order: (0..n as u32).collect(),
+            fitness: fitness.to_vec(),
+            net: vec![0.0; n + 1],
+            flips: vec![0; n + 1],
+            exits: vec![0; n + 1],
+            entry_times: entry_times.to_vec(),
+        }
+    }
+
+    #[test]
+    fn best_cut_applies_the_floor_and_the_tie_rule() {
+        let floor = |e| CutFloor { min_entry_times: e };
+        // t = 0 and t = n are never chosen, however low their fitness.
+        let s = hand_sweep(&[0.1, 0.9, 0.5, 0.7, 0.6, 0.95, 0.2], &[99, 40, 5, 40, 40, 40, 0]);
+        assert_eq!(s.best(&floor(30), 1), Some(4));
+        assert_eq!(s.best(&floor(1), 1), Some(2));
+        assert_eq!(s.best(&floor(41), 1), None);
+        let tie = hand_sweep(&[1.0, 0.5, 0.8, 0.8, 0.5, 1.0], &[40; 6]);
+        assert_eq!(tie.best(&floor(30), 4), Some(4));
+        assert_eq!(tie.best(&floor(30), 2), Some(1));
+        let even = hand_sweep(&[1.0, 0.5, 0.8, 0.5, 0.9, 1.0], &[40; 6]);
+        assert_eq!(even.best(&floor(30), 2), Some(1));
+        let mut invalid = hand_sweep(&[1.0, 0.7, f64::INFINITY, 0.9, 1.0], &[40; 5]);
+        invalid.net[2] = f64::NAN;
+        assert_eq!(invalid.best(&floor(30), 2), Some(1));
+        let none = hand_sweep(&[0.0, f64::INFINITY, f64::INFINITY, 0.0], &[40; 4]);
+        assert_eq!(none.best(&floor(1), 1), None);
+    }
+
+    /// The return pays only when the market feature is below its 3 % quantile.
+    #[test]
+    fn fitted_cut_finds_a_planted_gate() {
+        let (groups, steps) = (4usize, 4000usize);
+        let mut rng = Mix(268);
+        let z: Vec<f64> = (0..steps).map(|_| rng.gauss()).collect();
+        let mut sorted = z.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let q03 = sorted[steps * 3 / 100];
+        let mu = 0.01;
+        let market: Vec<f64> = z.iter().map(|&zk| 0.003 * rng.gauss() + if zk < q03 { mu } else { 0.0 } - mu * 0.03).collect();
+        let (mut time, mut group, mut ret, mut pred) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for g in 0..groups {
+            for k in 0..steps {
+                time.push(k as f64 * 3600.0);
+                group.push(g as u64);
+                ret.push(market[k] + 0.002 * rng.gauss());
+                pred.push(-z[k]);
+            }
+        }
+        let slice = crate::data::TradingSlice { rows: TradingRows { time: time.clone(), group, funding: Vec::new() }, ret };
+        let spec = TradingSpec { cost_bps: 10.0, min_trades: 1, ..TradingSpec::default() };
+        let b = FitnessBook::with_blocks(&slice, &spec, 0.0, 4, 1.0).unwrap();
+        let sw = b.cut_sweep(&pred, &time).unwrap();
+        let n = pred.len();
+        let reference = sw.index_of(&pred, 0.0);
+        let t = sw.best(&CutFloor { min_entry_times: 30 }, reference).expect("a cut passes the floor");
+        let share = (n - t) as f64 / n as f64;
+        let reference_share = (n - reference) as f64 / n as f64;
+        assert!((0.02..=0.05).contains(&share), "fitted long share {share}");
+        assert!(reference_share > 0.4, "reference long share {reference_share}");
+        assert!(sw.fitness(t) < sw.fitness(reference));
+    }
+
+    /// Seconds of one sweep at the campaign training shape: 306 groups x 7,403
+    /// hours, 4 blocks. A measurement, run by hand on an idle core.
+    #[test]
+    #[ignore]
+    fn cut_sweep_cost_at_the_campaign_shape() {
+        let mut rng = Mix(11);
+        let (slice, z) = panel(&mut rng, 306, 7403);
+        let b = book(&slice, 4);
+        let pred: Vec<f64> = z.iter().map(|zk| -zk + 0.5 * rng.gauss()).collect();
+        let mut best = f64::INFINITY;
+        for _ in 0..3 {
+            let start = std::time::Instant::now();
+            let sw = b.cut_sweep(&pred, &slice.rows.time).unwrap();
+            best = best.min(start.elapsed().as_secs_f64());
+            assert_eq!(sw.rows(), 306 * 7403);
+        }
+        println!("cut_sweep: {} rows, 306 groups, 4 blocks: best of 3 {:.3} s", 306 * 7403, best);
+    }
+}
+
+#[cfg(test)]
+mod book_family_tests {
+    use super::*;
+
+    struct Mix(u64);
+
+    impl Mix {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn uni(&mut self) -> f64 {
+            ((self.next() >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+        }
+
+        fn gauss(&mut self) -> f64 {
+            let (u, v) = (self.uni(), self.uni());
+            (-2.0 * u.ln()).sqrt() * (2.0 * std::f64::consts::PI * v).cos()
+        }
+    }
+
+    /// 3 x 8,192 + 77 rows in five groups of unequal length on an hourly grid:
+    /// segments cross group and block seams.
+    const SIZES: [usize; 5] = [6_000, 5_000, 7_000, 3_653, 3_000];
+
+    fn slice(seed: u64, sizes: &[usize]) -> crate::data::TradingSlice {
+        let mut rng = Mix(seed);
+        let (mut time, mut group, mut ret) = (Vec::new(), Vec::new(), Vec::new());
+        for (g, &len) in sizes.iter().enumerate() {
+            for k in 0..len {
+                time.push(3600.0 * k as f64);
+                group.push(g as u64);
+                ret.push(0.004 * rng.gauss() + 0.0005);
+            }
+        }
+        crate::data::TradingSlice { rows: TradingRows { time, group, funding: Vec::new() }, ret }
+    }
+
+    fn spec(threshold: f64) -> TradingSpec {
+        TradingSpec { cost_bps: 5.0, min_trades: 1, threshold, ..TradingSpec::default() }
+    }
+
+    /// The observed book and `extra` copies with every group's returns rotated.
+    fn family_books(s: &crate::data::TradingSlice, blocks: usize, threshold: f64, extra: usize) -> Vec<FitnessBook> {
+        let mut out = vec![FitnessBook::with_blocks(s, &spec(threshold), 0.0, blocks, 1.0).unwrap()];
+        for k in 1..=extra as u64 {
+            let shifted = crate::enumerate::shifted_slice(s, 337 * k, 7_000).unwrap();
+            out.push(FitnessBook::with_blocks(&shifted, &spec(threshold), 0.0, blocks, 1.0).unwrap());
+        }
+        out
+    }
+
+    /// Kind 0: ties on a 1/64 grid with +0 and -0; kind 1: three distinct values
+    /// (+0 and -0 are one); kind 2: magnitudes near 1e308 among standard normals.
+    fn values(kind: usize, n: usize, rng: &mut Mix) -> Vec<f64> {
+        (0..n)
+            .map(|i| match kind {
+                0 if i % 97 == 0 => -0.0,
+                0 if i % 89 == 0 => 0.0,
+                0 => (rng.gauss() * 64.0).round() / 64.0,
+                1 => [-1.5, 0.0, -0.0, 2.25][i % 4],
+                _ if i % 3 == 0 => [1.7e308, -1.7e308, 1e300, -1e307][(i / 3) % 4],
+                _ => rng.gauss(),
+            })
+            .collect()
+    }
+
+    /// `count` cuts on alternating sides: with `overflow` first the constants
+    /// where `v - c` or `c - v` overflows, then 0, -0, a value of `v` (ties) and
+    /// values of `v` spread over its ranks.
+    fn cut_list(v: &[f64], count: usize, overflow: bool) -> Vec<(bool, f64)> {
+        let mut sorted = v.to_vec();
+        sorted.sort_by(|a, b| a.total_cmp(b));
+        let tie = sorted[sorted.len() / 3];
+        let special: Vec<f64> = if overflow { vec![-1.5e308, 1.5e308, 0.0, -0.0, tie] } else { vec![0.0, -0.0, tie] };
+        (0..count)
+            .map(|j| {
+                let c = if j < special.len() { special[j] } else { sorted[(j * 7_919 + 13) % sorted.len()] };
+                (j % 2 == 0, c)
+            })
+            .collect()
+    }
+
+    fn same(a: &FitnessTotals, b: &FitnessTotals) -> bool {
+        a.gross.to_bits() == b.gross.to_bits() && a.flips == b.flips && a.exits == b.exits && a.long_rows == b.long_rows && a.nonfinite == b.nonfinite
+    }
+
+    #[test]
+    fn book_family_cut_totals_equal_block_totals() {
+        let s = slice(1257, &SIZES);
+        let n = s.ret.len();
+        assert_eq!(n, 3 * FITNESS_SEGMENT_ROWS + 77);
+        let mut rng = Mix(5);
+        let vectors: Vec<Vec<f64>> = (0..3).map(|k| values(k, n, &mut rng)).collect();
+        let (mut scratch, mut out) = (CutScratch::default(), Vec::new());
+        let (mut checked, mut nonfinite, mut long) = (0usize, 0usize, 0usize);
+        let mut mismatches: Vec<String> = Vec::new();
+        for blocks in [1usize, 4, 8, 64] {
+            for threshold in [0.0, 1e-30, 1.0] {
+                let books = family_books(&s, blocks, threshold, 19);
+                let refs: Vec<&FitnessBook> = books.iter().collect();
+                for (kind, v) in vectors.iter().enumerate() {
+                    for (count, overflow) in [(2usize, false), (2, true), (16, false), (16, true), (64, false), (64, true)] {
+                        let cuts = cut_list(v, count, overflow);
+                        let mut want: Vec<Vec<FitnessTotals>> = Vec::new();
+                        for book in &refs {
+                            for &(above, c) in &cuts {
+                                let pred: Vec<f64> = v.iter().map(|&x| if above { x - c } else { c - x }).collect();
+                                want.push(book.block_totals(&pred));
+                            }
+                        }
+                        // Families of 1, 3 and 20 books; the detected kernels and the portable ones.
+                        for size in [1usize, 3, 20] {
+                            let family = BookFamily::new(refs[..size].to_vec()).unwrap();
+                            for portable in [false, true] {
+                                if portable {
+                                    family_totals(&family, v, &cuts, &mut scratch, &mut out, false);
+                                } else {
+                                    family.cut_totals(v, &cuts, &mut scratch, &mut out);
+                                }
+                                assert_eq!(out.len(), size * count * blocks);
+                                for b in 0..size {
+                                    for j in 0..count {
+                                        for k in 0..blocks {
+                                            let (got, exp) = (&out[(b * count + j) * blocks + k], &want[b * count + j][k]);
+                                            checked += 1;
+                                            nonfinite += exp.nonfinite as usize;
+                                            long += (exp.long_rows > 0) as usize;
+                                            if !same(got, exp) {
+                                                mismatches.push(format!(
+                                                    "blocks {blocks}, threshold {threshold}, values {kind}, {count} cuts (overflow {overflow}), family {size}, portable {portable}, book {b}, cut {j}, block {k}: {got:?} vs {exp:?}"
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(nonfinite > 0 && long > 0 && checked > nonfinite, "{checked} totals, {nonfinite} non-finite, {long} with long rows");
+        assert!(mismatches.is_empty(), "{} of {checked} totals differ:\n{}", mismatches.len(), mismatches[..mismatches.len().min(8)].join("\n"));
+    }
+
+    #[test]
+    fn book_family_cut_totals_beyond_64_cuts_equal_block_totals() {
+        let s = slice(1308, &[3_000, 2_500, 3_200]);
+        let n = s.ret.len();
+        let mut rng = Mix(11);
+        let v = values(0, n, &mut rng);
+        let (mut scratch, mut out) = (CutScratch::default(), Vec::new());
+        for blocks in [1usize, 4] {
+            let books = family_books(&s, blocks, 0.0, 2);
+            let refs: Vec<&FitnessBook> = books.iter().collect();
+            let family = BookFamily::new(refs.clone()).unwrap();
+            for count in [65usize, 124] {
+                let cuts = cut_list(&v, count, false);
+                family.cut_totals(&v, &cuts, &mut scratch, &mut out);
+                assert_eq!(out.len(), refs.len() * count * blocks);
+                for (b, book) in refs.iter().enumerate() {
+                    for (j, &(above, c)) in cuts.iter().enumerate() {
+                        let pred: Vec<f64> = v.iter().map(|&x| if above { x - c } else { c - x }).collect();
+                        let want = book.block_totals(&pred);
+                        for k in 0..blocks {
+                            let got = &out[(b * count + j) * blocks + k];
+                            assert!(same(got, &want[k]), "blocks {blocks}, {count} cuts, book {b}, cut {j}, block {k}: {got:?} vs {:?}", want[k]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct Same;
+
+    impl PositionLayer for Same {
+        fn positions(&self, pred: &[f64]) -> Vec<f64> {
+            pred.to_vec()
+        }
+
+        fn identity(&self) -> String {
+            "same".to_string()
+        }
+    }
+
+    #[test]
+    fn book_family_refuses_other_rows() {
+        let s = slice(7, &SIZES);
+        let book = |s: &crate::data::TradingSlice, spec: &TradingSpec| FitnessBook::with_blocks(s, spec, 0.0, 4, 1.0).unwrap();
+        let base = book(&s, &spec(0.0));
+        assert!(BookFamily::new(Vec::new()).unwrap_err().contains("at least one book"));
+        let refuse = |other: &FitnessBook, needle: &str| {
+            let e = BookFamily::new(vec![&base, other]).unwrap_err();
+            assert!(e.contains(needle), "{needle}: {e}");
+        };
+        refuse(&book(&s, &TradingSpec { band: BandSpec::score(0.1), ..spec(0.0) }), "a band book");
+        refuse(&book(&s, &TradingSpec { min_holding: 3, ..spec(0.0) }), "a minimum-hold book");
+        let on: Vec<bool> = (0..s.ret.len()).map(|i| i % 50 != 0).collect();
+        let masked = FitnessBook::with_segments(&s, &spec(0.0), 0.0, 4, 1.0, &[], Some(BookMask { on: &on, identity: "x1 > 0" })).unwrap();
+        refuse(&masked, "a masked book");
+        refuse(&book(&s, &spec(0.0)).with_layer(std::sync::Arc::new(Same)).unwrap(), "a position layer");
+        refuse(&book(&slice(7, &[6_000, 5_000, 7_000, 3_653, 2_999]), &spec(0.0)), "rows");
+        refuse(&book(&slice(7, &[6_000, 5_000, 7_000, 3_000, 3_653]), &spec(0.0)), "seam flags");
+        let mut ids = base.clone();
+        let i = ids.block_id.iter().position(|&b| b == 1).unwrap();
+        ids.block_id[i] = 2;
+        refuse(&ids, "block ids");
+        refuse(&book(&s, &spec(1e-30)), "threshold");
+        // The observed book with shifted copies of it is one family.
+        let books = family_books(&s, 4, 0.0, 3);
+        assert_eq!(BookFamily::new(books.iter().collect()).unwrap().books().len(), 4);
+    }
+}
+
+#[cfg(test)]
+mod cash_mode_tests {
+    use super::*;
+    use crate::data::TradingSlice;
+
+    fn slice() -> TradingSlice {
+        let mut rows = TradingRows::default();
+        let mut ret = Vec::new();
+        for g in 0..3u64 {
+            for i in 0..80 {
+                rows.group.push(g);
+                rows.time.push(900.0 * i as f64);
+                let x = (g * 80 + i) as f64 * 0.618_033_988_749_894_9;
+                ret.push(0.004 * (x - x.floor() - 0.4));
+            }
+        }
+        TradingSlice { rows, ret }
+    }
+
+    fn spec(mode: CashMode) -> TradingSpec {
+        TradingSpec { cost_bps: 5.0, min_trades: 0, cash_mode: mode, ..Default::default() }
+    }
+
+    #[test]
+    fn train_mean_subtracts_the_mean_of_the_slice() {
+        let s = slice();
+        let m = s.ret.iter().sum::<f64>() / s.ret.len() as f64;
+        let book = FitnessBook::new(&s, &spec(CashMode::TrainMean), 900.0).unwrap();
+        assert_eq!(book.cash_return().to_bits(), m.to_bits());
+        for i in 0..s.ret.len() {
+            assert_eq!(book.excess()[i].to_bits(), (s.ret[i] - m).to_bits());
+        }
+        let same = FitnessBook::new(&s, &TradingSpec { cash_return: m, ..spec(CashMode::Constant) }, 900.0).unwrap();
+        assert_eq!(same.excess(), book.excess());
+        assert_ne!(same.hash(), book.hash());
+        let zero = FitnessBook::new(&s, &spec(CashMode::Constant), 900.0).unwrap();
+        assert_eq!(zero.cash_return(), 0.0);
+    }
+
+    #[test]
+    fn train_mean_under_a_mask_is_the_mean_of_the_rows_the_book_trades() {
+        let s = slice();
+        let on: Vec<bool> = (0..s.ret.len()).map(|i| i % 3 != 0).collect();
+        let (sum, n) = (0..s.ret.len()).filter(|&i| on[i]).fold((0.0, 0usize), |(a, c), i| (a + s.ret[i], c + 1));
+        let m = sum / n as f64;
+        let book = FitnessBook::with_segments(&s, &spec(CashMode::TrainMean), 900.0, 1, 1.0, &[], Some(BookMask { on: &on, identity: "g" })).unwrap();
+        assert_eq!(book.cash_return().to_bits(), m.to_bits());
+        for i in 0..s.ret.len() {
+            let want = if on[i] { s.ret[i] - m } else { 0.0 };
+            assert_eq!(book.excess()[i].to_bits(), want.to_bits(), "row {i}");
+        }
+    }
+
+    #[test]
+    fn xs_mean_refuses_train_mean() {
+        let bad = TradingSpec { pnl_excess: PnlExcess::XsMean, ..spec(CashMode::TrainMean) };
+        assert!(bad.validate().unwrap_err().contains("--pnl-excess xs-mean needs --cash-return 0"));
+        assert!(TradingSpec { pnl_excess: PnlExcess::XsMean, ..spec(CashMode::Constant) }.validate().is_ok());
     }
 }

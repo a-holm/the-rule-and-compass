@@ -132,6 +132,38 @@ fn folds_keep_fit_validation_and_test_apart() {
     }
 }
 
+/// #1291: the ladder prices the rows of the search's books. A row with a finite return and no
+/// finite `--target` leaves every fold, unless the SR run priced `--book-target`, the label is an
+/// `xs_rank` (a top-tercile book in the search) or no target spec names a fit label.
+#[test]
+fn folds_take_only_rows_with_a_fit_label() {
+    use rcsr::walkforward::LabelledRows;
+    let f = fixture(1);
+    let mut panel = f.panel.clone();
+    for i in (0..panel.len()).step_by(3) {
+        panel.y[i] = f64::NAN;
+    }
+    let inp = |target: &str| ladder::Input { data: String::new(), target: target.to_string(), ret: None, time: "t".to_string(), group: None, features: Vec::new() };
+    let o = Options { cost: Some(target::CostDecl::new(Some(&f.spec), 5.0, target::CostSource::Flag)), ..options(&f) };
+    let rule = ladder::labelled_rows(&inp("y"), &o);
+    assert_eq!(rule, LabelledRows::FitLabel("y".to_string()));
+    let no_spec = Options { spec: None, cost: None, ..options(&f) };
+    assert_eq!(ladder::labelled_rows(&ladder::Input { ret: Some("ret".to_string()), ..inp("y") }, &no_spec), LabelledRows::Return, "no target spec, no fit label apart from the return");
+    let xs = Options { spec: Some(target::TargetSpec { kind: target::KIND_XS_RANK.to_string(), ..f.spec.clone() }), ..o.clone() };
+    assert_eq!(ladder::labelled_rows(&inp("y"), &xs), LabelledRows::Return, "an xs_rank label is priced as the top-tercile book");
+    let test_rows = |p: &Panel| -> Vec<usize> { ladder::make_folds(p, &f.rows, 2.0 * STEP, &[], 0.0).unwrap().iter().flat_map(|k| k.fit.iter().chain(&k.valid).chain(&k.test).copied().collect::<Vec<_>>()).collect() };
+    let mut kept = panel.clone();
+    ladder::keep_labelled_rows(&mut kept, &rule);
+    let rows = test_rows(&kept);
+    assert!(rows.iter().all(|&i| kept.y[i].is_finite()));
+    let all = test_rows(&panel);
+    assert_eq!(all.len(), test_rows(&f.panel).len(), "the return rule keeps every finite return");
+    assert_eq!(rows.len(), all.iter().filter(|&&i| panel.y[i].is_finite()).count());
+    let mut book = panel.clone();
+    ladder::keep_labelled_rows(&mut book, &LabelledRows::BookTarget("yd".to_string()));
+    assert_eq!(test_rows(&book), all, "a --book-target run keeps every finite return");
+}
+
 #[test]
 fn controls_are_in_every_table_with_exposure_and_beta() {
     let f = fixture(2);
@@ -793,4 +825,265 @@ fn a_trend_rung_with_the_top_mean_is_the_best_long_flat_rule() {
     for name in ["trend_ma", "trend_donchian"] {
         assert_eq!(off.row(name).unwrap().status, "not_run");
     }
+}
+
+// ---------------------------------------------------------------------------
+// #1129: the ladder uses the walk-forward period rule and refuses a width the
+// labelled rows contradict.
+// ---------------------------------------------------------------------------
+
+const DAY: f64 = 86_400.0;
+
+fn width_spec_text(horizon: u64, stride: Option<u64>) -> String {
+    let stride = stride.map_or(String::new(), |s| format!(",\"stride_seconds\":{s}"));
+    format!(
+        "{{\"schema\":\"rcsr-target-spec/1\",\"targets\":[{{\"column\":\"y\",\"name\":\"label\",\
+\"kind\":\"forward_return\",\"deprecated\":false,\"return_column\":\"ret\",\"return_units\":\"simple\",\
+\"horizon_seconds\":{horizon},\"entry_offset_seconds\":0,\"delay_seconds\":0,\"entry_price\":\"open\",\"exit_price\":\"close\",\
+\"offset\":0.0,\"scale\":{{\"kind\":\"constant\",\"value\":1.0}},\"clip\":null,\"units\":\"simple_return\",\
+\"cost_bps\":null,\"cost_in_label\":false,\"construction_columns\":[],\"note\":null{stride}}}]}}"
+    )
+}
+
+fn width_spec(horizon: u64, stride: Option<u64>) -> target::TargetSpec {
+    target::parse_file(&width_spec_text(horizon, stride)).unwrap().remove(0)
+}
+
+/// `groups` groups with one labelled row every `step` seconds, group `g` at phase `phases[g]`.
+fn sparse_panel(step: f64, phases: &[f64], n: usize) -> Panel {
+    let mut rng = Mt::new(1129);
+    let (mut time, mut group, mut signal, mut vol, mut ret) = (vec![], vec![], vec![], vec![], vec![]);
+    for (g, phase) in phases.iter().enumerate() {
+        for t in 0..n {
+            let s = gauss(&mut rng);
+            time.push(T0 + phase + t as f64 * step);
+            group.push(g as u64);
+            signal.push(s);
+            vol.push(0.004 + 0.002 * rng.next_f64());
+            ret.push(0.01 * s + 0.01 * gauss(&mut rng));
+        }
+    }
+    let label = ret.clone();
+    Panel::new(vec!["signal".into(), "vol".into()], vec![signal, vol], time, group, label, ret, vec![]).unwrap()
+}
+
+fn sparse_windows(step: f64, n: usize) -> Vec<WindowRow> {
+    let test_start = T0 + (n * 2 / 3) as f64 * step;
+    let train_end = test_start - 3600.0;
+    vec![WindowRow {
+        scheme: "expanding".to_string(),
+        window: Window { label: "f0".to_string(), train_start: T0, train_end, test_start, test_end: T0 + n as f64 * step + DAY },
+        validation_start: train_end - (n / 6) as f64 * step,
+    }]
+}
+
+fn sparse_run(panel: &Panel, step: f64, n: usize, spec: target::TargetSpec) -> Result<Report, String> {
+    let folds = ladder::make_folds(panel, &sparse_windows(step, n), 3600.0, &[], 0.0).unwrap();
+    let o = Options {
+        horizon_seconds: spec.horizon_seconds,
+        spec: Some(spec),
+        vol_col: Some("vol".into()),
+        signal_col: Some("signal".into()),
+        draws: 100,
+        gbm_trees: 20,
+        purge_seconds: 3600.0,
+        ..Options::default()
+    };
+    ladder::run_ladder(panel, &folds, &o)
+}
+
+fn assert_annualization(r: &Report, source: &str, period_seconds: f64) {
+    let json = r.json();
+    let want = format!("\"annualization\":{{\"source\":\"{source}\",\"period_seconds\":{period_seconds}}}");
+    assert!(json.contains(&want), "{want} missing");
+}
+
+#[test]
+fn ladder_period_staggered_daily() {
+    let n = 120;
+    let panel = sparse_panel(DAY, &[0.0, 8.0 * 3600.0, 16.0 * 3600.0], n);
+    let r = sparse_run(&panel, DAY, n, width_spec(86_400, None)).unwrap();
+    assert_eq!(r.periods_per_year, 365.0);
+    assert_annualization(&r, "target_spec", 86_400.0);
+    let test_days = n - n * 2 / 3;
+    assert_eq!(r.periods, test_days, "one period per day, not one per stamp");
+    assert_eq!(r.min_group_step, Some(DAY));
+}
+
+#[test]
+fn ladder_period_stride_above_horizon() {
+    let n = 120;
+    let panel = sparse_panel(DAY, &[0.0, 0.0, 0.0], n);
+    let r = sparse_run(&panel, DAY, n, width_spec(3600, Some(86_400))).unwrap();
+    assert_eq!(r.periods_per_year, 365.0);
+    assert_annualization(&r, "target_spec", 86_400.0);
+}
+
+fn rung_fields(r: &Report) -> Vec<String> {
+    r.rows
+        .iter()
+        .map(|w| {
+            format!(
+                "{} {} {:?} {:?} {:?} {:?} {:?} {:?} {:?}",
+                w.name, w.status, w.net_by_cost.iter().map(|(a, b)| (a.to_bits(), b.to_bits())).collect::<Vec<_>>(),
+                w.mean_period_net.to_bits(), w.mean_ci.0.to_bits(), w.mean_ci.1.to_bits(), w.sharpe.to_bits(),
+                w.series.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), w.rank_ic.to_bits()
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn ladder_period_h1_unchanged() {
+    let n = 300;
+    let panel = sparse_panel(3600.0, &[0.0, 0.0, 0.0], n);
+    let declared = sparse_run(&panel, 3600.0, n, width_spec(3600, None)).unwrap();
+    // No spec and no horizon: the median step of the labelled test times.
+    let folds = ladder::make_folds(&panel, &sparse_windows(3600.0, n), 3600.0, &[], 0.0).unwrap();
+    let inferred_opts = Options {
+        vol_col: Some("vol".into()),
+        signal_col: Some("signal".into()),
+        draws: 100,
+        gbm_trees: 20,
+        purge_seconds: 3600.0,
+        ..Options::default()
+    };
+    let inferred = ladder::run_ladder(&panel, &folds, &inferred_opts).unwrap();
+    assert_eq!(declared.periods_per_year, 8760.0);
+    assert_eq!(declared.periods_per_year.to_bits(), inferred.periods_per_year.to_bits());
+    assert_eq!(declared.periods, inferred.periods);
+    assert_eq!(declared.block_len, inferred.block_len);
+    assert_annualization(&declared, "target_spec", 3600.0);
+    assert_annualization(&inferred, "inferred_labelled_rows", 3600.0);
+    let (fa, fb) = (rung_fields(&declared), rung_fields(&inferred));
+    let mut compared = 0;
+    for (i, (x, y)) in declared.rows.iter().zip(&inferred.rows).enumerate() {
+        assert_eq!(x.name, y.name);
+        if x.status == "ok" && y.status == "ok" {
+            assert_eq!(fa[i], fb[i], "{}", x.name);
+            compared += 1;
+        }
+    }
+    assert!(compared >= 6, "{compared} rungs compared");
+}
+
+fn sparse_cli(dir: &std::path::Path, step: f64, spec_stride: Option<u64>, horizon: u64) -> std::process::Output {
+    let n = 120;
+    let panel = sparse_panel(step, &[0.0, 0.0, 0.0], n);
+    let mut csv = String::from("ts,sym,signal,vol,y,ret\n");
+    for i in 0..panel.len() {
+        csv.push_str(&format!(
+            "{},s{},{},{},{},{}\n",
+            panel.time[i] as i64,
+            panel.group[i],
+            panel.col("signal").unwrap()[i],
+            panel.col("vol").unwrap()[i],
+            panel.y[i],
+            panel.ret[i]
+        ));
+    }
+    let data = dir.join("sparse.csv");
+    std::fs::write(&data, csv).unwrap();
+    let mut win = String::from("scheme,label,train_start,train_end,validation_start,test_start,test_end\n");
+    for w in &sparse_windows(step, n) {
+        win.push_str(&format!(
+            "expanding,{},{},{},{},{},{}\n",
+            w.window.label,
+            protocol::iso(w.window.train_start),
+            protocol::iso(w.window.train_end),
+            protocol::iso(w.validation_start),
+            protocol::iso(w.window.test_start),
+            protocol::iso(w.window.test_end)
+        ));
+    }
+    let windows = dir.join("windows.csv");
+    std::fs::write(&windows, win).unwrap();
+
+    let spec_path = dir.join("spec.json");
+    std::fs::write(&spec_path, width_spec_text(horizon, spec_stride)).unwrap();
+    rcsr_cmd::rcsr()
+        .args([
+            "ladder", "--data", data.to_str().unwrap(), "--target", "y", "--return-col", "ret", "--time", "ts",
+            "--group", "sym", "--features", "signal,vol", "--windows", windows.to_str().unwrap(),
+            "--purge-seconds", "3600", "--target-spec", spec_path.to_str().unwrap(), "--draws", "50", "--gbm-trees", "10",
+            "--vol-col", "vol", "--signal-col", "signal",
+        ])
+        .output()
+        .expect("run rcsr ladder")
+}
+
+#[test]
+fn ladder_stride_unknown_above_horizon() {
+    let (_scratch, dir) = scratch("ladder-stride-unknown");
+    let out = sparse_cli(&dir, DAY, None, 3600);
+    assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.starts_with("error: missing stride_seconds") && err.contains("86400"), "{err}");
+    let ok = sparse_cli(&dir, DAY, Some(86_400), 3600);
+    assert_eq!(ok.status.code(), Some(0), "{}", String::from_utf8_lossy(&ok.stderr));
+}
+
+#[test]
+fn ladder_stride_wider_than_step_refused() {
+    let (_scratch, dir) = scratch("ladder-stride-wider");
+    let out = sparse_cli(&dir, 3600.0, Some(86_400), 3600);
+    assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.starts_with("error: stride_seconds 86400") && err.contains("3600"), "{err}");
+}
+
+#[path = "common/masked_run.rs"]
+mod masked_run;
+
+/// #1216: `--sr-run` of a run that priced `--pnl-mask` is refused, because the rung prices the raw formula.
+#[test]
+fn ladder_refuses_a_masked_run() {
+    const START: f64 = 1_600_000_000.0;
+    let (_scratch, dir) = scratch("masked-run");
+    let mut csv = String::from("t,f1,f2,r,y\n");
+    for i in 0..600 {
+        let f = i as f64;
+        let f1 = (f * 0.618_033_988_749_894_9).fract() - 0.5;
+        let f2 = (f * 0.754_877_666_246_692_7).fract() - 0.5;
+        let r = 0.01 * f1 + 0.0005 * ((f * 0.324_717_957_244_746).fract() - 0.5);
+        csv.push_str(&format!("{},{},{},{},{}\n", START as i64 + 900 * i, f1, f2, r, r));
+    }
+    let data = dir.join("d.csv");
+    std::fs::write(&data, csv).unwrap();
+    let iso = |i: i64| protocol::iso(START + 900.0 * i as f64);
+    let windows = dir.join("w.csv");
+    std::fs::write(
+        &windows,
+        format!(
+            "scheme,label,train_start,train_end,validation_start,test_start,test_end\nexpanding,late,{},{},{},{},{}\n",
+            iso(0),
+            iso(250),
+            iso(200),
+            iso(400),
+            iso(600)
+        ),
+    )
+    .unwrap();
+    let go = |masked: bool, out: &str| {
+        let run = dir.join(if masked { "masked.run.json" } else { "plain.run.json" });
+        std::fs::write(&run, masked_run::run_json(masked, START, START + 300.0 * 900.0)).unwrap();
+        rcsr_cmd::rcsr()
+            .args([
+                "ladder", "--data", data.to_str().unwrap(), "--target", "y", "--return-col", "r", "--time", "t",
+                "--features", "f1,f2", "--windows", windows.to_str().unwrap(), "--purge-seconds", "1800", "--draws", "50",
+                "--gbm-trees", "10", "--sr-run", run.to_str().unwrap(), "--out", out,
+            ])
+            .output()
+            .expect("run rcsr ladder")
+    };
+    let out = dir.join("masked.ladder.json");
+    let refused = go(true, out.to_str().unwrap());
+    let err = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(refused.status.code(), Some(2), "{err}");
+    assert!(err.contains("pnl_mask"), "{err}");
+    assert!(!out.exists(), "a refused run writes no report");
+    let plain = dir.join("plain.ladder.json");
+    let ok = go(false, plain.to_str().unwrap());
+    assert_eq!(ok.status.code(), Some(0), "{}", String::from_utf8_lossy(&ok.stderr));
+    assert!(std::fs::read_to_string(&plain).unwrap().contains("\"sr_run\""));
 }

@@ -101,7 +101,7 @@ Any candidate producing a non-finite prediction is treated as a hard failure.
   non-dominated, so each member is the best shape found at some complexity, and
   this lets a building block found on another island or generations earlier
   re-enter the population. `--no-front-parents` disables the feedback.
-- **Distinct books** (`--fitness pnl`). The P&L fitness reads only the 0/1 position vector, so many trees share one book and one error. Every scored candidate carries a book signature (per time block: the gross bits, flips and exits; and the long rows), and the development log and run.json `search.books` count the distinct books per island and over all islands. With `--same-book-guard` the island tournament draws its four entrants from one representative per book (its simplest holder) instead of from the members, so a book held by several trees is not selected several times. The Pareto front needs no such rule: one book has one error, and the dominance test keeps only its simplest holder.
+- **Distinct books** (`--fitness pnl`). The P&L fitness reads only the 0/1 position vector, so many trees share one book and one error. Every scored candidate carries a book signature taken from the totals its regret is computed from (per `--pnl-blocks` time block: the gross bits, flips and exits; and the long rows; a row outside the `--pnl-mask` gate is flat there, as in the regret), and the development log and run.json `search.books` count the distinct books per island and over all islands. With `--same-book-guard` (lexicographic selection) the island tournament draws its four entrants from one representative per book (its simplest holder) instead of from the members, so a book held by several trees is not selected several times. The Pareto front needs no such rule: one book has one error, and the dominance test keeps only its simplest holder.
 - **Constant models.** A tree with no input outside an aggregate or meta operator (`exp(1.3)`, `mean(x1) + 0.2`) predicts one value for every row, so after its constant fit it equals the training-mean model. With `--reject-constant-offspring` such a child is dropped after simplification and before de-duplication and the fit, and counted in `variation.constant_rejected`. The first constant tree of an island is kept, so the front keeps its complexity-1 baseline. Random fill, QD immigrant and restart trees are drawn again (up to 8 times) when they are constant and the island already holds one. Seeds and migrants are not filtered. The flag is off by default.
 - **Survivor selection** is generational by default: the island is replaced by
   its offspring and only the best individual is carried over. With
@@ -111,6 +111,11 @@ Any candidate producing a non-finite prediction is treated as a hard failure.
   approximations, and individuals that are no better than the mean model are
   dropped by their rank. Parents are then drawn by Pareto rank and crowding
   distance.
+- **Lexicase parent selection** (`--selection lexicase`, #1023) keeps the generational replacement and the elite but replaces the island tournament by semi-dynamic epsilon-lexicase (La Cava, Spector and Danai, GECCO 2016; La Cava, Helmuth, Spector and Moore, Evolutionary Computation 27(3), 2019, Algorithm 3). The aggregate error ranks a formula that is best on half of the data below the aggregate winner; lexicase rewards a formula that is best somewhere. Each generation draws `K = --lexicase-cases` cases (default 256) from the seed and the generation alone (down-sampled lexicase, Hernandez, Lalejini, Dolson and Ofria, GECCO 2019 companion):
+  - under the metric fitness a case is one row of the generation's sample and its error is the metric's row loss (`(p - y)^2` for squared and the information criteria, `|p - y|` for absolute, `ln(1 + (p - y)^2)` for log_squashed, the classification row loss for log_loss, brier and the hinge forms). A row value depends on its own row only, so these are the bits the fitness pass computed. A metric without a per-row loss, a weighted sample, several targets or an implicit model exit 2;
+  - under `--fitness pnl` a case is one `(group, time block)` sub-book of the long/flat book (`--pnl-blocks`) with a positive hindsight bound, and its error is the sub-book regret `(B_c - net_c) / B_c` from the prediction vector that scored the candidate. When there are more sub-books than `K`, `K` are drawn per generation. A sub-book has no trade floor: a flat one scores exactly 1.
+
+  For each case, epsilon is the median absolute deviation of the island's finite errors on it. One selection visits the cases in a random order (the island generator) and keeps every survivor within epsilon of the best survivor on that case; it stops at one survivor. The survivors after the last case are narrowed to the lowest complexity and one is drawn uniformly. The 15 % front draw stays in front of it. A selection costs at most `pool x K` comparisons; `pop x K` above 2^24 exits 2, and so do sub-book vectors above 2^28 values (islands x pop x sub-books). Lexicase runs on the CPU node path: `--gpu` (device cases: #1169 for the metric fitness, #1031 for the P&L fitness) and `--variation postfix` exit 2, and a CUDA build without `--gpu` notes the reason and stays on the CPU. Nothing new enters the checkpoint except `lexicase_cases` off its default: the cases are a function of the seed and the generation, and a resumed member's sub-book errors are recomputed from its saved tree. Every generation line of the development log carries `"selection":{"mode":"lexicase","cases":N}`.
 - **Variation** has two parts:
   - *mutation* — the edit kind is drawn first (25 % point change, 35 %
     constant/input perturb, 40 % subtree grow/shrink) and the site is chosen
@@ -123,16 +128,23 @@ Any candidate producing a non-finite prediction is treated as a hard failure.
     0.20, terminal 0.30, subtree 0.20, insert 0.10, delete 0.10, swap 0.05,
     rotate 0.05. `--adaptive-mix` lets each island reweight the seven kinds
     from the success rate (a child beats its first parent) over the last 10
-    generations, `w = max(0.02, (s + 1) / (a + 2))`, normalised; it learns
-    from CPU-scored generations only;
+    generations, `w = max(0.02, (s + 1) / (a + 2))`, normalised. It learns on both backends: the CPU path counts a child as
+    soon as it is scored; with device scoring the counts are taken at the
+    generation barrier, after every offspring has its score, by the same win
+    rule. Only a screening subset (`--fit-samples`) keeps the base weights;
   - *crossover* — swap subtrees between two parents; `--crossover-internal P`
     picks an internal node as the cut point with probability `P`;
 - **Constant fitting** tunes the numeric constants of a candidate by local
   search. Without it, `y = a·sin(b·x) + c` would almost never be found, because
   random constants rarely land near the right values.
-- **Migration** periodically copies an island's best member into a neighbouring
-  island; **stagnant islands are restarted** to avoid getting stuck. Every
-  restart interval (60 generations) the default rule (`--restart-policy archive`)
+  By default every fit is kept. `--fit-accept fitness` (#1078) keeps the fitted
+  constants only when the search fitness is not worse than with the constants
+  before the fit; under `--fitness pnl` this protects a profitable sign boundary
+  from the squared-error fit.
+- **Migration** copies an island's best member into a neighbouring
+  island every migration interval (`--migration-interval`, default 25
+  generations; 0 turns migration off; no effect with one island); **stagnant islands are restarted** to avoid getting stuck. Every
+  restart interval (`--restart-interval`, default 60 generations) the default rule (`--restart-policy archive`)
   restarts an island after two checks in which its best error is worse than the
   archive best. Once migration has copied the archive best into every island,
   no island is behind it and that rule never fires. `--restart-policy island`
@@ -140,9 +152,70 @@ Any candidate producing a non-finite prediction is treated as a hard failure.
   error has not improved for one restart interval, except the keeper (the lowest
   island whose best equals the archive best, so the best expression is never
   discarded). A restarted island is isolated for `--restart-isolation`
-  generations (default 25): it draws no parent from the global front and takes
-  no migrant, so its new random material is not pulled back at once to the
-  region the other islands share. With one island nothing restarts.
+  generations (default 25): it draws no parent from the global front, no
+  `--qd-policy` parent (#1067) and takes no migrant, so its new random material
+  is not pulled back at once to the region the other islands share; it breeds
+  from its own members only. With one island nothing restarts. One island-policy
+  module decides migration, restarts and parent sources for the owned-tree loop
+  and the flat postfix loop alike (#1081).
+- **Explore tier** (`--explore-islands K`, #1100, default 0). Without it a run
+  behaves as one trial: the global front and the ring spread a new best to
+  every island within a few migration intervals, and the restart rules above
+  are fixed cutoffs. With it the highest `K` islands are explore islands. Each
+  is isolated for its whole life (no front parent, no `--qd-policy` parent, no
+  migrant in or out) and restarts at the end of each lifetime of the Luby
+  universal sequence 1, 1, 2, 1, 1, 2, 4, ... in units of the restart interval
+  (`--restart-interval`, default 60 generations; 0 turns every restart off,
+  explore restarts included). One sequence is spread over the explore islands: each next
+  lifetime goes to the island whose lifetimes add up to the least, ties to the
+  lowest island (the list schedule of Cire, Kadioglu and Sellmann 2014). Luby,
+  Sinclair and Zuckerman (1993) show that this sequence reaches a target within
+  a logarithmic factor of the best fixed cutoff without knowing the run-time
+  distribution, provided the trials are independent. The restart generations
+  depend on the generation alone, so a checkpoint needs no extra record. The
+  other islands form the exploit tier: they keep `--restart-policy` and a
+  directed ring among themselves, and they see explore results only through the
+  archive and its front parents. QD niche immigrants and AFP immigrants still
+  arrive on an explore island; they are fresh random trees. On the flat postfix
+  path a child that duplicates a program on any island is redrawn, which is the
+  one remaining link between an explore island and the others.
+- **Migrant choice** (`--migration-policy ring|ring-tournament`, #1029, default
+  `ring`). Under `ring` every migration copies the best member of the source
+  island, so the global best reaches every island within a few migration
+  intervals. Under `ring-tournament` the migrant is the winner of a tournament
+  of 8 draws over the source island (a finite error beats a non-finite one).
+  The destination island's own generator makes the draws (a positional Philox
+  stream on the flat postfix path), so the source island's stream is untouched.
+  A source with no finite member sends nothing, and a destination that already
+  holds a member with the migrant's error bits skips the migration: under
+  `--fitness pnl` equal error means the same book. The victim, isolation and
+  explore rules are unchanged. The development log counts `migrants` and
+  `migrants_skipped` per generation.
+- **Front scope** (`--front-scope global|island`, #1070, default `global`).
+  With `global` every island draws its 15 % front parents from the one Pareto
+  front of all islands, a channel far stronger than the ring: a new best
+  reaches every island within about one generation. With `island` each island
+  keeps its own error/complexity front of the members it scored, with the
+  archive's insert rule, cap and fixed-position filter. Fronts travel only with
+  the migrants: at a migration the destination island's front becomes the
+  canonical front of its own and the source's members (`canonical_front`
+  depends on the member set only, so this merge is associative, commutative
+  and idempotent). An island that receives no migrant keeps its front, and a
+  restart empties the restarted island's front. The global archive still takes
+  every member of every island each generation, so the report, patience and
+  the restart rules read it unchanged. `--qd-policy` is refused with `island`:
+  its QD archive is one parent pool for every island.
+- **QD descriptor** (`--qd-descriptor moments|book`, #1084, default
+  `moments`). The quality-diversity archive (`--qd`, `--qd-policy`, #120) keys
+  its cells by two behaviour axes. `moments` reads variable usage and
+  prediction skewness. Under `--fitness pnl` those axes do not separate the
+  books the fitness separates, so `book` reads the long/flat book of the
+  fitness from the reduction that gives the regret: the log exposure (long rows
+  over rows) and the log mean holding length (long rows per round trip), each
+  mapped from fixed bounds (`1e-4` to 1, 1 to `1e4` rows) onto `[0, 1]`. A cell
+  then means "trades rarely, holds long" against "trades often, holds short".
+  The parent draws, migration victims and restart aims of `--qd-policy` follow
+  those cells. Details in `docs/qd.md`.
 - Termination is by generation count or a time/effort budget.
 
 ## 7. Simplification and presentation

@@ -121,6 +121,8 @@ inside the locked range puts its test block there; the refusal tells you to
 
 **Retiring a read range.** After the one sealed read of a locked range, `rcsr protocol retire --ledger L --range START,END --out retired.json` verifies the ledger (hash chain intact, exactly one locked read of that exact range, after a seal; no read exits 2, two or more exit 3) and writes a record that names the ledger by path and SHA-256. `--retired retired.json` on the search, `walkforward`, `ladder`, `ablation`, `audit`, `enrich`, `panel base`, `panel build` and `panel append` drops the protocol default 2025-07-01..2026-07-01 from the guard of a `--lockbox` or `--locked-test` range on undeclared data, so the retired year becomes development data and a new forward range is the only confirmatory set. A changed ledger exits 3; a new range that overlaps the retired one, a data declaration of it, `--lockbox none` or no flag exits 2. Reports and sidecars record `lockbox.retired`. Reading a retired range as a test is never done.
 
+**Lock record.** `--lock-record record.json` on the panel builders and `rcsr enrich` keeps locked-range rows out of every sidecar summary while the store keeps them; `rcsr lock check --record record.json PATH...` counts range hits in sidecars (exit 4 on a hit). See [`docs/panel.md`](panel.md#lock-record-sidecars-without-locked-range-information).
+
 **Lookback embargo after the end.** Features look back: a development row at `t >= END` is computed from locked bars while `t - lookback < END`, so a model fitted, validated or selected on it sees locked prices. This is the embargo of AFML 7.4.2. Every guard refuses the span `[START - purge, END + embargo)` of each declared range, both ranges of a pair included. A guard that knows the label purge (`walkforward`, `ladder`, `ablation score`, and the search with a target spec) refuses `[START - purge, END + max(embargo, purge))`: a locked row at `END - 1` has a label that reaches `END - 1 + h`, and a development row in that span shares those returns, so a store that declares an embargo shorter than its label window still keeps the two apart. `embargo` is one number per data file: the largest lookback of its columns, declared by the writer as `lockbox_embargo` (`seconds`, `column`, `rule`, `bar_seconds`) in the sidecar next to `locked_test` and read as the largest value over the carriers. `rcsr enrich` computes it from `enrich::lookback_seconds`, the rule `rcsr-lookback/1`: finite windows count their bars, a recursive filter (EMA, Wilder RSI, ATR, ADX, MACD) counts the lags that hold all but `protocol::LOOKBACK_RESIDUAL` (1e-4) of the weight of each stage, an MTF leaf counts `(K + 2)` higher bars, a trend leaf counts its first finite daily index plus 2 days, a cross-section column takes its source, a long-label column takes the larger of its volatility window and its label purge `entry_offset + h + delay` (so the embargo of a store with a 336 h label and only short features is 1213200 s, and the default feature set keeps 10972800 s). `rcsr panel build` takes at least `lookback_days + rebalance_days` of the membership sidecar (`<membership>.json`). A store with no declaration gets `protocol::DEFAULT_LOCKBOX_EMBARGO_SECONDS` (10972800 s, 127 days, the longest lookback of the default feature set on hourly bars). `--lockbox-embargo SECONDS` on the search, `walkforward`, `ladder`, `ablation prepare`, `ablation score`, `panel spread` and `audit` widens it and is refused (exit 2) when smaller. The reports record `embargo_seconds` and `embargo_source` (`store`, `flag` or `protocol_default`) in the `lockbox` object, and `split.lockbox_embargo_seconds` in `run.json`. A store with the opt-in trend family (`--features trend`, #932) declares 31622400 s (366 days, `trend_mom52w`), so its guards refuse `[START - purge, END + 366 d)`. A test row whose 366-day lookback reaches back into earlier development prices is not leakage: that is the history a live trader has. Leakage is a feature or label that reads data after its row, or a training label that ends inside the test block. `rcsr protocol selectors --gap-seconds 31622400` prints a `sensitivity_fold` line beside the normal fold, whose training range ends 366 days before the test start; it is a robustness view of how much a result depends on the first test months, not the leakage guard. A range at the end of the data has no row in the embargo, so its outputs do not change. The audit leaves out `[START - purge, END + embargo)` as well, and the enrich feature and label reports leave out the same span. `rcsr ablation prepare` builds its null columns in a separate segment for `[END, END + embargo)`.
 
 A locked read of one range keeps every other declared range sealed: `walkforward --locked-test` and `ladder --locked-test` refuse a window or fold that reaches the span of the other range.
@@ -157,6 +159,22 @@ puts it. Add the purge rows to the expressions yourself, or use a positional
 split.
 
 **Verify.** `tests/selection.rs::selection_overrides_a_temporal_spec_and_says_so`.
+
+### Interval-list splits: purge and embargo at every edge
+
+**Check.** With `--split-table` (#1173) a model trains before and after a test interval, so every edge needs both guards. Before each test interval the label purge drops the training and validation rows whose label window `[t, t + purge)` reaches it. After each test interval the embargo drops the rows in `[end, end + embargo)`; `--embargo auto` takes the longest lookback of the `--vars` columns (rule `rcsr-lookback/1`) or the label purge when that is longer, because a feature of a row after the test interval is computed from test bars. Training rows are purged on both sides of every validation interval. A table interval that reaches a declared locked range exits 3.
+
+**What fails.** Without the embargo, a 28-day return column of a row two weeks after the test interval holds two weeks of test prices: the fit learns from the test path and the test score is optimistic, the leak López de Prado's embargo (AFML 7.4.2) removes. Without the purge, the last training label before the test interval ends inside it. The cost is real: a 200-day column needs a 200-day embargo after every test interval, so long-lookback views lose more training rows under combinatorial splits; that is the price, not a bug.
+
+**Verify.** `tests/interval_split.rs::planted_leaks_are_excluded_from_training` (a feature that reads 500 hours back and a label that crosses the test interval are both left out), `src/intervals.rs::tests::interval_split_purges_and_embargoes_every_edge` (200 random tables at each label horizon 1, 24, 72 and 168 h), `tests/interval_split.rs::embargo_auto_follows_the_lookback`, and `tests/interval_split.rs::interval_guard_allows_cpcv_test_groups` with `interval_guard_refuses_overlap` for the walk-forward guard: a window is in sample when a kept training or validation row of the run reaches it, not when it is earlier than the last training row.
+
+### Combinatorial purged cross-validation: many test periods
+
+**Check.** One walk-forward path tests only the years after its first training window, so a bear market in the first year is never out of sample. `rcsr protocol cpcv --groups N --test-groups k` (#1174) cuts the span into N equal calendar groups at UTC midnights (locked ranges become holes) and writes the C(N, k) splits as a `--split-table`; every group is tested C(N-1, k-1) times and `rcsr trials --cpcv-assemble` joins the test series into C(N-1, k-1) complete paths (López de Prado 2018, ch. 12). The training and validation intervals of the table are already trimmed by the purge before and the lookback embargo after every test group, with the same predicate as `--split-table`. Each group of a path starts flat and pays its final exit, so no position carries from one split's model into another's.
+
+**What fails.** A long lookback costs training rows after every test group: under CPCV(6, 2) the 56-day embargo of `ma_slope672` drops up to 112 days of training rows per split, 56 after each test group. A view whose embargo empties a training group is refused (exit 2) instead of training on a sliver. Paths of configurations with different embargoes still compare: the path's `window_definition` hashes the groups, not the embargo.
+
+**Verify.** `tests/cpcv.rs::cpcv_splits_respect_purge_and_embargo` (random spans, hole layouts and horizons 1, 24, 72 and 168 h: no training or validation interval meets a test group widened by the purge before and the embargo after, and the search's own trim keeps every table row), `cpcv_skips_locked_holes`, `cpcv_6_2_counts`, `cpcv_6_1_counts` and `cpcv_paths_cover_each_group_once`.
 
 ---
 
@@ -417,6 +435,7 @@ it is also used for choices, there is no holdout.
 **Verify.**
 
 * The chosen expression is written down before the lockbox run.
+* Every file the verdict of the locked read uses (the candidate table with its frozen thresholds, a development table, the subwindows and years calendars) is frozen in the ledger with `rcsr protocol freeze` before the final seal. `rcsr protocol verdict` refuses a file whose SHA-256 differs from its freeze event or whose freeze follows the seal, and the lock calendar must be the one `rcsr protocol regimes --after-read` recorded (`docs/overfitting.md` 3.15).
 * `--eval-expr` output names the metric and reports `train_error` / `test_error`
   separately; the test side is the lockbox rows.
 * `tests/reports.rs::json_stays_valid_when_a_report_is_requested` and the
@@ -429,7 +448,9 @@ type-7 quantile of the train/validation scores, not a sketch. `rcsr walkforward`
 selects the two ranks around `h = (n - 1) q` by order-preserving radix count,
 canonicalises `-0` to `+0`, drops NaN/`±inf`, and interpolates in `f64`. The
 window's `threshold_source` is `train_type7`, `validation_type7` or `fixed`
-(a pre-registered `--threshold-fixed` value).
+(a pre-registered `--threshold-fixed` value), or `train_fitness` or
+`validation_fitness` for a cut fitted on the same rows (`--threshold-fit
+fitness`, see `docs/walkforward.md`).
 
 Positions use the shared valid-row mask: a row is usable only when **both** its
 score and target are finite. That matters at the boundary — in the pinned eval
@@ -514,6 +535,26 @@ done
 **What fails.** One profitable symbol can carry the mean while the model loses
 on every other symbol. The per-group spread, not the pooled mean, is the result.
 
+### Regime strata (#1175)
+
+A pooled mean hides regimes. Report the strategy per regime with `rcsr walkforward --regimes calendar.csv` or `rcsr trials --regimes calendar.csv`. `rcsr protocol regimes` writes the calendar: bull, bear and sideways (at least 60 days inside a 25 % band).
+
+* The default dating is ex-post: it uses the whole range, so it labels the past with later closes. It is a reporting tool, never a feature.
+* `--mode causal` dates a day from closes at or before it. A planted look-ahead test pins this.
+* Rows of a locked range (purge before, embargo after) are dropped before their price is parsed and written as `not_dated`. Dating the sealed range needs `--after-read` with `--ledger`, `--sealed` and `--expect-reads`: the ledger must hold every read the final seal allows. The ledger records a `regime_dating` event with the calendar hash. A null store (`rcsr panel permute-labels`) with `--after-read` exits 2 before the ledger is read (#1304).
+* Any label set works as a calendar: rows `label,start,end`, UTC half-open, no overlap.
+* An always-long book has zero alpha against the equal-weight benchmark in every stratum. A positive alpha in one stratum and a negative one in another is the result to read, not the pooled mean.
+
+
+### A stateful gate needs the whole readable prefix (#1214)
+
+A regime gate with a hysteresis band or a minimum dwell has state: a value inside the band holds the previous state, so the state of a row can depend on every earlier row of its group. A gate that restarts at each window, slice or fold start ties the state to the split, and one dropped row shifts every later flip of a dwell. The engine therefore reads every gate under one rule, `rcsr-gate-state/1`, in compose, the `--pnl-mask` validation and test books, walk-forward, the ladder, `--reselect-run` and the sealed read:
+
+* The gate rows are every row of the data file with a finite time, per group in file order. The gate reads its own columns only, never a label, and no row filter removes a gate row: the state of a row is the same in every command.
+* The state at a window start comes from one pass over the whole readable prefix. Each window reports it as `gate.start` (warm-up rows, first and last warm-up time, groups, groups on, groups inside a running dwell).
+* A locked range the command does not open, with its lookback embargo, is never read; the state restarts after it. A sealed read opens its own range only, so its warm-up is the development rows before the locked start.
+* A selection read (validation rows, `--reselect-run`) never reads a test interval or its embargo, so a validation interval after a test interval restarts its gate after the embargo. Out-of-sample pricing reads every earlier readable row.
+
 ### Cross-sectional context is a PIT join, not a survivor list
 
 `rcsr enrich --features cross` produces equal-weight market state, breadth,
@@ -555,7 +596,7 @@ r = 2 * (rank - 1) / (n - 1) - 1      rank 1 = lowest value, ties take the avera
 
 A rank reads the values of one timestamp only. The existing blocks are copied unchanged (column SHA-256 in `<out>.schema.json` stays), the input is never written, and the output carries the locked-test declaration of the input (`lockbox::resolve`, protocol default for an undeclared panel). `--name` must be `lbl_<label>_xs`: the registry knows it as a label-family lead column (`causal_offset 1`), so it is refused in `--vars` (D13a, exit 5) and never drawn by `--project`.
 
-The command adds an `xs_rank` entry to `<out stem>.targets.json` (the entries of the input sidecar carry over). `horizon_seconds`, `entry_offset_seconds`, `delay_seconds`, `return_units` and `cost_bps` come from the `forward_return` entry whose `return_column` (or column) is `--column`, found in `--target-spec` or `<data stem>.targets.json`; `return_column` is `--column`, the scale is constant 1, `clip` is null, the offset is 0 and `construction_columns` is `[--column]`. The purge is the `forward_return` rule: `entry_offset + delay + horizon`.
+The command adds an `xs_rank` entry to `<out stem>.targets.json` (the entries of the input sidecar carry over). `horizon_seconds`, `stride_seconds` (when present), `entry_offset_seconds`, `delay_seconds`, `return_units` and `cost_bps` come from the `forward_return` entry whose `return_column` (or column) is `--column`, found in `--target-spec` or `<data stem>.targets.json`; `return_column` is `--column`, the scale is constant 1, `clip` is null, the offset is 0 and `construction_columns` is `[--column]`. The purge is the `forward_return` rule: `entry_offset + delay + horizon`.
 
 `--objective pnl|sharpe|log_growth` accepts a `forward_return` or `xs_rank` target; the book is always priced on `return_column` with its `return_units` and the one cost rule of the spec. An `xs_rank` target needs `--position top_tercile`: per timestamp, `p = 1` for the top `floor(n / 3)` finite predictions (ties by row order, as `ladder::top_tercile`), `p = 0` otherwise. A timestamp with fewer than 3 finite predictions holds nothing, a NaN prediction is never long, and the final exit is charged. Rows of one timestamp are averaged (equal weight), exposure is the share of long rows (about 1/3). The map needs `--split temporal` (whole timestamps on each side of the split; `temporal-group` cuts every symbol at its own row quantile), `--min-holding 1`, `--max-position 1`, no `--threshold` and no `--fitness pnl`. The search and `rcsr walkforward --policy top-tercile` rank the same cross-section: every row of the timestamp with a finite score, whether or not its label or return exists (rows that `--fill drop` removes for a missing label stay in the ranks of the validation and test books). A row without a return earns and pays nothing (`tests/xs_rank.rs::search_and_walkforward_rank_the_same_cross_section`).
 

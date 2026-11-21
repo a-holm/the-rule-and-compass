@@ -1,4 +1,4 @@
-//! Evaluation protocol: windows, candidate ledger, "rcsr protocol <windows|seal|verify|retire|candidates|selectors> ...ed list, one-read lockbox.
+//! Evaluation protocol: windows, candidate ledger, sealed list, one-read lockbox, frozen inputs and the sealed-read verdict (`rcsr protocol <windows|seal|verify|retire|candidates|selectors|freeze|verdict>`).
 //!
 //! Four tiers: training fits, validation selects, development out-of-sample
 //! evaluates the procedure, and a locked test is read once per sealed
@@ -31,6 +31,8 @@
 //! * `seal`: the SHA-256 of `locked_candidates.json`, written before any read.
 //! * `test_read`: one locked read (`id`, `report_sha256`, `read_count`,
 //!   `test_read:true`).
+//! * `freeze` (#1238): the `role`, `sha256` and `bytes` of a file the sealed-read
+//!   verdict reads, recorded before any seal or read; one file per role.
 //!
 //! A locked read needs a `seal` line whose hash matches the sealed file, an id
 //! inside that file, no earlier `test_read` for the id, and the same data and
@@ -387,8 +389,23 @@ impl RangeBinding<'_> {
 pub enum Event {
     Candidate(Candidate),
     Seal { sealed_sha256: String, final_seal: Option<FinalSeal> },
-    TestRead { id: String, report_sha256: String, read_count: u64, locked_test: Option<LockedRange> },
-    BaselineRead { data_sha256: String, report_sha256: String, locked_test: Option<LockedRange> },
+    TestRead {
+        id: String,
+        report_sha256: String,
+        read_count: u64,
+        locked_test: Option<LockedRange>,
+        binding_sha256: Option<String>,
+    },
+    /// #1175: the regime calendar of the locked range, dated after the reads.
+    RegimeDating { calendar_sha256: String, params_sha256: String, locked_test: Option<LockedRange> },
+    BaselineRead {
+        data_sha256: String,
+        report_sha256: String,
+        locked_test: Option<LockedRange>,
+        binding_sha256: Option<String>,
+    },
+    /// #1238: a file the sealed-read verdict reads, frozen before the seal.
+    Freeze { role: String, sha256: String, bytes: u64 },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -496,11 +513,23 @@ impl Ledger {
                     report_sha256: need("report_sha256")?,
                     read_count: field_u64(&line, "read_count").ok_or_else(|| fault_field(p, n, &kind, "read_count"))?,
                     locked_test: LockedRange::parse(&line),
+                    binding_sha256: field_str(&line, "binding_sha256"),
+                },
+                "regime_dating" => Event::RegimeDating {
+                    calendar_sha256: need("calendar_sha256")?,
+                    params_sha256: get("params_sha256"),
+                    locked_test: LockedRange::parse(&line),
                 },
                 "baseline_read" => Event::BaselineRead {
                     data_sha256: need("data_sha256")?,
                     report_sha256: need("report_sha256")?,
                     locked_test: LockedRange::parse(&line),
+                    binding_sha256: field_str(&line, "binding_sha256"),
+                },
+                "freeze" => Event::Freeze {
+                    role: need("role")?,
+                    sha256: need("sha256")?,
+                    bytes: field_u64(&line, "bytes").ok_or_else(|| fault_field(p, n, &kind, "bytes"))?,
                 },
                 other => return Err(format!("unknown ledger event '{}'", other)),
             });
@@ -531,6 +560,44 @@ impl Ledger {
         let line = format!("{{\"prev\":\"{}\",{}}}\n", prev, body);
         f.write_all(line.as_bytes()).map_err(io)?;
         f.sync_all().map_err(io)
+    }
+
+    /// #1175: record the calendar that dated the locked range after the reads.
+    pub fn record_regime_dating(&self, calendar_sha256: &str, params_sha256: &str, range: &LockedRange) -> Result<(), String> {
+        self.append(&format!(
+            "\"event\":\"regime_dating\",\"calendar_sha256\":\"{}\",\"params_sha256\":\"{}\",\"test_read\":false,{}",
+            calendar_sha256,
+            params_sha256,
+            range.json()
+        ))
+    }
+
+    /// #1238: why `role` cannot be frozen now: the ledger has a seal or a locked
+    /// read, or the role holds a file already.
+    pub fn freeze_refusal(&self, role: &str) -> Result<(), String> {
+        self.verify_chain()?;
+        let events = self.events()?;
+        if events.iter().any(|e| matches!(e, Event::Seal { .. })) {
+            return Err("the ledger has a seal: files are frozen before the seal".to_string());
+        }
+        if events.iter().any(|e| matches!(e, Event::TestRead { .. } | Event::BaselineRead { .. })) {
+            return Err("the ledger has a locked read: files are frozen before any read".to_string());
+        }
+        let frozen = events.iter().find_map(|e| match e {
+            Event::Freeze { role: r, sha256, .. } if r == role => Some(sha256),
+            _ => None,
+        });
+        match frozen {
+            Some(sha) => Err(format!("role {} is frozen already (sha256 {}); one file per role", role, sha)),
+            None => Ok(()),
+        }
+    }
+
+    /// #1238: append the freeze event of a file the sealed-read verdict reads:
+    /// role, SHA-256 and byte count, no path.
+    pub fn record_freeze(&self, role: &str, sha256: &str, bytes: u64) -> Result<(), String> {
+        self.freeze_refusal(role)?;
+        self.append(&format!("\"event\":\"freeze\",\"role\":{},\"sha256\":\"{}\",\"bytes\":{}", esc(role), sha256, bytes))
     }
 
     /// Record a development candidate. Returns its id.
@@ -796,13 +863,26 @@ impl Ledger {
 
     /// Append `test_read:true` for `id`. Returns the new total read count.
     pub fn record_read(&self, id: &str, report_sha256: &str, range: Option<&LockedRange>) -> Result<u64, String> {
+        self.record_read_bound(id, report_sha256, range, None)
+    }
+
+    /// [`Ledger::record_read`] that also stores the binding digest of the read
+    /// (see [`binding_digest`]), the value `--verify-read` compares before scoring.
+    pub fn record_read_bound(
+        &self,
+        id: &str,
+        report_sha256: &str,
+        range: Option<&LockedRange>,
+        binding: Option<&str>,
+    ) -> Result<u64, String> {
         let count = self.read_count()? + 1;
         self.append(&format!(
-            "\"event\":\"test_read\",\"id\":\"{}\",\"report_sha256\":\"{}\",\"read_count\":{},{}\"test_read\":true",
+            "\"event\":\"test_read\",\"id\":\"{}\",\"report_sha256\":\"{}\",\"read_count\":{},{}{}\"test_read\":true",
             id,
             report_sha256,
             count,
-            range.map(|l| format!("{},", l.json())).unwrap_or_default()
+            range.map(|l| format!("{},", l.json())).unwrap_or_default(),
+            binding_field(binding)
         ))?;
         Ok(count)
     }
@@ -815,11 +895,27 @@ impl Ledger {
 
     /// Check that a recompute of the baseline read is allowed: the checks of
     /// [`Ledger::authorize_baseline_read`] without the refusal of a second read,
-    /// plus a recorded read. Refuses before any locked row is scored.
-    pub fn authorize_baseline_verify(&self, sealed: &std::path::Path, bind: Option<RangeBinding>) -> Result<(), String> {
+    /// plus a recorded read of the store with this data hash. Refuses before any
+    /// locked row is loaded or scored.
+    pub fn authorize_baseline_verify(
+        &self,
+        sealed: &std::path::Path,
+        data_sha256: &str,
+        bind: Option<RangeBinding>,
+    ) -> Result<(), String> {
         self.baseline_checks(sealed, bind, false)?;
-        self.baseline_report_sha()?.ok_or("no recorded baseline read")?;
-        Ok(())
+        let recorded = self.events()?.into_iter().find_map(|e| match e {
+            Event::BaselineRead { data_sha256, .. } => Some(data_sha256),
+            _ => None,
+        });
+        match recorded {
+            None => Err("no recorded baseline read".to_string()),
+            Some(r) if r != data_sha256 => Err(format!(
+                "data hash {} differs from the recorded baseline read {}; the verify is void",
+                data_sha256, r
+            )),
+            Some(_) => Ok(()),
+        }
     }
 
     /// Report hash recorded by the baseline read, if there was one.
@@ -865,12 +961,45 @@ impl Ledger {
         report_sha256: &str,
         range: Option<&LockedRange>,
     ) -> Result<(), String> {
+        self.record_baseline_read_bound(data_sha256, report_sha256, range, None)
+    }
+
+    /// [`Ledger::record_baseline_read`] that also stores the binding digest.
+    pub fn record_baseline_read_bound(
+        &self,
+        data_sha256: &str,
+        report_sha256: &str,
+        range: Option<&LockedRange>,
+        binding: Option<&str>,
+    ) -> Result<(), String> {
         self.append(&format!(
-            "\"event\":\"baseline_read\",\"data_sha256\":\"{}\",\"report_sha256\":\"{}\",{}\"test_read\":true",
+            "\"event\":\"baseline_read\",\"data_sha256\":\"{}\",\"report_sha256\":\"{}\",{}{}\"test_read\":true",
             data_sha256,
             report_sha256,
-            range.map(|l| format!("{},", l.json())).unwrap_or_default()
+            range.map(|l| format!("{},", l.json())).unwrap_or_default(),
+            binding_field(binding)
         ))
+    }
+
+    /// Compare the binding digest of this `--verify-read` with the one stored by
+    /// the recorded read (`id` for a candidate read, `None` for the baseline
+    /// read). Refuses before any locked row is scored and names no report hash.
+    pub fn check_verify_binding(&self, id: Option<&str>, binding: &str) -> Result<(), String> {
+        let recorded = self.events()?.into_iter().find_map(|e| match (e, id) {
+            (Event::TestRead { id: read, binding_sha256, .. }, Some(want)) if read == want => Some(binding_sha256),
+            (Event::BaselineRead { binding_sha256, .. }, None) => Some(binding_sha256),
+            _ => None,
+        });
+        match recorded {
+            None => Err("no recorded read to verify".to_string()),
+            Some(None) => Err("the recorded read stores no binding digest (written by an older build); \
+                 --verify-read cannot compare the window set and settings and refuses to score"
+                .to_string()),
+            Some(Some(b)) if b == binding => Ok(()),
+            Some(Some(_)) => Err("the window set or another setting that binds the report differs from the \
+                 recorded read; the verify is void and nothing was scored"
+                .to_string()),
+        }
     }
 }
 
@@ -1000,6 +1129,27 @@ impl LockboxFacts {
     }
 }
 
+fn binding_field(binding: Option<&str>) -> String {
+    binding.map(|b| format!("\"binding_sha256\":\"{}\",", b)).unwrap_or_default()
+}
+
+/// SHA-256 of every input that binds a locked report beyond the sealed entry:
+/// the text of `parts` in order. Callers pass the debug form of the resolved
+/// windows and options, so a changed window set or setting changes the digest.
+pub fn binding_digest(parts: &[String]) -> String {
+    sha256_hex(parts.join("\n--\n").as_bytes())
+}
+
+/// Binding digest of a walkforward read. The `--front` path is left out: the
+/// run file's SHA-256 binds its content and the report hash ignores the spelling.
+pub fn walkforward_binding(spec: &crate::walkforward::EvalSpec, o: &crate::walkforward::ProtocolOptions) -> String {
+    let mut o = o.clone();
+    if let Some(f) = &mut o.front {
+        f.run.clear();
+    }
+    binding_digest(&[format!("{:?}", spec), format!("{:?}", o)])
+}
+
 /// Canonical text of the procedure a candidate stands for: everything that
 /// changes the report except the windows and the output options. Its SHA-256
 /// is the candidate's spec hash, so a development run and the locked read of
@@ -1038,6 +1188,7 @@ pub fn procedure_spec(spec: &crate::walkforward::EvalSpec, o: &crate::walkforwar
         spec.periods_per_year,
         spec.band_select
     ));
+    s.push_str(&format!("missing_score={}\n", o.missing_score.name()));
     if spec.policy == crate::walkforward::Policy::Vote {
         s.push_str(&format!("quorum={:?}\n", o.quorum));
     }
@@ -1049,6 +1200,36 @@ pub fn procedure_spec(spec: &crate::walkforward::EvalSpec, o: &crate::walkforwar
             s.push_str(&format!("run_band={:?},{:?}\n", b.multiple, b.resolved));
         }
     }
+    if let Some(f) = &o.threshold_fit {
+        s.push_str(&format!(
+            "threshold_fit=fitness,min_entry_times={},blocks={},lambda={:?}\n",
+            f.min_entry_times, f.blocks, f.lambda
+        ));
+    }
+    if o.period_grid != crate::walkforward::PeriodGrid::Score {
+        s.push_str(&format!("period_grid={}\n", o.period_grid.as_str()));
+    }
+    if let Some(g) = &o.mask {
+        s.push_str(&format!("pnl_mask={}|rule={}\n", g.identity(), crate::walkforward::MASK_STATE_RULE));
+    }
+    if o.cost.as_ref().is_some_and(|c| c.log_returns()) {
+        s.push_str("return_units=log\n");
+    }
+    if let Some((width, _)) = crate::walkforward::declared_period(spec, o) {
+        if width != spec.horizon {
+            s.push_str(&format!("period_width={:?}\n", width));
+        }
+    }
+    // #1212: a book on another label than the fit label binds both labels and the fit label's purge.
+    if let Some(b) = &o.book_label {
+        s.push_str(&format!("book_target={}|fit_label={}|fit_purge={:?}\n", b.book.column, b.fit.column, b.fit_purge_seconds()));
+    }
+    // #1214: a composed candidate's book is its switch, one line per candidate.
+    if o.switches.iter().any(Option::is_some) {
+        for c in &o.switches {
+            s.push_str(&format!("switch={}\n", c.as_ref().map_or_else(|| "none".to_string(), |c| c.switch.identity())));
+        }
+    }
     s
 }
 
@@ -1058,7 +1239,7 @@ pub fn procedure_spec(spec: &crate::walkforward::EvalSpec, o: &crate::walkforwar
 pub const LEDGER_FAULT_EXIT: i32 = 1;
 
 fn protocol_usage() -> &'static str {
-    "rcsr protocol <windows|seal|verify|candidates|selectors> ...
+    "rcsr protocol <windows|seal|verify|retire|candidates|selectors|regimes|cpcv|freeze|verdict> ...
 
   windows [--purge-seconds N] [--out FILE]
       Write the UTC windows table (default purge 219600 s: 1 h entry + 60 h label).
@@ -1100,9 +1281,55 @@ fn protocol_usage() -> &'static str {
       (a mismatch exits 3) and stop guarding the protocol default 2025-07-01,2026-07-01
       next to a --lockbox or --locked-test range; the retired range is development
       data from then on and a new locked range that overlaps it exits 2.
+  regimes --data FILE --time-col C --price-col C --symbol-col C (--symbol S | --index equal-weight) --out FILE [options]
+      Write a regime calendar (bull, bear, sideways, not_dated) from daily closes.
+      Locked ranges are never read; --after-read dates the sealed range after the
+      final read. Run `rcsr protocol regimes --help` for the rule and the flags.
   candidates --ledger FILE
       List the candidates without a locked read.
+  freeze --ledger FILE --role thresholds|development|subwindows|years --file PATH
+      #1238: record the SHA-256 and byte count of a file the sealed-read verdict
+      reads (the candidate table with the frozen thresholds of #1237, a
+      development table for D2 and D3, the subwindows and years calendars) as a
+      freeze event, before the seal; the event holds no path. A file its role
+      cannot read exits 2. One file per role: a second freeze of a role, a freeze
+      after any seal and a freeze after any locked read exit 1.
 "
+}
+
+/// `rcsr protocol freeze --ledger FILE --role ROLE --file PATH` (#1238). Exit 2 for
+/// a bad argument or a file its role cannot read, 3 for an unreadable file, 1 when
+/// the ledger refuses the freeze.
+fn freeze_cli(args: &[String]) -> ! {
+    let fail = |msg: String, code: i32| -> ! {
+        eprintln!("error: {}", msg);
+        std::process::exit(code)
+    };
+    let (mut ledger, mut role, mut file) = (None, None, None);
+    let mut i = 0;
+    while i < args.len() {
+        let value = args.get(i + 1).cloned().unwrap_or_else(|| fail(format!("{} requires a value", args[i]), 2));
+        match args[i].as_str() {
+            "--ledger" => ledger = Some(value),
+            "--role" => role = Some(value),
+            "--file" => file = Some(value),
+            other => fail(format!("unknown option '{}' for protocol freeze\n\n{}", other, protocol_usage()), 2),
+        }
+        i += 2;
+    }
+    let need = |v: Option<String>, flag: &str| v.unwrap_or_else(|| fail(format!("protocol freeze needs {}", flag), 2));
+    let (ledger, role, file) = (need(ledger, "--ledger"), need(role, "--role"), need(file, "--file"));
+    if !crate::verdict::ROLES.contains(&role.as_str()) {
+        fail(format!("--role {}: unknown role; one of {}", role, crate::verdict::ROLES.join(", ")), 2);
+    }
+    let bytes = std::fs::read(&file).unwrap_or_else(|e| fail(format!("{}: {}", file, e), 3));
+    let l = Ledger::new(&ledger);
+    l.freeze_refusal(&role).unwrap_or_else(|e| fail(e, LEDGER_FAULT_EXIT));
+    crate::verdict::check_frozen(&role, &bytes).unwrap_or_else(|e| fail(format!("--file {}: {}", file, e), 2));
+    let sha = sha256_hex(&bytes);
+    l.record_freeze(&role, &sha, bytes.len() as u64).unwrap_or_else(|e| fail(e, LEDGER_FAULT_EXIT));
+    println!("frozen {} sha256 {} bytes {}", role, sha, bytes.len());
+    std::process::exit(0)
 }
 
 /// `rcsr protocol ...`.
@@ -1112,8 +1339,20 @@ pub fn run(args: &[String]) -> ! {
         std::process::exit(code)
     };
     if args.is_empty() || args.iter().any(|a| a == "-h" || a == "--help") {
-        print!("{}", protocol_usage());
+        print!("{}{}{}", protocol_usage(), crate::verdict::usage(), crate::cpcv::protocol_usage());
         std::process::exit(if args.is_empty() { 2 } else { 0 });
+    }
+    if args[0] == "regimes" {
+        crate::regime_dating::run(&args[1..]);
+    }
+    if args[0] == "cpcv" {
+        crate::cpcv::protocol_cli(&args[1..]);
+    }
+    if args[0] == "freeze" {
+        freeze_cli(&args[1..]);
+    }
+    if args[0] == "verdict" {
+        crate::verdict::run(&args[1..]);
     }
     let mut purge = DEFAULT_PURGE_SECONDS;
     let mut out: Option<String> = None;
@@ -1435,6 +1674,14 @@ impl Ledger {
         let mut out = vec!["0".repeat(64)];
         out.extend(self.lines()?.iter().map(|l| sha256_hex(l.as_bytes())));
         Ok(out)
+    }
+
+    /// Refuse `--verify-read` on a store that no read marker names.
+    pub fn require_read_marker(&self, data_path: &str) -> Result<(), String> {
+        if marker_lines(data_path)?.is_empty() {
+            return Err(format!("{} has no read marker; --verify-read applies to the store that was read", data_path));
+        }
+        Ok(())
     }
 
     /// Refuse a locked read of the store at `data_path` through a ledger that is

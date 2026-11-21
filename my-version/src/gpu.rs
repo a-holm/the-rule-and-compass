@@ -536,11 +536,22 @@ pub(crate) const SPAN_FIT: i32 = 1;
 /// #481: why a tiled context cannot score the long/flat fitness.
 pub const LONG_PNL_TILED: &str = "long_pnl fitness needs resident training rows (tiled residency: #293)";
 
+/// #1244: why a regime-masked book with an sd-unit band stays on the CPU.
+pub const LONG_PNL_MASKED_SD: &str =
+    "--pnl-mask with --band-units sd is priced on the CPU: the device sd reads every row, not the rows inside the mask";
+
+/// #1245: why a book with a position layer (`--gate-search`) cannot be uploaded.
+pub const LONG_PNL_LAYERED: &str =
+    "the long_pnl fitness book has a position layer (--gate-search) and the device book carries none";
+
 /// #604: prefix of an injected device refusal (test hook, see [`injected_fault`]).
 pub const INJECTED_REFUSAL: &str = "injected fault: the device refused ";
 
 /// #604: test hook. `RCSR_FAULT` is a comma list of sites (`pnl_book`, `batch`,
-/// `pipeline`) at which a device call fails before it reaches the driver.
+/// `pipeline`, `rescore` after the fit of the synchronous admission path,
+/// `pipeline_fit` before the device fit of the overlap queue) at which a device
+/// call fails before it reaches the driver, and
+/// `island_panic` (#1090), at which every island thread of the node path panics.
 /// `site@N` fires only in the N-th search of the process (1-based). Unset in
 /// normal use. The variable is read once per process.
 pub fn injected_fault(site: &str) -> bool {
@@ -612,7 +623,7 @@ struct RawStats {
 
 /// #481: `RcPnlTotals` in `src/cuda/eval.cu`, field for field.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 struct RawPnlTotals {
     gross: f64,
     flips: u64,
@@ -620,9 +631,25 @@ struct RawPnlTotals {
     longs: u64,
     nonfinite: i32,
     pad: i32,
-    block_gross: [f64; 8],
-    block_flips: [u64; 8],
-    block_exits: [u64; 8],
+    block_gross: [f64; crate::trading::FITNESS_BOOK_MAX_BLOCKS],
+    block_flips: [u64; crate::trading::FITNESS_BOOK_MAX_BLOCKS],
+    block_exits: [u64; crate::trading::FITNESS_BOOK_MAX_BLOCKS],
+}
+
+impl Default for RawPnlTotals {
+    fn default() -> Self {
+        RawPnlTotals {
+            gross: 0.0,
+            flips: 0,
+            exits: 0,
+            longs: 0,
+            nonfinite: 0,
+            pad: 0,
+            block_gross: [0.0; crate::trading::FITNESS_BOOK_MAX_BLOCKS],
+            block_flips: [0; crate::trading::FITNESS_BOOK_MAX_BLOCKS],
+            block_exits: [0; crate::trading::FITNESS_BOOK_MAX_BLOCKS],
+        }
+    }
 }
 
 /// #1082: [`crate::trading::book_signature`] of one candidate's device totals;
@@ -880,12 +907,15 @@ extern "C" {
         ctx: *mut RawCtx,
         excess: *const f64,
         flags: *const u8,
+        block_ids: *const u8,
         n: i32,
         side: f64,
         threshold: f64,
         bounds: *const f64,
         nblocks: i32,
         lambda: f64,
+        stat: i32,
+        cvar_count: i32,
         min_trades: u64,
     ) -> i32;
     fn rc_pnl_totals(
@@ -1825,6 +1855,12 @@ impl GpuEvaluator {
         self.n_rows as usize
     }
 
+    /// #1258: the context the enumerate device arm (`src/cuda/enumerate.h`)
+    /// evaluates on and allocates through.
+    pub(crate) fn raw_context(&mut self) -> *mut std::ffi::c_void {
+        self.ctx as *mut std::ffi::c_void
+    }
+
     /// #265: rows and bytes of the f64 fit twin uploaded by [`Self::set_fit_data`].
     pub fn fit_twin(&self) -> (u64, u64) {
         (self.fit_twin_rows, self.fit_twin_bytes)
@@ -1943,6 +1979,12 @@ impl GpuEvaluator {
         if injected_fault("pnl_book") {
             return Err(format!("{}the long_pnl fitness book", INJECTED_REFUSAL));
         }
+        if book.is_masked() && book.band_units() == crate::trading::BandUnits::Sd {
+            return Err(LONG_PNL_MASKED_SD.to_string());
+        }
+        if book.has_layer() {
+            return Err(LONG_PNL_LAYERED.to_string());
+        }
         if book.len() as u64 != self.n_rows {
             return Err(format!(
                 "the long_pnl fitness book has {} rows, the device sample {}",
@@ -1950,13 +1992,22 @@ impl GpuEvaluator {
                 self.n_rows
             ));
         }
-        self.upload_pnl_book(
+        // #1178: the ids travel apart from the flags only when the flags cannot hold them.
+        let ids: &[u8] = if book.blocks() > crate::trading::FITNESS_MAX_BLOCKS { book.block_ids() } else { &[] };
+        let stat = book.stat();
+        let cvar_count = match stat {
+            crate::trading::BlockStat::Cvar(q) => crate::trading::BlockStat::cvar_count(q, book.blocks()) as i32,
+            _ => 0,
+        };
+        self.upload_pnl_book_with(
             book.excess(),
             book.flags(),
+            ids,
             book.side(),
             book.threshold(),
             book.block_bounds(),
             book.lambda(),
+            (stat.code(), cvar_count),
             book.min_trades() as u64,
         )?;
         self.set_pnl_band(book.band(), book.band_units() == crate::trading::BandUnits::Sd, book.min_hold())
@@ -2019,17 +2070,48 @@ impl GpuEvaluator {
         lambda: f64,
         min_trades: u64,
     ) -> Result<(), String> {
+        self.upload_pnl_book_with(excess, flags, &[], side, threshold, bounds, lambda, (0, 0), min_trades)
+    }
+
+    /// #1178: [`GpuEvaluator::upload_pnl_book`] with the block id of every row
+    /// (empty up to [`crate::trading::FITNESS_MAX_BLOCKS`] blocks, whose ids sit
+    /// in the flags) and the block statistic as `(code, cvar count)`
+    /// ([`crate::trading::BlockStat::code`], [`crate::trading::BlockStat::cvar_count`]).
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn upload_pnl_book_with(
+        &mut self,
+        excess: &[f64],
+        flags: &[u8],
+        block_ids: &[u8],
+        side: f64,
+        threshold: f64,
+        bounds: &[f64],
+        lambda: f64,
+        stat: (i32, i32),
+        min_trades: u64,
+    ) -> Result<(), String> {
+        if !block_ids.is_empty() && block_ids.len() != excess.len() {
+            return Err(format!(
+                "the device refused the long_pnl fitness book: {} block ids for {} rows",
+                block_ids.len(),
+                excess.len()
+            ));
+        }
         let rc = unsafe {
             rc_set_pnl_book(
                 self.ctx,
                 if excess.is_empty() { std::ptr::null() } else { excess.as_ptr() },
                 if flags.is_empty() { std::ptr::null() } else { flags.as_ptr() },
+                if block_ids.is_empty() { std::ptr::null() } else { block_ids.as_ptr() },
                 excess.len() as i32,
                 side,
                 threshold,
                 if bounds.is_empty() { std::ptr::null() } else { bounds.as_ptr() },
                 bounds.len() as i32,
                 lambda,
+                stat.0,
+                stat.1,
                 min_trades,
             )
         };
@@ -2081,7 +2163,7 @@ impl GpuEvaluator {
         n: usize,
         blocks: usize,
     ) -> Option<Vec<Option<crate::trading::BookSig>>> {
-        if n == 0 || blocks == 0 || blocks > crate::trading::FITNESS_MAX_BLOCKS {
+        if n == 0 || blocks == 0 || blocks > crate::trading::FITNESS_BOOK_MAX_BLOCKS {
             return None;
         }
         let mut raw = vec![RawPnlTotals::default(); n];
@@ -2127,7 +2209,7 @@ impl GpuEvaluator {
         let totals = raw
             .iter()
             .map(|t| {
-                (0..blocks.min(8))
+                (0..blocks.min(crate::trading::FITNESS_BOOK_MAX_BLOCKS))
                     .map(|b| crate::trading::FitnessTotals {
                         gross: t.block_gross[b],
                         flips: t.block_flips[b],
@@ -5070,6 +5152,28 @@ mod tests {
         assert_eq!(pop.len(), 0, "nothing may be counted as emitted");
     }
 
+    /// #1178: the block limits and the statistic codes of the long/flat book
+    /// match the kernel defines.
+    #[test]
+    fn pnl_block_constants_match_the_kernel() {
+        let src = include_str!("cuda/eval.cu");
+        let define = |name: &str| -> i64 {
+            let line = src
+                .lines()
+                .find(|l| l.trim_start().starts_with(&format!("#define {name} ")))
+                .unwrap_or_else(|| panic!("the kernel defines {name}"));
+            line.split_whitespace().nth(2).expect("a value").parse().expect("a number")
+        };
+        assert_eq!(define("RC_PNL_MAX_BLOCKS"), crate::trading::FITNESS_MAX_BLOCKS as i64);
+        assert_eq!(define("RC_PNL_WIDE_BLOCKS"), crate::trading::FITNESS_BOOK_MAX_BLOCKS as i64);
+        assert_eq!(define("RC_PNL_BLOCK_SHIFT"), crate::trading::FITNESS_BLOCK_SHIFT as i64);
+        assert_eq!(define("RC_PNL_MASK_OFF"), crate::trading::FITNESS_MASK_OFF as i64);
+        use crate::trading::BlockStat;
+        assert_eq!(define("RC_PNL_STAT_MEAN_SD"), BlockStat::MeanSd.code() as i64);
+        assert_eq!(define("RC_PNL_STAT_MEAN_SEMI"), BlockStat::MeanSemi.code() as i64);
+        assert_eq!(define("RC_PNL_STAT_CVAR"), BlockStat::Cvar(0.5).code() as i64);
+    }
+
     /// #121: the host stack constant must match `RC_MAX_STACK` in the kernel.
     #[test]
     fn stack_limits_match_the_kernel() {
@@ -6258,14 +6362,14 @@ mod fit_tests {
         assert_eq!(crate::fit::GPU_FIT_MAX_CONSTANTS, 20);
         for p in 1..=20usize {
             let m = linear_model(&vec![0.1; p]);
-            let plan = crate::fit::gpu_fit_plan_reason(&m)
+            let plan = crate::fit::gpu_fit_plan_reason(&m, false)
                 .unwrap_or_else(|e| panic!("p={} must be offered to the kernel: {:?}", p, e));
             assert_eq!(plan.nconst, p);
         }
         for p in 21..=24usize {
             let m = linear_model(&vec![0.1; p]);
             assert_eq!(
-                crate::fit::gpu_fit_plan_reason(&m).err(),
+                crate::fit::gpu_fit_plan_reason(&m, false).err(),
                 Some(GpuFitReject::TooManyConstants),
                 "p={} must be labelled too_many_constants",
                 p
@@ -6467,7 +6571,7 @@ mod fit_tests {
         let asinh = node(Op::Asinh, vec![node(Op::Mul, vec![constant(0.5), input(0)])]);
         assert!(crate::fit::gpu_fit_plan(&asinh).is_none());
         assert_eq!(
-            crate::fit::gpu_fit_plan_reason(&asinh).err(),
+            crate::fit::gpu_fit_plan_reason(&asinh, false).err(),
             Some(crate::fit::GpuFitReject::UnsupportedOp)
         );
         // Floor has a device opcode since #548.
@@ -6907,7 +7011,7 @@ mod fit_tests {
         let mut trees = Vec::new();
         while trees.len() < 24 {
             let t = crate::expr::simplify(&random_tree_with(&mut rng, 2, &ops, 4, None));
-            if crate::fit::gpu_fit_plan_reason(&t).is_ok() {
+            if crate::fit::gpu_fit_plan_reason(&t, false).is_ok() {
                 trees.push(t);
             }
         }
@@ -8239,7 +8343,7 @@ mod rank_tests {
     }
 
     fn plan(t: &Node) -> crate::fit::GpuFitPlan {
-        gpu_fit_plan_reason(t).expect("an eligible plan")
+        gpu_fit_plan_reason(t, false).expect("an eligible plan")
     }
 
     fn cpu_pred(f: &Fixture, t: &Node) -> Vec<f64> {
@@ -9065,7 +9169,7 @@ mod score_batch_bench {
                 crate::expr::constant(0.1),
             ],
         );
-        let plan = gpu_fit_plan_reason(&tree).expect("an eligible plan");
+        let plan = gpu_fit_plan_reason(&tree, false).expect("an eligible plan");
         let constants: Vec<Vec<f64>> = (0..p)
             .map(|k| {
                 let mut c = plan.c0.clone();
@@ -9168,7 +9272,7 @@ mod maximum_tests {
     }
 
     fn plan(t: &Node) -> crate::fit::GpuFitPlan {
-        gpu_fit_plan_reason(t).expect("an eligible plan")
+        gpu_fit_plan_reason(t, false).expect("an eligible plan")
     }
 
     /// `a·x + b`: arithmetic only, so the device's f64 forward sweep and
@@ -9549,7 +9653,7 @@ mod order_stat_tests {
     }
 
     fn plan(t: &Node) -> crate::fit::GpuFitPlan {
-        gpu_fit_plan_reason(t).expect("an eligible plan")
+        gpu_fit_plan_reason(t, false).expect("an eligible plan")
     }
 
     /// `a·x + b`: arithmetic-only, so the device's f64 forward sweep and
@@ -10435,7 +10539,7 @@ mod persistent_tests {
     }
 
     fn plans_of(trees: &[Node]) -> Vec<crate::fit::GpuFitPlan> {
-        trees.iter().map(|t| gpu_fit_plan_reason(t).expect("an eligible plan")).collect()
+        trees.iter().map(|t| gpu_fit_plan_reason(t, false).expect("an eligible plan")).collect()
     }
 
     /// Value captured from the pre-change per-call allocating path.
@@ -10822,7 +10926,7 @@ mod alloc_ledger_tests {
             return;
         };
         let t = linear();
-        let p = gpu_fit_plan_reason(&t).expect("an eligible plan");
+        let p = gpu_fit_plan_reason(&t, false).expect("an eligible plan");
         let plans = [&p, &p];
         let trials = trial_lists(2, 6);
         let unsplit = ev
@@ -10846,7 +10950,7 @@ mod alloc_ledger_tests {
             return;
         };
         let t = linear();
-        let p = gpu_fit_plan_reason(&t).expect("an eligible plan");
+        let p = gpu_fit_plan_reason(&t, false).expect("an eligible plan");
         let plans = [&p, &p];
         let trials = trial_lists(2, 6);
         let unsplit = ev
@@ -10879,7 +10983,7 @@ mod alloc_ledger_tests {
             return;
         };
         let t = linear();
-        let p = gpu_fit_plan_reason(&t).expect("an eligible plan");
+        let p = gpu_fit_plan_reason(&t, false).expect("an eligible plan");
         let trials = trial_lists(1, 6);
         let before = ev.alloc_report();
         let sums = ev.rank_score_trials(&[&p], &trials).expect("rank call");

@@ -47,6 +47,8 @@ pub struct FrontMember {
     pub rank: usize,
     pub expression: String,
     pub source: ExpressionSource,
+    /// #1214: the switch of a composed C1 or C2 member; its book is not `expression`.
+    pub switch: Option<crate::regime_gate::Switch>,
     /// #946: `validation_book.band_resolved` and `band_sd`, written under sd units.
     pub band_resolved: Option<f64>,
     pub band_sd: Option<f64>,
@@ -54,6 +56,45 @@ pub struct FrontMember {
 
 /// #855: the refusal for a run.json written by an `--interim-chunk` run.
 pub const INTERIM_REFUSAL: &str = "run.json comes from an --interim-chunk run: it holds no report; use the run.json of the last chunk";
+
+/// #1214: the refusal for a composed run written before the switch block: its
+/// finalist gate state is carried in `compose.gate` only.
+pub const STALE_COMPOSE_REFUSAL: &str = "run.json comes from rcsr compose with a carried finalist gate (compose.gate.carried) and no objective.finalist.switch: \
+     it was written before the switch block; run rcsr compose again";
+
+/// #1279: the refusal for a gate-search run written before its training states followed
+/// `rcsr-gate-state/1`: its `gate_search` record has no `train_state_rule`.
+pub const STALE_GATE_SEARCH_REFUSAL: &str = "run.json comes from rcsr --gate-search without gate_search.train_state_rule: its gate was searched under the per-segment training rule, not rcsr-gate-state/1; run rcsr --gate-search again";
+
+/// #1237 (D19): the compose provenance of a run's finalist, `compose.chosen` of an `rcsr compose` run.json.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CompositeMarker {
+    /// `compose.chosen.type`: C0 to C3.
+    pub kind: String,
+    /// `compose.chosen.form`, e.g. `if(gate, f, cash)`.
+    pub form: Option<String>,
+    /// `compose.chosen.gate`: the menu gate name, `None` for C0.
+    pub gate: Option<String>,
+}
+
+impl CompositeMarker {
+    /// The marker a walk-forward report writes as `selection.composite`.
+    pub fn json(&self) -> String {
+        let text = |v: &Option<String>| v.as_deref().map_or("null".to_string(), crate::walkforward::jstr);
+        format!(
+            "{{\"source\":\"rcsr compose\",\"type\":{},\"form\":{},\"gate\":{}}}",
+            crate::walkforward::jstr(&self.kind),
+            text(&self.form),
+            text(&self.gate)
+        )
+    }
+
+    fn of(j: &Json) -> Option<CompositeMarker> {
+        let chosen = j.get("compose")?.get("chosen")?;
+        let text = |k: &str| chosen.get(k).and_then(Json::as_str).map(str::to_string);
+        Some(CompositeMarker { kind: text("type")?, form: text("form"), gate: text("gate") })
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct RunFile {
@@ -75,18 +116,29 @@ pub struct RunFile {
     pub band: crate::trading::BandSpec,
     /// `objective.spec.min_holding`; 1 without it.
     pub min_holding: usize,
+    /// #1180: the regime gate the run priced its books under (`objective.spec.pnl_mask`).
+    pub mask: Option<crate::regime_gate::GateSpec>,
     /// `split.train_time`: `[first, last]` raw time keys.
     pub train_time: Option<(f64, f64)>,
     /// `split.validation_time`: `[first, last]`, absent without a validation slice.
     pub validation_time: Option<(f64, f64)>,
     /// `split.required_purge_seconds`, else `split.purge_seconds`.
     pub purge_seconds: Option<f64>,
+    /// #1173: the intervals of an interval-list run (`split.intervals`), resolved
+    /// again with `split.interval_purge_seconds` and `split.embargo_seconds`.
+    pub intervals: Option<crate::intervals::IntervalSplit>,
     /// `search.candidates_evaluated`.
     pub candidates_evaluated: Option<u64>,
     /// `elapsed_seconds`.
     pub elapsed_seconds: Option<f64>,
     /// `search.cumulative.elapsed_seconds` when the block is complete (#923).
     pub cumulative_elapsed_seconds: Option<f64>,
+    /// #1237: `compose.chosen` of a composed run; `None` for every other run.
+    pub composite: Option<CompositeMarker>,
+    /// #1291: `objective.book_target` of a run searched with `--book-target`.
+    pub book_target: Option<crate::run_book::BookTarget>,
+    /// `preparation.fill`.
+    pub fill: Option<String>,
     /// The parsed document, for views such as `RunFile::book`.
     doc: Json,
 }
@@ -121,6 +173,15 @@ impl RunFile {
         if matches!(j.get("interim"), Some(Json::Bool(true))) {
             return Err(INTERIM_REFUSAL.to_string());
         }
+        let carried = matches!(j.get("compose").and_then(|c| c.get("gate")).and_then(|g| g.get("carried")), Some(Json::Bool(true)));
+        if carried && j.get("objective").and_then(|o| o.get("finalist")).and_then(|f| f.get("switch")).is_none() {
+            return Err(STALE_COMPOSE_REFUSAL.to_string());
+        }
+        if let Some(gs) = j.get("gate_search") {
+            if gs.get("train_state_rule").and_then(Json::as_str) != Some(crate::regime_gate::STATE_RULE) {
+                return Err(STALE_GATE_SEARCH_REFUSAL.to_string());
+            }
+        }
         let variables = match j.get("variables") {
             Some(Json::Arr(a)) => a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
             _ => Vec::new(),
@@ -129,14 +190,21 @@ impl RunFile {
             Some(Json::Arr(a)) => a
                 .iter()
                 .enumerate()
-                .filter_map(|(k, m)| {
-                    ExpressionSource::pick(m)
+                .map(|(k, m)| -> Result<Option<FrontMember>, String> {
+                    let switch = match m.get("switch") {
+                        None | Some(Json::Null) => None,
+                        Some(s) => Some(crate::regime_gate::Switch::parse(s).map_err(|e| format!("pareto[{}].{}", k, e))?),
+                    };
+                    Ok(ExpressionSource::pick(m)
                         .map(|(expression, source)| {
                         let vb = m.get("validation_book");
                         let at = |key: &str| vb.and_then(|b| b.get(key)).and_then(Json::as_f64);
-                        FrontMember { rank: k + 1, expression, source, band_resolved: at("band_resolved"), band_sd: at("band_sd") }
-                    })
+                        FrontMember { rank: k + 1, expression, source, band_resolved: at("band_resolved"), band_sd: at("band_sd"), switch: switch.clone() }
+                    }))
                 })
+                .collect::<Result<Vec<_>, String>>()?
+                .into_iter()
+                .flatten()
                 .collect(),
             _ => return Err("no 'pareto' array (not a single-target run.json)".to_string()),
         };
@@ -163,9 +231,11 @@ impl RunFile {
             position: position_of(objective_spec),
             band,
             min_holding,
+            mask: crate::run_book::mask_of(objective_spec)?,
             train_time: pair(split.and_then(|s| s.get("train_time"))),
             validation_time: pair(split.and_then(|s| s.get("validation_time"))),
             purge_seconds: purge("required_purge_seconds").or_else(|| purge("purge_seconds")),
+            intervals: run_intervals(split)?,
             candidates_evaluated: j
                 .get("search")
                 .and_then(|s| s.get("candidates_evaluated"))
@@ -178,6 +248,9 @@ impl RunFile {
                 .filter(|c| c.get("complete").map_or(false, |v| matches!(v, Json::Bool(true))))
                 .and_then(|c| c.get("elapsed_seconds"))
                 .and_then(Json::as_f64),
+            composite: CompositeMarker::of(&j),
+            book_target: crate::run_book::book_target_of(&j)?,
+            fill: j.get("preparation").and_then(|p| p.get("fill")).and_then(Json::as_str).map(str::to_string),
             doc: j.clone(),
         })
     }
@@ -195,6 +268,13 @@ impl RunFile {
     /// `objective.cost.source`; a run without the block counts as a flag cost.
     pub fn cost_source(&self) -> crate::target::CostSource {
         crate::run_book::cost_source_of(&self.doc)
+    }
+
+    /// #1291: the search filled missing labels (`preparation.fill` other than drop or none), so its
+    /// books priced every row with a finite return. A run without the block (`rcsr compose` needs
+    /// `--fill drop`) did not.
+    pub fn fills_labels(&self) -> bool {
+        !matches!(self.fill.as_deref(), None | Some("drop") | Some("none"))
     }
 
     /// Last time key the search trained or selected on.
@@ -258,4 +338,98 @@ pub fn rounded_refusal(path: &str) -> String {
          rerun the search with a build that writes expression_exact",
         path
     )
+}
+
+fn interval_list(j: Option<&Json>, key: &str) -> Result<Vec<(i64, i64)>, String> {
+    let bad = || format!("split.intervals.{} is not a list of [start, end] pairs", key);
+    match j {
+        Some(Json::Arr(a)) => a
+            .iter()
+            .map(|p| match p {
+                Json::Arr(q) if q.len() == 2 => match (q[0].as_f64(), q[1].as_f64()) {
+                    (Some(s), Some(e)) => Ok((s as i64, e as i64)),
+                    _ => Err(bad()),
+                },
+                _ => Err(bad()),
+            })
+            .collect(),
+        _ => Err(bad()),
+    }
+}
+
+/// #1173: `split.intervals` with its purge and embargo; `None` for a run of
+/// another split mode. A malformed block is an error, never the old rule.
+fn run_intervals(split: Option<&Json>) -> Result<Option<crate::intervals::IntervalSplit>, String> {
+    let Some(s) = split else { return Ok(None) };
+    let Some(iv) = s.get("intervals") else { return Ok(None) };
+    let declared = crate::intervals::Declared {
+        split_id: s.get("split_id").and_then(Json::as_str).unwrap_or("").to_string(),
+        train: interval_list(iv.get("train"), "train")?,
+        validation: interval_list(iv.get("validation"), "validation")?,
+        test: interval_list(iv.get("test"), "test")?,
+    };
+    let int = |key: &str| {
+        s.get(key)
+            .and_then(Json::as_f64)
+            .map(|v| v as i64)
+            .ok_or_else(|| format!("split.intervals needs split.{}", key))
+    };
+    let source = s
+        .get("embargo_source")
+        .and_then(Json::as_str)
+        .and_then(crate::intervals::EmbargoSource::parse)
+        .ok_or_else(|| "split.intervals needs split.embargo_source (flag, lookback or purge)".to_string())?;
+    Ok(Some(crate::intervals::IntervalSplit::new(declared, int("interval_purge_seconds")?, int("embargo_seconds")?, source, None)))
+}
+
+impl RunFile {
+    /// #1173: the test window `[test_start, test_end)` is in sample. An
+    /// interval-list run compares intervals: in sample when a kept training or
+    /// validation row has a label window that reaches the window or lies within
+    /// the embargo after it, so a window before later training rows can be out of
+    /// sample. Any other run keeps [`RunFile::in_sample`].
+    pub fn in_sample_window(&self, test_start: f64, test_end: f64) -> bool {
+        match &self.intervals {
+            Some(iv) => {
+                let mut kept = iv.effective(crate::intervals::Role::Train);
+                kept.extend(iv.effective(crate::intervals::Role::Validation));
+                crate::intervals::window_in_sample(&kept, test_start.floor() as i64, test_end.ceil() as i64, iv.purge, iv.embargo)
+            }
+            None => self.in_sample(test_start),
+        }
+    }
+
+    /// Why a window is in sample under the interval rule, for refusals.
+    pub fn interval_reason(&self) -> String {
+        match &self.intervals {
+            Some(iv) => format!(
+                "a kept training or validation row of split '{}' has a label window reaching the window (purge {} s) or reads its bars (embargo {} s after it)",
+                iv.declared.split_id, iv.purge, iv.embargo
+            ),
+            None => "the run has no split.intervals".to_string(),
+        }
+    }
+
+    /// [`RunFile::oof_flags`] over `(label, test_start, test_end)` folds with
+    /// [`RunFile::in_sample_window`].
+    pub fn oof_flags_windows(&self, folds: &[(String, f64, f64)], allow: bool) -> Result<Vec<bool>, String> {
+        if self.intervals.is_none() {
+            let starts: Vec<(String, f64)> = folds.iter().map(|(l, s, _)| (l.clone(), *s)).collect();
+            return self.oof_flags(&starts, allow);
+        }
+        let flags: Vec<bool> = folds.iter().map(|(_, s, e)| !self.in_sample_window(*s, *e)).collect();
+        if !allow {
+            let bad: Vec<&(String, f64, f64)> = folds.iter().zip(&flags).filter(|(_, ok)| !**ok).map(|(f, _)| f).collect();
+            if !bad.is_empty() {
+                let labels: Vec<&str> = bad.iter().map(|f| f.0.as_str()).collect();
+                return Err(format!(
+                    "fold(s) {} test rows the run trained or selected on ({}); \
+                     use a run trained before the fold, or --allow-in-sample to label them oof:false",
+                    labels.join(", "),
+                    self.interval_reason()
+                ));
+            }
+        }
+        Ok(flags)
+    }
 }

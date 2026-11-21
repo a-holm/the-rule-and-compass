@@ -596,3 +596,56 @@ fn require_edge_needs_fitness_pnl() {
     let o = fx.rcsr(&fx.data, &[EDGE, "--generations", "2", "--pop", "16", "--no-dev-log"]);
     assert_eq!(code(&o), 2, "{}", stderr(&o));
 }
+
+/// `objective.selection_rule` without the checkpoint path and without the
+/// per-member `block_len`.
+fn rule_without_block_len(j: &Json) -> Json {
+    let Json::Obj(fields) = without_reselected_from(j) else { panic!("selection_rule is not an object") };
+    Json::Obj(
+        fields
+            .into_iter()
+            .map(|(k, v)| match (k.as_str(), v) {
+                ("members", Json::Arr(ms)) => {
+                    let ms = ms
+                        .into_iter()
+                        .map(|m| match m {
+                            Json::Obj(f) => Json::Obj(f.into_iter().filter(|(k, _)| k != "block_len").collect()),
+                            other => other,
+                        })
+                        .collect();
+                    (k, Json::Arr(ms))
+                }
+                (_, v) => (k, v),
+            })
+            .collect(),
+    )
+}
+
+const EXPLICIT_21_GOLDEN: &str = r#"{"rule":"robust","blocks":4,"se_z":1,"block_len":21,"verdict":"selected","members":[{"archive_rank":1,"complexity":1,"trades":1,"block_alpha":[0,0,0,0],"pooled_alpha":0,"se":0,"eligible":false},{"archive_rank":2,"complexity":3,"trades":68,"block_alpha":[0.003448414357680999,0.00318745296680618,0.0034700610713886406,0.0032726717948161456],"pooled_alpha":0.0033438413032588696,"se":0.000031885123491145875,"eligible":true},{"archive_rank":3,"complexity":7,"trades":68,"block_alpha":[0.003448414357680999,0.0032716454183990304,0.0034700610713886406,0.0032726717948161456],"pooled_alpha":0.0033646529205065396,"se":0.000027725298681147136,"eligible":true}],"chosen_rank":2}"#;
+
+#[test]
+fn robust_explicit_block_len_unchanged() {
+    let fx = fixture();
+    ok(&fx.search("a", &[]));
+    let mut args = ROBUST.to_vec();
+    args.extend_from_slice(&["--select-block-len", "21"]);
+    ok(&fx.reselect("a", "b", &args));
+    let b = fx.run_json("b");
+    let sel = at(&b, &["objective", "selection_rule"]);
+    assert_eq!(at(sel, &["block_len"]).as_usize(), Some(21));
+    let got = rule_without_block_len(&b);
+    let want = Json::parse(EXPLICIT_21_GOLDEN).expect("golden parses");
+    assert_eq!(got, want, "got {got:?}");
+}
+
+#[test]
+fn select_block_len_above_half_the_series_is_refused() {
+    let fx = fixture();
+    let o = fx.rcsr(
+        &fx.data,
+        &["--generations", "2", "--pop", "16", "--select-rule", "robust", "--select-block-len", "7", "--validation-frac", "0.044", "--no-dev-log"],
+    );
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    let e = stderr(&o);
+    assert!(e.contains("--select-block-len 7") && e.contains("12 validation periods (6)"), "{e}");
+}

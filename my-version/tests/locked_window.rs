@@ -4,6 +4,8 @@
 
 #[path = "common/rcsr.rs"]
 mod rcsr_cmd;
+#[path = "common/timing.rs"]
+mod timing;
 
 use rcsr::devlog::Json;
 use rcsr::lockbox::{self, Lockbox};
@@ -359,32 +361,8 @@ fn dev_ladder(data: &str, win: &str, out: &str, purge: &str) -> (i32, String) {
     (code, err)
 }
 
-fn is_timing_key(key: &str) -> bool {
-    key.ends_with("_s")
-        || key.ends_with("_ms")
-        || key.ends_with("_seconds")
-        || key.starts_with("wall")
-        || key.starts_with("elapsed")
-        || ["numerator", "denominator", "device_fraction", "duty_run", "declared_in", "bytes_per_s", "rows_per_s"]
-            .contains(&key)
-}
-
-fn drop_timing(value: Json) -> Json {
-    match value {
-        Json::Obj(items) => Json::Obj(
-            items
-                .into_iter()
-                .filter(|(key, _)| !is_timing_key(key))
-                .map(|(key, v)| (key, drop_timing(v)))
-                .collect(),
-        ),
-        Json::Arr(items) => Json::Arr(items.into_iter().map(drop_timing).collect()),
-        other => other,
-    }
-}
-
 fn without_timing(json: &str) -> Json {
-    drop_timing(Json::parse(json).unwrap_or_else(|| panic!("not one JSON document: {json}")))
+    timing::drop_timing(Json::parse(json).unwrap_or_else(|| panic!("not one JSON document: {json}")))
 }
 
 #[test]
@@ -396,6 +374,68 @@ fn without_timing_drops_timing_keys_and_keeps_data() {
     assert_eq!(without_timing(a), without_timing(b));
     assert_ne!(without_timing(a), without_timing(c));
     assert_ne!(without_timing(a), without_timing(d));
+}
+
+#[test]
+fn without_timing_drops_the_ledger_closure_ratio() {
+    let a = r#"{"ledger":{"closure":{"value":1e-16}},"rows":5}"#;
+    let b = r#"{"ledger":{"closure":{"value":0}},"rows":5}"#;
+    assert_eq!(without_timing(a), without_timing(b));
+    assert_ne!(without_timing(a), without_timing(&a.replace("5", "6")));
+}
+
+#[test]
+fn without_timing_keeps_seconds_spec_and_config_members() {
+    for key in [
+        "purge_seconds_effective", "embargo_seconds", "purge_seconds", "horizon_seconds", "bar_seconds", "bar_seconds_modal_share",
+        "lookback_seconds", "required_purge_seconds", "period_seconds", "min_group_step_seconds", "seconds",
+    ] {
+        let a = format!(r#"{{"{key}":1,"rows":5}}"#);
+        let b = format!(r#"{{"{key}":2,"rows":5}}"#);
+        assert_ne!(without_timing(&a), without_timing(&b), "{key} is data and must be compared");
+    }
+    for key in ["wall_seconds", "sr_wall_seconds", "elapsed_seconds", "total_seconds", "search_seconds", "gpu_seconds", "phases_seconds"] {
+        let a = format!(r#"{{"{key}":1,"rows":5}}"#);
+        let b = format!(r#"{{"{key}":2,"rows":5}}"#);
+        assert_eq!(without_timing(&a), without_timing(&b), "{key} is timing and must be dropped");
+    }
+}
+
+#[test]
+fn drop_timing_drops_gpu_fit_and_prune_seconds_but_keeps_embargo_seconds() {
+    let fixture = |gpu_s: &str, prune_s: &str, embargo_s: &str, attempts: &str, fits: &str| {
+        format!(
+            r#"{{"gpu":{{"fit":{{"seconds":{gpu_s},"attempts":{attempts}}}}},"prune":{{"seconds":{prune_s},"fits":{fits},"accepted":1}},"lockbox_embargo":{{"seconds":{embargo_s}}}}}"#
+        )
+    };
+    let base = fixture("1", "1", "86400", "4", "2");
+    assert_eq!(without_timing(&base), without_timing(&fixture("7.5", "3", "86400", "4", "2")));
+    assert_ne!(without_timing(&base), without_timing(&fixture("1", "1", "172800", "4", "2")));
+    assert_ne!(without_timing(&base), without_timing(&fixture("1", "1", "86400", "5", "2")));
+    assert_ne!(without_timing(&base), without_timing(&fixture("1", "1", "86400", "4", "3")));
+}
+
+#[test]
+fn search_validation_block_ignores_locked_prices() {
+    let (_scratch, dir) = scratch("search_validation");
+    let a = diff_store(&dir, "a", false);
+    let b = diff_store(&dir, "b", true);
+    let exclude = format!("ts >= {}", T0 + 400 * H - DEFAULT_PURGE);
+    let run = |data: &str, out: &str| {
+        let (code, _, err) = rcsr(&[
+            "--data", data, "--target", "y", "--vars", "f1,f2", "--time", "ts", "--group-by", "sym", "--split", "temporal",
+            "--validation-frac", "0.2", "--fill", "drop", "--exclude", &exclude, "--cpu", "--no-dev-log", "--seed", "1",
+            "--generations", "3", "--pop", "20", "--quiet", "--json-out", out,
+        ]);
+        assert_eq!(code, 0, "{err}");
+        let json = std::fs::read_to_string(out).unwrap();
+        let doc = without_timing(&json);
+        let selection = doc.get("selection").cloned().unwrap_or_else(|| panic!("no selection member: {json}"));
+        let validation = selection.get("validation").cloned().unwrap_or_else(|| panic!("no validation member: {json}"));
+        assert!(validation.get("purge_seconds_effective").is_some(), "{json}");
+        validation
+    };
+    assert_eq!(run(&a, &s(&dir.join("ra.json"))), run(&b, &s(&dir.join("rb.json"))));
 }
 
 #[test]
@@ -1635,4 +1675,294 @@ fn ladder_refuses_a_relative_out_and_its_dot_slash_form() {
     assert_eq!(f.bytes(&f.ledger), ledger_before);
     assert!(f.bytes(&f.marker()).is_none());
     assert!(!f.dir.join("a.json").exists() && !f.dir.join("a.json.tmp").exists());
+}
+
+/// A verify with another window set is refused before the panel is loaded: no
+/// report hash is printed and neither the ledger nor the marker changes.
+#[test]
+fn ladder_verify_read_with_other_windows_scores_nothing() {
+    let f = Sealed::new("lad-verify-windows");
+    let out = s(&f.dir.join("first.json"));
+    let (code, _, err) = f.read(&out, &[]);
+    assert_eq!(code, 0, "{}", err);
+    let sha = f.recorded_sha();
+    let (ledger_before, marker_before) = (f.bytes(&f.ledger), f.bytes(&f.marker()));
+    let row = |train_end: i64| {
+        format!(
+            "scheme,label,train_start,train_end,validation_start,test_start,test_end\nlocked,locked_0,{},{},{},{},{}\n",
+            T0,
+            T0 + train_end * H,
+            T0 + 250 * H,
+            T0 + 400 * H,
+            T0 + 500 * H
+        )
+    };
+    let draws_more = ["--draws", "60"];
+    for (name, windows, extra) in [
+        ("shorter-train", row(390), vec![]),
+        ("unscorable", row(3), vec![]),
+        ("same-windows-other-setting", row(398), draws_more.to_vec()),
+    ] {
+        let other = s(&f.dir.join(format!("{name}.csv")));
+        std::fs::write(&other, windows).unwrap();
+        for hash in [None, Some(sha.as_str())] {
+            let mut a = vec!["--locked-test", "--ledger", f.ledger.as_str(), "--sealed", f.sealed.as_str(), "--verify-read"];
+            if let Some(h) = hash {
+                a.extend_from_slice(&["--expect-report-sha256", h]);
+            }
+            let probe = s(&f.dir.join(format!("{name}.out.json")));
+            let draws = extra.clone();
+            // the later --draws wins over the helper default
+            a.extend_from_slice(&draws);
+            let (code, stdout, err) = ladder(&f.data, &other, &probe, &a);
+            assert_eq!(code, 3, "{name}: {stdout}{err}");
+            assert!(err.contains("binds the report"), "{name}: {err}");
+            assert!(!err.contains("report sha256") && !stdout.contains("report_sha256"), "{name}: {stdout}{err}");
+            assert!(!Path::new(&probe).exists());
+            assert_eq!(f.bytes(&f.ledger), ledger_before);
+            assert_eq!(f.bytes(&f.marker()), marker_before);
+        }
+    }
+    let (code, _, err) = f.read(&s(&f.dir.join("again.json")), &["--verify-read", "--expect-report-sha256", &sha]);
+    assert_eq!(code, 0, "{}", err);
+}
+
+/// A second store with the same declared locked range and the given data file.
+fn second_store(f: &Sealed, name: &str) -> String {
+    let p = f.dir.join(name);
+    let d = s(&p);
+    lockbox::write_sidecar(&d, &Lockbox { start: T0 + 400 * H, end: T0 + 500 * H }, "test").unwrap();
+    d
+}
+
+#[test]
+fn ladder_verify_read_on_another_store_is_refused() {
+    let f = Sealed::new("lad-verify-other");
+    let out = s(&f.dir.join("first.json"));
+    assert_eq!(f.read(&out, &[]).0, 0);
+    let sha = f.recorded_sha();
+    // no rows inside the locked range: a run that reached scoring fails differently
+    let other = second_store(&f, "other.csv");
+    let text = std::fs::read_to_string(&f.data).unwrap();
+    let keep: Vec<&str> = text
+        .lines()
+        .enumerate()
+        .filter(|(i, l)| *i == 0 || l.split(',').next().unwrap().parse::<i64>().unwrap() < T0 + 400 * H)
+        .map(|(_, l)| l)
+        .collect();
+    std::fs::write(&other, keep.join("\n") + "\n").unwrap();
+    let (ledger_before, marker_before) = (f.bytes(&f.ledger), f.bytes(&f.marker()));
+    let out2 = s(&f.dir.join("other.json"));
+    for extra in [vec!["--verify-read"], vec!["--verify-read", "--expect-report-sha256", sha.as_str()]] {
+        let mut a = vec!["--locked-test", "--ledger", f.ledger.as_str(), "--sealed", f.sealed.as_str()];
+        a.extend_from_slice(&extra);
+        let (code, stdout, err) = ladder(&other, &f.windows, &out2, &a);
+        assert_eq!(code, 3, "{}", err);
+        assert!(err.contains("differs from the recorded baseline read") && err.contains("the verify is void"), "{}", err);
+        assert!(!err.contains("report sha256") && !stdout.contains("report_sha256"), "{}{}", stdout, err);
+        assert!(!Path::new(&out2).exists());
+        assert_eq!(f.bytes(&f.ledger), ledger_before);
+        assert_eq!(f.bytes(&f.marker()), marker_before);
+        assert!(!Path::new(&format!("{}.locked_reads.jsonl", other)).exists());
+    }
+    // the recorded read still verifies on its own store
+    let (code, _, err) = f.read(&out2, &["--verify-read", "--expect-report-sha256", &sha]);
+    assert_eq!(code, 0, "{}", err);
+}
+
+#[test]
+fn ladder_verify_read_needs_a_read_marker() {
+    let f = Sealed::new("lad-verify-marker");
+    let out = s(&f.dir.join("first.json"));
+    assert_eq!(f.read(&out, &[]).0, 0);
+    let copy = second_store(&f, "copy.csv");
+    std::fs::copy(&f.data, &copy).unwrap();
+    let ledger_before = f.bytes(&f.ledger);
+    let out2 = s(&f.dir.join("copy.json"));
+    let (code, _, err) = ladder(
+        &copy,
+        &f.windows,
+        &out2,
+        &["--locked-test", "--ledger", &f.ledger, "--sealed", &f.sealed, "--verify-read"],
+    );
+    assert_eq!(code, 3, "{}", err);
+    assert!(err.contains("has no read marker"), "{}", err);
+    assert!(!Path::new(&out2).exists());
+    assert_eq!(f.bytes(&f.ledger), ledger_before);
+    assert!(!Path::new(&format!("{}.locked_reads.jsonl", copy)).exists());
+}
+
+fn verify_args<'a>(f: &'a Sealed, sha: Option<&'a str>, extra: &[&'a str]) -> Vec<&'a str> {
+    let mut a = vec!["--locked-test", "--ledger", f.ledger.as_str(), "--sealed", f.sealed.as_str(), "--verify-read"];
+    if let Some(h) = sha {
+        a.extend_from_slice(&["--expect-report-sha256", h]);
+    }
+    a.extend_from_slice(extra);
+    a
+}
+
+/// A verify refused on the binding digest: exit 3, no hash, nothing written or recorded.
+fn assert_binding_refusal(f: &Sealed, name: &str, extra: &[&str], sha: &str, ledger: &Option<Vec<u8>>, marker: &Option<Vec<u8>>) {
+    for hash in [None, Some(sha)] {
+        let probe = s(&f.dir.join(format!("{name}.out.json")));
+        let (code, stdout, err) = ladder(&f.data, &f.windows, &probe, &verify_args(f, hash, extra));
+        assert_eq!(code, 3, "{name}: {stdout}{err}");
+        assert!(err.contains("binds the report"), "{name}: {err}");
+        assert!(!err.contains("report sha256") && !stdout.contains("report_sha256"), "{name}: {stdout}{err}");
+        assert!(!Path::new(&probe).exists());
+        assert_eq!(&f.bytes(&f.ledger), ledger);
+        assert_eq!(&f.bytes(&f.marker()), marker);
+    }
+}
+
+/// A `--retired` record whose ledger holds one read of the protocol default range.
+fn retired_record(dir: &Path) -> String {
+    let ledger = dir.join("retire-ledger.jsonl");
+    let l = Ledger::new(&ledger);
+    let spec = "spec-r".to_string();
+    let c = Candidate {
+        id: Candidate::address(&spec, "data", "build"),
+        spec_sha256: spec,
+        data_sha256: "data".into(),
+        build_commit: "build".into(),
+        report_sha256: "report".into(),
+        expression: "x".into(),
+        locked_test: None,
+    };
+    l.add_candidate(&c).unwrap();
+    l.seal(&dir.join("retire-sealed.json"), &[]).unwrap();
+    l.record_read(&c.id, "locked", Some(&rcsr::protocol::LockedRange::new(&lockbox::protocol_default(), "store"))).unwrap();
+    let out = s(&dir.join("retired.json"));
+    let (code, _, err) = rcsr(&["protocol", "retire", "--ledger", &s(&ledger), "--range", "2025-07-01,2026-07-01", "--out", &out]);
+    assert_eq!(code, 0, "{}", err);
+    out
+}
+
+#[test]
+fn ladder_verify_read_with_another_retirement_scores_nothing() {
+    let f = Sealed::new("lad-verify-retired");
+    let range = format!(
+        "{},{}",
+        rcsr::protocol::iso((T0 + 400 * H) as f64),
+        rcsr::protocol::iso((T0 + 500 * H) as f64)
+    );
+    let out = s(&f.dir.join("first.json"));
+    let (code, _, err) = f.read(&out, &["--lockbox", &range]);
+    assert_eq!(code, 0, "{}", err);
+    let sha = f.recorded_sha();
+    let (ledger, marker) = (f.bytes(&f.ledger), f.bytes(&f.marker()));
+    let record = retired_record(&f.dir);
+    assert_binding_refusal(&f, "retired", &["--lockbox", &range, "--retired", &record], &sha, &ledger, &marker);
+    let (code, _, err) = f.read(&s(&f.dir.join("again.json")), &["--lockbox", &range, "--verify-read", "--expect-report-sha256", &sha]);
+    assert_eq!(code, 0, "{}", err);
+}
+
+/// A verify without `--allow-in-sample` is refused on the binding digest, not
+/// after the panel load by the in-sample check of the run.
+#[test]
+fn ladder_verify_read_without_allow_in_sample_scores_nothing() {
+    let (_scratch, dir) = scratch("lad-verify-in-sample");
+    let (data, win, spec, run) = (s(&dir.join("p.csv")), s(&dir.join("w.csv")), s(&dir.join("spec.json")), s(&dir.join("run.json")));
+    panel_csv(&dir.join("plain.csv"));
+    let text = std::fs::read_to_string(dir.join("plain.csv")).unwrap();
+    let with_r: Vec<String> = text
+        .lines()
+        .enumerate()
+        .map(|(i, l)| if i == 0 { format!("{l},r") } else { format!("{l},{}", l.rsplit(',').next().unwrap()) })
+        .collect();
+    std::fs::write(&data, with_r.join("\n") + "\n").unwrap();
+    std::fs::write(
+        &spec,
+        "{\"schema\":\"rcsr-target-spec/1\",\"targets\":[{\"column\":\"y\",\"name\":\"raw_target\",\"kind\":\"forward_return\",\
+\"deprecated\":false,\"return_column\":\"r\",\"return_units\":\"log\",\"horizon_seconds\":3600,\"entry_offset_seconds\":0,\
+\"delay_seconds\":0,\"entry_price\":\"next open\",\"exit_price\":\"close\",\"offset\":0.0,\
+\"scale\":{\"kind\":\"constant\",\"value\":1.0},\"clip\":null,\"units\":\"log_return\",\"cost_bps\":null,\
+\"cost_in_label\":false,\"construction_columns\":[],\"note\":null}]}",
+    )
+    .unwrap();
+    let (code, _, err) = rcsr(&[
+        "--data", &data, "--target", "y", "--vars", "f1,f2", "--time", "ts", "--group-by", "sym", "--split", "temporal",
+        "--target-spec", &spec, "--cpu", "--no-dev-log", "--seed", "3", "--generations", "5", "--pop", "20",
+        "--metric", "squared", "--quiet", "--objective", "pnl", "--cost-bps", "5", "--validation-frac", "0.3",
+        "--json-out", &run,
+    ]);
+    assert_eq!(code, 0, "{}", err);
+    // the run saw the first locked window but not the second
+    let text = std::fs::read_to_string(&run).unwrap();
+    let key = "\"validation_time\":[";
+    let at = text.find(key).unwrap() + key.len();
+    let end_at = at + text[at..].find(',').unwrap() + 1;
+    let close = end_at + text[end_at..].find(']').unwrap();
+    std::fs::write(&run, format!("{}{}{}", &text[..end_at], T0 + 425 * H, &text[close..])).unwrap();
+    let row = |label: &str, a: i64, b: i64| format!("locked,{label},{},{},{},{},{}\n", T0, T0 + 398 * H, T0 + 250 * H, T0 + a * H, T0 + b * H);
+    std::fs::write(
+        &win,
+        format!(
+            "scheme,label,train_start,train_end,validation_start,test_start,test_end\n{}{}",
+            row("locked_0", 400, 450),
+            row("locked_1", 450, 500)
+        ),
+    )
+    .unwrap();
+    let lock = format!("{},{}", T0 + 400 * H, T0 + 500 * H);
+    let (l, sealed) = (s(&dir.join("ledger.jsonl")), s(&dir.join("sealed.json")));
+    let dev = format!("dev,{},{},{},{}", T0, T0 + 150 * H, T0 + 160 * H, T0 + 250 * H);
+    let (code, _, err) = rcsr(&[
+        "walkforward", "--data", &data, "--target", "y", "--expr", "f1", "--time", "ts", "--group-by", "sym", "--horizon", "5",
+        "--cost-bps", "5", "--periods-per-year", "365", "--json", "--ledger", &l, "--lockbox", &lock, "--window", &dev,
+    ]);
+    assert_eq!(code, 0, "{}", err);
+    let (code, _, err) = rcsr(&["protocol", "seal", "--final", "--ledger", &l, "--out", &sealed]);
+    assert_eq!(code, 0, "{}", err);
+    let go = |out: &str, extra: &[&str]| {
+        let mut a = vec![
+            "ladder", "--data", data.as_str(), "--target", "y", "--return-col", "r", "--time", "ts", "--group", "sym",
+            "--features", "f1,f2", "--windows", win.as_str(), "--scheme", "locked", "--purge-seconds", "7200",
+            "--gbm-trees", "10", "--draws", "50", "--max-fit-rows", "600", "--lockbox", lock.as_str(), "--locked-test",
+            "--ledger", l.as_str(), "--sealed", sealed.as_str(), "--sr-run", run.as_str(), "--out", out,
+        ];
+        a.extend_from_slice(extra);
+        rcsr(&a)
+    };
+    let first = s(&dir.join("first.json"));
+    let (code, _, err) = go(&first, &["--allow-in-sample"]);
+    assert_eq!(code, 0, "{}", err);
+    let text = std::fs::read_to_string(&l).unwrap();
+    let line = text.lines().find(|l| l.contains("\"event\":\"baseline_read\"")).unwrap();
+    let sha = line.split("\"report_sha256\":\"").nth(1).unwrap().split('"').next().unwrap().to_string();
+    let marker = format!("{data}.locked_reads.jsonl");
+    let (ledger_before, marker_before) = (std::fs::read(&l).unwrap(), std::fs::read(&marker).unwrap());
+    for hash in [None, Some(sha.as_str())] {
+        let probe = s(&dir.join("probe.json"));
+        let mut extra = vec!["--verify-read"];
+        if let Some(h) = hash {
+            extra.extend_from_slice(&["--expect-report-sha256", h]);
+        }
+        let (code, stdout, err) = go(&probe, &extra);
+        assert_eq!(code, 3, "{stdout}{err}");
+        assert!(err.contains("binds the report"), "{err}");
+        assert!(!err.contains("report sha256") && !stdout.contains("report_sha256"), "{stdout}{err}");
+        assert!(!Path::new(&probe).exists());
+        assert_eq!(std::fs::read(&l).unwrap(), ledger_before);
+        assert_eq!(std::fs::read(&marker).unwrap(), marker_before);
+    }
+    let (code, _, err) = go(&s(&dir.join("again.json")), &["--allow-in-sample", "--verify-read", "--expect-report-sha256", &sha]);
+    assert_eq!(code, 0, "{}", err);
+}
+
+/// A second carrier that declares the same range changes the hashed lockbox
+/// object only; the verify is refused on the binding digest, before the load.
+#[test]
+fn ladder_verify_read_after_another_carrier_appears_scores_nothing() {
+    let f = Sealed::new("lad-verify-carrier");
+    let (code, _, err) = f.read(&s(&f.dir.join("first.json")), &[]);
+    assert_eq!(code, 0, "{}", err);
+    let sha = f.recorded_sha();
+    let (ledger, marker) = (f.bytes(&f.ledger), f.bytes(&f.marker()));
+    let carrier = format!("{}.enrich.json", f.data);
+    std::fs::copy(format!("{}.lockbox.json", f.data), &carrier).unwrap();
+    assert_binding_refusal(&f, "carrier", &[], &sha, &ledger, &marker);
+    std::fs::remove_file(&carrier).unwrap();
+    let (code, _, err) = f.read(&s(&f.dir.join("again.json")), &["--verify-read", "--expect-report-sha256", &sha]);
+    assert_eq!(code, 0, "{}", err);
 }

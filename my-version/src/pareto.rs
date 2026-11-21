@@ -15,6 +15,7 @@ pub struct Sol {
     pub cost: f64,
 }
 
+#[derive(Clone, Debug)]
 pub struct Archive {
     pub items: Vec<Sol>,
     pub cap: usize,

@@ -10,6 +10,7 @@ mod rcsr_cmd;
 
 use rcsr::data;
 use rcsr::store;
+use rcsr::trading::MissingScore;
 use rcsr::walkforward::{self, EvalSpec, Window};
 
 #[path = "common/scratch.rs"]
@@ -587,7 +588,7 @@ fn final_exit_is_charged_per_group_when_rows_are_dropped() {
     let target = [f64::NAN, 0.01, 0.02, 0.03, 0.04];
     let scores = [1.0; 5];
     let mut previous = std::collections::HashMap::new();
-    let t = walkforward::reference_cell(&time, &group, &target, &scores, 0.0, 0.001, &mut previous);
+    let t = walkforward::reference_cell(&time, &group, &target, &scores, 0.0, 0.001, &mut previous, rcsr::trading::MissingScore::Flat);
     assert_eq!(t.rows, 4);
     assert_eq!(t.final_exits, 2);
     assert_eq!(t.entries, 2);
@@ -746,6 +747,14 @@ mod front {
         rcsr(&a)
     }
 
+    /// Like `wf` for a run that declares its target spec: the spec sets the period width.
+    fn wf_book(data: &str, source: &[&str], window: &str, extra: &[&str]) -> (i32, String, String) {
+        let mut a = vec!["walkforward", "--data", data, "--time", "ts", "--validation-frac", "0.3", "--window", window, "--json"];
+        a.extend_from_slice(source);
+        a.extend_from_slice(extra);
+        rcsr(&a)
+    }
+
     /// last seen 179 + required purge 5
     const OK_WINDOW: &str = "late,0,150,184,300";
 
@@ -810,17 +819,197 @@ mod front {
         }
     }
 
+    const BOOK_RUN: &str = r#"{"tool":"rcsr","variables":["x"],
+        "target_spec":{"column":"target","name":"target","kind":"forward_return","deprecated":false,
+            "return_column":"target","return_units":"log","horizon_seconds":1,"entry_offset_seconds":0,
+            "delay_seconds":0,"entry_price":"next open","exit_price":"close","offset":0.0,
+            "scale":{"kind":"constant","value":1.0},"clip":null,"units":"log_return","cost_bps":null,
+            "cost_in_label":false,"construction_columns":[],"note":null},
+        "split":{"train_time":[0,119],"validation_time":[120,179],"required_purge_seconds":5,"purge_seconds":9},
+        "search":{"candidates_evaluated":1000},
+        "objective":{"spec":{"threshold":0,"per_side_bps":5,"max_position":1,"cash_return":0},
+            "finalist":{"expression":"x"}},
+        "pareto":[{"expression":"x"},{"expression":"x * 2 + 0.1"},{"expression":"0.5 - x"}]}"#;
+
+    const IN_SAMPLE_WINDOW: &str = "bad,0,100,150,300";
+
+    fn num(j: &Json, path: &[&str]) -> f64 {
+        let mut cur = j;
+        for k in path {
+            cur = cur.get(k).unwrap_or_else(|| panic!("missing {k} in {path:?}"));
+        }
+        cur.as_f64().unwrap_or_else(|| panic!("{path:?} is not a number"))
+    }
+
+    fn multiple(out: &str) -> Json {
+        let j = Json::parse(out.trim()).unwrap();
+        j.get("inference").and_then(|i| i.get("multiple_testing")).expect("multiple_testing").clone()
+    }
+
+    fn source(m: &Json) -> String {
+        m.get("n_trials_source").and_then(Json::as_str).expect("n_trials_source").to_string()
+    }
+
+    fn mt(m: &Json, path: &[&str]) -> f64 {
+        num(m, path)
+    }
+
     #[test]
-    fn front_trials_default_to_candidates_evaluated_and_can_be_overridden() {
+    fn from_run_trials_are_one_out_of_sample_book() {
+        let (_scratch, dir) = scratch("fromrun1");
+        let data = write_data(&dir);
+        let run = write_run(&dir, BOOK_RUN);
+        let (code, a, err) = wf_book(&data, &["--from-run", &run], OK_WINDOW, &["--bootstrap", "100"]);
+        assert_eq!(code, 0, "{err}");
+        let m = multiple(&a);
+        assert_eq!(mt(&m, &["trials"]), 1.0);
+        assert_eq!(source(&m), "out_of_sample_book");
+        let (code, b, err) = wf_book(&data, &["--from-run", &run], OK_WINDOW, &["--bootstrap", "100", "--trials", "1"]);
+        assert_eq!(code, 0, "{err}");
+        let mb = multiple(&b);
+        assert_eq!(source(&mb), "flag");
+        for k in ["dsr_at_n_eff", "dsr_at_10_n_eff"] {
+            assert_eq!(format!("{:?}", m.get(k)), format!("{:?}", mb.get(k)), "{k}");
+        }
+        assert_eq!(format!("{:?}", m.get("psr")), format!("{:?}", m.get("dsr_at_n_eff")));
+        let (code, c, err) = wf_book(&data, &["--from-run", &run], OK_WINDOW, &["--bootstrap", "100", "--trials", "77"]);
+        assert_eq!(code, 0, "{err}");
+        let mc = multiple(&c);
+        assert_eq!(mt(&mc, &["trials"]), 77.0);
+        assert_eq!(source(&mc), "flag");
+    }
+
+    #[test]
+    fn in_sample_window_deflates_by_the_search_trials() {
+        let (_scratch, dir) = scratch("fromrun2");
+        let data = write_data(&dir);
+        let run = write_run(&dir, BOOK_RUN);
+        let extra = ["--bootstrap", "100", "--allow-in-sample-windows"];
+        let (code, a, err) = wf_book(&data, &["--from-run", &run], IN_SAMPLE_WINDOW, &extra);
+        assert_eq!(code, 0, "{err}");
+        let m = multiple(&a);
+        assert_eq!(mt(&m, &["trials"]), 1000.0);
+        assert_eq!(source(&m), "run.candidates_evaluated");
+        assert!(mt(&m, &["dsr_at_n_eff", "sr0"]) > 0.0);
+        assert!(mt(&m, &["dsr_at_n_eff", "dsr"]) < mt(&m, &["psr", "dsr"]));
+        assert_eq!(mt(&m, &["psr", "sr0"]), 0.0);
+    }
+
+    #[test]
+    fn front_trials_follow_what_selected_on_the_scored_rows() {
         let (_scratch, dir) = scratch("trials");
         let data = write_data(&dir);
         let run = write_run(&dir, RUN);
         let (code, a, err) = wf(&data, &["--front", &run], OK_WINDOW, &["--bootstrap", "100"]);
         assert_eq!(code, 0, "{err}");
-        assert!(a.contains("\"trials\":4321"), "{a}");
+        let m = multiple(&a);
+        assert_eq!(mt(&m, &["trials"]), 3.0);
+        assert_eq!(source(&m), "front_size");
+        let (code, a, err) = wf(&data, &["--front", &run], IN_SAMPLE_WINDOW, &["--bootstrap", "100", "--allow-in-sample-windows"]);
+        assert_eq!(code, 0, "{err}");
+        let m = multiple(&a);
+        assert_eq!(mt(&m, &["trials"]), 4321.0);
+        assert_eq!(source(&m), "run.candidates_evaluated");
         let (code, b, err) = wf(&data, &["--front", &run], OK_WINDOW, &["--trials", "77", "--bootstrap", "100"]);
         assert_eq!(code, 0, "{err}");
-        assert!(b.contains("\"trials\":77"), "{b}");
+        let m = multiple(&b);
+        assert_eq!(mt(&m, &["trials"]), 77.0);
+        assert_eq!(source(&m), "flag");
+    }
+
+    #[test]
+    fn trials_fall_back_to_front_size() {
+        let (_scratch, dir) = scratch("fallback");
+        let data = write_data(&dir);
+        let no_count = [
+            ("--front", RUN.replace(r#""search":{"candidates_evaluated":4321},"#, "")),
+            ("--from-run", BOOK_RUN.replace(r#""search":{"candidates_evaluated":1000},"#, "")),
+        ];
+        for (flag, text) in &no_count {
+            let path = write_run(&dir, text);
+            for (window, extra) in [
+                (OK_WINDOW, vec!["--bootstrap", "100"]),
+                (IN_SAMPLE_WINDOW, vec!["--bootstrap", "100", "--allow-in-sample-windows"]),
+            ] {
+                let (code, out, err) = if *flag == "--from-run" { wf_book(&data, &[*flag, &path], window, &extra) } else { wf(&data, &[*flag, &path], window, &extra) };
+                assert_eq!(code, 0, "{flag} {window}: {err}");
+                let m = multiple(&out);
+                let in_sample = window == IN_SAMPLE_WINDOW;
+                let (n, s) = match (*flag, in_sample) {
+                    ("--from-run", false) => (1.0, "out_of_sample_book"),
+                    _ => (3.0, "front_size"),
+                };
+                assert_eq!(mt(&m, &["trials"]), n, "{flag} {window}");
+                assert_eq!(source(&m), s, "{flag} {window}");
+            }
+        }
+    }
+
+    #[test]
+    fn min_btl_years_in_report() {
+        let (_scratch, dir) = scratch("minbtl");
+        let data = write_data(&dir);
+        let run = write_run(&dir, RUN);
+        let (code, out, err) = wf(&data, &["--front", &run], OK_WINDOW, &["--bootstrap", "100"]);
+        assert_eq!(code, 0, "{err}");
+        let j = Json::parse(out.trim()).unwrap();
+        let m = multiple(&out);
+        let sharpe_annual = num(&j, &["inference", "bootstrap", "sharpe_annual"]);
+        let want = rcsr::inference::min_btl_years(sharpe_annual, mt(&m, &["n_eff"]));
+        let got = m.get("min_btl_years").and_then(Json::as_f64);
+        if want.is_nan() {
+            assert!(got.is_none(), "{got:?}");
+        } else {
+            assert!((got.expect("min_btl_years") - want).abs() < 1e-12, "{got:?} vs {want}");
+        }
+    }
+
+    #[test]
+    fn front_identical_columns_dsr_equals_psr() {
+        let (_scratch, dir) = scratch("identical");
+        let data = write_data(&dir);
+        let same = RUN.replace(r#"{"expression":"x * 2 + 0.1"},{"expression":"0.5 - x"}"#, r#"{"expression":"x"}"#);
+        let run = write_run(&dir, &same);
+        let (code, out, err) = wf(&data, &["--front", &run], OK_WINDOW, &["--bootstrap", "100"]);
+        assert_eq!(code, 0, "{err}");
+        let m = multiple(&out);
+        assert_eq!(mt(&m, &["trials"]), 2.0);
+        assert!(mt(&m, &["n_eff"]) <= 1.0 + 1e-9, "{m:?}");
+        assert_eq!(format!("{:?}", m.get("psr").and_then(|p| p.get("dsr"))), format!("{:?}", m.get("dsr_at_n_eff").and_then(|p| p.get("dsr"))));
+        assert_eq!(mt(&m, &["dsr_at_n_eff", "sr0"]), 0.0);
+        assert_eq!(m.get("min_btl_years").and_then(Json::as_f64).unwrap_or(0.0), 0.0);
+    }
+
+    #[test]
+    fn trials_source_labels_for_vote_and_a_raised_flag() {
+        let (_scratch, dir) = scratch("labels");
+        let data = write_data(&dir);
+        let run = write_run(&dir, BOOK_RUN);
+        let vote = ["--bootstrap", "100", "--policy", "vote", "--quorum", "0.5"];
+        let (code, a, err) = wf_book(&data, &["--from-run", &run], OK_WINDOW, &vote);
+        assert_eq!(code, 0, "{err}");
+        let m = multiple(&a);
+        assert_eq!(source(&m), "out_of_sample_book", "{m:?}");
+        let mut flagged = vote.to_vec();
+        flagged.extend(["--trials", "5"]);
+        let (code, b, err) = wf_book(&data, &["--from-run", &run], OK_WINDOW, &flagged);
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(source(&multiple(&b)), "flag");
+        assert_eq!(mt(&multiple(&b), &["trials"]), 5.0);
+        let exprs = ["--target", "target", "--vars", "x", "--expr", "x", "--expr", "x * 2 + 0.1", "--expr", "0.5 - x", "--expr", "x - 0.1", "--expr", "x + 0.2"];
+        let mut raised = exprs.to_vec();
+        raised.extend(["--bootstrap", "100", "--trials", "2"]);
+        let (code, c, err) = wf(&data, &[], OK_WINDOW, &raised);
+        assert_eq!(code, 0, "{err}");
+        let m = multiple(&c);
+        assert_eq!(mt(&m, &["trials"]), 5.0);
+        assert_eq!(source(&m), "candidate_count");
+        let mut kept = exprs.to_vec();
+        kept.extend(["--bootstrap", "100", "--trials", "9"]);
+        let (code, d, err) = wf(&data, &[], OK_WINDOW, &kept);
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(mt(&multiple(&d), &["trials"]), 9.0);
+        assert_eq!(source(&multiple(&d)), "flag");
     }
 
     #[test]
@@ -894,8 +1083,7 @@ mod front {
 
         let no_count = write_run(&dir, &RUN.replace(r#""search":{"candidates_evaluated":4321},"#, ""));
         let (code, _, err) = wf(&data, &["--front", &no_count], OK_WINDOW, &[]);
-        assert_eq!(code, 2, "{err}");
-        assert!(err.contains("--trials"), "{err}");
+        assert_eq!(code, 0, "{err}");
         let (code, _, err) = wf(&data, &["--front", &no_count], OK_WINDOW, &["--trials", "10"]);
         assert_eq!(code, 0, "{err}");
 
@@ -903,6 +1091,34 @@ mod front {
         let (code, _, err) = wf(&data, &["--front", &missing_var], OK_WINDOW, &[]);
         assert_eq!(code, 3, "{err}");
         assert!(err.contains("zz"), "{err}");
+    }
+
+    /// #1094: the cut is fitted on rows before the test block, so it is no trial
+    /// on the scored rows: the trials and their source follow the #1027 table.
+    #[test]
+    fn threshold_fit_keeps_the_trial_count() {
+        let (_scratch, dir) = scratch("fittrials");
+        let data = write_data(&dir);
+        let run = write_run(&dir, BOOK_RUN);
+        let fit = ["--threshold-fit", "fitness", "--cut-min-entries", "1", "--cut-blocks", "1"];
+        for (window, extra, trials, want) in [
+            (OK_WINDOW, vec!["--bootstrap", "100"], 1.0, "out_of_sample_book"),
+            (IN_SAMPLE_WINDOW, vec!["--bootstrap", "100", "--allow-in-sample-windows"], 1000.0, "run.candidates_evaluated"),
+        ] {
+            let (code, plain, err) = wf_book(&data, &["--from-run", &run], window, &extra);
+            assert_eq!(code, 0, "{err}");
+            let mut with_fit = extra.clone();
+            with_fit.extend_from_slice(&fit);
+            let (code, fitted, err) = wf_book(&data, &["--from-run", &run], window, &with_fit);
+            assert_eq!(code, 0, "{err}");
+            let j = Json::parse(fitted.trim()).unwrap();
+            assert_eq!(j.get("threshold").and_then(|t| t.get("fit")).and_then(Json::as_str), Some("fitness"), "{fitted}");
+            for out in [&plain, &fitted] {
+                let m = multiple(out);
+                assert_eq!(mt(&m, &["trials"]), trials);
+                assert_eq!(source(&m), want);
+            }
+        }
     }
 }
 
@@ -1309,4 +1525,1692 @@ fn vote_members_and_thresholds_ignore_test_rows() {
         assert_eq!(w.expression, w0.expression);
         assert!(!other.test_used_for_selection);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Projected store scan (issue #1034): the scan reads only the columns the run uses.
+// ---------------------------------------------------------------------------
+
+const WIDE_FEATURES: usize = 6;
+const WIDE_GARBAGE: usize = 40;
+const WIDE_STEPS: usize = 60;
+const WIDE_SYMBOLS: usize = 3;
+
+/// Rows in time order, `WIDE_SYMBOLS` per step. Columns: a time (`ts`, whole
+/// numbers, or `ts` with a fraction when `fractional_time`), a text key `sym`,
+/// a numeric key `gid`, features `f0..`, unused numeric columns `g0..` with NaN
+/// and huge values, an unused text column `note`, and the target `y`.
+fn wide_table(fractional_time: bool) -> data::Table {
+    let mut csv = String::from("ts,sym,gid");
+    for j in 0..WIDE_FEATURES {
+        csv.push_str(&format!(",f{j}"));
+    }
+    for j in 0..WIDE_GARBAGE {
+        csv.push_str(&format!(",g{j}"));
+    }
+    csv.push_str(",note,y\n");
+    for k in 0..WIDE_STEPS * WIDE_SYMBOLS {
+        let (step, sym) = (k / WIDE_SYMBOLS, k % WIDE_SYMBOLS);
+        let ts = if fractional_time { format!("{}.25", step) } else { step.to_string() };
+        csv.push_str(&format!("{ts},s{sym},{sym}"));
+        for j in 0..WIDE_FEATURES {
+            let v = ((k * (7 + j) + 3 * j) % 17) as f64 / 8.0 - 1.0;
+            if j == 4 && k % 23 == 5 {
+                csv.push_str(",NaN");
+            } else {
+                csv.push_str(&format!(",{v}"));
+            }
+        }
+        for j in 0..WIDE_GARBAGE {
+            match (k + j) % 9 {
+                0 => csv.push_str(",NaN"),
+                1 => csv.push_str(",1e300"),
+                _ => csv.push_str(&format!(",{}", (k * j) as f64 - 50.0)),
+            }
+        }
+        let y = (((k * 13) % 11) as f64 - 5.0) * 0.001 + (((k * 7) % 17) as f64 / 8.0 - 1.0) * 0.0004;
+        csv.push_str(&format!(",n{},{y}\n", k % 7));
+    }
+    data::parse_table(&csv).unwrap()
+}
+
+fn wide_spec(expr: &str, windows: Vec<Window>, group: Option<&str>) -> EvalSpec {
+    let mut s = spec(expr, windows);
+    s.vars = (0..WIDE_FEATURES).map(|j| format!("f{j}")).collect();
+    s.target = "y".to_string();
+    s.group = group.map(str::to_string);
+    s.cost_bps = 20.0;
+    s.threshold_quantile = 0.5;
+    s
+}
+
+fn write_wide(scratch: &Scratch, name: &str, table: &data::Table, group_rows: usize) -> String {
+    let path = scratch.join(name).to_string_lossy().into_owned();
+    store::write_store(&path, table, group_rows).unwrap();
+    path
+}
+
+/// The report without the members that name the source of the rows.
+fn without_source(json: &str) -> rcsr::devlog::Json {
+    use rcsr::devlog::Json;
+    match Json::parse(json).unwrap() {
+        Json::Obj(items) => Json::Obj(items.into_iter().filter(|(k, _)| k != "source" && k != "memory_bound").collect()),
+        other => panic!("not an object: {other:?}"),
+    }
+}
+
+/// Equal structure and strings; numbers equal to rounding, since the resident
+/// table path adds the same terms in a different order than the store scan.
+fn close(a: &rcsr::devlog::Json, b: &rcsr::devlog::Json, at: &str) {
+    use rcsr::devlog::Json;
+    match (a, b) {
+        (Json::Num(x), Json::Num(y)) => assert!((x - y).abs() <= 1e-9 * x.abs().max(y.abs()).max(1e-6), "{at}: {x} vs {y}"),
+        (Json::Arr(x), Json::Arr(y)) => {
+            assert_eq!(x.len(), y.len(), "{at}");
+            x.iter().zip(y).enumerate().for_each(|(i, (p, q))| close(p, q, &format!("{at}[{i}]")));
+        }
+        (Json::Obj(x), Json::Obj(y)) => {
+            assert_eq!(x.iter().map(|m| &m.0).collect::<Vec<_>>(), y.iter().map(|m| &m.0).collect::<Vec<_>>(), "{at}");
+            x.iter().zip(y).for_each(|(p, q)| close(&p.1, &q.1, &format!("{at}.{}", p.0)));
+        }
+        _ => assert_eq!(format!("{a:?}"), format!("{b:?}"), "{at}"),
+    }
+}
+
+/// Projected store scan against the full-decode reference: the resident table
+/// the store was written from, which holds every column.
+fn assert_matches_full_decode(path: &str, table: &data::Table, spec: &EvalSpec, opts: &walkforward::ProtocolOptions) -> walkforward::Report {
+    let streamed = walkforward::run_path_with(path, spec, opts).unwrap();
+    let resident = walkforward::run_table_with(table, spec, "test", opts).unwrap();
+    close(&without_source(&streamed.json()), &without_source(&resident.json()), "report");
+    streamed
+}
+
+#[test]
+fn store_scan_reads_only_the_named_columns() {
+    let scratch = Scratch::new("wf-scan-columns");
+    let w = vec![window("w", 0.0, 24.0, 24.0, 40.0)];
+    // (fractional time, group column, expected projected columns): 2 named + target
+    // + 1 for an f64 time + 1 for a numeric group.
+    for (fractional, group, extra) in [(false, None, 0), (false, Some("sym"), 0), (false, Some("gid"), 1), (true, Some("gid"), 2), (true, None, 1)] {
+        let table = wide_table(fractional);
+        let path = write_wide(&scratch, &format!("wide-{fractional}-{group:?}.rcsb"), &table, 36);
+        let s = wide_spec("f1 + f4 * f1", w.clone(), group);
+        let r = walkforward::run_path(&path, &s).unwrap();
+        let scan = r.scan.clone().expect("the store scan reports its reads");
+        assert_eq!(scan.store_columns, 3 + WIDE_FEATURES + WIDE_GARBAGE + 2, "{fractional} {group:?}");
+        assert_eq!(scan.named_variables, 2, "{fractional} {group:?}");
+        assert_eq!(scan.projected_columns, 2 + 1 + extra, "{fractional} {group:?}");
+        // An f64 time is part of the value read, so no group is skipped before it.
+        let (read, skipped) = if fractional { (5, 0) } else { (4, 1) };
+        assert_eq!((scan.groups_read, scan.groups_skipped), (read, skipped), "{fractional} {group:?}");
+        assert_eq!(scan.value_bytes, scan.projected_columns as u64 * read as u64 * 36 * 8, "{fractional} {group:?}");
+        assert!(r.json_with_ledger(None).contains(&format!("\"scan\":{{\"source\":\"store\",\"store_columns\":{}", scan.store_columns)));
+        assert!(!r.json().contains("\"scan\""), "the hashed report must stay deterministic");
+        assert_matches_full_decode(&path, &table, &s, &walkforward::ProtocolOptions::default());
+    }
+}
+
+#[test]
+fn a_constant_candidate_projects_only_the_target() {
+    let scratch = Scratch::new("wf-scan-constant");
+    let table = wide_table(false);
+    let path = write_wide(&scratch, "wide.rcsb", &table, 36);
+    let s = wide_spec("0.5", vec![window("w", 0.0, 24.0, 24.0, 40.0)], None);
+    let scan = assert_matches_full_decode(&path, &table, &s, &walkforward::ProtocolOptions::default()).scan.unwrap();
+    assert_eq!((scan.named_variables, scan.projected_columns), (0, 1));
+}
+
+#[test]
+fn store_scan_skips_groups_outside_the_windows() {
+    let scratch = Scratch::new("wf-scan-skip");
+    let table = wide_table(false);
+    let path = write_wide(&scratch, "wide.rcsb", &table, 36);
+    // 180 rows in 5 groups of 36 rows (12 time steps); the windows end inside group 2.
+    let s = wide_spec("f1 + f4", vec![window("w", 0.0, 24.0, 24.0, 30.0)], Some("sym"));
+    let r = assert_matches_full_decode(&path, &table, &s, &walkforward::ProtocolOptions::default());
+    let scan = r.scan.unwrap();
+    assert_eq!((scan.groups_read, scan.groups_skipped), (3, 2));
+    assert_eq!(scan.value_bytes, scan.projected_columns as u64 * 3 * 36 * 8);
+}
+
+#[test]
+fn store_scan_matches_the_full_decode_with_a_final_read_and_a_locked_range() {
+    let scratch = Scratch::new("wf-scan-final");
+    let table = wide_table(false);
+    let path = write_wide(&scratch, "wide.rcsb", &table, 20);
+    let mut s = wide_spec("f1 + f4", vec![window("w", 0.0, 24.0, 40.0, 56.0)], Some("gid"));
+    s.candidates = vec!["f1 + f4".to_string(), "f2 - f0 * f5".to_string(), "0.25".to_string()];
+    s.validation_frac = 0.25;
+    for (final_read, locked) in [(false, vec![]), (true, vec![]), (false, vec![(30, 34)]), (true, vec![(30, 34)])] {
+        let opts = walkforward::ProtocolOptions { final_read, locked_ranges: locked, locked_embargo: 2, ..walkforward::ProtocolOptions::default() };
+        let r = assert_matches_full_decode(&path, &table, &s, &opts);
+        let scan = r.scan.unwrap();
+        // union of f0, f1, f2, f4, f5 plus the target and the numeric group key
+        assert_eq!((scan.named_variables, scan.projected_columns), (5, 7), "{final_read} {:?}", opts.locked_ranges);
+        assert_eq!(scan.groups_read + scan.groups_skipped, if final_read { 18 } else { 9 });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #1149: one group id per numeric key value on the table path and the store path.
+// ---------------------------------------------------------------------------
+
+/// The `controls` member of every window, as printed.
+fn window_controls(json: &str) -> Vec<String> {
+    use rcsr::devlog::Json;
+    let report = Json::parse(json).unwrap();
+    match report.get("windows") {
+        Some(Json::Arr(ws)) => ws.iter().map(|w| format!("{:?}", w.get("controls").expect("controls"))).collect(),
+        other => panic!("no windows: {other:?}"),
+    }
+}
+
+fn assert_csv_and_store_agree(table: &data::Table, scratch: &Scratch, name: &str, group: &str) {
+    let path = scratch.join(name).to_string_lossy().into_owned();
+    store::write_store(&path, table, 36).unwrap();
+    let mut s = spec("x", vec![window("w", 0.0, 6.0, 6.0, 12.0)]);
+    s.target = "y".to_string();
+    s.group = Some(group.to_string());
+    s.control_seed = 7;
+    s.cost_bps = 20.0;
+    s.threshold_quantile = 0.5;
+    let opts = walkforward::ProtocolOptions::default();
+    let resident = walkforward::run_table_with(table, &s, "test", &opts).unwrap();
+    let streamed = walkforward::run_path_with(&path, &s, &opts).unwrap();
+    assert_eq!(window_controls(&resident.json()), window_controls(&streamed.json()), "controls");
+    close(&without_source(&streamed.json()), &without_source(&resident.json()), "report");
+}
+
+/// `keys` distinct numeric keys, 12 steps, one row per key and step. Each key
+/// alternates between two spellings of the same number (`1` and `1.0`, `0` and
+/// `-0`); the last key is NaN.
+fn keyed_table(keys: usize) -> data::Table {
+    let mut vals: Vec<f64> = (0..keys - 2).map(|i| (i as f64 - keys as f64 / 3.0) * 0.25).filter(|v| *v != 0.0).collect();
+    if !vals.contains(&1.0) {
+        vals.push(1.0);
+    }
+    let mut csv = String::from("ts,gid,x,y\n");
+    for step in 0..12usize {
+        let rows = vals.iter().map(|v| if step % 2 == 0 { format!("{v}") } else { format!("{v:?}") });
+        let zero = if step % 2 == 0 { "0".to_string() } else { "-0".to_string() };
+        for (k, key) in rows.chain([zero, "NaN".to_string()]).enumerate() {
+            let x = ((k * 7 + step * 3) % 13) as f64 / 6.0 - 1.0;
+            let y = (((k * 5 + step * 11) % 17) as f64 - 8.0) * 0.001;
+            csv.push_str(&format!("{step},{key},{x},{y}\n"));
+        }
+    }
+    data::parse_table(&csv).unwrap()
+}
+
+#[test]
+fn numeric_group_ids_match_between_csv_and_store() {
+    let scratch = Scratch::new("wf-numeric-group");
+    let table = wide_table(false);
+    let path = write_wide(&scratch, "wide.rcsb", &table, 36);
+    let mut s = wide_spec("f1 + f4 * f1", vec![window("w", 0.0, 24.0, 24.0, 40.0)], Some("gid"));
+    s.control_seed = 7;
+    let opts = walkforward::ProtocolOptions::default();
+    let resident = walkforward::run_table_with(&table, &s, "test", &opts).unwrap();
+    let streamed = walkforward::run_path_with(&path, &s, &opts).unwrap();
+    assert_eq!(window_controls(&resident.json()), window_controls(&streamed.json()));
+    close(&without_source(&streamed.json()), &without_source(&resident.json()), "report");
+}
+
+#[test]
+fn numeric_group_keys_agree_across_spellings_negative_zero_nan_and_cardinality() {
+    let scratch = Scratch::new("wf-numeric-group-keys");
+    // 6 keys keep a dictionary on the table path; 4200 keys drop it.
+    for keys in [6, 4200] {
+        assert_csv_and_store_agree(&keyed_table(keys), &scratch, &format!("keys-{keys}.rcsb"), "gid");
+    }
+}
+
+#[test]
+fn the_cli_prints_the_same_controls_for_a_numeric_group_as_csv_and_store() {
+    let scratch = Scratch::new("wf-numeric-group-cli");
+    let csv_path = scratch.join("d.csv");
+    let store_path = scratch.join("d.rcsb");
+    let mut csv = String::from("ts,gid,x,target\n");
+    for step in 0..12 {
+        for (k, gid) in ["-1", "0.5", "2", "7"].iter().enumerate() {
+            let x = ((k * 7 + step * 3) % 13) as f64 / 6.0 - 1.0;
+            let y = (((k * 5 + step * 11) % 17) as f64 - 8.0) * 0.001;
+            csv.push_str(&format!("{},{gid},{x},{y}\n", 3600 * step));
+        }
+    }
+    std::fs::write(&csv_path, csv).unwrap();
+    let import = rcsr_cmd::rcsr().args(["import", csv_path.to_str().unwrap(), store_path.to_str().unwrap(), "--time", "ts"]).output().unwrap();
+    assert_eq!(import.status.code(), Some(0), "{}", String::from_utf8_lossy(&import.stderr));
+    let run = |data: &std::path::Path| {
+        let out = rcsr_cmd::rcsr()
+            .args([
+                "walkforward", "--data", data.to_str().unwrap(), "--target", "target", "--expr", "x", "--time", "ts",
+                "--group-by", "gid", "--horizon", "3600", "--cost-bps", "5", "--periods-per-year", "365",
+                "--window", "w,0,18000,25200,43200", "--control-seed", "7", "--json",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+        window_controls(&String::from_utf8_lossy(&out.stdout))
+    };
+    assert_eq!(run(&csv_path), run(&store_path));
+}
+
+/// #1094: `--threshold-fit fitness`, the cut of each window fitted on its
+/// validation slice (training rows without one) and frozen on the test block.
+mod fitted_cut {
+    use super::*;
+    use rcsr::devlog::Json;
+    use walkforward::{CutFit, ProtocolOptions};
+
+    fn unit(k: u64, salt: u64) -> f64 {
+        let mut z = k.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ salt.wrapping_mul(0xD1B5_4A32_D192_ED03);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        ((z >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+    }
+
+    const SYMBOLS: [&str; 4] = ["A", "B", "C", "D"];
+
+    /// Four symbols on stamps `k * step`. `x` is one market value per stamp,
+    /// uniform on [-2, 2). Before `split` the target pays 2 % where x > 1.5 and
+    /// loses 1 % where 0.5 < x <= 1.5; from `split` on it pays 2 % where
+    /// x > 0.5, a cut that is best only on those rows. `swap` draws every value
+    /// from `split` on (x and target) again with another seed.
+    fn planted_csv(steps: usize, split: usize, step: f64, swap: Option<u64>) -> String {
+        let mut s = String::from("ts,sym,x,target\n");
+        for k in 0..steps {
+            let late = k >= split;
+            let salt = if late { swap.unwrap_or(0) } else { 0 };
+            let x = 4.0 * unit(k as u64, 1 + salt) - 2.0;
+            for (g, sym) in SYMBOLS.iter().enumerate() {
+                let e = 0.004 * (unit((4 * k + g) as u64, 2 + salt) - 0.5);
+                let y = match (late, swap) {
+                    (false, _) if x > 1.5 => 0.02,
+                    (false, _) if x > 0.5 => -0.01,
+                    (false, _) => -0.001,
+                    (true, Some(_)) => 0.03 * (unit((4 * k + g) as u64, 3 + salt) - 0.5),
+                    (true, None) if x > 0.5 => 0.02,
+                    (true, None) => -0.001,
+                };
+                s.push_str(&format!("{},{},{},{}\n", k as f64 * step, sym, x, y + e));
+            }
+        }
+        s
+    }
+
+    fn planted(swap: Option<u64>) -> data::Table {
+        data::parse_table(&planted_csv(2500, 2000, 1.0, swap)).unwrap()
+    }
+
+    fn fit_spec(validation_frac: f64) -> EvalSpec {
+        let mut s = spec("x", vec![window("w", 0.0, 2000.0, 2000.0, 2500.0)]);
+        s.group = Some("sym".to_string());
+        s.threshold_fixed = Some(0.0);
+        s.validation_frac = validation_frac;
+        s.periods_per_year = Some(8760.0);
+        s
+    }
+
+    fn fit_opts(fit: CutFit) -> ProtocolOptions {
+        ProtocolOptions { threshold_fit: Some(fit), ..ProtocolOptions::default() }
+    }
+
+    /// Replacing every test score and test return leaves the cut bit-identical,
+    /// and a cut planted to be best on the test block only is not found.
+    #[test]
+    fn fitted_cut_ignores_the_test_rows() {
+        let (a, b) = (planted(None), planted(Some(77)));
+        let o = fit_opts(CutFit::default());
+        for (vf, want) in [(0.0, "train_fitness"), (0.25, "validation_fitness")] {
+            let s = fit_spec(vf);
+            let ra = walkforward::run_table_with(&a, &s, "t", &o).unwrap();
+            let rb = walkforward::run_table_with(&b, &s, "t", &o).unwrap();
+            let (wa, wb) = (&ra.windows[0], &rb.windows[0]);
+            let (ca, cb) = (wa.cut.as_ref().expect("a cut"), wb.cut.as_ref().expect("a cut"));
+            assert_eq!(ca.source.as_str(), want);
+            assert_eq!(wa.threshold_source, want);
+            assert!(ca.fallback.is_none(), "{:?}", ca.fallback_detail);
+            assert_eq!(wa.threshold.to_bits(), wb.threshold.to_bits(), "vf {vf}");
+            assert_eq!(ca.value.to_bits(), wa.threshold.to_bits());
+            assert_eq!(format!("{:?}", (&ca.cut, &ca.reference, &ca.plateau, &ca.profile)), format!("{:?}", (&cb.cut, &cb.reference, &cb.plateau, &cb.profile)));
+            assert_ne!(ra.pooled.mean_return.to_bits(), rb.pooled.mean_return.to_bits(), "the test rows differ");
+            assert!((wa.threshold - 1.5).abs() < 0.05, "fitted cut {} is not the source-row gate 1.5", wa.threshold);
+            // The cut of the test block (0.5) earns more there than the fitted cut.
+            let mut at_test_gate = s.clone();
+            at_test_gate.threshold_fixed = Some(0.5);
+            let rt = walkforward::run_table(&a, &at_test_gate, "t").unwrap();
+            assert!(rt.pooled.mean_return > ra.pooled.mean_return, "{} vs {}", rt.pooled.mean_return, ra.pooled.mean_return);
+        }
+    }
+
+    #[test]
+    fn threshold_fit_refusals() {
+        let t = planted(None);
+        let o = fit_opts(CutFit::default());
+        let refused = |s: &EvalSpec, o: &ProtocolOptions, needle: &str| {
+            let e = walkforward::run_table_with(&t, s, "t", o).err().expect("refused");
+            assert!(e.contains("--threshold-fit") && e.contains(needle), "{e}");
+        };
+        let mut s = fit_spec(0.0);
+        s.threshold_fixed = None;
+        refused(&s, &o, "--threshold-fixed");
+        let mut s = fit_spec(0.0);
+        s.policy = walkforward::Policy::Band;
+        refused(&s, &o, "band");
+        let mut s = fit_spec(0.0);
+        s.device_pnl = true;
+        refused(&s, &o, "--device-pnl");
+        let mut batch = fit_opts(CutFit::default());
+        batch.batch_pnl = true;
+        refused(&fit_spec(0.0), &batch, "--batch-pnl");
+
+        let dir = Scratch::new("wf-fit-refusals");
+        let data = dir.path().join("d.csv");
+        std::fs::write(&data, planted_csv(40, 40, 3600.0, None)).unwrap();
+        let run = |extra: &[&str]| {
+            let out = super::rcsr_cmd::rcsr()
+                .args([
+                    "walkforward", "--data", data.to_str().unwrap(), "--target", "target", "--expr", "x",
+                    "--time", "ts", "--group-by", "sym", "--horizon", "3600", "--cost-bps", "5",
+                    "--periods-per-year", "8760", "--window", "w,0,72000,75600,140400", "--json",
+                ])
+                .args(extra)
+                .output()
+                .unwrap();
+            (out.status.code(), String::from_utf8_lossy(&out.stderr).into_owned())
+        };
+        let fit = ["--threshold-fit", "fitness"];
+        let with = |more: &[&'static str]| -> Vec<&'static str> { fit.iter().chain(more).copied().collect() };
+        let cases: Vec<(Vec<&str>, &str)> = vec![
+            (with(&[]), "--threshold-fixed"),
+            (with(&["--threshold-quantile", "0.5"]), "--threshold-quantile"),
+            (with(&["--threshold-fixed", "0", "--policy", "band"]), "--policy"),
+            (with(&["--threshold-fixed", "0", "--policy", "vote", "--quorum", "1"]), "--policy"),
+            (with(&["--threshold-fixed", "0", "--policy", "dp"]), "--policy"),
+            (with(&["--threshold-fixed", "0", "--policy", "top-tercile"]), "--policy"),
+            (with(&["--threshold-fixed", "0", "--expr", "-x", "--validation-frac", "0.3", "--select-band"]), "--select-band"),
+            (with(&["--threshold-fixed", "0", "--device-pnl"]), "--device-pnl"),
+            (with(&["--threshold-fixed", "0", "--batch-pnl"]), "--batch-pnl"),
+            (with(&["--threshold-fixed", "0", "--cut-blocks", "9"]), "--cut-blocks"),
+            (with(&["--threshold-fixed", "0", "--cut-min-entries", "0"]), "--cut-min-entries"),
+            (with(&["--threshold-fixed", "0", "--cut-lambda", "-1"]), "--cut-lambda"),
+            (vec!["--threshold-fit", "quantile", "--threshold-fixed", "0"], "--threshold-fit"),
+            (vec!["--threshold-fixed", "0", "--cut-min-entries", "5"], "--cut-min-entries"),
+        ];
+        for (extra, needle) in cases {
+            let (code, err) = run(&extra);
+            assert_eq!(code, Some(2), "{extra:?}: {err}");
+            assert!(err.contains("--threshold-fit") && err.contains(needle), "{extra:?}: {err}");
+        }
+        let (code, err) = run(&with(&["--threshold-fixed", "0"]));
+        assert_eq!(code, Some(0), "{err}");
+    }
+
+    fn report_csv() -> String {
+        let mut s = planted_csv(2600, 2600, 3600.0, None);
+        // Symbol A pays in every stamp of the short training range of `w2`, so
+        // every block of its book has a profitable path.
+        let lines: Vec<String> = s
+            .lines()
+            .map(|l| {
+                let f: Vec<&str> = l.split(',').collect();
+                match f[0].parse::<f64>() {
+                    Ok(ts) if f[1] == "A" && (2250.0..2270.0).contains(&(ts / 3600.0)) => format!("{},A,{},0.01", f[0], f[2]),
+                    _ => l.to_string(),
+                }
+            })
+            .collect();
+        s = lines.join("\n");
+        s.push('\n');
+        s
+    }
+
+    fn hours(label: &str, a: i64, b: i64, c: i64, d: i64) -> String {
+        format!("{},{},{},{},{}", label, a * 3600, b * 3600, c * 3600, d * 3600)
+    }
+
+    fn get<'a>(j: &'a Json, path: &[&str]) -> &'a Json {
+        path.iter().fold(j, |cur, k| cur.get(k).unwrap_or_else(|| panic!("missing {k} in {path:?}")))
+    }
+
+    fn window_at(j: &Json, i: usize) -> &Json {
+        match j.get("windows") {
+            Some(Json::Arr(w)) => &w[i],
+            _ => panic!("no windows"),
+        }
+    }
+
+    #[test]
+    fn threshold_fit_report_fields() {
+        let dir = Scratch::new("wf-fit-report");
+        let data = dir.path().join("d.csv");
+        std::fs::write(&data, report_csv()).unwrap();
+        let (w1, w2) = (hours("w1", 0, 2000, 2001, 2250), hours("w2", 2250, 2270, 2271, 2600));
+        let run = |extra: &[&str]| {
+            let out = super::rcsr_cmd::rcsr()
+                .args([
+                    "walkforward", "--data", data.to_str().unwrap(), "--target", "target", "--expr", "x",
+                    "--time", "ts", "--group-by", "sym", "--horizon", "3600", "--cost-bps", "5",
+                    "--periods-per-year", "8760", "--window", &w1, "--window", &w2,
+                    "--threshold-fixed", "0", "--threshold-fit", "fitness",
+                ])
+                .args(extra)
+                .output()
+                .unwrap();
+            assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let out = run(&["--json"]);
+        let j = Json::parse(out.trim()).unwrap();
+        assert_eq!(get(&j, &["threshold", "fit"]).as_str(), Some("fitness"));
+        assert_eq!(get(&j, &["threshold", "source"]).as_str(), Some("train_fitness"));
+        assert_eq!(get(&j, &["threshold", "cut_min_entries"]).as_f64(), Some(30.0));
+        assert_eq!(get(&j, &["threshold", "cut_blocks"]).as_f64(), Some(4.0));
+        assert_eq!(get(&j, &["threshold", "cut_lambda"]).as_f64(), Some(1.0));
+        for i in 0..2 {
+            let w = window_at(&j, i);
+            for k in ["source", "value", "index", "rows", "fitness", "net", "flips", "exits", "entry_times", "exposure", "reference", "plateau", "floor", "blocks", "lambda", "fallback", "profile"] {
+                assert!(get(w, &["cut"]).get(k).is_some(), "window {i}: cut.{k}");
+            }
+            match get(w, &["cut", "profile"]) {
+                Json::Arr(p) => {
+                    assert_eq!(p.len(), 32, "window {i}");
+                    for row in p {
+                        for k in ["long_share", "index", "value", "fitness", "net", "entry_times"] {
+                            assert!(row.get(k).is_some(), "window {i}: profile.{k}");
+                        }
+                    }
+                }
+                other => panic!("window {i}: profile {other:?}"),
+            }
+            assert_eq!(get(w, &["cut", "reference", "value"]).as_f64(), Some(0.0));
+            assert_eq!(get(w, &["cut", "floor", "min_entry_times"]).as_f64(), Some(30.0));
+        }
+        let w = window_at(&j, 0);
+        assert_eq!(get(w, &["threshold_source"]).as_str(), Some("train_fitness"));
+        assert_eq!(get(w, &["cut", "source"]).as_str(), Some("train_fitness"));
+        assert!(matches!(get(w, &["cut", "fallback"]), Json::Null));
+        let theta = get(w, &["threshold"]).as_f64().unwrap();
+        assert_eq!(get(w, &["cut", "value"]).as_f64(), Some(theta));
+        assert!((theta - 1.5).abs() < 0.05, "{theta}");
+        assert!(get(w, &["cut", "entry_times"]).as_f64().unwrap() >= 30.0);
+        let (lo, hi) = (get(w, &["cut", "plateau", "lo"]).as_f64().unwrap(), get(w, &["cut", "plateau", "hi"]).as_f64().unwrap());
+        assert!(lo <= theta && theta <= hi, "plateau {lo}..{hi} around {theta}");
+        let index = get(w, &["cut", "index"]).as_f64().unwrap();
+        let (rlo, rhi) = (get(w, &["cut", "plateau", "rows_lo"]).as_f64().unwrap(), get(w, &["cut", "plateau", "rows_hi"]).as_f64().unwrap());
+        assert!(rlo <= index && index <= rhi);
+        let w = window_at(&j, 1);
+        assert_eq!(get(w, &["cut", "fallback"]).as_str(), Some("floor"));
+        assert_eq!(get(w, &["threshold_source"]).as_str(), Some("fixed"));
+        assert_eq!(get(w, &["threshold"]).as_f64(), Some(0.0));
+        assert!(get(w, &["cut", "reference", "entry_times"]).as_f64().unwrap() < 30.0);
+        let sha = |o: &str| o.split("\"report_sha256\":\"").nth(1).unwrap().split('"').next().unwrap().to_string();
+        assert_eq!(sha(&out), sha(&run(&["--json"])), "the same run gives the same report");
+        let md = run(&["--markdown", "-"]);
+        assert!(md.contains("## Fitted cut"), "{md}");
+        assert!(md.contains("| w2 | fixed |") && md.contains("floor"), "{md}");
+        let v = Json::parse(run(&["--json", "--validation-frac", "0.25"]).trim()).unwrap();
+        assert_eq!(get(window_at(&v, 0), &["threshold_source"]).as_str(), Some("validation_fitness"));
+    }
+
+    #[test]
+    fn threshold_fit_enters_the_candidate_id_and_the_read_binding() {
+        let s = fit_spec(0.0);
+        let plain = ProtocolOptions::default();
+        let fit = fit_opts(CutFit::default());
+        let other = fit_opts(CutFit { lambda: 2.0, ..CutFit::default() });
+        let base = rcsr::protocol::procedure_spec(&s, &plain);
+        assert!(!base.contains("threshold_fit"), "{base}");
+        let text = rcsr::protocol::procedure_spec(&s, &fit);
+        assert!(text.starts_with(&base) && text.contains("threshold_fit=fitness"), "{text}");
+        assert_ne!(rcsr::protocol::procedure_spec(&s, &other), text);
+        let bind = |o: &ProtocolOptions| rcsr::protocol::walkforward_binding(&s, o);
+        assert_ne!(bind(&fit), bind(&plain));
+        assert_ne!(bind(&other), bind(&fit));
+    }
+
+    #[test]
+    fn mask_enters_the_candidate_id() {
+        let s = fit_spec(0.0);
+        let gate = |e: &str, band: f64, dwell: usize| rcsr::regime_gate::GateSpec::parse(e, band, dwell).unwrap();
+        let with = |g: rcsr::regime_gate::GateSpec| ProtocolOptions { mask: Some(g), ..ProtocolOptions::default() };
+        let base = rcsr::protocol::procedure_spec(&s, &ProtocolOptions::default());
+        assert!(!base.contains("pnl_mask"), "{base}");
+        let text = rcsr::protocol::procedure_spec(&s, &with(gate("x", 0.0, 1)));
+        assert!(text.starts_with(&base) && text.contains("pnl_mask="), "{text}");
+        // #1214: the mask line names the rule its states follow.
+        assert!(text.ends_with("|rule=rcsr-gate-state/1\n"), "{text}");
+        assert_ne!(text, base);
+        let mut seen = vec![base, text];
+        for g in [gate("-x", 0.0, 1), gate("x", 0.5, 1), gate("x", 0.0, 3)] {
+            let t = rcsr::protocol::procedure_spec(&s, &with(g));
+            assert!(!seen.contains(&t), "{t}");
+            seen.push(t);
+        }
+    }
+
+    #[test]
+    fn return_units_and_period_width_enter_the_candidate_id() {
+        let mut s = fit_spec(0.0);
+        s.horizon = 3600.0;
+        let from_spec = |units: &str, stride: Option<f64>| ProtocolOptions {
+            horizon_from_spec: true,
+            stride_seconds: stride,
+            cost: Some(rcsr::target::CostDecl {
+                per_side_bps: 5.0,
+                source: rcsr::target::CostSource::TargetSpec,
+                return_units: units.to_string(),
+                spec_per_side_bps: None,
+            }),
+            ..ProtocolOptions::default()
+        };
+        let text = |o: &ProtocolOptions| rcsr::protocol::procedure_spec(&s, o);
+        let simple = text(&from_spec("simple", None));
+        assert!(!simple.contains("return_units") && !simple.contains("period_width"), "{simple}");
+        let log = text(&from_spec("log", None));
+        assert_eq!(log, format!("{simple}return_units=log\n"));
+        assert_eq!(text(&from_spec("simple", Some(1800.0))), simple, "a stride below the horizon keeps the text");
+        assert_eq!(text(&from_spec("simple", Some(3600.0))), simple, "a stride equal to the horizon keeps the text");
+        let wide = text(&from_spec("simple", Some(7200.0)));
+        assert_eq!(wide, format!("{simple}period_width=7200.0\n"));
+        let wider = text(&from_spec("simple", Some(14400.0)));
+        assert!(wider.contains("period_width=14400.0\n"), "{wider}");
+        assert_ne!(wide, wider);
+        let both = text(&from_spec("log", Some(7200.0)));
+        assert!(both.contains("return_units=log\n") && both.contains("period_width=7200.0\n"), "{both}");
+        let flag_run = ProtocolOptions { stride_seconds: Some(7200.0), ..ProtocolOptions::default() };
+        assert_eq!(text(&flag_run), text(&ProtocolOptions::default()), "a stride without a target spec is ignored");
+    }
+
+    /// Reports without the flag, pinned to the bytes of the base build.
+    #[test]
+    fn default_reports_are_pinned() {
+        let t = planted(None);
+        let mut parts: Vec<(String, String)> = Vec::new();
+        let quantile = {
+            let mut s = fit_spec(0.0);
+            s.threshold_fixed = None;
+            s
+        };
+        let fixed = fit_spec(0.25);
+        let mut pair = fit_spec(0.25);
+        pair.candidates = vec!["x".to_string(), "-x".to_string()];
+        let inference = ProtocolOptions { bootstrap_draws: 200, null_draws: 50, ..ProtocolOptions::default() };
+        for (name, s, o) in [
+            ("quantile", &quantile, ProtocolOptions::default()),
+            ("fixed", &fixed, inference.clone()),
+            ("pair", &pair, inference),
+        ] {
+            let r = walkforward::run_table_with(&t, s, "t", &o).unwrap();
+            parts.push((format!("{name}.json"), r.hashed_json()));
+            parts.push((format!("{name}.md"), r.markdown()));
+            parts.push((format!("{name}.procedure"), rcsr::protocol::procedure_spec(s, &o)));
+        }
+        let got: Vec<String> = parts.iter().map(|(k, v)| format!("{k} {}", rcsr::manifest::sha256_hex(v.as_bytes()))).collect();
+        let all = rcsr::manifest::sha256_hex(got.join("\n").as_bytes());
+        assert_eq!(all, PINNED_DEFAULT_REPORTS, "{}", got.join("\n"));
+    }
+
+    const PINNED_DEFAULT_REPORTS: &str = "b613101aacb8980c0938816d6c8b12f69fdb034752a926307f758ba1e9bbfd9f";
+}
+
+#[test]
+fn flat_gaps_reset_the_pooled_path_only_at_gaps() {
+    let rows: Vec<(f64, f64, f64)> = (0..11).map(|k| (k as f64, k as f64, if k >= 4 { 0.01 } else { 0.0 })).collect();
+    let t = single(&rows);
+    let mut s = spec(
+        "x",
+        vec![
+            window("a", 0.0, 4.0, 4.0, 6.0),
+            window("b", 0.0, 4.0, 6.0, 8.0),
+            window("c", 0.0, 4.0, 9.0, 11.0),
+        ],
+    );
+    s.threshold_quantile = 0.0;
+    let run = |s: &EvalSpec, flat_gaps: bool| {
+        let opts = walkforward::ProtocolOptions { flat_gaps, ..walkforward::ProtocolOptions::default() };
+        walkforward::run_table_with(&t, s, "test", &opts).unwrap()
+    };
+    let carried = run(&s, false);
+    assert_eq!(carried.pooled.trades, 1, "one entry for the whole pooled path");
+    let gaps = run(&s, true);
+    assert_eq!(gaps.pooled.trades, 2, "windows a and b touch and share the book; c starts flat");
+    assert_eq!(gaps.seam_trades, 0);
+    assert!(!gaps.pool_reset_flat);
+    s.pool_reset_flat = true;
+    assert_eq!(run(&s, true).pooled.trades, 3, "every window is a book");
+}
+
+/// #1199: three symbols at t = 0..400. `z` is `x` with every symbol NaN on
+/// `[120, 220)`, `zo` is 1 where `z` is finite, `o` is 1 everywhere and the
+/// gate `g` is off on the same stretch.
+fn grid_table() -> data::Table {
+    let frac = |v: f64| v - v.floor();
+    let mut s = String::from("ts,sym,x,z,o,zo,g,target\n");
+    for i in 0..400usize {
+        for (k, sym) in ["A", "B", "C"].iter().enumerate() {
+            let f = i as f64 + 0.37 * k as f64;
+            let x = frac(f * 0.618_033_988_749_894_9) - 0.5;
+            let y = 0.01 * (frac(f * 0.754_877_666_246_692_7) - 0.5) + 0.002 * x;
+            let gap = (120..220).contains(&i);
+            let z = if gap { String::new() } else { x.to_string() };
+            let (zo, g) = if gap { ("", "-1") } else { ("1", "1") };
+            s.push_str(&format!("{i},{sym},{x},{z},1,{zo},{g},{y}\n"));
+        }
+    }
+    data::parse_table(&s).unwrap()
+}
+
+const GRID_GAP: std::ops::Range<f64> = 120.0..220.0;
+
+fn grid_run(t: &data::Table, expr: &str, grid: walkforward::PeriodGrid, reset: bool, gate: bool) -> walkforward::Report {
+    grid_run_rule(t, expr, grid, reset, gate, MissingScore::Flat)
+}
+
+fn grid_run_rule(t: &data::Table, expr: &str, grid: walkforward::PeriodGrid, reset: bool, gate: bool, missing: MissingScore) -> walkforward::Report {
+    let mut s = spec(expr, vec![window("w1", 0.0, 100.0, 100.0, 250.0), window("w2", 0.0, 250.0, 250.0, 400.0)]);
+    s.vars = ["x", "z", "o", "zo"].map(String::from).to_vec();
+    s.group = Some("sym".to_string());
+    s.threshold_fixed = Some(0.0);
+    s.periods_per_year = Some(8760.0);
+    s.pool_reset_flat = reset;
+    let opts = walkforward::ProtocolOptions {
+        period_grid: grid,
+        mask: gate.then(|| rcsr::regime_gate::GateSpec::parse("g", 0.0, 1).unwrap()),
+        missing_score: missing,
+        ..walkforward::ProtocolOptions::default()
+    };
+    walkforward::run_table_with(t, &s, "test", &opts).unwrap()
+}
+
+fn bits(v: &[f64]) -> Vec<u64> {
+    v.iter().map(|x| x.to_bits()).collect()
+}
+
+#[test]
+fn period_grid_target_is_formula_free() {
+    use walkforward::PeriodGrid::{Score, Target};
+    let t = grid_table();
+    let x = grid_run(&t, "x", Target, true, false);
+    let z = grid_run(&t, "z", Target, true, false);
+    assert_eq!(x.period_time.len(), 300, "every timestamp of the two test windows");
+    assert_eq!(bits(&x.period_time), bits(&z.period_time), "one grid for both formulas");
+    let zg = z.period_grid.as_ref().expect("pooled.grid under --period-grid target");
+    assert_eq!(zg.rule, Target);
+    assert_eq!(zg.empty_periods, 100);
+    assert_eq!(x.period_grid.as_ref().unwrap().empty_periods, 0);
+    assert_eq!(z.pooled.periods, 300);
+    for (k, &tm) in z.period_time.iter().enumerate() {
+        let gap = GRID_GAP.contains(&tm);
+        assert_eq!(zg.period_rows[k] == 0, gap, "period {tm}");
+        if gap {
+            assert_eq!(z.period_net[k].to_bits(), 0f64.to_bits(), "an empty period books net 0 at {tm}");
+        } else {
+            assert_eq!(zg.period_rows[k], 3);
+        }
+    }
+    let j = z.json();
+    assert!(j.contains("\"grid\":{\"rule\":\"target\",\"periods\":300,\"empty_periods\":100}"), "{j}");
+    // Under the score grid the stretch has no period, so the two grids differ.
+    let zs = grid_run(&t, "z", Score, true, false);
+    assert_eq!(zs.period_time.len(), 200);
+    assert!(zs.period_grid.is_none());
+    assert!(!zs.json().contains("\"grid\":"), "a score report has no grid field");
+}
+
+#[test]
+fn period_grid_target_inserts_only_zeros() {
+    use walkforward::PeriodGrid::{Score, Target};
+    let t = grid_table();
+    for reset in [false, true] {
+        let s = grid_run(&t, "z", Score, reset, false);
+        let g = grid_run(&t, "z", Target, reset, false);
+        let rows = &g.period_grid.as_ref().unwrap().period_rows;
+        let kept = |v: &[f64]| -> Vec<u64> { v.iter().zip(rows).filter(|(_, &r)| r > 0).map(|(x, _)| x.to_bits()).collect() };
+        assert_eq!(kept(&g.period_net), bits(&s.period_net), "reset {reset}: the priced periods are the score series bit for bit");
+        assert_eq!(kept(&g.period_time), bits(&s.period_time));
+        let sum = |v: &[f64]| v.iter().sum::<f64>().to_bits();
+        assert_eq!(sum(&g.period_net), sum(&s.period_net));
+        let (a, b) = (&g.pooled, &s.pooled);
+        assert_eq!(a.total_cost.to_bits(), b.total_cost.to_bits(), "reset {reset}: cost");
+        assert_eq!(a.total_abs_delta.to_bits(), b.total_abs_delta.to_bits(), "reset {reset}: traded notional");
+        assert_eq!(a.total_return.to_bits(), b.total_return.to_bits());
+        assert_eq!(a.max_drawdown.to_bits(), b.max_drawdown.to_bits());
+        assert_eq!((a.trades, a.entries, a.rows, a.active_rows), (b.trades, b.entries, b.rows, b.active_rows));
+        assert_eq!(g.seam_cost.to_bits(), s.seam_cost.to_bits());
+        assert_eq!((a.periods, b.periods), (300, 200));
+    }
+}
+
+#[test]
+fn period_grid_target_inference_runs_on_the_grid() {
+    let t = grid_table();
+    let mut s = spec("z", vec![window("w1", 0.0, 100.0, 100.0, 250.0), window("w2", 0.0, 250.0, 250.0, 400.0)]);
+    s.vars = ["x", "z", "o", "zo"].map(String::from).to_vec();
+    s.group = Some("sym".to_string());
+    s.threshold_fixed = Some(0.0);
+    s.periods_per_year = Some(8760.0);
+    s.pool_reset_flat = true;
+    let opts = walkforward::ProtocolOptions {
+        period_grid: walkforward::PeriodGrid::Target,
+        bootstrap_draws: 100,
+        null_draws: 30,
+        ..walkforward::ProtocolOptions::default()
+    };
+    let r = walkforward::run_table_with(&t, &s, "test", &opts).unwrap();
+    let inf = r.inference.as_ref().unwrap();
+    assert_eq!(inf.bootstrap.as_ref().unwrap().n, 300);
+    let nulls = inf.nulls.as_ref().unwrap();
+    assert_eq!(nulls.periods, 300, "the nulls see the grid of the observed series");
+    assert!(nulls.observed_mean.is_finite() && nulls.observed_sharpe.is_finite());
+    for p in [nulls.block_permutation.p_mean, nulls.block_permutation.p_sharpe, nulls.matched_exposure_random.p_mean] {
+        assert!((0.0..=1.0).contains(&p), "{p}");
+    }
+    let m = inf.multiple.as_ref().unwrap();
+    assert!(m.psr.dsr.is_finite(), "{:?}", m.psr);
+}
+
+#[test]
+fn period_grid_gap_rule_follows_the_missing_score_rule_and_closes_at_a_gate() {
+    use walkforward::PeriodGrid::{Score, Target};
+    let t = grid_table();
+    // #1203 flat: no score on the stretch ends the run, so window w1 has two entries and two
+    // paid exits per symbol and the stretch books net 0 with no priced row.
+    let flat = grid_run(&t, "zo", Target, true, false);
+    let f1 = &flat.windows[0].metrics;
+    assert_eq!((f1.entries, f1.trades), (6, 6));
+    assert_eq!(flat.missing_score_exits, 3, "one exit per symbol before the stretch");
+    // hold: the position stays on through the stretch and the stretch rows are priced.
+    let held = grid_run_rule(&t, "zo", Target, true, false, MissingScore::Hold);
+    let h1 = &held.windows[0].metrics;
+    assert_eq!((h1.entries, h1.trades), (3, 3), "no exit or re-entry at the stretch");
+    assert!((h1.total_cost - 0.006).abs() < 1e-15, "3 entries and 3 final exits at 10 bp: {}", h1.total_cost);
+    assert_eq!((held.missing_score_exits, held.period_grid.as_ref().unwrap().empty_periods), (0, 0));
+    // The gate off on the stretch: every on-run is its own book (#1180).
+    let gated = grid_run(&t, "o", Target, true, true);
+    let g1 = &gated.windows[0].metrics;
+    assert_eq!((g1.entries, g1.trades), (6, 6), "flat after the gate turns off");
+    let ungated = grid_run(&t, "o", Target, true, false);
+    assert_eq!(bits(&gated.period_time), bits(&ungated.period_time), "a gated and an ungated book share the grid");
+    assert_eq!(bits(&gated.period_time), bits(&flat.period_time));
+    assert_eq!(bits(&held.period_time), bits(&flat.period_time));
+    for r in [&flat, &gated, &held] {
+        let rows = &r.period_grid.as_ref().unwrap().period_rows;
+        for (k, &tm) in r.period_time.iter().enumerate() {
+            if GRID_GAP.contains(&tm) {
+                if std::ptr::eq(r, &held) {
+                    assert_eq!(rows[k], 3, "a held row is priced at {tm}");
+                } else {
+                    assert_eq!((rows[k], r.period_net[k].to_bits()), (0, 0f64.to_bits()), "net 0 and no cost at {tm}");
+                }
+            }
+        }
+    }
+    assert_eq!(gated.period_grid.as_ref().unwrap().empty_periods, 100);
+    assert_eq!(grid_run(&t, "o", Score, true, true).period_time.len(), 200, "the score grid drops the gate-off stretch");
+}
+
+/// #1203: the synthetic fixture of the issue. Two symbols, hourly rows 0..299,
+/// target +0.001 per row and -0.005 on rows 120..159; `z` is 1 with no value on
+/// rows 120..159 and `o` is 1 everywhere.
+fn carry_table() -> data::Table {
+    let mut s = String::from("ts,sym,z,o,target\n");
+    for i in 0..300usize {
+        for sym in ["A", "B"] {
+            let gap = (120..160).contains(&i);
+            let z = if gap { "" } else { "1" };
+            let y = if gap { -0.005 } else { 0.001 };
+            s.push_str(&format!("{},{sym},{z},1,{y}\n", 3600 * i));
+        }
+    }
+    data::parse_table(&s).unwrap()
+}
+
+fn carry_run(t: &data::Table, expr: &str, windows: Vec<Window>, opts: &walkforward::ProtocolOptions) -> walkforward::Report {
+    let mut s = spec(expr, windows);
+    s.vars = vec!["z".to_string(), "o".to_string()];
+    s.group = Some("sym".to_string());
+    s.threshold_fixed = Some(0.0);
+    s.periods_per_year = Some(8760.0);
+    s.pool_reset_flat = true;
+    walkforward::run_table_with(t, &s, "test", opts).unwrap()
+}
+
+const H: f64 = 3600.0;
+
+#[test]
+fn missing_score_flat_equals_the_book_split_at_the_stretch() {
+    let t = carry_table();
+    let o = walkforward::ProtocolOptions::default();
+    let flat = carry_run(&t, "z", vec![window("w", 0.0, 100.0 * H, 100.0 * H, 250.0 * H)], &o);
+    let split = carry_run(
+        &t,
+        "o",
+        vec![window("a", 0.0, 100.0 * H, 100.0 * H, 120.0 * H), window("b", 0.0, 100.0 * H, 160.0 * H, 250.0 * H)],
+        &o,
+    );
+    let sum = |r: &walkforward::Report| r.period_net.iter().sum::<f64>();
+    let (f, s) = (&flat.pooled, &split.pooled);
+    assert_eq!(f.total_cost.to_bits(), s.total_cost.to_bits(), "exit at row 119 and re-entry at row 160: {} vs {}", f.total_cost, s.total_cost);
+    assert_eq!(sum(&flat).to_bits(), sum(&split).to_bits());
+    assert_eq!(f.total_return.to_bits(), s.total_return.to_bits());
+    assert_eq!(f.max_drawdown.to_bits(), s.max_drawdown.to_bits());
+    assert_eq!(bits(&flat.period_net), bits(&split.period_net));
+    assert_eq!((f.trades, f.entries), (4, 4));
+    assert!((f.total_cost - 0.008).abs() < 1e-15, "{}", f.total_cost);
+}
+
+#[test]
+fn missing_score_flat_pays_exit_and_reentry() {
+    use walkforward::PeriodGrid::Target;
+    let t = grid_table();
+    let flat = grid_run(&t, "zo", Target, true, false);
+    let gated = grid_run(&t, "o", Target, true, true);
+    let (w, g) = (&flat.windows[0].metrics, &gated.windows[0].metrics);
+    assert_eq!((w.entries, w.trades), (6, 6), "an exit before the stretch and a re-entry after it per symbol");
+    assert_eq!(w.total_cost.to_bits(), g.total_cost.to_bits(), "the gated o book: {} vs {}", w.total_cost, g.total_cost);
+    assert!((w.total_cost - 0.012).abs() < 1e-15, "6 entries and 6 exits at 10 bp: {}", w.total_cost);
+    // The gate relabels the groups, so a period sums its symbols in another order.
+    assert_eq!(flat.period_net.len(), gated.period_net.len());
+    for (a, b) in flat.period_net.iter().zip(&gated.period_net) {
+        assert!((a - b).abs() <= 1e-15, "the series of the gated book: {a} vs {b}");
+    }
+}
+
+/// #1203: two symbols at t = 0..300; `z` is `x` with no value on `[150, 200)`.
+fn pbo_table() -> data::Table {
+    let frac = |v: f64| v - v.floor();
+    let mut s = String::from("ts,sym,x,z,target\n");
+    for i in 0..300usize {
+        for (k, sym) in ["A", "B"].iter().enumerate() {
+            let f = i as f64 + 0.37 * k as f64;
+            let x = frac(f * 0.618_033_988_749_894_9) - 0.5;
+            let y = 0.01 * (frac(f * 0.754_877_666_246_692_7) - 0.5) + 0.002 * x;
+            let z = if (150..200).contains(&i) { String::new() } else { x.to_string() };
+            s.push_str(&format!("{i},{sym},{x},{z},{y}\n"));
+        }
+    }
+    data::parse_table(&s).unwrap()
+}
+
+fn pbo_run(t: &data::Table, exprs: &[&str], grid: walkforward::PeriodGrid, inference: bool) -> walkforward::Report {
+    let mut s = spec(exprs[0], vec![window("w", 0.0, 100.0, 100.0, 300.0)]);
+    if exprs.len() > 1 {
+        s.candidates = exprs.iter().map(|e| e.to_string()).collect();
+    }
+    s.vars = vec!["x".to_string(), "z".to_string()];
+    s.group = Some("sym".to_string());
+    s.threshold_fixed = Some(0.0);
+    s.validation_frac = 0.2;
+    s.periods_per_year = Some(8760.0);
+    s.pool_reset_flat = true;
+    let opts = walkforward::ProtocolOptions {
+        period_grid: grid,
+        bootstrap_draws: if inference { 200 } else { 0 },
+        block_len: inference.then_some(5),
+        pbo_blocks: 4,
+        ..walkforward::ProtocolOptions::default()
+    };
+    walkforward::run_table_with(t, &s, "test", &opts).unwrap()
+}
+
+#[test]
+fn in_report_pbo_columns_share_the_target_grid() {
+    use walkforward::PeriodGrid::{Score, Target};
+    let t = pbo_table();
+    let pair = pbo_run(&t, &["z", "x + 1"], Score, true);
+    assert_eq!(pair.windows[0].candidate, 0, "z has the lower validation error");
+    assert_eq!(pair.pooled.periods, 150, "the pooled series stays on the score grid");
+    // The column of each candidate is its own book on the window's target grid.
+    let cols: Vec<Vec<f64>> = ["z", "x + 1"].iter().map(|e| pbo_run(&t, &[e], Target, false).period_net).collect();
+    assert!(cols.iter().all(|c| c.len() == 200), "the target grid has 200 periods");
+    let stretch: Vec<usize> = (50..100).collect();
+    assert!(stretch.iter().all(|&k| cols[0][k] == 0.0), "z prices no row on the stretch");
+    assert!(stretch.iter().filter(|&&k| cols[1][k] != 0.0).count() > 40, "x + 1 is long on the stretch");
+    let m = pair.inference.as_ref().unwrap().multiple.as_ref().unwrap();
+    let pbo = m.pbo.as_ref().expect("two candidates give a PBO");
+    let want = rcsr::inference::pbo_cscv(&cols, 4).unwrap();
+    assert_eq!(pbo.rows_per_block, 50, "every column has the length of the target grid");
+    assert_eq!(pbo.pbo.to_bits(), want.pbo.to_bits());
+    assert_eq!(bits(&pbo.logits), bits(&want.logits));
+    for (c, col) in cols.iter().enumerate() {
+        let d = rcsr::inference::bootstrap_draws(col, 5, 200, walkforward::ProtocolOptions::default().seed.wrapping_add(c as u32 + 1));
+        assert_eq!(m.p_values[c].to_bits(), rcsr::inference::bootstrap_p_mean_positive(col, &d).to_bits(), "candidate {c}");
+    }
+    // With full coverage the score and the target grid are one grid and the block is unchanged.
+    let multiple = |r: &walkforward::Report| -> String {
+        let j = rcsr::devlog::Json::parse(&r.json()).unwrap();
+        j.get("inference").and_then(|i| i.get("multiple_testing")).map(|m| format!("{m:?}")).expect("the multiple_testing block")
+    };
+    assert_eq!(multiple(&pbo_run(&t, &["x", "x + 1"], Score, true)), multiple(&pbo_run(&t, &["x", "x + 1"], Target, true)));
+}
+
+#[test]
+fn missing_score_hold_prices_the_held_position() {
+    use walkforward::PeriodGrid::{Score, Target};
+    let t = grid_table();
+    for grid in [Score, Target] {
+        for reset in [false, true] {
+            let held = grid_run_rule(&t, "zo", grid, reset, false, MissingScore::Hold);
+            let o = grid_run(&t, "o", grid, reset, false);
+            let (h, b) = (&held.pooled, &o.pooled);
+            assert_eq!(bits(&held.period_net), bits(&o.period_net), "{grid:?} reset {reset}");
+            assert_eq!(h.total_cost.to_bits(), b.total_cost.to_bits(), "{grid:?} reset {reset}");
+            assert_eq!((h.trades, h.entries, h.rows, h.active_rows), (b.trades, b.entries, b.rows, b.active_rows), "{grid:?} reset {reset}");
+        }
+    }
+    let j = grid_run_rule(&t, "zo", Target, true, false, MissingScore::Hold).json();
+    assert!(j.contains("\"book\":{\"missing_score\":\"hold\",\"missing_score_exits\":0,"), "{j}");
+}
+
+/// #1203: one symbol at t = 0..12; `z` is 1 with no value at t = 7, the last row of
+/// window `a`, and at t = 8, the first row of window `b`.
+fn seam_table() -> data::Table {
+    let mut s = String::from("ts,sym,z,target\n");
+    for i in 0..12 {
+        let z = if i == 7 || i == 8 { "" } else { "1" };
+        s.push_str(&format!("{i},A,{z},{}\n", 0.001 * (i as f64 + 1.0)));
+    }
+    data::parse_table(&s).unwrap()
+}
+
+#[test]
+fn missing_score_at_a_carried_seam() {
+    let t = seam_table();
+    let run = |missing: MissingScore| {
+        let mut s = spec("z", vec![window("a", 0.0, 4.0, 4.0, 8.0), window("b", 0.0, 4.0, 8.0, 12.0)]);
+        s.vars = vec!["z".to_string()];
+        s.threshold_fixed = Some(0.0);
+        let opts = walkforward::ProtocolOptions { missing_score: missing, ..walkforward::ProtocolOptions::default() };
+        walkforward::run_table_with(&t, &s, "test", &opts).unwrap()
+    };
+    // flat: window a pays its exit at t = 6, its last priced row, and leaves flat; window b
+    // starts flat and pays the entry at t = 9. No position crosses the seam.
+    let flat = run(MissingScore::Flat);
+    assert!(!flat.pool_reset_flat);
+    assert_eq!((flat.pooled.rows, flat.pooled.entries, flat.pooled.trades), (6, 2, 2));
+    assert!((flat.pooled.total_cost - 0.004).abs() < 1e-15, "{}", flat.pooled.total_cost);
+    assert_eq!((flat.missing_score_exits, flat.seam_trades), (1, 0));
+    // hold: t = 7 and t = 8 hold the long and earn their returns; window b's first row holds the
+    // carried position, so the seam trades nothing.
+    let held = run(MissingScore::Hold);
+    assert_eq!((held.pooled.rows, held.pooled.entries, held.pooled.trades), (8, 1, 1));
+    assert!((held.pooled.total_cost - 0.003).abs() < 1e-15, "entry, the window-end exit of a, the final exit: {}", held.pooled.total_cost);
+    assert_eq!((held.missing_score_exits, held.seam_trades), (0, 0));
+}
+
+/// #1203: one symbol at t = 0..20 under `--policy band --min-hold 3`, with no score at t = 6.
+fn cooldown_table(drop_gap: bool) -> data::Table {
+    let mut s = String::from("ts,sym,z,target\n");
+    for i in 0..20usize {
+        let z = match i {
+            6 if drop_gap => continue,
+            6 => String::new(),
+            4 | 8 | 9 | 13 => "1".to_string(),
+            _ => "-1".to_string(),
+        };
+        s.push_str(&format!("{i},A,{z},{}\n", 0.001 * ((i * 7 % 5) as f64 - 1.5)));
+    }
+    data::parse_table(&s).unwrap()
+}
+
+fn cooldown_run(t: &data::Table, windows: Vec<Window>, missing: MissingScore) -> walkforward::Report {
+    let mut s = spec("z", windows);
+    s.vars = vec!["z".to_string()];
+    s.threshold_fixed = Some(0.0);
+    s.policy = walkforward::Policy::Band;
+    s.min_hold = 3;
+    s.pool_reset_flat = true;
+    let opts = walkforward::ProtocolOptions { missing_score: missing, ..walkforward::ProtocolOptions::default() };
+    walkforward::run_table_with(t, &s, "test", &opts).unwrap()
+}
+
+#[test]
+fn missing_score_inside_a_cooldown_hold() {
+    let t = cooldown_table(false);
+    let one = || vec![window("w", 0.0, 4.0, 4.0, 20.0)];
+    // flat: the cooldown automaton restarts at t = 7, as in a window that starts there.
+    let flat = cooldown_run(&t, one(), MissingScore::Flat);
+    let split = cooldown_run(&t, vec![window("a", 0.0, 4.0, 4.0, 6.0), window("b", 0.0, 4.0, 7.0, 20.0)], MissingScore::Flat);
+    assert_eq!(bits(&flat.period_net), bits(&split.period_net));
+    assert_eq!(flat.pooled.total_cost.to_bits(), split.pooled.total_cost.to_bits());
+    assert_eq!((flat.pooled.trades, flat.pooled.entries), (split.pooled.trades, split.pooled.entries));
+    assert_eq!(flat.missing_score_exits, 1, "the long of t = 4 and 5 exits at t = 5");
+    // hold: the automaton carries its state across t = 6, so the scored rows hold the positions of the
+    // book without that row, and t = 6 holds the long of t = 5.
+    let held = cooldown_run(&t, one(), MissingScore::Hold);
+    let dropped = cooldown_run(&cooldown_table(true), one(), MissingScore::Hold);
+    assert_eq!((held.pooled.trades, held.pooled.entries), (dropped.pooled.trades, dropped.pooled.entries));
+    assert_eq!(held.pooled.total_cost.to_bits(), dropped.pooled.total_cost.to_bits());
+    assert_eq!((held.pooled.rows, held.pooled.active_rows), (dropped.pooled.rows + 1, dropped.pooled.active_rows + 1));
+    assert!(flat.pooled.entries > held.pooled.entries, "flat re-enters at t = 8; hold is still long there");
+    let band = held.windows[0].band.as_ref().expect("the cooldown scan check");
+    assert!((band.net - band.scalar_net).abs() < 1e-15, "the scan net plus the held row equals the book: {} vs {}", band.net, band.scalar_net);
+}
+
+#[test]
+fn missing_score_under_top_tercile() {
+    // Three symbols at t = 0..10. A has the top score at every timestamp and no score at t = 6,
+    // which leaves two finite scores there, so the tercile holds nothing on B and C at t = 6.
+    let mut s = String::from("ts,sym,z,target\n");
+    for i in 0..10 {
+        for (sym, z) in [("A", "3"), ("B", "2"), ("C", "1")] {
+            let z = if sym == "A" && i == 6 { "" } else { z };
+            s.push_str(&format!("{i},{sym},{z},0.001\n"));
+        }
+    }
+    let t = data::parse_table(&s).unwrap();
+    let run = |missing: MissingScore| {
+        let mut s = spec("z", vec![window("w", 0.0, 4.0, 4.0, 10.0)]);
+        s.vars = vec!["z".to_string()];
+        s.group = Some("sym".to_string());
+        s.policy = walkforward::Policy::TopTercile;
+        let opts = walkforward::ProtocolOptions { missing_score: missing, ..walkforward::ProtocolOptions::default() };
+        walkforward::run_table_with(&t, &s, "test", &opts).unwrap()
+    };
+    let flat = run(MissingScore::Flat);
+    let f = &flat.pooled;
+    assert_eq!((f.rows, f.active_rows, f.entries, f.trades), (17, 5, 2, 2), "A exits at t = 5 and re-enters at t = 7");
+    assert!((f.total_cost - 0.004).abs() < 1e-15, "{}", f.total_cost);
+    assert_eq!(flat.missing_score_exits, 1);
+    let held = run(MissingScore::Hold);
+    let h = &held.pooled;
+    assert_eq!((h.rows, h.active_rows, h.entries, h.trades), (18, 6, 1, 1), "A holds its long at t = 6");
+    assert!((h.total_cost - 0.002).abs() < 1e-15, "{}", h.total_cost);
+}
+
+#[test]
+fn unpriced_target_rows_count_the_uncovered_rows_inside_a_run() {
+    let table = |target: &dyn Fn(usize) -> bool| {
+        let mut s = String::from("ts,sym,z,target\n");
+        for i in 0..60usize {
+            let y = if target(i) { "0.001" } else { "" };
+            s.push_str(&format!("{},A,1,{y}\n", 3600 * i));
+        }
+        data::parse_table(&s).unwrap()
+    };
+    let run = |t: &data::Table, horizon: f64, train_end: f64, test_start: f64| {
+        let mut s = spec("z", vec![window("w", 0.0, train_end, test_start, 60.0 * H)]);
+        s.vars = vec!["z".to_string()];
+        s.threshold_fixed = Some(0.0);
+        s.horizon = horizon;
+        s.periods_per_year = Some(8760.0);
+        walkforward::run_table(t, &s, "test").unwrap()
+    };
+    // A missing next bar on rows 20..29: a score and no target, inside the long run.
+    let r = run(&table(&|i| !(20..30).contains(&i)), H, 9.0 * H, 10.0 * H);
+    assert_eq!(r.unpriced_target_rows, 10);
+    assert!(r.json().contains("\"unpriced_target_rows\":10}"), "{}", r.json());
+    // A strided label: a target every fourth hour and a four-hour horizon. The return of a target row
+    // covers the next three rows, so none of them counts.
+    let r = run(&table(&|i| i % 4 == 0), 4.0 * H, 8.0 * H, 12.0 * H);
+    assert_eq!(r.unpriced_target_rows, 0);
+}
+
+/// #1203: one symbol at t = 0..20. `z` has no value on `gap`; after t = 12 `late` scores
+/// and returns replace the base ones. The target at t = 9, the last priced row before
+/// the gap, is a loss of 5 %.
+fn causal_table(gap: std::ops::Range<usize>, late: bool) -> data::Table {
+    let mut s = String::from("ts,sym,z,target\n");
+    for i in 0..20usize {
+        let z = if gap.contains(&i) { String::new() } else if late && i > 12 { "-1".to_string() } else { "1".to_string() };
+        let y = if i == 9 { -0.05 } else if late && i > 12 { -0.02 } else { 0.001 };
+        s.push_str(&format!("{i},A,{z},{y}\n"));
+    }
+    data::parse_table(&s).unwrap()
+}
+
+#[test]
+fn missing_score_flat_exit_is_causal() {
+    let run = |t: &data::Table| {
+        let mut s = spec("z", vec![window("w", 0.0, 4.0, 4.0, 20.0)]);
+        s.vars = vec!["z".to_string()];
+        s.threshold_fixed = Some(0.0);
+        walkforward::run_table(t, &s, "test").unwrap()
+    };
+    let at = |r: &walkforward::Report, t: f64| r.period_net[r.period_time.iter().position(|&x| x == t).unwrap()];
+    let gapped = run(&causal_table(10..13, false));
+    let scored = run(&causal_table(0..0, false));
+    // The missing score of t = 10 is known at t = 10, so the long of t = 9 earns the loss of
+    // t = 9 and pays its exit there; every earlier period is the book with no gap.
+    for t in 4..9 {
+        assert_eq!(at(&gapped, t as f64).to_bits(), at(&scored, t as f64).to_bits(), "t = {t}");
+    }
+    assert_eq!(at(&gapped, 9.0).to_bits(), (-0.05f64 - 0.001).to_bits(), "the loss and the exit at t = 9");
+    assert_eq!(at(&scored, 9.0).to_bits(), (-0.05f64).to_bits());
+    // Scores and returns after the gap do not reach any period up to it.
+    let late = run(&causal_table(10..13, true));
+    for t in 4..10 {
+        assert_eq!(at(&gapped, t as f64).to_bits(), at(&late, t as f64).to_bits(), "t = {t}");
+    }
+    assert_ne!(bits(&gapped.period_net), bits(&late.period_net), "the late rows do change the later periods");
+}
+
+#[test]
+fn missing_score_device_pnl_reduction_reads_the_same_book() {
+    let t = grid_table();
+    for missing in [MissingScore::Flat, MissingScore::Hold] {
+        let mut s = spec("z", vec![window("w1", 0.0, 100.0, 100.0, 250.0), window("w2", 0.0, 250.0, 250.0, 400.0)]);
+        s.vars = ["x", "z", "o", "zo"].map(String::from).to_vec();
+        s.group = Some("sym".to_string());
+        s.threshold_fixed = Some(0.0);
+        s.periods_per_year = Some(8760.0);
+        s.pool_reset_flat = true;
+        s.device_pnl = true;
+        let opts = walkforward::ProtocolOptions { missing_score: missing, ..walkforward::ProtocolOptions::default() };
+        let r = walkforward::run_table_with(&t, &s, "test", &opts).unwrap();
+        let d = r.device_pnl.as_ref().expect("the --device-pnl summary");
+        assert_eq!((d.windows, d.bit_mismatch_windows, d.count_mismatch_windows), (2, 0, 0), "{missing:?}");
+        assert!(d.max_abs_net_delta < 1e-12, "{missing:?}: {}", d.max_abs_net_delta);
+        assert_eq!(d.rows, r.pooled.rows as u64, "{missing:?}: the reduction prices the rows of the book");
+    }
+}
+
+/// #1176: `--all-members` and `--emit-series` on a 3-symbol panel and a front of 3 members.
+mod members {
+    use rcsr::devlog::Json;
+    use std::path::{Path, PathBuf};
+
+    use super::scratch::Scratch;
+
+    const COST_BPS: &str = "9.765625";
+    const EXPRS: [&str; 3] = ["x", "0.5 - x", "sqrt(x) - 1"];
+    const W1: &str = "w1,0,1080000,1083600,1620000";
+    const W2: &str = "w2,0,1620000,1623600,2160000";
+    const SPLITS: &str = "split_id,role,start,end\ns1,train,0,1076400\ns1,test,1083600,1400400\ns1,test,1620000,2160000\n";
+    const METRICS: [&str; 22] = [
+        "sharpe", "cagr", "max_drawdown", "sortino", "sortino_mar", "log_growth", "turnover", "exposure", "hit_rate",
+        "break_even_hit_rate", "trades", "entries", "rows", "active_rows", "periods", "periods_per_year", "total_return",
+        "mean_return", "avg_cost_bps", "gross_sharpe", "total_cost", "total_abs_delta",
+    ];
+    const SERIES: [&str; 9] = [
+        "period_time", "period_net", "period_gross", "period_cost", "period_exposure", "period_entries",
+        "period_entry_stamp", "period_bh", "period_bh_net",
+    ];
+    const RUN_HEAD: &str = r#"{"tool":"rcsr","variables":["x"],
+        "target_spec":{"column":"target","name":"target","kind":"forward_return","deprecated":false,
+            "return_column":"target","return_units":"simple","horizon_seconds":3600,"entry_offset_seconds":0,
+            "delay_seconds":0,"entry_price":"next open","exit_price":"close","offset":0.0,
+            "scale":{"kind":"constant","value":1.0},"clip":null,"units":"simple_return","cost_bps":null,
+            "cost_in_label":false,"construction_columns":[],"note":null},
+        "split":{"train_time":[0,716400],"validation_time":[720000,1076400],"required_purge_seconds":3600,"purge_seconds":3600},
+        "objective":{"spec":{"threshold":0,"per_side_bps":9.765625,"max_position":1,"cash_return":0},"finalist":{"expression":"x"}},
+        "pareto":"#;
+
+    struct Fixture {
+        _scratch: Scratch,
+        dir: PathBuf,
+        data: String,
+    }
+
+    /// Three symbols, hourly from 0 to 599 h. Targets are multiples of 2^-12 and the
+    /// per-side cost is 2^-10, so every sum of row returns and costs is exact.
+    fn fixture(tag: &str) -> Fixture {
+        let scratch = Scratch::new(tag);
+        let dir = scratch.path().to_path_buf();
+        let data = write(&dir, "panel.csv", &panel_csv());
+        Fixture { _scratch: scratch, dir, data }
+    }
+
+    fn panel_csv() -> String {
+        let mut csv = String::from("ts,sym,x,target\n");
+        for i in 0..600i64 {
+            for (s, sym) in ["A", "B", "C"].iter().enumerate() {
+                let s = s as i64;
+                let x = ((i * 7 + s * 3) % 11) as f64 - 5.0;
+                let y = (((i * 5 + s * 7) % 13) as f64 - 6.0) / 4096.0;
+                csv.push_str(&format!("{},{},{},{}\n", i * 3600, sym, x, y));
+            }
+        }
+        csv
+    }
+
+    fn write(dir: &Path, name: &str, text: &str) -> String {
+        let path = dir.join(name);
+        std::fs::write(&path, text).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    fn run_text(members: &[&str]) -> String {
+        let list: Vec<String> = members.iter().map(|e| format!("{{\"expression\":\"{e}\"}}")).collect();
+        format!("{}[{}]}}", RUN_HEAD, list.join(","))
+    }
+
+    fn rcsr(args: &[&str]) -> (i32, String, String) {
+        let out = super::rcsr_cmd::rcsr().args(args).output().unwrap();
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    fn wf_raw(data: &str, args: &[&str]) -> (i32, String, String) {
+        let mut a = vec!["walkforward", "--data", data, "--time", "ts", "--group-by", "sym", "--periods-per-year", "8760", "--json"];
+        a.extend_from_slice(args);
+        rcsr(&a)
+    }
+
+    fn wf(data: &str, args: &[&str]) -> Json {
+        let (code, out, err) = wf_raw(data, args);
+        assert_eq!(code, 0, "{args:?}: {err}");
+        Json::parse(out.trim()).unwrap()
+    }
+
+    fn get<'a>(j: &'a Json, path: &[&str]) -> &'a Json {
+        path.iter().fold(j, |cur, k| cur.get(k).unwrap_or_else(|| panic!("missing {k} in {path:?}")))
+    }
+
+    fn items(j: &Json) -> &[Json] {
+        match j {
+            Json::Arr(a) => a,
+            other => panic!("not an array: {other:?}"),
+        }
+    }
+
+    fn nums(j: &Json, path: &[&str]) -> Vec<f64> {
+        items(get(j, path)).iter().map(|v| v.as_f64().unwrap_or_else(|| panic!("{path:?}: {v:?}"))).collect()
+    }
+
+    fn single(expr: &str) -> Vec<&str> {
+        vec![
+            "--expr", expr, "--threshold-fixed", "0", "--cost-bps", COST_BPS, "--target", "target", "--vars", "x",
+            "--horizon", "3600", "--emit-series",
+        ]
+    }
+
+    fn variants(splits: &str) -> Vec<Vec<&str>> {
+        let win = vec!["--window", W1, "--window", W2, "--validation-frac", "0.3"];
+        vec![
+            win.clone(),
+            [win.clone(), vec!["--period-grid", "target"]].concat(),
+            [win, vec!["--missing-score", "hold"]].concat(),
+            vec!["--windows", splits, "--split-id", "s1", "--period-grid", "target"],
+        ]
+    }
+
+    #[test]
+    fn all_members_equal_single_expr_runs() {
+        let f = fixture("members-equal");
+        let run = write(&f.dir, "run.json", &run_text(&EXPRS));
+        let splits = write(&f.dir, "splits.csv", SPLITS);
+        for variant in variants(&splits) {
+            let all = wf(&f.data, &[vec!["--front", &run, "--all-members"], variant.clone()].concat());
+            assert_eq!(get(&all, &["selection", "source"]).as_str(), Some("front_all_members"), "{variant:?}");
+            assert_eq!(get(&all, &["selection", "test_used_for_selection"]), &Json::Bool(false));
+            assert_eq!(get(&all, &["diagnostic"]), &Json::Bool(true));
+            let members = items(get(&all, &["members"]));
+            assert_eq!(members.len(), 3, "{variant:?}");
+            if variant.contains(&"--split-id") {
+                // No validation slice: plain --front refuses to select, the report book is the first member.
+                let (code, _, err) = wf_raw(&f.data, &[vec!["--front", &run], variant.clone()].concat());
+                assert_eq!(code, 3, "{err}");
+                assert!(get(&all, &["selection", "selected_on"]).as_str().unwrap().starts_with("none (--all-members"));
+                for k in METRICS {
+                    assert_eq!(get(&all, &["pooled", k]), get(&members[0], &["pooled", k]), "{variant:?}: pooled.{k}");
+                }
+                assert_eq!(get(&all, &["pooled", "period_net"]), get(&members[0], &["series", "period_net"]));
+            } else {
+                let plain = wf(&f.data, &[vec!["--front", &run, "--emit-series"], variant.clone()].concat());
+                for k in ["candidates", "windows", "economics"] {
+                    assert_eq!(get(&all, &[k]), get(&plain, &[k]), "{variant:?}: {k}");
+                }
+                for k in METRICS.iter().chain(&["period_net", "period_time"]) {
+                    assert_eq!(get(&all, &["pooled", k]), get(&plain, &["pooled", k]), "{variant:?}: pooled.{k}");
+                }
+            }
+            let target_grid = variant.contains(&"target");
+            for (k, (m, e)) in members.iter().zip(EXPRS).enumerate() {
+                let at = format!("{variant:?} member {k}");
+                assert_eq!(get(m, &["archive_rank"]).as_f64(), Some((k + 1) as f64), "{at}");
+                assert_eq!(get(m, &["label"]).as_str(), Some(format!("front_rank_{}", k + 1).as_str()), "{at}");
+                assert_eq!(get(m, &["expression"]).as_str(), Some(e), "{at}");
+                assert_eq!(get(m, &["constant"]), &Json::Bool(false), "{at}");
+                let one = wf(&f.data, &[single(e), variant.clone()].concat());
+                for key in METRICS {
+                    assert_eq!(get(m, &["pooled", key]), get(&one, &["pooled", key]), "{at}: pooled.{key}");
+                }
+                assert_eq!(get(m, &["pooled", "net_mean"]), get(&one, &["pooled", "mean_return"]), "{at}");
+                assert_eq!(get(m, &["pooled", "entry_times"]), get(&one, &["pooled", "entry_times"]), "{at}");
+                assert_eq!(get(m, &["pooled", "cost_ladder"]), get(&one, &["economics", "cost_ladder"]), "{at}");
+                assert_eq!(get(m, &["pooled", "break_even_bps_per_side"]), get(&one, &["economics", "break_even_bps_per_side"]), "{at}");
+                assert_eq!(get(m, &["dropped_rows"]), get(&one, &["dropped_rows"]), "{at}");
+                let keys: Vec<&str> = SERIES.iter().copied().chain(target_grid.then_some("period_rows")).collect();
+                for key in keys {
+                    assert_eq!(get(m, &["series", key]), get(&one, &["pooled", key]), "{at}: series.{key}");
+                }
+                let (mw, ow) = (items(get(m, &["windows"])), items(get(&one, &["windows"])));
+                assert_eq!(mw.len(), ow.len(), "{at}");
+                for (a, b) in mw.iter().zip(ow) {
+                    for key in ["label", "threshold", "threshold_source", "train_rows", "validation_rows", "test_rows", "dropped_rows", "metrics"] {
+                        assert_eq!(get(a, &[key]), get(b, &[key]), "{at}: windows[].{key}");
+                    }
+                }
+            }
+            let dropped: Vec<f64> = members.iter().map(|m| get(m, &["dropped_rows"]).as_f64().unwrap()).collect();
+            assert!(dropped[0] == 0.0 && dropped[2] > 0.0, "{variant:?}: only the sqrt member drops rows: {dropped:?}");
+        }
+    }
+
+    /// The series of one book: the pooled block of a report or a member's `series`.
+    fn check_close(at: &str, s: &Json, pooled: &Json, cost_bps: f64, break_even: &Json, ladder: &Json, ppy: f64) {
+        let get_s = |k: &str| nums(s, &[k]);
+        let (time, net, gross, cost) = (get_s("period_time"), get_s("period_net"), get_s("period_gross"), get_s("period_cost"));
+        let (entries, stamp, rows) = (get_s("period_entries"), get_s("period_entry_stamp"), get_s("period_rows"));
+        for k in SERIES.iter().chain(&["period_rows"]) {
+            assert_eq!(get_s(k).len(), time.len(), "{at}: {k}");
+        }
+        assert!(!time.is_empty(), "{at}");
+        for t in 0..time.len() {
+            assert_eq!(cost[t].to_bits(), (gross[t] - net[t]).to_bits(), "{at}: period {t}");
+            // `gross - cost` rounds once more than `net`: the identity holds to one rounding of the larger term.
+            let bound = 2.0 * f64::EPSILON * gross[t].abs().max(net[t].abs());
+            assert!((gross[t] - cost[t] - net[t]).abs() <= bound, "{at}: period {t}");
+            assert_eq!(stamp[t], if entries[t] > 0.0 { 1.0 } else { 0.0 }, "{at}: period {t}");
+        }
+        let total = get(pooled, &["total_cost"]).as_f64().unwrap();
+        let weighted: f64 = cost.iter().zip(&rows).map(|(c, n)| c * n).sum();
+        assert!(total > 0.0 && (weighted - total).abs() <= 1e-12 * total, "{at}: {weighted} vs {total}");
+        let (g, c) = (gross.iter().sum::<f64>(), cost.iter().sum::<f64>());
+        assert_eq!(break_even.as_f64().map(f64::to_bits), Some((cost_bps * g / c).to_bits()), "{at}: break-even");
+        for row in items(ladder) {
+            let m = get(row, &["multiplier"]).as_f64().unwrap();
+            let priced: Vec<f64> = gross.iter().zip(&cost).map(|(g, c)| g - m * c).collect();
+            let r = rcsr::risk::risk_stats(&priced, ppy, rcsr::risk::DEFAULT_SORTINO_MAR);
+            assert_eq!(get(row, &["mean_return"]).as_f64().map(f64::to_bits), Some(r.mean.to_bits()), "{at}: ladder {m}");
+            assert_eq!(get(row, &["sharpe"]).as_f64().map(f64::to_bits), Some(r.sharpe.to_bits()), "{at}: ladder {m}");
+        }
+    }
+
+    #[test]
+    fn period_series_close() {
+        let f = fixture("members-close");
+        let run = write(&f.dir, "run.json", &run_text(&EXPRS));
+        let win = ["--window", W1, "--window", W2, "--validation-frac", "0.3", "--period-grid", "target"];
+        let all = wf(&f.data, &[&["--front", run.as_str(), "--all-members"][..], &win].concat());
+        let one = wf(&f.data, &[single("x"), win.to_vec()].concat());
+        let cost_bps: f64 = COST_BPS.parse().unwrap();
+        for (at, j) in [("all-members", &all), ("emit-series", &one)] {
+            let p = get(j, &["pooled"]);
+            check_close(at, p, p, cost_bps, get(j, &["economics", "break_even_bps_per_side"]), get(j, &["economics", "cost_ladder"]), 8760.0);
+        }
+        for (k, m) in items(get(&all, &["members"])).iter().enumerate() {
+            let p = get(m, &["pooled"]);
+            check_close(&format!("member {k}"), get(m, &["series"]), p, cost_bps, get(p, &["break_even_bps_per_side"]), get(p, &["cost_ladder"]), 8760.0);
+        }
+    }
+
+    #[test]
+    fn entry_times_count_stamps_not_rows() {
+        let scratch = Scratch::new("members-stamps");
+        let dir = scratch.path().to_path_buf();
+        // Ten symbols enter together at 20 h; three of them enter again at 30 h.
+        let mut csv = String::from("ts,sym,x,target\n");
+        for i in 0..40i64 {
+            for s in 0..10 {
+                let long = (20..25).contains(&i) || (s < 3 && (30..33).contains(&i));
+                csv.push_str(&format!("{},S{},{},0.0009765625\n", i * 3600, s, if long { 1 } else { -1 }));
+            }
+        }
+        let data = write(&dir, "stamps.csv", &csv);
+        let j = wf(&data, &[single("x"), vec!["--window", "w,0,36000,39600,144000"]].concat());
+        assert_eq!(get(&j, &["pooled", "entries"]).as_f64(), Some(13.0));
+        assert_eq!(get(&j, &["pooled", "entry_times"]).as_f64(), Some(2.0));
+        let (time, entries, stamp) = (nums(&j, &["pooled", "period_time"]), nums(&j, &["pooled", "period_entries"]), nums(&j, &["pooled", "period_entry_stamp"]));
+        let at = |h: f64| time.iter().position(|&t| t == h * 3600.0).unwrap();
+        assert_eq!((entries[at(20.0)], stamp[at(20.0)]), (10.0, 1.0));
+        assert_eq!((entries[at(30.0)], stamp[at(30.0)]), (3.0, 1.0));
+        assert_eq!(stamp.iter().sum::<f64>(), 2.0);
+    }
+
+    /// #1236: `windows[].entry_times` under `--emit-series`, through the library so the
+    /// report holds no path and no timing.
+    #[test]
+    fn emit_series_window_entry_times_sum_to_pooled() {
+        use rcsr::walkforward::{self, ProtocolOptions};
+        let t = rcsr::data::parse_table(&panel_csv()).unwrap();
+        let mut s = super::spec(
+            "x",
+            vec![
+                super::window("w1", 0.0, 1_080_000.0, 1_083_600.0, 1_440_000.0),
+                super::window("w2", 0.0, 1_440_000.0, 1_443_600.0, 1_800_000.0),
+                super::window("w3", 0.0, 1_800_000.0, 1_803_600.0, 2_160_000.0),
+            ],
+        );
+        s.group = Some("sym".to_string());
+        s.threshold_fixed = Some(0.0);
+        s.cost_bps = 9.765625;
+        s.horizon = 3600.0;
+        s.periods_per_year = Some(8760.0);
+        let plain = walkforward::run_table_with(&t, &s, "panel", &ProtocolOptions::default()).unwrap().hashed_json();
+        assert_eq!(rcsr::manifest::sha256_hex(plain.as_bytes()), PINNED_PLAIN_REPORT, "the report without --emit-series");
+        let p = Json::parse(plain.trim()).unwrap();
+        assert!(items(get(&p, &["windows"])).iter().all(|w| w.get("entry_times").is_none()));
+        let emit = ProtocolOptions { emit_series: true, ..ProtocolOptions::default() };
+        let j = Json::parse(walkforward::run_table_with(&t, &s, "panel", &emit).unwrap().hashed_json().trim()).unwrap();
+        let per: Vec<f64> = items(get(&j, &["windows"])).iter().map(|w| get(w, &["entry_times"]).as_f64().unwrap()).collect();
+        assert_eq!(per.len(), 3);
+        assert!(per.iter().all(|&v| v > 0.0), "{per:?}");
+        assert_eq!(per.iter().sum::<f64>(), get(&j, &["pooled", "entry_times"]).as_f64().unwrap());
+    }
+
+    const PINNED_PLAIN_REPORT: &str = "ab322d39470888d46f39b5f4a56372cb29fae75c22473b411fa589a26eeca269";
+
+    /// Buy and hold of the rows the book prices: long on every row of a symbol in a
+    /// window, the entry paid on its first row and the exit on its last.
+    fn buy_and_hold(data: &str, windows: &[(f64, f64)], cost: f64) -> Vec<f64> {
+        let text = std::fs::read_to_string(data).unwrap();
+        let rows: Vec<(f64, String, f64)> = text
+            .lines()
+            .skip(1)
+            .map(|l| {
+                let f: Vec<&str> = l.split(',').collect();
+                (f[0].parse().unwrap(), f[1].to_string(), f[3].parse().unwrap())
+            })
+            .collect();
+        let mut out = Vec::new();
+        for &(start, end) in windows {
+            let inside: Vec<&(f64, String, f64)> = rows.iter().filter(|r| r.0 >= start && r.0 < end).collect();
+            let first = |r: &(f64, String, f64)| !inside.iter().any(|o| o.1 == r.1 && o.0 < r.0);
+            let last = |r: &(f64, String, f64)| !inside.iter().any(|o| o.1 == r.1 && o.0 > r.0);
+            let mut times: Vec<f64> = inside.iter().map(|r| r.0).collect();
+            times.dedup();
+            for t in times {
+                let at: Vec<&&(f64, String, f64)> = inside.iter().filter(|r| r.0 == t).collect();
+                let sum: f64 = at.iter().map(|r| r.2 - if first(r) { cost } else { 0.0 } - if last(r) { cost } else { 0.0 }).sum();
+                out.push(sum / at.len() as f64);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn bh_series_matches_control() {
+        let f = fixture("members-bh");
+        let run = write(&f.dir, "run.json", &run_text(&EXPRS));
+        let win = ["--window", W1, "--window", W2, "--validation-frac", "0.3", "--period-grid", "target"];
+        let want = buy_and_hold(&f.data, &[(1_083_600.0, 1_620_000.0), (1_623_600.0, 2_160_000.0)], 1.0 / 1024.0);
+        let one = wf(&f.data, &[single("x"), win.to_vec()].concat());
+        let all = wf(&f.data, &[&["--front", run.as_str(), "--all-members"][..], &win].concat());
+        let member = &items(get(&all, &["members"]))[0];
+        for (at, s) in [("emit-series", get(&one, &["pooled"])), ("member x", get(member, &["series"]))] {
+            let got = nums(s, &["period_bh_net"]);
+            assert_eq!(got.len(), want.len(), "{at}");
+            for (t, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert_eq!(g.to_bits(), w.to_bits(), "{at}: period {t}: {g} vs {w}");
+            }
+        }
+        let bh = items(get(&one, &["economics", "benchmarks"])).iter().find(|b| get(b, &["name"]).as_str() == Some("buy_and_hold")).unwrap().clone();
+        let r = rcsr::risk::risk_stats(&nums(&one, &["pooled", "period_bh_net"]), 8760.0, rcsr::risk::DEFAULT_SORTINO_MAR);
+        assert_eq!(get(&bh, &["mean_return"]).as_f64().map(f64::to_bits), Some(r.mean.to_bits()));
+        assert_eq!(get(&bh, &["sharpe"]).as_f64().map(f64::to_bits), Some(r.sharpe.to_bits()));
+    }
+
+    #[test]
+    fn all_members_edge_cases() {
+        let f = fixture("members-edge");
+        let win = ["--window", W1, "--window", W2, "--validation-frac", "0.3"];
+        // A constant member is reported, flat on every period.
+        let run = write(&f.dir, "run.json", &run_text(&["x", "-1"]));
+        let all = wf(&f.data, &[&["--front", run.as_str(), "--all-members"][..], &win].concat());
+        let flat = &items(get(&all, &["members"]))[1];
+        assert_eq!(get(flat, &["constant"]), &Json::Bool(true));
+        assert_eq!(get(flat, &["pooled", "active_rows"]).as_f64(), Some(0.0));
+        assert!(nums(flat, &["series", "period_net"]).iter().all(|&v| v == 0.0));
+        // A front of one member is the run's book: its member equals --from-run bit for bit.
+        let run = write(&f.dir, "one.json", &run_text(&["x"]));
+        let all = wf(&f.data, &[&["--front", run.as_str(), "--all-members"][..], &win].concat());
+        let book = wf(&f.data, &[&["--from-run", run.as_str(), "--emit-series"][..], &win].concat());
+        let member = &items(get(&all, &["members"]))[0];
+        for key in METRICS {
+            assert_eq!(get(member, &["pooled", key]), get(&book, &["pooled", key]), "pooled.{key}");
+        }
+        for key in SERIES {
+            assert_eq!(get(member, &["series", key]), get(&book, &["pooled", key]), "series.{key}");
+        }
+    }
+
+    #[test]
+    fn all_members_refusal_in_the_library() {
+        use rcsr::walkforward::{self, CutFit, EvalSpec, FrontSource, ProtocolOptions};
+        let rows: Vec<(f64, f64, f64)> = (0..40).map(|i| (i as f64, ((i * 7) % 11) as f64 - 5.0, 0.001)).collect();
+        let t = super::single(&rows);
+        let mut s = super::spec("x", vec![super::window("w", 0.0, 20.0, 20.0, 40.0)]);
+        s.candidates = vec!["x".to_string(), "0.5 - x".to_string()];
+        s.validation_frac = 0.3;
+        s.threshold_fixed = Some(0.0);
+        let front = FrontSource {
+            run: "run.json".to_string(),
+            run_sha256: String::new(),
+            labels: vec!["front_rank_1".to_string(), "front_rank_2".to_string()],
+            ranks: vec![1, 2],
+        };
+        let opts = ProtocolOptions { all_members: true, front: Some(front), ..ProtocolOptions::default() };
+        let ok = walkforward::run_table_with(&t, &s, "t", &opts).unwrap();
+        assert_eq!(ok.members.as_ref().map(Vec::len), Some(2));
+        let refused = |s: &EvalSpec, o: &ProtocolOptions| walkforward::run_table_with(&t, s, "t", o).err().unwrap_or_default();
+        let band = EvalSpec { band_select: true, ..s.clone() };
+        assert!(refused(&band, &opts).contains("--all-members refuses --select-band"), "{}", refused(&band, &opts));
+        let fit = ProtocolOptions { threshold_fit: Some(CutFit::default()), ..opts.clone() };
+        assert!(refused(&s, &fit).contains("--all-members refuses --threshold-fit"), "{}", refused(&s, &fit));
+        let no_front = ProtocolOptions { front: None, ..opts.clone() };
+        assert!(refused(&s, &no_front).contains("--all-members needs --front"), "{}", refused(&s, &no_front));
+    }
+
+    #[test]
+    fn all_members_refusals() {
+        let f = fixture("members-refuse");
+        let run = write(&f.dir, "run.json", &run_text(&EXPRS));
+        let win = ["--window", W1, "--window", W2, "--validation-frac", "0.3"];
+        let front = ["--front", run.as_str(), "--all-members"];
+        let cases: [(Vec<&str>, &str); 5] = [
+            (vec!["--expr", "x", "--expr", "-x", "--target", "target", "--horizon", "3600", "--all-members"], "--all-members needs --front"),
+            ([&front[..], &["--select-band"]].concat(), "--all-members refuses --select-band"),
+            ([&front[..], &["--threshold-fit", "fitness"]].concat(), "--all-members refuses --threshold-fit"),
+            ([&front[..], &["--policy", "vote", "--quorum", "0.5"]].concat(), "--all-members refuses --policy vote"),
+            ([&front[..], &["--locked-test"]].concat(), "--all-members refuses --locked-test"),
+        ];
+        for (args, want) in cases {
+            let (code, _, err) = wf_raw(&f.data, &[args.clone(), win.to_vec()].concat());
+            assert_eq!(code, 2, "{args:?}: {err}");
+            assert!(err.contains(want), "{args:?}: {err}");
+        }
+    }
+}
+
+/// #1278: under a regime mask a row without a finite target (an unlabelled row of a strided label)
+/// neither starts nor ends an on-run, whatever its gate state. The walk-forward book is the masked
+/// book of the labelled rows alone (`regime_gate::masked_slice`), the book the search prices.
+#[test]
+fn masked_book_skips_unlabelled_rows() {
+    let frac = |v: f64| v - v.floor();
+    // Two symbols; the target is finite on every third stamp. The gate is the same for both: on in
+    // alternate 30-stamp blocks, off for one unlabelled stamp inside each on block.
+    let on_at = |i: usize| (i / 30) % 2 == 0 && i % 30 != 13;
+    let mut s = String::from("ts,sym,x,g,target\n");
+    let mut rows = Vec::new();
+    for i in 0..240usize {
+        for (k, sym) in ["A", "B"].iter().enumerate() {
+            let f = i as f64 + 0.37 * k as f64;
+            let x = frac(f * 0.618_033_988_749_894_9) - 0.3;
+            let y = 0.01 * (frac(f * 0.754_877_666_246_692_7) - 0.5);
+            let g = if on_at(i) { 1 } else { -1 };
+            let target = if i % 3 == 0 { y.to_string() } else { String::new() };
+            s.push_str(&format!("{i},{sym},{x},{g},{target}\n"));
+            if i >= 60 && i % 3 == 0 {
+                rows.push((i as f64, k as u64, x, y, on_at(i)));
+            }
+        }
+    }
+    let t = data::parse_table(&s).unwrap();
+    let mut sp = spec("x", vec![window("w", 0.0, 60.0, 60.0, 240.0)]);
+    sp.group = Some("sym".to_string());
+    sp.threshold_fixed = Some(0.0);
+    sp.periods_per_year = Some(8760.0);
+    let opts = walkforward::ProtocolOptions { mask: Some(rcsr::regime_gate::GateSpec::parse("g", 0.0, 1).unwrap()), ..walkforward::ProtocolOptions::default() };
+    let m = walkforward::run_table_with(&t, &sp, "test", &opts).unwrap().windows[0].metrics.clone();
+    let slice = rcsr::data::TradingSlice {
+        rows: rcsr::trading::TradingRows { time: rows.iter().map(|r| r.0).collect(), group: rows.iter().map(|r| r.1).collect(), funding: Vec::new() },
+        ret: rows.iter().map(|r| r.3).collect(),
+    };
+    let on: Vec<bool> = rows.iter().map(|r| r.4).collect();
+    let book = rcsr::regime_gate::masked_slice(&slice, &on);
+    let ts = rcsr::trading::TradingSpec { cost_bps: 10.0, threshold: 0.0, min_trades: 0, ..rcsr::trading::TradingSpec::default() };
+    let pred: Vec<f64> = rows.iter().map(|r| r.2).collect();
+    let want = rcsr::trading::evaluate(&pred, &book.ret, &book.rows, &ts).unwrap();
+    assert!(want.entries >= 4, "the labelled on rows form several runs: {}", want.entries);
+    assert_eq!((m.rows, m.trades, m.entries), (want.rows, want.trades, want.entries));
+    assert!((m.total_cost - want.total_cost).abs() <= 1e-15, "{} vs {}", m.total_cost, want.total_cost);
+    // One gate for both symbols: each priced stamp holds both rows.
+    let net = m.mean_return * m.periods as f64 * 2.0;
+    assert!((net - want.net_pnl).abs() <= 1e-12, "walkforward {net} vs masked book {}", want.net_pnl);
+}
+
+#[test]
+fn vote_quorum_warning_just_above_integer() {
+    assert_eq!(walkforward::votes_required(0.67, 3), 3);
+    let msg = walkforward::vote_quorum_warning(0.67, 3).expect("0.67 of 3 rounds up");
+    assert!(msg.starts_with("warning: "), "{msg}");
+    assert!(msg.contains("requires 3 votes"), "{msg}");
+    assert!(msg.contains("--quorum 0.66"), "{msg}");
+    assert!(msg.contains("for 2 votes"), "{msg}");
+    for (q, k) in [(0.66, 3), (1.0, 3), (0.5, 4), (0.05, 1), (0.34, 1), (0.98, 2)] {
+        assert_eq!(walkforward::vote_quorum_warning(q, k), None, "{q} of {k}");
+    }
+    assert!(walkforward::vote_quorum_warning(0.34, 3).is_some());
+}
+
+#[test]
+fn walkforward_vote_quorum_warning_stderr() {
+    let dir = Scratch::new("wf-vote-quorum-warning");
+    let data = dir.path().join("d.csv");
+    let mut csv = String::from("ts,x,target\n");
+    for i in 0..8 {
+        csv.push_str(&format!("{},{},0.001\n", 3600 * i, i));
+    }
+    std::fs::write(&data, csv).unwrap();
+    let run = |quorum: &str| {
+        rcsr_cmd::rcsr()
+            .args([
+                "walkforward", "--data", data.to_str().unwrap(), "--target", "target", "--expr", "x", "--expr", "x - 1", "--expr", "x - 2",
+                "--time", "ts", "--horizon", "3600", "--cost-bps", "5", "--periods-per-year", "365",
+                "--window", "w,0,7200,14400,28800", "--json", "--threshold-fixed", "1.5", "--policy", "vote", "--quorum", quorum,
+            ])
+            .output()
+            .unwrap()
+    };
+    let up = run("0.67");
+    assert_eq!(up.status.code(), Some(0), "{}", String::from_utf8_lossy(&up.stderr));
+    let err = String::from_utf8_lossy(&up.stderr);
+    let lines: Vec<&str> = err.lines().filter(|l| l.starts_with("warning:")).collect();
+    assert_eq!(lines.len(), 1, "{err}");
+    assert!(lines[0].contains("3 votes"), "{err}");
+    assert!(String::from_utf8_lossy(&up.stdout).contains("\"votes_required\":3"));
+    let exact = run("0.66");
+    assert_eq!(exact.status.code(), Some(0), "{}", String::from_utf8_lossy(&exact.stderr));
+    assert!(!String::from_utf8_lossy(&exact.stderr).contains("warning:"));
+    assert!(String::from_utf8_lossy(&exact.stdout).contains("\"votes_required\":2"));
 }

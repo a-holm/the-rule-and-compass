@@ -223,6 +223,7 @@ impl Runner {
             allow_lockbox: true,
             calibration: crate::dispatch::CalibrationRequest::Anchors,
             cross_symbol: cross_symbol.to_string(),
+            threads: 1,
             ..Options::default()
         };
         let report = enrich::build(&opts)?;

@@ -631,6 +631,189 @@ fn shared_pass_cpu_estimate_does_not_grow_with_the_compact_column_count() {
     assert_eq!(cpu_ms(1), cpu_ms(50));
 }
 
+
+const C2_ROWS: usize = 19_097_916;
+const C2_SEGMENTS: usize = 630;
+
+fn count(op: OpClass, cols: usize, supported: usize, exact: usize) -> enrich::ClassCount {
+    enrich::ClassCount { op, cols, supported, exact }
+}
+
+fn plan_mix(
+    mix: &[(&'static str, Vec<enrich::ClassCount>)],
+    threads: usize,
+    n_segments: usize,
+    gpu: GpuMode,
+) -> Vec<enrich::GroupPlan> {
+    let mix: std::collections::BTreeMap<_, _> = mix.iter().cloned().collect();
+    enrich::plan_groups_mixed(
+        &mix,
+        C2_ROWS,
+        n_segments,
+        threads,
+        gpu,
+        true,
+        true,
+        &enrich::EnrichRates::anchors(),
+    )
+}
+
+#[test]
+fn compact_family_with_join_columns_is_priced_at_its_per_column_cost() {
+    let rates = enrich::EnrichRates::anchors();
+    let mrow = C2_ROWS as f64 / 1e6;
+    let join_ms = mrow * rates.class(OpClass::Join).cpu_col_ms;
+    let pass_ms = mrow * rates.class(OpClass::CompactPass).cpu_fixed_ms;
+    let mixed = vec![
+        count(OpClass::CompactPass, 4, 4, 4),
+        count(OpClass::Join, 30, 26, 26),
+    ];
+    let plan = plan_mix(&[("btc", mixed)], 1, C2_SEGMENTS, GpuMode::Off);
+    assert_eq!(plan[0].op, "compact-pass");
+    let want = pass_ms + 30.0 * join_ms;
+    assert!(
+        (plan[0].cpu_ms - want).abs() < 1e-6 * want,
+        "cpu_ms {} want {}",
+        plan[0].cpu_ms,
+        want
+    );
+    let compact_only = plan_mix(
+        &[("btc", vec![count(OpClass::CompactPass, 34, 34, 34)])],
+        1,
+        C2_SEGMENTS,
+        GpuMode::Off,
+    );
+    assert!((compact_only[0].cpu_ms - pass_ms).abs() < 1e-6 * pass_ms);
+}
+
+#[test]
+fn mixed_family_is_priced_by_its_name_classes() {
+    if !enrich::gpu_kernels_compiled() {
+        return;
+    }
+    let seed = (
+        "seed",
+        vec![count(OpClass::Join, 5, 5, 5)],
+    );
+    for threads in [1usize, 4] {
+        let btc = vec![
+            count(OpClass::CompactPass, 4, 4, 4),
+            count(OpClass::Join, 30, 26, 26),
+            count(OpClass::Join, 6, 0, 0),
+        ];
+        let compact_only = vec![count(OpClass::CompactPass, 10, 10, 10)];
+        let plan = plan_mix(
+            &[seed.clone(), ("btc", btc), ("exotic", compact_only)],
+            threads,
+            C2_SEGMENTS,
+            GpuMode::Auto,
+        );
+        let by = |g: &str| plan.iter().find(|p| p.group == g).unwrap();
+        assert_eq!(by("seed").backend, "gpu", "{} workers", threads);
+        assert_eq!(by("btc").backend, "gpu", "{} workers", threads);
+        assert_eq!(by("btc").gpu_cols, 30, "{} workers", threads);
+        assert_eq!(by("exotic").backend, "cpu", "{} workers", threads);
+    }
+}
+
+#[test]
+fn join_columns_that_are_not_bit_identical_keep_their_backend() {
+    if !enrich::gpu_kernels_compiled() {
+        return;
+    }
+    let seed = ("seed", vec![count(OpClass::Join, 5, 5, 5)]);
+    let btc = vec![
+        count(OpClass::CompactPass, 4, 4, 4),
+        count(OpClass::Join, 30, 26, 20),
+    ];
+    let plan = plan_mix(&[seed, ("btc", btc)], 1, C2_SEGMENTS, GpuMode::Auto);
+    let btc = plan.iter().find(|p| p.group == "btc").unwrap();
+    assert_eq!(btc.backend, "cpu");
+    assert_eq!(btc.gpu_cols, 0);
+    let mrow = C2_ROWS as f64 / 1e6;
+    let join_ms = mrow * enrich::EnrichRates::anchors().class(OpClass::Join).cpu_col_ms;
+    assert!(btc.cpu_ms > 30.0 * join_ms, "the estimate still prices the join columns");
+}
+
+#[test]
+fn cpu_estimate_divides_by_the_worker_count() {
+    let family = vec![("lags", vec![count(OpClass::Elementwise, 20, 20, 20)])];
+    let cpu_ms = |threads: usize, segments: usize| {
+        plan_mix(&family, threads, segments, GpuMode::Off)[0].cpu_ms
+    };
+    let one = cpu_ms(1, C2_SEGMENTS);
+    assert!(one > 0.0);
+    assert!((cpu_ms(4, C2_SEGMENTS) - one / 4.0).abs() < 1e-9 * one);
+    assert!((cpu_ms(4, 2) - one / 2.0).abs() < 1e-9 * one);
+    assert_eq!(cpu_ms(0, C2_SEGMENTS), one);
+}
+
+#[test]
+fn c2_names_price_the_btc_family_by_its_join_columns() {
+    let features = "all,py15m,ta:full,exotic:cheap,cross:btc,compact,mtf,cross,flow,price_action,trend";
+    let mut requested: Vec<String> = Vec::new();
+    for f in features.split(',') {
+        for n in enrich::expand(f).unwrap() {
+            if !requested.contains(&n) {
+                requested.push(n);
+            }
+        }
+    }
+    let flow_or_action = |n: &String| {
+        enrich::FLOW_NAMES.contains(&n.as_str()) || enrich::PRICE_ACTION_NAMES.contains(&n.as_str())
+    };
+    let compact: Vec<String> = requested
+        .iter()
+        .filter(|n| enrich::is_compact(n) && !flow_or_action(n))
+        .cloned()
+        .collect();
+    let py15m_all = enrich::py15m_names();
+    let py15m: Vec<String> = requested
+        .iter()
+        .filter(|n| py15m_all.contains(n) && !compact.contains(n) && !flow_or_action(n))
+        .cloned()
+        .collect();
+    let mix = enrich::class_mix(&requested, &compact, &py15m);
+    for (family, classes) in &mix {
+        let line: Vec<String> = classes
+            .iter()
+            .map(|c| format!("{} {}/{}/{}", c.op.name(), c.cols, c.supported, c.exact))
+            .collect();
+        eprintln!("[mix] {family}: {}", line.join(", "));
+    }
+    let btc = &mix["btc"];
+    let join_cols: usize = btc.iter().filter(|c| c.op == OpClass::Join).map(|c| c.cols).sum();
+    assert!(join_cols > 0, "the btc family holds join columns: {btc:?}");
+    assert!(btc.iter().any(|c| c.op == OpClass::CompactPass), "{btc:?}");
+
+    let rates = enrich::EnrichRates::anchors();
+    let mrow = C2_ROWS as f64 / 1e6;
+    let join_ms = mrow * rates.class(OpClass::Join).cpu_col_ms;
+    for threads in [1usize, 4] {
+        let plan = enrich::plan_groups_mixed(
+            &mix,
+            C2_ROWS,
+            C2_SEGMENTS,
+            threads,
+            GpuMode::Auto,
+            true,
+            true,
+            &rates,
+        );
+        let p = plan.iter().find(|p| p.group == "btc").unwrap();
+        assert!(
+            p.cpu_ms >= join_cols as f64 * join_ms / threads as f64,
+            "{threads} workers: cpu_ms {} for {join_cols} join columns",
+            p.cpu_ms
+        );
+        let supported_join: usize = btc.iter().filter(|c| c.op == OpClass::Join).map(|c| c.supported).sum();
+        let exact_join: usize = btc.iter().filter(|c| c.op == OpClass::Join).map(|c| c.exact).sum();
+        eprintln!(
+            "[mix] btc {threads} workers: backend {} cpu_ms {:.0} gpu_ms {:.0} join supported {supported_join} exact {exact_join}",
+            p.backend, p.cpu_ms, p.gpu_ms
+        );
+    }
+}
 #[test]
 fn output_stage_is_bounded_at_64_mib_for_any_column_count() {
     let wide = rcsr::memory::enrich_output_stage_bytes(16_000_000, 358);
@@ -869,7 +1052,8 @@ fn default_financial_registry_is_complete_and_explicit() {
             .unwrap_or_else(|| panic!("{name} missing from registry"));
         assert!(e.available, "{name} must be available");
         assert_eq!(e.family, "cross", "{name} family");
-        assert_eq!(e.timeframe, "15m");
+        let daily = matches!(name.as_str(), "btc_trend_ma100_ratio" | "mkt_trend_ma100_ratio" | "mkt_trend_hi90_dist");
+        assert_eq!(e.timeframe, if daily { "1d" } else { "15m" });
         assert!(!e.formula.is_empty());
         assert!(enrich::expand(&name).is_ok(), "{name} must expand");
     }
@@ -1764,6 +1948,13 @@ fn cross_family_is_exactly_the_registry_and_market_state_is_ex_self_pit() {
     assert_eq!(&names[start..], &expected[..], "cross emission order");
     assert!(rcsr::schema::json().contains("\"family\":\"cross\""));
     for name in &expected {
+        // The fixture spans 800 bars of 15 minutes: too short for these four gate columns.
+        if matches!(
+            name.as_str(),
+            "btc_trend_ma100_ratio" | "mkt_trend_ma100_ratio" | "mkt_trend_hi90_dist" | "btc_vol_ratio_168_2160"
+        ) {
+            continue;
+        }
         let vals = column(&out, name);
         assert!(
             vals.iter().any(|v| v.is_finite()),
@@ -5273,4 +5464,825 @@ fn threads_zero_is_refused_with_exit_3() {
         .unwrap();
     assert_eq!(r.status.code(), Some(3), "{}", String::from_utf8_lossy(&r.stderr));
     assert!(String::from_utf8_lossy(&r.stderr).contains("--threads needs a positive integer"));
+}
+
+// ---------------------------------------------------------------------------
+// Gate-menu columns (#1270)
+// ---------------------------------------------------------------------------
+
+const GATE_NAMES: [&str; 6] = [
+    "btc_r168",
+    "mkt_r672",
+    "btc_trend_ma100_ratio",
+    "mkt_trend_ma100_ratio",
+    "btc_vol_ratio_168_2160",
+    "mkt_trend_hi90_dist",
+];
+const GATE_HOURS: usize = 3200;
+const GATE_SYMBOLS: usize = 24;
+
+fn gate_symbol(k: usize) -> String {
+    if k == 0 {
+        "BTCUSDT".to_string()
+    } else {
+        format!("ALT{:02}USDT", k)
+    }
+}
+
+/// Symbols in the lexical order the cross-section sums them in.
+fn gate_lexical() -> Vec<usize> {
+    let mut ks: Vec<usize> = (0..GATE_SYMBOLS).collect();
+    ks.sort_by_key(|k| gate_symbol(*k));
+    ks
+}
+
+/// Market-wide slow wave plus per-symbol drift and wave, so the equal-weight
+/// index rises and falls and its 90-day high distance is not identically zero.
+fn gate_close(k: usize, i: usize) -> f64 {
+    let t = i as f64;
+    100.0 * (0.00008 * (k as f64 - 11.5) * t + 0.15 * (t * 0.004).sin() + 0.03 * (t * 0.23 + k as f64 * 0.41).sin()).exp()
+}
+
+struct GateFixture {
+    path: String,
+    /// `index[k][i]`: store row of symbol `k` at hour `i`, `None` when the bar is absent.
+    index: Vec<Vec<Option<usize>>>,
+    times: Vec<i64>,
+}
+
+/// Hourly 24-symbol panel from 1970-01-01. `skip(k, i)` removes a bar; `edit(k, i)` scales a bar.
+fn gate_fixture(
+    dir: &std::path::Path,
+    tag: &str,
+    skip: impl Fn(usize, usize) -> bool,
+    edit: impl Fn(usize, usize) -> f64,
+) -> GateFixture {
+    let mut rows = Vec::new();
+    let mut index = vec![vec![None; GATE_HOURS]; GATE_SYMBOLS];
+    let mut times = Vec::new();
+    for k in 0..GATE_SYMBOLS {
+        for i in 0..GATE_HOURS {
+            if skip(k, i) {
+                continue;
+            }
+            let p = gate_close(k, i) * edit(k, i);
+            index[k][i] = Some(rows.len());
+            times.push(i as i64 * 3600);
+            rows.push((i as i64 * 3600, gate_symbol(k), p * 0.999, p * 1.002, p * 0.998, p, 1000.0 + k as f64, 0.0));
+        }
+    }
+    let path = dir.join(format!("{tag}.rcsb")).to_string_lossy().into_owned();
+    write_panel_store(&path, &rows, 4096);
+    GateFixture { path, index, times }
+}
+
+fn gate_build(f: &GateFixture, dir: &std::path::Path, tag: &str) -> String {
+    let out = dir.join(format!("{tag}-out.rcsb")).to_string_lossy().into_owned();
+    let mut o = opts(&f.path, &out, &GATE_NAMES.join(","));
+    o.gpu = GpuMode::Off;
+    enrich::build(&o).unwrap();
+    out
+}
+
+/// The equal-weight daily index of the members by hand. `closes[j][d]` is the
+/// close of the last bar of day `d` of the `j`-th symbol in lexical order.
+/// Returns `(mkt_trend_ma100_ratio, mkt_trend_hi90_dist)` per closed day.
+fn gate_hand_daily(closes: &[Vec<Option<f64>>]) -> (Vec<f64>, Vec<f64>) {
+    let days = closes[0].len();
+    let mut idx = vec![f64::NAN; days];
+    for d in 1..days {
+        let mut sum = 0.0;
+        let mut n = 0usize;
+        for c in closes {
+            if let (Some(now), Some(prev)) = (c[d], c[d - 1]) {
+                sum += (now / prev).ln();
+                n += 1;
+            }
+        }
+        if n >= 20 {
+            let prev = if idx[d - 1].is_finite() { idx[d - 1] } else { 1.0 };
+            idx[d] = prev * (sum / n as f64).exp();
+        }
+    }
+    let mut ratio = vec![f64::NAN; days];
+    let mut hi = vec![f64::NAN; days];
+    for d in 0..days {
+        if d >= 99 && idx[d - 99..=d].iter().all(|v| v.is_finite()) {
+            let mean = idx[d - 99..=d].iter().sum::<f64>() / 100.0;
+            ratio[d] = idx[d] / mean - 1.0;
+        }
+        if d >= 89 && idx[d - 89..=d].iter().all(|v| v.is_finite()) {
+            let max = idx[d - 89..=d].iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            hi[d] = idx[d] / max - 1.0;
+        }
+    }
+    (ratio, hi)
+}
+
+fn gate_day_closes(f: &GateFixture) -> Vec<Vec<Option<f64>>> {
+    let days = GATE_HOURS.div_ceil(24);
+    gate_lexical()
+        .iter()
+        .map(|&k| {
+            (0..days)
+                .map(|d| {
+                    let last = ((d + 1) * 24).min(GATE_HOURS);
+                    (d * 24..last)
+                        .rev()
+                        .find(|i| f.index[k][*i].is_some())
+                        .map(|i| gate_close(k, i))
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn gate_same(want: f64, got: f64, tol: f64, what: &str) {
+    if want.is_nan() || got.is_nan() {
+        assert!(want.is_nan() && got.is_nan(), "{what}: expected {want}, got {got}");
+    } else if tol == 0.0 {
+        assert_eq!(want.to_bits(), got.to_bits(), "{what}: expected {want}, got {got}");
+    } else {
+        closeish(want, got, tol, what);
+    }
+}
+
+#[test]
+fn market_gate_columns_match_hand_built_series() {
+    let (_scratch, dir) = tmp_dir("gate-hand");
+    let f = gate_fixture(&dir, "in", |_, _| false, |_, _| 1.0);
+    let out = gate_build(&f, &dir, "hand");
+    let lex = gate_lexical();
+    let close = gate_close;
+    let btc = |i: usize| close(0, i);
+    let ret1 = |i: usize| (btc(i) / btc(i - 1)).ln();
+    let sd = |i: usize, w: usize| {
+        let v: Vec<f64> = (i + 1 - w..=i).map(ret1).collect();
+        let m = v.iter().sum::<f64>() / w as f64;
+        (v.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / w as f64).sqrt()
+    };
+    let (ratio, hi) = gate_hand_daily(&gate_day_closes(&f));
+    // The first closed day with a trend value is day 99 of BTC.
+    let btc_days: Vec<f64> = (0..GATE_HOURS.div_ceil(24))
+        .map(|d| btc(((d + 1) * 24).min(GATE_HOURS) - 1))
+        .collect();
+    let btc_trend = |d: usize| {
+        if d < 99 {
+            f64::NAN
+        } else {
+            btc_days[d] / (btc_days[d - 99..=d].iter().sum::<f64>() / 100.0) - 1.0
+        }
+    };
+    let cols: Vec<Vec<f64>> = GATE_NAMES.iter().map(|n| column(&out, n)).collect();
+    let mut finite = [0usize; 6];
+    for k in 0..GATE_SYMBOLS {
+        for i in 0..GATE_HOURS {
+            let r = f.index[k][i].unwrap();
+            let day = i / 24;
+            let closed = |v: &[f64]| if day == 0 { f64::NAN } else { v[day - 1] };
+            let want = [
+                if i >= 168 { (btc(i) / btc(i - 168)).ln() } else { f64::NAN },
+                if i >= 672 {
+                    let mut s = 0.0;
+                    for &j in &lex {
+                        s += (close(j, i) / close(j, i - 672)).ln();
+                    }
+                    s / GATE_SYMBOLS as f64
+                } else {
+                    f64::NAN
+                },
+                if day == 0 { f64::NAN } else { btc_trend(day - 1) },
+                closed(&ratio),
+                if i >= 2160 { sd(i, 168) / sd(i, 2160) } else { f64::NAN },
+                closed(&hi),
+            ];
+            for (c, name) in GATE_NAMES.iter().enumerate() {
+                let tol = match c {
+                    0 | 1 => 0.0,
+                    _ => 1e-12,
+                };
+                gate_same(want[c], cols[c][r], tol, &format!("{name} k={k} i={i}"));
+                finite[c] += cols[c][r].is_finite() as usize;
+            }
+        }
+    }
+    for (c, name) in GATE_NAMES.iter().enumerate() {
+        assert!(finite[c] > GATE_SYMBOLS * 100, "{name} is nearly all NaN: {}", finite[c]);
+    }
+    let hi = column(&out, "mkt_trend_hi90_dist");
+    assert!(hi.iter().filter(|v| **v < -0.01).count() > GATE_SYMBOLS * 100, "hi90 must leave the running high");
+}
+
+#[test]
+fn market_gate_columns_are_causal_under_future_edits() {
+    let (_scratch, dir) = tmp_dir("gate-causal");
+    let a_fix = gate_fixture(&dir, "a", |_, _| false, |_, _| 1.0);
+    let t = 110 * 86_400 + 12 * 3600;
+    let b_fix = gate_fixture(
+        &dir,
+        "b",
+        |_, _| false,
+        |k, i| if i as i64 * 3600 > t { 1.0 + 0.04 * (1 + k % 5) as f64 } else { 1.0 },
+    );
+    assert_eq!(a_fix.times, b_fix.times);
+    let a_out = gate_build(&a_fix, &dir, "a");
+    let b_out = gate_build(&b_fix, &dir, "b");
+    for name in GATE_NAMES {
+        let a = column(&a_out, name);
+        let b = column(&b_out, name);
+        assert!(changed_before(&a_fix.times, &a, &b, t + 1).is_empty(), "{name} reads a bar after t");
+        assert!(
+            (0..a.len()).any(|r| a_fix.times[r] > t && a[r].is_finite() && a[r].to_bits() != b[r].to_bits()),
+            "{name}: the edit after t moved nothing, the check is vacuous"
+        );
+    }
+    // A daily column moved one day earlier reads the running day: the edit is caught.
+    for name in ["btc_trend_ma100_ratio", "mkt_trend_ma100_ratio", "mkt_trend_hi90_dist"] {
+        let a = shifted_one_day(&column(&a_out, name));
+        let b = shifted_one_day(&column(&b_out, name));
+        assert!(
+            !changed_before(&a_fix.times, &a, &b, t + 1).is_empty(),
+            "{name}: a one-day future shift must move a value at or before t"
+        );
+    }
+}
+
+#[test]
+fn market_gate_columns_respect_the_member_floor() {
+    let (_scratch, dir) = tmp_dir("gate-floor");
+    // Symbols 1..=5 have no bar on day 30: that day has 19 members, and so has
+    // day 31 because the five lack the day-30 close.
+    let hole = |k: usize, i: usize| (1..=5).contains(&k) && i / 24 == 30;
+    let gap = gate_fixture(&dir, "gap", hole, |_, _| 1.0);
+    let ctl = gate_fixture(&dir, "ctl", |_, _| false, |_, _| 1.0);
+    let gap_out = gate_build(&gap, &dir, "gap");
+    let ctl_out = gate_build(&ctl, &dir, "ctl");
+    let row = |f: &GateFixture, i: usize| f.index[0][i].unwrap();
+    let col = |out: &str, name: &str, f: &GateFixture, i: usize| column(out, name)[row(f, i)];
+
+    // mkt_r672: the 19 full symbols are the only members at day 30, and the
+    // five lose r672 until their window clears the hole.
+    let m_gap = column(&gap_out, "mkt_r672");
+    let m_ctl = column(&ctl_out, "mkt_r672");
+    for i in 0..GATE_HOURS {
+        let r = row(&gap, i);
+        let inside = (720..1416).contains(&i);
+        if inside {
+            assert!(m_gap[r].is_nan(), "mkt_r672 must be NaN at hour {i}");
+            assert!(m_ctl[r].is_finite(), "control mkt_r672 at hour {i}");
+        } else {
+            assert_eq!(m_gap[r].to_bits(), m_ctl[r].to_bits(), "mkt_r672 outside the hole at hour {i}");
+        }
+    }
+
+    // The daily columns: every window that holds day 30 or 31 is NaN, later windows are finite.
+    let (ratio, hi) = gate_hand_daily(&gate_day_closes(&gap));
+    for (name, hand) in [("mkt_trend_ma100_ratio", &ratio), ("mkt_trend_hi90_dist", &hi)] {
+        let a = column(&gap_out, name);
+        for i in 24..GATE_HOURS {
+            let want = hand[i / 24 - 1];
+            gate_same(want, a[row(&gap, i)], 1e-12, &format!("{name} hour {i}"));
+        }
+    }
+    // d = D - 1: day 105 reads d = 104 (window 5..104 holds day 30), day 131 reads d = 130.
+    for i in [105 * 24, 131 * 24 + 5] {
+        assert!(col(&ctl_out, "mkt_trend_ma100_ratio", &ctl, i).is_finite(), "control ratio at hour {i}");
+        assert!(col(&gap_out, "mkt_trend_ma100_ratio", &gap, i).is_nan(), "ratio must be NaN at hour {i}");
+    }
+    assert!(col(&gap_out, "mkt_trend_ma100_ratio", &gap, 132 * 24 + 5).is_finite(), "window 32..131 is clear");
+    for i in [95 * 24, 120 * 24 + 5] {
+        assert!(col(&ctl_out, "mkt_trend_hi90_dist", &ctl, i).is_finite(), "control hi90 at hour {i}");
+        assert!(col(&gap_out, "mkt_trend_hi90_dist", &gap, i).is_nan(), "hi90 must be NaN at hour {i}");
+    }
+    assert!(col(&gap_out, "mkt_trend_hi90_dist", &gap, 122 * 24 + 5).is_finite(), "window 32..121 is clear");
+    // The BTC columns do not use the cross-section.
+    for name in ["btc_r168", "btc_trend_ma100_ratio", "btc_vol_ratio_168_2160"] {
+        assert_eq!(col(&gap_out, name, &gap, 3000).to_bits(), col(&ctl_out, name, &ctl, 3000).to_bits(), "{name}");
+    }
+}
+
+#[test]
+fn cross_inventory_and_schema_list_the_six_gate_columns() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let text = std::fs::read_to_string(root.join("../docs/cross-asset-inventory.json")).unwrap();
+    assert!(text.contains("\"count\": 51,"), "inventory count");
+    assert_eq!(text.matches("\"name\":").count(), 51);
+    assert_eq!(enrich::cross_names().len(), 51);
+    let schema = rcsr::schema::json();
+    for name in GATE_NAMES {
+        assert!(text.contains(&format!("\"name\": \"{name}\"")), "inventory misses {name}");
+        assert!(schema.contains(&format!("\"name\":\"{name}\"")), "schema misses {name}");
+        let e = enrich::default_registry().into_iter().find(|e| e.name == name).unwrap_or_else(|| panic!("{name} is not registered"));
+        assert_eq!(e.family, "cross");
+        assert_eq!(rcsr::registry::lookup(name).unwrap().warmup, e.warmup);
+        assert!(e.available && e.warmup > 0 && e.formula != "see docs/ohlcv.md", "{name}");
+        for id in rcsr::registry::test_ids(&e) {
+            let (file, func) = id.split_once("::").unwrap();
+            let src = std::fs::read_to_string(root.join(file)).unwrap();
+            assert!(src.contains(&format!("fn {func}(")), "{name} cites missing test {id}");
+        }
+    }
+    assert_eq!(
+        enrich::lookback_seconds("btc_r168", 3600),
+        Some(168 * 3600)
+    );
+    assert_eq!(enrich::lookback_seconds("mkt_r672", 3600), Some(672 * 3600));
+    assert_eq!(enrich::lookback_seconds("btc_vol_ratio_168_2160", 3600), Some(2160 * 3600));
+    let ma = rcsr::trend::lookback_seconds("trend_ma100_ratio");
+    assert_eq!(enrich::lookback_seconds("btc_trend_ma100_ratio", 3600), ma);
+    assert_eq!(enrich::lookback_seconds("mkt_trend_ma100_ratio", 3600), Some(102 * 86_400));
+    assert_eq!(enrich::lookback_seconds("mkt_trend_hi90_dist", 3600), Some(92 * 86_400));
+}
+
+// ---------------------------------------------------------------------------
+// Member floor of the cross-section columns (#1274)
+// ---------------------------------------------------------------------------
+
+/// The 19 columns of the cross family that read a member floor before #1270.
+const FLOORED_19: &[&str] = &[
+    "mkt_r16", "mkt_ew_ret16", "breadth", "mkt_breadth", "dispersion", "mkt_dispersion", "rel_mkt16", "mkt_r96",
+    "rel_mkt96", "mkt_vol96", "mkt_ew_ret1", "avg_corr", "btc_volume_share", "xs_rank_r1", "xs_rank_r16",
+    "xs_rank_r20", "xs_rank_vol20", "xs_rank_amihud96", "cs_rank_r60",
+];
+const CLASS_R_19: &[&str] =
+    &["avg_corr", "xs_rank_r1", "xs_rank_r16", "xs_rank_r20", "xs_rank_vol20", "xs_rank_amihud96", "cs_rank_r60"];
+
+/// A symbol-major panel of `symbols` members, BTCUSDT first, all members from the first bar.
+fn member_rows(symbols: usize, n: usize, step: i64) -> Vec<(i64, String, f64, f64, f64, f64, f64, f64)> {
+    let mut rows = Vec::new();
+    for k in 0..symbols {
+        let sym = if k == 0 { "BTCUSDT".to_string() } else { format!("ALT{:02}USDT", k) };
+        let mu = 0.0002 * (k as f64 - 3.0);
+        let phase = k as f64 * 0.41;
+        for i in 0..n {
+            let p = 100.0 * (mu * i as f64 + 0.03 * (i as f64 * 0.23 + phase).sin()).exp();
+            let v = 1000.0 + 10.0 * k as f64 + (i % 7) as f64;
+            rows.push((i as i64 * step, sym.clone(), p * 0.999, p * 1.002, p * 0.998, p, v, 0.0));
+        }
+    }
+    rows
+}
+
+fn cli_enrich(src: &str, out: &str, features: &str, extra: &[&str]) -> std::process::Output {
+    rcsr_cmd::rcsr()
+        .args(["enrich", "--data", src, "--out", out, "--cpu", "--features", features, "--eth-symbol", "BTCUSDT", "--locked-test", "none"])
+        .args(extra)
+        .output()
+        .unwrap()
+}
+
+fn cli_enrich_ok(src: &str, out: &str, features: &str, extra: &[&str]) {
+    let r = cli_enrich(src, out, features, extra);
+    assert_eq!(r.status.code(), Some(0), "{}", String::from_utf8_lossy(&r.stderr));
+}
+
+/// `min_members` of every `{"name":..}` entry of a sidecar text.
+fn column_floors(text: &str) -> std::collections::BTreeMap<String, usize> {
+    let mut out = std::collections::BTreeMap::new();
+    for part in text.split("{\"name\":\"").skip(1) {
+        let name = part.split('"').next().unwrap_or_default();
+        let body = part.split('}').next().unwrap_or_default();
+        if let Some(at) = body.find("\"min_members\":") {
+            let digits: String = body[at + 14..].chars().take_while(|c| c.is_ascii_digit()).collect();
+            out.insert(name.to_string(), digits.parse().unwrap());
+        }
+    }
+    out
+}
+
+fn stderr_of(r: &std::process::Output) -> String {
+    String::from_utf8_lossy(&r.stderr).into_owned()
+}
+
+fn symbol_store(dir: &std::path::Path, name: &str, symbols: usize, n: usize, step: i64) -> String {
+    let path = dir.join(name).to_string_lossy().into_owned();
+    write_panel_store(&path, &member_rows(symbols, n, step), 64);
+    path
+}
+
+/// Golden `sha256` of the 19 columns on the 20-member fixture, taken from the engine before the floor became a parameter.
+const GOLDEN_DEFAULT_HASHES: &[(&str, &str)] = &[
+    ("mkt_r16", "e9b795fa1195e480f1cb76f1be02b15356521d02749953b84d74e62773ed42ce"),
+    ("mkt_ew_ret16", "e9b795fa1195e480f1cb76f1be02b15356521d02749953b84d74e62773ed42ce"),
+    ("breadth", "67b32f55a8d4f3fa0edbb839fb0e5432a8e80f2803b42a88ed1032c845bee509"),
+    ("mkt_breadth", "67b32f55a8d4f3fa0edbb839fb0e5432a8e80f2803b42a88ed1032c845bee509"),
+    ("dispersion", "c190d78501e509f47447ee25f8c70b92acca72bcf35d2debf8c2c29b2db99010"),
+    ("mkt_dispersion", "c190d78501e509f47447ee25f8c70b92acca72bcf35d2debf8c2c29b2db99010"),
+    ("rel_mkt16", "859e6b828f5ec8d5021356f7a2180de66ca40168a58fecaf1dc0210622dcaaef"),
+    ("mkt_r96", "5b2e412a32c98ee02361f1db742fe2cb5ba5b8d7cdfd3d09e2fd1a509af5cbc1"),
+    ("rel_mkt96", "0ac8cd2cbb7650e013a8259771a22def40c767d8ac4bea8fd88fd67259a9b581"),
+    ("mkt_vol96", "8e1cea6b4d1de472ba22466d01b65438253291c86e04252d399798be261e0b36"),
+    ("mkt_ew_ret1", "149a5c76653882c4d96afc56f939448acc44ed37cc46bd93f11e720af22cc60b"),
+    ("avg_corr", "df15f070709875b5938a97ba6b526bf28153a6401788091267f2f5b9d083906a"),
+    ("btc_volume_share", "298a3e09af665757cb07d0cf4c1e7166917c6b387af59d21611aed80a1f91cc4"),
+    ("xs_rank_r1", "3ac4d5bbcd4e89834067214423d1a3fdbfa0aca02a476830a49176571e53827d"),
+    ("xs_rank_r16", "af068f064ac1a20a4c02d66641d59790fcba81e5ed6304ab2c0d5b0d9ee0de95"),
+    ("xs_rank_r20", "33f607a42960598c3e619495e678fddce8d8084ec4f5b880698934f1ae3d8d9b"),
+    ("xs_rank_vol20", "c82443154d7160ae9a66e16db198c3fb516d7cb398dcd340a8ed2bed612d87b8"),
+    ("xs_rank_amihud96", "449115020d0b15f92293e140afbc7e12871644e82607283962b8054904de1092"),
+    ("cs_rank_r60", "863a567fc38920ba1dd0ac80e3ce4ad7a81235151ee9ff9fa5bb13a4e6d4f2ec"),
+];
+
+#[test]
+fn min_cross_members_default_is_byte_identical() {
+    let (_scratch, dir) = tmp_dir("floor-default");
+    let input = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let rows = cross_panel_rows(300, 900, 0.0, Some("ALT01USDT"), 1.0e12);
+    write_panel_store(&input, &rows, 64);
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    let report = enrich::build(&cross_opts(&input, &out, &FLOORED_19.join(","))).unwrap();
+    let got: Vec<(String, String)> = report.features.iter().map(|f| (f.name.clone(), f.hash.clone())).collect();
+    for name in FLOORED_19 {
+        assert!(column(&out, name).iter().any(|v| v.is_finite()), "{name} has no finite value at 20 members");
+    }
+    let want: Vec<(String, String)> = GOLDEN_DEFAULT_HASHES.iter().map(|(n, h)| (n.to_string(), h.to_string())).collect();
+    assert_eq!(got, want, "the default floor changed a cross column");
+
+    let explicit = dir.join("explicit.rcsb").to_string_lossy().into_owned();
+    cli_enrich_ok(&input, &explicit, &FLOORED_19.join(","), &["--min-cross-members", "20", "--min-cross-members-rank", "20"]);
+    for name in FLOORED_19 {
+        assert_eq!(
+            column(&out, name).iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            column(&explicit, name).iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "{name}: explicit 20 differs from the default"
+        );
+    }
+}
+
+#[test]
+fn min_cross_members_5_fills_a_thin_cross_section() {
+    let (_scratch, dir) = tmp_dir("floor-thin");
+    let input = symbol_store(&dir, "in.rcsb", 7, 300, 900);
+    let features = FLOORED_19.join(",");
+    let default = dir.join("default.rcsb").to_string_lossy().into_owned();
+    cli_enrich_ok(&input, &default, &features, &[]);
+    for name in FLOORED_19 {
+        assert!(column(&default, name).iter().all(|v| v.is_nan()), "{name} must be NaN with 7 members at the default floor");
+    }
+    let five = dir.join("five.rcsb").to_string_lossy().into_owned();
+    cli_enrich_ok(&input, &five, &features, &["--min-cross-members", "5"]);
+    for name in FLOORED_19 {
+        let v = column(&five, name);
+        for sym in 0..7usize {
+            for i in 200..300usize {
+                assert!(v[symbol_index(sym, i, 300)].is_finite(), "{name} symbol {sym} bar {i} is NaN at floor 5");
+            }
+        }
+    }
+}
+
+#[test]
+fn min_cross_members_five_member_values() {
+    let (_scratch, dir) = tmp_dir("floor-values");
+    let n = 200usize;
+    let input = symbol_store(&dir, "in.rcsb", 5, n, 900);
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    cli_enrich_ok(&input, &out, "r16,mkt_r16,breadth,dispersion,xs_rank_r16", &["--min-cross-members", "5"]);
+    let r16 = column(&out, "r16");
+    let (mkt, breadth, disp, rank) =
+        (column(&out, "mkt_r16"), column(&out, "breadth"), column(&out, "dispersion"), column(&out, "xs_rank_r16"));
+    for i in 100..n {
+        let vals: Vec<f64> = (0..5).map(|k| r16[symbol_index(k, i, n)]).collect();
+        let mean = vals.iter().sum::<f64>() / 5.0;
+        let share = vals.iter().filter(|v| **v > 0.0).count() as f64 / 5.0;
+        let sd = (vals.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / 5.0).sqrt();
+        let mut order: Vec<usize> = (0..5).collect();
+        order.sort_by(|&a, &b| vals[a].partial_cmp(&vals[b]).unwrap());
+        for k in 0..5usize {
+            let at = symbol_index(k, i, n);
+            closeish(mean, mkt[at], 1e-12, "mkt_r16");
+            closeish(share, breadth[at], 1e-12, "breadth");
+            closeish(sd, disp[at], 1e-12, "dispersion");
+            let pos = order.iter().position(|&o| o == k).unwrap();
+            closeish(-1.0 + 0.5 * pos as f64, rank[at], 1e-12, "xs_rank_r16");
+        }
+    }
+}
+
+#[test]
+fn min_cross_members_rank_floor_is_separate() {
+    let (_scratch, dir) = tmp_dir("floor-rank");
+    let features = FLOORED_19.join(",");
+    let seven = symbol_store(&dir, "seven.rcsb", 7, 300, 900);
+    let out7 = dir.join("out7.rcsb").to_string_lossy().into_owned();
+    cli_enrich_ok(&seven, &out7, &features, &["--min-cross-members", "5", "--min-cross-members-rank", "10"]);
+    for name in FLOORED_19 {
+        let v = column(&out7, name);
+        if CLASS_R_19.contains(name) {
+            assert!(v.iter().all(|x| x.is_nan()), "{name} must be NaN at 7 members with rank floor 10");
+        } else {
+            assert!(v[symbol_index(0, 250, 300)].is_finite(), "{name} must be finite at 7 members with floor 5");
+        }
+    }
+    let ten = symbol_store(&dir, "ten.rcsb", 10, 300, 900);
+    let out10 = dir.join("out10.rcsb").to_string_lossy().into_owned();
+    cli_enrich_ok(&ten, &out10, &features, &["--min-cross-members", "5", "--min-cross-members-rank", "10"]);
+    for name in FLOORED_19 {
+        assert!(column(&out10, name)[symbol_index(0, 250, 300)].is_finite(), "{name} must be finite at 10 members");
+    }
+}
+
+#[test]
+fn min_cross_members_boundary_per_column() {
+    let (_scratch, dir) = tmp_dir("floor-boundary");
+    let mut features: Vec<&str> = FLOORED_19.to_vec();
+    features.push("mkt_r672");
+    let features = features.join(",");
+    for floor in [5usize, 20] {
+        let flag = floor.to_string();
+        for (members, finite) in [(floor, true), (floor - 1, false)] {
+            let input = symbol_store(&dir, &format!("in{floor}-{members}.rcsb"), members, 720, 900);
+            let out = dir.join(format!("out{floor}-{members}.rcsb")).to_string_lossy().into_owned();
+            cli_enrich_ok(&input, &out, &features, &["--min-cross-members", &flag]);
+            for name in features.split(',') {
+                let at = symbol_index(0, 710, 720);
+                assert_eq!(column(&out, name)[at].is_finite(), finite, "{name} with {members} members at floor {floor}");
+            }
+        }
+        for (members, finite) in [(floor, true), (floor - 1, false)] {
+            let input = symbol_store(&dir, &format!("day{floor}-{members}.rcsb"), members, 150, 86_400);
+            let out = dir.join(format!("dayout{floor}-{members}.rcsb")).to_string_lossy().into_owned();
+            cli_enrich_ok(&input, &out, "mkt_trend_ma100_ratio,mkt_trend_hi90_dist", &["--min-cross-members", &flag]);
+            for name in ["mkt_trend_ma100_ratio", "mkt_trend_hi90_dist"] {
+                let at = symbol_index(0, 149, 150);
+                assert_eq!(column(&out, name)[at].is_finite(), finite, "{name} with {members} members at floor {floor}");
+            }
+        }
+    }
+}
+
+#[test]
+fn min_cross_members_flag_validation() {
+    let (_scratch, dir) = tmp_dir("floor-flags");
+    let input = symbol_store(&dir, "in.rcsb", 6, 40, 900);
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    for flag in ["--min-cross-members", "--min-cross-members-rank"] {
+        for bad in ["0", "4", "201", "x"] {
+            let _ = std::fs::remove_file(&out);
+            let r = cli_enrich(&input, &out, "mkt_r16", &[flag, bad]);
+            assert_eq!(r.status.code(), Some(2), "{flag} {bad}: {}", stderr_of(&r));
+            assert!(stderr_of(&r).contains("5..=200"), "{flag} {bad}: {}", stderr_of(&r));
+            assert!(!std::path::Path::new(&out).exists());
+        }
+        for ok in ["5", "200"] {
+            let r = cli_enrich(&input, &out, "mkt_r16", &[flag, ok]);
+            assert_eq!(r.status.code(), Some(0), "{flag} {ok}: {}", stderr_of(&r));
+        }
+    }
+    let help = rcsr_cmd::rcsr().args(["enrich", "--help"]).output().unwrap();
+    let help = String::from_utf8_lossy(&help.stdout).into_owned();
+    let schema = rcsr::schema::json();
+    for flag in ["--min-cross-members", "--min-cross-members-rank"] {
+        assert!(help.contains(flag), "enrich --help misses {flag}");
+        assert!(schema.contains(&format!("\"name\":\"{flag}\"")), "rcsr schema misses {flag}");
+    }
+}
+
+#[test]
+fn min_cross_members_is_recorded_in_the_sidecar() {
+    let (_scratch, dir) = tmp_dir("floor-sidecar");
+    let input = symbol_store(&dir, "in.rcsb", 8, 120, 900);
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    cli_enrich_ok(&input, &out, "r16,mkt_r16,breadth,xs_rank_r1,avg_corr", &["--min-cross-members", "5", "--min-cross-members-rank", "8"]);
+    let text = std::fs::read_to_string(format!("{out}.enrich.json")).unwrap();
+    assert!(text.contains("\"cross_floor\":{\"members\":5,\"rank_members\":8}"), "{text}");
+    let floors = column_floors(&text);
+    assert_eq!(floors.get("mkt_r16"), Some(&5));
+    assert_eq!(floors.get("breadth"), Some(&5));
+    assert_eq!(floors.get("xs_rank_r1"), Some(&8));
+    assert_eq!(floors.get("avg_corr"), Some(&8));
+    assert_eq!(floors.len(), 4, "a column outside the table must carry no min_members: {floors:?}");
+
+    let default = dir.join("default.rcsb").to_string_lossy().into_owned();
+    cli_enrich_ok(&input, &default, "r16,mkt_r16,xs_rank_r1", &[]);
+    let text = std::fs::read_to_string(format!("{default}.enrich.json")).unwrap();
+    assert!(text.contains("\"cross_floor\":{\"members\":20,\"rank_members\":20}"), "{text}");
+    assert_eq!(column_floors(&text).len(), 2);
+
+    let plain = dir.join("plain.rcsb").to_string_lossy().into_owned();
+    cli_enrich_ok(&input, &plain, "r16,r1", &[]);
+    let text = std::fs::read_to_string(format!("{plain}.enrich.json")).unwrap();
+    assert!(!text.contains("cross_floor") && !text.contains("min_members"), "{text}");
+}
+
+#[test]
+fn min_cross_members_mixing_is_refused_by_enrich() {
+    let (_scratch, dir) = tmp_dir("floor-mix");
+    let input = symbol_store(&dir, "in.rcsb", 8, 120, 900);
+    let five = dir.join("five.rcsb").to_string_lossy().into_owned();
+    cli_enrich_ok(&input, &five, "mkt_r16", &["--min-cross-members", "5"]);
+    let next = dir.join("next.rcsb").to_string_lossy().into_owned();
+    let r = cli_enrich(&five, &next, "mkt_r96", &[]);
+    assert_eq!(r.status.code(), Some(2), "{}", stderr_of(&r));
+    let text = stderr_of(&r);
+    assert!(text.contains("--min-cross-members 5") && text.contains("--min-cross-members 20"), "{text}");
+    assert!(!std::path::Path::new(&next).exists());
+    cli_enrich_ok(&five, &next, "mkt_r96", &["--min-cross-members", "5"]);
+    let text = std::fs::read_to_string(format!("{next}.enrich.json")).unwrap();
+    assert!(text.contains("\"cross_floor\":{\"members\":5,\"rank_members\":5}"), "{text}");
+
+    // Columns that carry no floor never conflict, and a run that builds none keeps the recorded floors.
+    let plain = dir.join("plain.rcsb").to_string_lossy().into_owned();
+    cli_enrich_ok(&five, &plain, "r1", &[]);
+    let text = std::fs::read_to_string(format!("{plain}.enrich.json")).unwrap();
+    assert!(text.contains("\"cross_floor\":{\"members\":5,\"rank_members\":5}"), "{text}");
+    let again = dir.join("again.rcsb").to_string_lossy().into_owned();
+    let r = cli_enrich(&plain, &again, "mkt_r96", &[]);
+    assert_eq!(r.status.code(), Some(2), "{}", stderr_of(&r));
+
+    // A store without the record counts as 20.
+    let legacy = dir.join("legacy.rcsb").to_string_lossy().into_owned();
+    cli_enrich_ok(&input, &legacy, "mkt_r16", &["--min-cross-members", "5"]);
+    std::fs::remove_file(format!("{legacy}.enrich.json")).unwrap();
+    let out = dir.join("legacy-next.rcsb").to_string_lossy().into_owned();
+    let r = cli_enrich(&legacy, &out, "mkt_r96", &["--min-cross-members", "5"]);
+    assert_eq!(r.status.code(), Some(2), "{}", stderr_of(&r));
+    let text = stderr_of(&r);
+    assert!(text.contains("--min-cross-members 20") && text.contains("--min-cross-members 5"), "{text}");
+    cli_enrich_ok(&legacy, &out, "mkt_r96", &[]);
+}
+
+#[test]
+fn min_cross_members_mixing_is_refused_by_panel_append() {
+    let (_scratch, dir) = tmp_dir("floor-panel");
+    let rows = member_rows(8, 120, 900);
+    let mut time_major_rows = rows.clone();
+    time_major_rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    let panel = dir.join("panel.rcsb").to_string_lossy().into_owned();
+    write_panel_store(&panel, &time_major_rows, 64);
+    let base = dir.join("base.rcsb").to_string_lossy().into_owned();
+    write_panel_store(&base, &rows, 64);
+    let family = |name: &str, features: &str, floor: &str| {
+        let out = dir.join(name).to_string_lossy().into_owned();
+        cli_enrich_ok(&base, &out, features, &["--min-cross-members", floor]);
+        out
+    };
+    let append = |target: &str, family: &str, columns: &str, out: &str| {
+        rcsr_cmd::rcsr()
+            .args(["panel", "append", "--data", target, "--family", family, "--columns", columns, "--out", out])
+            .output()
+            .unwrap()
+    };
+    let schema_floors = |out: &str| {
+        let text = std::fs::read_to_string(format!("{out}.schema.json")).unwrap();
+        column_floors(&text)
+    };
+
+    let f5 = family("f5.rcsb", "r16,mkt_r16,mkt_r96", "5");
+    let first = dir.join("first.rcsb").to_string_lossy().into_owned();
+    let r = append(&panel, &f5, "mkt_r16,r16", &first);
+    assert_eq!(r.status.code(), Some(0), "{}", stderr_of(&r));
+    let floors = schema_floors(&first);
+    assert_eq!(floors.get("mkt_r16"), Some(&5), "{floors:?}");
+    assert_eq!(floors.len(), 1, "{floors:?}");
+    let text = std::fs::read_to_string(format!("{first}.schema.json")).unwrap();
+    let line = text.lines().find(|l| l.starts_with("{\"name\":\"mkt_r16\"")).unwrap();
+    assert!(line.contains("N>=5") && !line.contains("N>=20"), "{line}");
+
+    // Matching floors append.
+    let second = dir.join("second.rcsb").to_string_lossy().into_owned();
+    let r = append(&first, &f5, "mkt_r96", &second);
+    assert_eq!(r.status.code(), Some(0), "{}", stderr_of(&r));
+    assert_eq!(schema_floors(&second).get("mkt_r96"), Some(&5));
+
+    // A family built at 20 and a panel holding floor-5 columns: exit 3, both values named.
+    let f20 = family("f20.rcsb", "mkt_vol96", "20");
+    let third = dir.join("third.rcsb").to_string_lossy().into_owned();
+    let r = append(&second, &f20, "mkt_vol96", &third);
+    assert_eq!(r.status.code(), Some(3), "{}", stderr_of(&r));
+    let text = stderr_of(&r);
+    assert!(text.contains("min_members 20") && text.contains("min_members 5"), "{text}");
+    assert!(!std::path::Path::new(&third).exists());
+
+    // A family store without the record counts as 20.
+    std::fs::remove_file(format!("{f20}.enrich.json")).unwrap();
+    let r = append(&second, &f20, "mkt_vol96", &third);
+    assert_eq!(r.status.code(), Some(3), "{}", stderr_of(&r));
+
+    // A rank column is its own class: it may carry another floor than the mean columns.
+    let rank = family("rank.rcsb", "xs_rank_r1", "20");
+    let fourth = dir.join("fourth.rcsb").to_string_lossy().into_owned();
+    let r = append(&second, &rank, "xs_rank_r1", &fourth);
+    assert_eq!(r.status.code(), Some(0), "{}", stderr_of(&r));
+    assert_eq!(schema_floors(&fourth).get("xs_rank_r1"), Some(&20));
+}
+
+#[test]
+fn min_cross_members_floor_survives_a_chained_enrich() {
+    let (_scratch, dir) = tmp_dir("floor-chain");
+    let rows = member_rows(8, 120, 900);
+    let mut time_major_rows = rows.clone();
+    time_major_rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    let panel = dir.join("panel.rcsb").to_string_lossy().into_owned();
+    write_panel_store(&panel, &time_major_rows, 64);
+    let base = dir.join("base.rcsb").to_string_lossy().into_owned();
+    write_panel_store(&base, &rows, 64);
+    let p = |name: &str| dir.join(name).to_string_lossy().into_owned();
+
+    // Step 1 builds the cross columns at 5, step 2 builds no cross column: its features[] lists only r1.
+    let (s1, s2, f20) = (p("s1.rcsb"), p("s2.rcsb"), p("f20.rcsb"));
+    cli_enrich_ok(&base, &s1, "mkt_r16,mkt_r96", &["--min-cross-members", "5"]);
+    cli_enrich_ok(&s1, &s2, "r1", &[]);
+    cli_enrich_ok(&base, &f20, "mkt_vol96", &[]);
+    let text = std::fs::read_to_string(format!("{s2}.enrich.json")).unwrap();
+    assert!(text.contains("\"cross_floor\":{\"members\":5,\"rank_members\":5}"), "{text}");
+
+    let append = |target: &str, family: &str, columns: &str, out: &str| {
+        rcsr_cmd::rcsr()
+            .args(["panel", "append", "--data", target, "--family", family, "--columns", columns, "--out", out])
+            .output()
+            .unwrap()
+    };
+    let (first, second) = (p("first.rcsb"), p("second.rcsb"));
+    let r = append(&panel, &s2, "mkt_r16", &first);
+    assert_eq!(r.status.code(), Some(0), "{}", stderr_of(&r));
+    let schema = std::fs::read_to_string(format!("{first}.schema.json")).unwrap();
+    let line = schema.lines().find(|l| l.starts_with("{\"name\":\"mkt_r16\"")).unwrap();
+    assert!(line.contains("\"min_members\":5") && line.contains("N>=5") && !line.contains("N>=20"), "{line}");
+    let r = append(&first, &f20, "mkt_vol96", &second);
+    assert_eq!(r.status.code(), Some(3), "{}", stderr_of(&r));
+    let text = stderr_of(&r);
+    assert!(text.contains("min_members 20") && text.contains("min_members 5"), "{text}");
+    assert!(!std::path::Path::new(&second).exists());
+
+    // enrich of a default floor onto the chained store is still refused.
+    let r = cli_enrich(&s2, &p("s3.rcsb"), "mkt_vol96", &[]);
+    assert_eq!(r.status.code(), Some(2), "{}", stderr_of(&r));
+}
+
+#[test]
+fn min_cross_members_panel_append_floor_is_seen_by_a_later_enrich() {
+    let (_scratch, dir) = tmp_dir("floor-append-enrich");
+    let rows = member_rows(8, 120, 900);
+    let base = dir.join("base.rcsb").to_string_lossy().into_owned();
+    write_panel_store(&base, &rows, 64);
+    let p = |name: &str| dir.join(name).to_string_lossy().into_owned();
+    let (s1, o, oe) = (p("s1.rcsb"), p("o.rcsb"), p("oe.rcsb"));
+    cli_enrich_ok(&base, &s1, "mkt_r16,mkt_r96", &["--min-cross-members", "5"]);
+    let append = |target: &str, family: &str, columns: &str, out: &str| {
+        rcsr_cmd::rcsr()
+            .args(["panel", "append", "--data", target, "--family", family, "--columns", columns, "--out", out])
+            .output()
+            .unwrap()
+    };
+    // A floor-5 column appended into a symbol-major store: the floor lives only in o.rcsb.schema.json.
+    let r = append(&base, &s1, "mkt_r16", &o);
+    assert_eq!(r.status.code(), Some(0), "{}", stderr_of(&r));
+    assert!(!std::path::Path::new(&format!("{o}.enrich.json")).exists());
+
+    let r = cli_enrich(&o, &oe, "mkt_vol96", &[]);
+    assert_eq!(r.status.code(), Some(2), "{}", stderr_of(&r));
+    let text = stderr_of(&r);
+    assert!(text.contains("'mkt_r16'") && text.contains("--min-cross-members 5") && text.contains("--min-cross-members 20"), "{text}");
+    assert!(!std::path::Path::new(&oe).exists());
+
+    cli_enrich_ok(&o, &oe, "mkt_vol96", &["--min-cross-members", "5"]);
+    let text = std::fs::read_to_string(format!("{oe}.enrich.json")).unwrap();
+    assert!(text.contains("\"cross_floor\":{\"members\":5,\"rank_members\":5}"), "{text}");
+    let floors = column_floors(&text);
+    assert_eq!(floors.get("mkt_r16"), Some(&5), "the carried column keeps its floor: {floors:?}");
+    assert_eq!(floors.get("mkt_vol96"), Some(&5));
+
+    // The floor of the carried column reaches a later append.
+    let panel = dir.join("panel.rcsb").to_string_lossy().into_owned();
+    let mut time_major = rows.clone();
+    time_major.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    write_panel_store(&panel, &time_major, 64);
+    let out = p("final.rcsb");
+    let r = append(&panel, &oe, "mkt_r16,mkt_vol96", &out);
+    assert_eq!(r.status.code(), Some(0), "{}", stderr_of(&r));
+    let floors = column_floors(&std::fs::read_to_string(format!("{out}.schema.json")).unwrap());
+    assert_eq!((floors.get("mkt_r16"), floors.get("mkt_vol96")), (Some(&5), Some(&5)), "{floors:?}");
+}
+
+#[test]
+fn min_cross_members_rebuild_does_not_keep_a_stale_schema_floor() {
+    let (_scratch, dir) = tmp_dir("floor-rebuild");
+    let base = symbol_store(&dir, "base.rcsb", 8, 120, 900);
+    let p = |name: &str| dir.join(name).to_string_lossy().into_owned();
+    let x = p("x.rcsb");
+    cli_enrich_ok(&base, &x, "mkt_r16", &["--min-cross-members", "5"]);
+    let r = rcsr_cmd::rcsr().args(["panel", "schema", "--data", &x]).output().unwrap();
+    assert_eq!(r.status.code(), Some(0), "{}", stderr_of(&r));
+    let schema = format!("{x}.schema.json");
+    assert_eq!(column_floors(&std::fs::read_to_string(&schema).unwrap()).get("mkt_r16"), Some(&5));
+    let stale = std::fs::read_to_string(&schema).unwrap();
+
+    // Rebuild the store into the same path at the default floor.
+    cli_enrich_ok(&base, &x, "mkt_r16", &[]);
+    assert!(!std::path::Path::new(&schema).exists(), "a rebuilt store must not keep the schema of the old one");
+    assert!(std::path::Path::new(&format!("{schema}.prev")).exists());
+    let next = p("next.rcsb");
+    let r = cli_enrich(&x, &next, "mkt_vol96", &["--min-cross-members", "5"]);
+    assert_eq!(r.status.code(), Some(2), "{}", stderr_of(&r));
+    let text = stderr_of(&r);
+    assert!(text.contains("'mkt_r16'") && text.contains("--min-cross-members 20") && text.contains("--min-cross-members 5"), "{text}");
+    cli_enrich_ok(&x, &next, "mkt_vol96", &[]);
+
+    // A stale schema that is put back (its hash no longer matches the column) is ignored by the resolver.
+    std::fs::write(&schema, &stale).unwrap();
+    let again = p("again.rcsb");
+    let r = cli_enrich(&x, &again, "mkt_vol96", &["--min-cross-members", "5"]);
+    assert_eq!(r.status.code(), Some(2), "{}", stderr_of(&r));
+    cli_enrich_ok(&x, &again, "mkt_vol96", &[]);
 }

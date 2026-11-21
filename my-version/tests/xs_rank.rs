@@ -622,3 +622,100 @@ fn search_and_walkforward_rank_the_same_cross_section() {
         close(num(&m, &["mean_return"]) * num(&m, &["periods"]), period_sum);
     }
 }
+
+/// #1291: six symbols on an hourly grid over 600 stamps. The `xs_rank` label is NaN on every fifth
+/// stamp while the return `r` stays finite, so those rows are the context rows of the search's
+/// top-tercile book (#493): ranked, and priced on their return.
+fn write_label_gap_csv(dir: &Path) -> String {
+    let frac = |v: f64| v - v.floor();
+    let mut text = String::from("t,sym,f1,f2,r,lbl_h1_xs\n");
+    for t in 0..600i64 {
+        let f1: Vec<f64> = (0..6i64).map(|k| frac((t * 7 + k * 3) as f64 * 0.618_033_988_749_894_9) - 0.5).collect();
+        let f2: Vec<f64> = (0..6i64).map(|k| frac((t * 5 + k * 11) as f64 * 0.754_877_666_246_692_7) - 0.5).collect();
+        let r: Vec<f64> = (0..6i64).map(|k| 0.004 * f1[k as usize] + 0.002 * (frac((t * 13 + k * 17) as f64 * 0.324_717_957_244_746) - 0.5)).collect();
+        for k in 0..6 {
+            let below = r.iter().filter(|&&v| v < r[k]).count() as f64;
+            let ties = (0..6).filter(|&m| m != k && r[m] == r[k]).count() as f64;
+            let label = if t % 5 == 0 { "NaN".to_string() } else { format!("{:.12}", 2.0 * (below + ties / 2.0) / 5.0 - 1.0) };
+            text.push_str(&format!("{},S{},{:.12},{:.12},{:.12},{}\n", T0 + STEP * t, k, f1[k], f2[k], r[k], label));
+        }
+    }
+    let path = dir.join("gap.csv");
+    std::fs::write(&path, text).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+/// The top-tercile search on [`write_label_gap_csv`]: data, spec, run file and run. Its test block
+/// is the last 200 stamps, `1601440000..1602160000`.
+fn label_gap_run(dir: &Path) -> (String, String, String, Json) {
+    let data = write_label_gap_csv(dir);
+    let spec = write_xs_spec(dir, "gap.json");
+    let run = p(dir, "gap-run.json");
+    let o = rcsr(&[
+        "--data", &data, "--target", "lbl_h1_xs", "--vars", "f1,f2", "--time", "t", "--group-by", "sym", "--split", "temporal", "--target-spec", &spec, "--cpu",
+        "--no-dev-log", "--seed", "3", "--generations", "12", "--pop", "24", "--metric", "squared", "--quiet", "--objective", "pnl", "--position", "top_tercile",
+        "--fill", "drop", "--validation-frac", "0.2", "--test-frac", "0.33334", "--json-out", &run,
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let j = read_json(&run);
+    // 200 stamps of 6 symbols: 160 labelled stamps and 40 whose label alone is missing.
+    assert_eq!(num(&j, &["objective", "test", "rows"]), 1200.0);
+    assert!(num(&j, &["objective", "test", "entries"]) > 0.0);
+    (data, spec, run, j)
+}
+
+/// #1291: the ladder takes the rows of the search's books. On an `xs_rank` label (the search prices
+/// it as the top-tercile book) and without a target spec the ladder keeps every finite return, so
+/// its top-tercile rung holds the rows and entries of the search's `objective.test`.
+#[test]
+fn ladder_takes_the_rows_of_the_top_tercile_search_on_an_xs_rank_label() {
+    let (_scratch, dir) = scratch();
+    let (data, spec, _, j) = label_gap_run(&dir);
+    let windows = p(&dir, "windows.csv");
+    std::fs::write(&windows, "scheme,label,train_start,train_end,validation_start,test_start,test_end\nexpanding,f1,1600000000,1601080000,1600720000,1601440000,1602160000\n").unwrap();
+    let want = at(&j, &["objective", "test"]);
+    for with_spec in [false, true] {
+        let out = p(&dir, "ladder.json");
+        let mut args = vec![
+            "ladder", "--data", &data, "--target", "lbl_h1_xs", "--return-col", "r", "--time", "t", "--group", "sym", "--features", "f1,f2", "--windows", &windows,
+            "--purge-seconds", "3600", "--horizon-seconds", "3600", "--cost-bps", "10", "--draws", "50", "--gbm-trees", "10", "--out", &out,
+        ];
+        if with_spec {
+            args.extend(["--target-spec", spec.as_str()]);
+        }
+        let o = rcsr(&args);
+        assert_eq!(code(&o), 0, "{}", stderr(&o));
+        let l = read_json(&out);
+        assert_eq!(num(&l, &["rows_scored"]), num(want, &["rows"]), "spec {with_spec}");
+        let Json::Arr(rungs) = at(&l, &["rungs"]) else { panic!("rungs is not an array") };
+        let basket = rungs.iter().find(|r| r.get("name").and_then(Json::as_str) == Some("top_tercile_long")).expect("top_tercile_long rung");
+        assert_eq!(num(basket, &["entries"]), num(want, &["entries"]), "spec {with_spec}");
+        assert_eq!(at(&l, &["split", "labelled_rows", "rule"]).as_str(), Some("return"), "spec {with_spec}");
+    }
+}
+
+/// #1291: a top-tercile walk-forward prices a row whose return is finite and whose label alone is
+/// missing, as the search's book does (#493), from the run and from the target spec.
+#[test]
+fn walkforward_top_tercile_prices_rows_whose_label_alone_is_missing() {
+    let (_scratch, dir) = scratch();
+    let (data, spec, run, j) = label_gap_run(&dir);
+    let window = "t,1600000000,1601432800,1601440000,1602160000";
+    let from_run = json(&rcsr(&["walkforward", "--data", &data, "--time", "t", "--group-by", "sym", "--from-run", &run, "--window", window, "--allow-in-sample-windows", "--json"]));
+    let m = first_window_metrics(&from_run);
+    for key in ["rows", "trades", "entries"] {
+        assert_eq!(num(&m, &[key]), num(&j, &["objective", "test", key]), "{key}");
+    }
+    assert_eq!(at(&from_run, &["split", "labelled_rows", "rule"]).as_str(), Some("return"));
+    let o = rcsr(&["walkforward", "--data", &data, "--target", "lbl_h1_xs", "--target-spec", &spec, "--policy", "top-tercile", "--expr", "f1", "--vars", "f1", "--time", "t", "--group-by", "sym", "--window", window, "--json"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let flagged = json(&o);
+    let m = first_window_metrics(&flagged);
+    assert_eq!(num(&m, &["rows"]), 1200.0);
+    assert_eq!(at(&flagged, &["split", "labelled_rows", "rule"]).as_str(), Some("return"));
+}
+
+fn first_window_metrics(report: &Json) -> Json {
+    let Json::Arr(windows) = at(report, &["windows"]) else { panic!("windows is not an array") };
+    at(&windows[0], &["metrics"]).clone()
+}

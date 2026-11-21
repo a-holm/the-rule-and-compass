@@ -34,7 +34,7 @@ use crate::risk::{risk_stats, BetaAlpha, DEFAULT_SORTINO_MAR};
 use crate::target::TargetSpec;
 use crate::target_structure;
 use crate::trading_gpu::{band_positions, BandParams};
-use crate::walkforward::{quantile, SECONDS_PER_YEAR};
+use crate::walkforward::{quantile, LabelledRows, PeriodSource, SECONDS_PER_YEAR};
 use std::time::Instant;
 
 pub const SCHEMA: &str = "rcsr-ladder/1";
@@ -213,6 +213,7 @@ fn group_column(t: &Table, name: Option<&str>) -> Result<Vec<u64>, String> {
 pub struct Fold {
     pub label: String,
     pub test_start: f64,
+    pub test_end: f64,
     pub fit: Vec<usize>,
     pub valid: Vec<usize>,
     pub test: Vec<usize>,
@@ -268,6 +269,7 @@ pub fn make_folds(
         let mut f = Fold {
             label: win.label.clone(),
             test_start: win.test_start,
+            test_end: win.test_end,
             fit: Vec::new(),
             valid: Vec::new(),
             test: Vec::new(),
@@ -329,14 +331,22 @@ pub struct SrRun {
     pub band: crate::trading::BandSpec,
     /// #951: the minimum hold the run priced.
     pub min_holding: usize,
+    /// #1214: `objective.finalist.switch` of a composed run: the rung prices the switch.
+    pub switch: Option<crate::regime_gate::Switch>,
     /// `(fold label, out-of-fold)` for every window of the table.
     pub fold_oof: Vec<(String, bool)>,
 }
+
+/// #1216: the refusal of a run that priced a regime mask.
+pub const MASK_REFUSAL: &str = "the run priced a regime mask (objective.spec.pnl_mask): the SR rung prices the raw formula and cannot price a mask; walkforward --from-run prices it";
 
 impl SrRun {
     pub fn load(path: &str) -> Result<SrRun, String> {
         let run = crate::run_json::RunFile::load(path)?;
         let book = run.band_book()?;
+        if run.mask.is_some() {
+            return Err(MASK_REFUSAL.to_string());
+        }
         if book.position != crate::trading::PositionMap::Threshold {
             return Err("the run priced the top_tercile book: the SR rung prices the threshold rule only".to_string());
         }
@@ -347,6 +357,7 @@ impl SrRun {
             threshold: book.threshold,
             band: book.band.clone(),
             min_holding: book.min_holding,
+            switch: book.switch.clone(),
             run,
             fold_oof: Vec::new(),
         })
@@ -369,11 +380,14 @@ impl SrRun {
             .iter()
             .map(|(l, ok)| format!("{{\"fold\":{},\"oof\":{}}}", jstr(l), ok))
             .collect();
-        let book = if self.has_band() {
+        let mut book = if self.has_band() {
             format!(",\"policy\":\"band\"{},\"min_holding\":{},\"band_source\":\"run\"", self.band.json_fields(), self.min_holding)
         } else {
             String::new()
         };
+        if let Some(sw) = &self.switch {
+            book.push_str(&format!(",\"switch\":{}", sw.json()));
+        }
         format!(
             "{{{}\"run_sha256\":{},\"expression\":{},\"expression_source\":{},\"expression_from\":\"objective.finalist\",\
 \"threshold\":{},\"threshold_source\":\"run\"{},\"folds\":[{}]}}",
@@ -417,6 +431,9 @@ pub struct Options {
     pub sr_wall_basis: Option<&'static str>,
     /// A single search run scored on every fold (#492); see [`SrRun`].
     pub sr_run: Option<SrRun>,
+    /// #1214: the locked ranges this run does not open, each up to its lookback
+    /// embargo: the barriers of the SR run's switch gate.
+    pub gate_barriers: Vec<crate::regime_gate::Barrier>,
     pub spec: Option<TargetSpec>,
     pub gbm_trees: usize,
     pub seed: u32,
@@ -449,6 +466,7 @@ impl Default for Options {
             sr_wall_seconds: None,
             sr_wall_basis: None,
             sr_run: None,
+            gate_barriers: Vec::new(),
             spec: None,
             gbm_trees: DEFAULT_GBM_TREES,
             seed: 0,
@@ -473,12 +491,16 @@ struct Pool {
     by_time: Vec<usize>,
     bounds: Vec<usize>,
     times: Vec<f64>,
+    /// Period buckets over `by_time`: one equal-weight period per `floor(t / S)` when the run declares the width `S`, else one per timestamp.
+    period_bounds: Vec<usize>,
+    period_times: Vec<f64>,
     ppy: f64,
     step: Option<f64>,
+    source: PeriodSource,
 }
 
 impl Pool {
-    fn new(p: &Panel, folds: &[Fold]) -> Pool {
+    fn new(p: &Panel, folds: &[Fold], declared: Option<(f64, PeriodSource)>) -> Pool {
         let mut idx = Vec::new();
         let mut ranges = Vec::new();
         for f in folds {
@@ -502,7 +524,35 @@ impl Pool {
         bounds.push(by_time.len());
         let mut steps: Vec<f64> = times.windows(2).map(|w| w[1] - w[0]).filter(|d| *d > 1e-9).collect();
         steps.sort_by(|a, b| a.total_cmp(b));
-        let step = steps.get(steps.len() / 2).copied().filter(|dt| *dt >= 1.0 && *dt <= SECONDS_PER_YEAR);
+        let declared = declared.filter(|(s, _)| *s >= 1.0 && *s <= SECONDS_PER_YEAR);
+        let (period_bounds, period_times) = match declared {
+            Some((s, _)) => {
+                let mut pb = vec![0usize];
+                let mut pt = Vec::new();
+                let mut last = f64::NAN;
+                for k in 0..by_time.len() {
+                    let t = p.time[idx[by_time[k]]];
+                    let key = (t / s).floor();
+                    if k == 0 || key != last {
+                        if k > 0 {
+                            pb.push(k);
+                        }
+                        pt.push(t);
+                        last = key;
+                    }
+                }
+                pb.push(by_time.len());
+                (pb, pt)
+            }
+            None => (bounds.clone(), times.clone()),
+        };
+        let (step, source) = match declared {
+            Some((s, source)) => (Some(s), source),
+            None => (
+                steps.get(steps.len() / 2).copied().filter(|dt| *dt >= 1.0 && *dt <= SECONDS_PER_YEAR),
+                PeriodSource::InferredLabelledRows,
+            ),
+        };
         let ppy = step.map_or(365.0, |dt| SECONDS_PER_YEAR / dt);
         Pool {
             idx,
@@ -510,8 +560,11 @@ impl Pool {
             by_time,
             bounds,
             times,
+            period_bounds,
+            period_times,
             ppy,
             step,
+            source,
         }
     }
 
@@ -519,11 +572,11 @@ impl Pool {
         self.idx.len()
     }
 
-    /// Equal-weight mean of a per-row vector for each timestamp.
+    /// Equal-weight mean of a per-row vector for each period.
     fn periods(&self, v: &[f64]) -> Vec<f64> {
-        (0..self.times.len())
+        (0..self.period_times.len())
             .map(|b| {
-                let (s, e) = (self.bounds[b], self.bounds[b + 1]);
+                let (s, e) = (self.period_bounds[b], self.period_bounds[b + 1]);
                 self.by_time[s..e].iter().map(|&k| v[k]).sum::<f64>() / (e - s) as f64
             })
             .collect()
@@ -1201,6 +1254,8 @@ pub struct Report {
     pub periods: usize,
     pub rows_scored: usize,
     pub periods_per_year: f64,
+    pub period_source: PeriodSource,
+    pub period_seconds: Option<f64>,
     pub block_len: usize,
     pub cost: crate::target::CostDecl,
     pub min_group_step: Option<f64>,
@@ -1493,7 +1548,7 @@ pub fn check_fold_spacing(p: &Panel, folds: &[Fold], horizon_seconds: f64) -> Re
 /// Exit code for an error from the ladder or ablation scoring path: 2 for an
 /// overlap refusal (as in the search objective and walk-forward), else `other`.
 pub fn spacing_exit(message: &str, other: i32) -> i32 {
-    if message.contains("overlapping returns") {
+    if message.contains("overlapping returns") || message.starts_with("missing stride_seconds") || message.starts_with("stride_seconds") {
         2
     } else {
         other
@@ -1514,12 +1569,20 @@ fn run_ladder_rungs(p: &Panel, folds: &[Fold], opts: &Options) -> Result<Report,
     if opts.quantiles.is_empty() {
         return Err("--quantiles needs at least one value".to_string());
     }
-    let pool = Pool::new(p, folds);
+    let min_group_step = check_fold_spacing(p, folds, opts.horizon_seconds)?;
+    if let Some(s) = &opts.spec {
+        crate::target::check_period_width(s.horizon_seconds, s.stride_seconds, min_group_step)?;
+    }
+    let declared = match &opts.spec {
+        Some(s) => Some((s.period_width_seconds(), PeriodSource::TargetSpec)),
+        None if opts.horizon_seconds > 0.0 => Some((opts.horizon_seconds, PeriodSource::HorizonFlag)),
+        None => None,
+    };
+    let pool = Pool::new(p, folds, declared);
     let feats: Vec<usize> = (0..p.names.len()).collect();
     let mut rungs: Vec<Rung> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
     let n = pool.len();
-    let min_group_step = check_fold_spacing(p, folds, opts.horizon_seconds)?;
 
     let mut cash = Rung::new("cash", "control");
     cash.pos = vec![0.0; n];
@@ -1759,14 +1822,22 @@ fn run_ladder_rungs(p: &Panel, folds: &[Fold], opts: &Options) -> Result<Report,
 
     // symbolic regression: one search run scored on every fold, or the caller's column
     let sr = if let Some(sr_run) = &opts.sr_run {
-        let tree = crate::expr::parse(&sr_run.expression, &sr_run.variables)
-            .map_err(|e| format!("cannot parse '{}': {}", sr_run.expression, e))?;
+        let parse = |src: &str| crate::expr::parse(src, &sr_run.variables).map_err(|e| format!("cannot parse '{}': {}", src, e));
+        // #1214: a switch holds the on branch where the gate state of the row is on: the
+        // state of the store row from the gate rows of the whole store, never the fold rows.
+        let (tree, gate_state) = match &sr_run.switch {
+            Some(sw) => {
+                let state = crate::expr::input(sr_run.variables.len());
+                (crate::expr::node(crate::expr::Op::If, vec![state, parse(&sw.on)?, parse(&sw.off)?]), Some(switch_states(p, &sw.gate, &opts.gate_barriers)?))
+            }
+            None => (parse(&sr_run.expression)?, None),
+        };
         let cols: Vec<&[f64]> = sr_run
             .variables
             .iter()
             .map(|v| p.col(v).ok_or_else(|| format!("variable '{}' is not in the data", v)))
             .collect::<Result<_, _>>()?;
-        let mut row = vec![0.0f64; cols.len()];
+        let mut row = vec![0.0f64; cols.len() + 1];
         let mut r = Rung::new("symbolic_regression", "model");
         r.pos = vec![0.0; n];
         r.score = vec![f64::NAN; n];
@@ -1777,6 +1848,9 @@ fn run_ladder_rungs(p: &Panel, folds: &[Fold], opts: &Options) -> Result<Report,
             for (k, &i) in f.test.iter().enumerate() {
                 for (c, col) in cols.iter().enumerate() {
                     row[c] = col[i];
+                }
+                if let Some(states) = &gate_state {
+                    row[cols.len()] = states[i];
                 }
                 let sc = crate::expr::eval(&tree, &row);
                 r.score[s + k] = sc;
@@ -2031,12 +2105,14 @@ fn finish_report(
     let _ = market;
     Ok(Report {
         rows,
-        period_time: pool.times.clone(),
+        period_time: pool.period_times.clone(),
         emit_series: opts.emit_series,
         folds: folds.iter().map(|f| f.label.clone()).collect(),
-        periods: pool.times.len(),
+        periods: pool.period_times.len(),
         rows_scored: pool.len(),
         periods_per_year: pool.ppy,
+        period_source: pool.source,
+        period_seconds: pool.step,
         block_len: block,
         cost: opts.cost.clone().unwrap_or(crate::target::CostDecl {
             per_side_bps: opts.cost_bps,
@@ -2198,7 +2274,7 @@ impl Report {
         };
         format!(
             "{{\"schema\":{},\"folds\":{},\"periods\":{},\"rows_scored\":{},\"periods_per_year\":{},\"block_len\":{},\
-\"min_group_step_seconds\":{},\"cost_bps\":{},\"cost\":{},\"n_trials\":{},\"benchmark\":{},\"best_long_flat_rule\":{},\"equal_cost\":{{\"gbm_tree_budget_per_fold\":{},\
+\"min_group_step_seconds\":{},\"annualization\":{{\"source\":{},\"period_seconds\":{}}},\"cost_bps\":{},\"cost\":{},\"n_trials\":{},\"benchmark\":{},\"best_long_flat_rule\":{},\"equal_cost\":{{\"gbm_tree_budget_per_fold\":{},\
 \"sr_candidate_evaluations\":{},\"sr_wall_seconds\":{},\"sr_wall_basis\":{},\"gbm_beats_sr\":{}}},\"multiple_testing\":{{\"draws\":{},\"seed\":{},\
 \"fdr\":{},\"spa\":{},\"dsr\":{},\"pbo\":{}}},\"notes\":{},\"sr_run\":{},\"rungs\":[{}]{}}}",
             jstr(SCHEMA),
@@ -2208,6 +2284,8 @@ impl Report {
             jnum(self.periods_per_year),
             self.block_len,
             jopt(self.min_group_step),
+            jstr(self.period_source.as_str()),
+            jopt(self.period_seconds),
             jnum(self.cost_bps),
             self.cost.json(),
             self.n_trials,
@@ -2351,14 +2429,76 @@ pub struct Input {
     pub features: Vec<String>,
 }
 
+/// #1214: the `rcsr-gate-state/1` state of every panel row: 1 on, 0 off, NaN for
+/// a row inside a barrier or without a finite time. The panel holds every row of
+/// the store sorted by (group, time), so the rows of each group meet the kernel
+/// in time order and no fold or label decides which rows the gate reads.
+fn switch_states(p: &Panel, gate: &crate::regime_gate::GateSpec, barriers: &[crate::regime_gate::Barrier]) -> Result<Vec<f64>, String> {
+    let cols: Vec<&[f64]> = gate
+        .columns
+        .iter()
+        .map(|c| p.col(c).ok_or_else(|| format!("the switch gate column '{}' is not in the data", c)))
+        .collect::<Result<_, _>>()?;
+    let mut tape = crate::regime_gate::GateTape::new(gate, barriers.to_vec());
+    let mut row = vec![0.0f64; cols.len()];
+    let mut out = Vec::with_capacity(p.len());
+    for i in 0..p.len() {
+        let state = tape.step_with(p.group[i], p.time[i], || {
+            for (k, c) in cols.iter().enumerate() {
+                row[k] = c[i];
+            }
+            crate::expr::eval(&gate.tree, &row)
+        })?;
+        out.push(match state {
+            Some(true) => 1.0,
+            Some(false) => 0.0,
+            None => f64::NAN,
+        });
+    }
+    Ok(out)
+}
+
+/// The target spec's return column, when a spec declares the cost.
+fn declared_return(opts: &Options) -> Option<String> {
+    opts.cost.as_ref().and_then(|_| opts.spec.as_ref()).and_then(|s| s.return_column.clone())
+}
+
+/// The panel's return column: `--return-col`, else the target spec's, else `--target`.
+fn return_name(inp: &Input, opts: &Options) -> String {
+    inp.ret.clone().or_else(|| declared_return(opts)).unwrap_or_else(|| inp.target.clone())
+}
+
+/// #1291: the rows the ladder prices, by the rule of the search's books
+/// ([`LabelledRows::of_search`]). The search prices an `xs_rank` label only as
+/// the top-tercile book, so a `--target` spec of that kind keeps every finite
+/// return; without a target spec there is no fit label apart from the return.
+pub fn labelled_rows(inp: &Input, opts: &Options) -> LabelledRows {
+    let run = opts.sr_run.as_ref().map(|s| &s.run);
+    let top_tercile = opts.spec.as_ref().is_some_and(|s| s.kind == crate::target::KIND_XS_RANK);
+    LabelledRows::of_search(
+        opts.spec.as_ref(),
+        &return_name(inp, opts),
+        top_tercile,
+        run.is_some_and(|r| r.fills_labels()),
+        run.and_then(|r| r.book_target.as_ref()).map(|b| b.column.clone()),
+    )
+}
+
+/// #1291: under [`LabelledRows::FitLabel`] a row without a finite `y` gets a NaN
+/// return, so no fold takes it.
+pub fn keep_labelled_rows(p: &mut Panel, rule: &LabelledRows) {
+    if rule.fit_label().is_some() {
+        for (r, y) in p.ret.iter_mut().zip(&p.y) {
+            if !y.is_finite() {
+                *r = f64::NAN;
+            }
+        }
+    }
+}
+
 /// Load the columns the ladder needs from a CSV or a `.rcsb` store.
 pub fn load_panel(inp: &Input, opts: &Options) -> Result<Panel, String> {
-    let declared_ret = opts
-        .cost
-        .as_ref()
-        .and_then(|_| opts.spec.as_ref())
-        .and_then(|s| s.return_column.clone());
-    if let (Some(given), Some(declared)) = (&inp.ret, &declared_ret) {
+    if let (Some(given), Some(declared)) = (&inp.ret, &declared_return(opts)) {
         if given != declared {
             return Err(format!(
                 "--return-col {} differs from the target spec return column {}; remove the flag",
@@ -2366,7 +2506,7 @@ pub fn load_panel(inp: &Input, opts: &Options) -> Result<Panel, String> {
             ));
         }
     }
-    let ret_name = inp.ret.clone().or(declared_ret).unwrap_or_else(|| inp.target.clone());
+    let ret_name = return_name(inp, opts);
     let mut want: Vec<String> = vec![inp.target.clone(), ret_name.clone(), inp.time.clone()];
     if let Some(g) = &inp.group {
         want.push(g.clone());
@@ -2390,6 +2530,11 @@ pub fn load_panel(inp: &Input, opts: &Options) -> Result<Panel, String> {
         for v in &sr.variables {
             if !inp.features.is_empty() && !inp.features.contains(v) {
                 extras.push(v.clone());
+            }
+        }
+        for c in sr.switch.iter().flat_map(|s| s.gate.columns.iter()) {
+            if !sr.variables.contains(c) && !inp.features.contains(c) && !extras.contains(c) {
+                extras.push(c.clone());
             }
         }
     }
@@ -2463,14 +2608,14 @@ Long-only baseline ladder on one panel, one set of folds and one cost model.\n\
 \n\
   --data <path>             CSV or .rcsb store (the pinned panel projection)\n\
   --target <col>            fit target (the label); the return is --return-col\n\
-  --return-col <col>        realised forward return of the row (default: --target)\n\
+  --return-col <col>        realised forward return of the row (default: --target). #1291: a fold takes a row when its return and its --target are finite, the rows of the search's threshold books; it takes every row with a finite return when the --target spec entry is kind xs_rank (the search prices it only as the top-tercile book, which keeps rows whose label alone is missing), when no --target-spec names a fit label, and when the --sr-run was searched with --book-target or with a --fill that fills missing labels (mean, median, zero, previous or interpolate; drop and none fill nothing); the JSON split.labelled_rows {rule, column} names the rule\n\
   --time <col>              epoch seconds or ISO dates\n\
   --group <col>             symbol column (default: one group)\n\
   --features <a,b,...>      feature columns (default: every other numeric column)\n\
   --windows <file>          protocol windows table (rcsr protocol windows)\n\
   --scheme <name>           expanding | rolling | locked (default expanding)\n\
   --purge-seconds <s>       gap between the fit range and the validation slice and between the validation slice and the test block (default 219600; the --target-spec purge when larger, reported as purge_source); with a spec whose column has a report in <data>.labels.json the JSON carries split.fit_label (name, stride, average_uniqueness, effective_n, effective_n_hours)\n\
-  --horizon-seconds <s>     label horizon; floors the bootstrap block; test rows of one group closer than it overlap and are refused (exit 2); the report carries min_group_step_seconds (default 0)\n\
+  --horizon-seconds <s>     label horizon; floors the bootstrap block; test rows of one group closer than it overlap and are refused (exit 2); the report carries min_group_step_seconds (default 0). Period width S: the target spec max(horizon_seconds, stride_seconds), else this flag, else the median step of labelled test times; periods_per_year = 31536000 / S, one period per floor(t / S) bucket, report annualization {source, period_seconds}. A spec with no stride_seconds whose labelled rows of one group are 2 horizons or more apart, and a stride_seconds wider than the smallest per-group step, exit 2\n\
   --cost-bps <x>            per-side cost of the headline book (default 12; with a --target-spec cost, the spec cost, and a different value is refused)\n\
   --cost-override <x>       per-side cost that differs from the --target-spec cost on purpose; reported as source flag with the spec cost beside it\n\
   --cost-grid <a,b,...>     per-side costs reported per rung (default 12,20,40; 1x, 2x and 3.33x the spec cost when a --target-spec declares one)\n\
@@ -2483,10 +2628,12 @@ Long-only baseline ladder on one panel, one set of folds and one cost model.\n\
   --trend-donchian-cols <a,b,...> columns of trend_donchian (default don20,don96,mtf_4h_donchian_pos,mtf_1d_donchian_pos)\n\
   --target-spec <file>      target spec file: per-side cost (cost_bps / 2), return units (log is converted with exp_m1), return column and horizon; also the zero-parameter rung (scale column must be in the panel)\n\
   --sr-run <run.json>       one search run (rcsr --objective ... --json-out) scored on every fold with the run's fixed threshold;\n\
+                            a composed run (rcsr compose) is priced as its switch (objective.finalist.switch): the gate state of each store row under rcsr-gate-state/1, from every row of the store (never the fold rows), the held branch long above 0; a label, target, return or construction gate column exits 5;\n\
                             a run that priced a band or a minimum hold is priced with it: half-width objective.spec.band_resolved as recorded, objective.spec.min_holding, every fold starts flat (sr_run.policy band);\n\
-                            a fold whose test starts before the run's last seen row + purge is refused (exit 3)\n\
+                            a fold whose test starts before the run's last seen row + purge is refused (exit 3; for a --split-table run: a fold that a kept training or validation row reaches with its label window or reads within the run embargo after it)\n\
                             prices objective.finalist.expression_exact, else the rounded expression (sr_run.expression_source);\n\
                             --locked-test refuses a rounded source (exit 3)\n\
+                            a run that priced --pnl-mask (objective.spec.pnl_mask) is refused (exit 2): the rung prices the raw formula; walkforward --from-run prices the mask\n\
   --allow-in-sample         with --sr-run: drop in-sample folds from every rung and label them oof:false\n\
   --sr-score <col>          out-of-fold symbolic-regression score column from the caller (labelled oof=caller)\n\
   --sr-evals <n>            candidate evaluations of the symbolic-regression run\n\
@@ -2505,15 +2652,19 @@ Long-only baseline ladder on one panel, one set of folds and one cost model.\n\
                             else 2025-07-01,2026-07-01; none opts out. A fold ending after START minus\n\
                             --purge-seconds is refused (exit 3)\n\
   --locked-test             read the locked test: needs --scheme locked, --ledger and --sealed;\n\
-                            appends a baseline_read to the ledger after the report files are staged, a second read is refused\n\
+                            appends a baseline_read to the ledger after the report files are staged, a second read is refused;\n\
+                            a null store (rcsr panel permute-labels) exits 2 before the read is authorised (#1304)\n\
   --ledger <file>           candidate ledger (with --locked-test)\n\
   --sealed <file>           sealed candidate list recorded in the ledger (with --locked-test)\n\
   --allow-unbound-ledger    with --locked-test: accept a sealed list whose candidates recorded no\n\
                             locked test range (old ledger); a different range is refused (exit 3)\n\
   --verify-read             with --locked-test: recompute a recorded baseline read, compare its report hash\n\
                             with the ledger, write --out and --markdown, record nothing (the route after a\n\
-                            failed write); no recorded read is refused (exit 3) before the panel is\n\
-                            loaded; a mismatch writes no file (exit 3)\n\
+                            failed write); no recorded read, a store whose data hash differs from the\n\
+                            recorded read, a store with no read marker, a window set or setting that differs\n\
+                            from the recorded read and a read stored without a binding digest are refused\n\
+                            (exit 3) before the panel is loaded; the verify needs the same build line\n\
+                            that recorded the read; a mismatch writes no file (exit 3)\n\
   --expect-report-sha256 <h> exit 3 and write no file unless the report hashes to h;\n\
                             with --locked-test it needs --verify-read (exit 2 without it)\n\
   --out <file>              write the JSON report (ends with a ledger object: io and\n\
@@ -2671,7 +2822,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             return Err(usage_err("--sr-run and --sr-score are alternatives".to_string()));
         }
         let sr = SrRun::load(path).map_err(|e| {
-            if e.contains(crate::run_json::INTERIM_REFUSAL) {
+            if e.contains(crate::run_json::INTERIM_REFUSAL) || e.contains(MASK_REFUSAL) {
                 usage_err(format!("--sr-run {}", e))
             } else {
                 input_err(format!("--sr-run {}", e))
@@ -2717,6 +2868,16 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
     if opts.cost_grid.is_empty() {
         opts.cost_grid = vec![opts.cost_bps];
     }
+    // #1214: a switch gate column of the label family, the target, its return column or a construction column exits 5.
+    if let Some(sw) = opts.sr_run.as_ref().and_then(|s| s.switch.as_ref()) {
+        let specs: Vec<&TargetSpec> = opts.spec.iter().collect();
+        let mut names: Vec<String> = vec![target.clone()];
+        names.extend(ret.iter().cloned());
+        names.extend(opts.spec.iter().flat_map(|s| [Some(s.column.clone()), s.return_column.clone()]).flatten());
+        if let Some(why) = crate::regime_gate::gate_column_leak(&sw.gate.columns, &specs, &names, false) {
+            return Err((5, format!("--sr-run objective.finalist.switch: {}", why)));
+        }
+    }
     let text = std::fs::read_to_string(&windows).map_err(|e| input_err(format!("{}: {}", windows, e)))?;
     let rows = protocol::parse_windows_csv(&text, Some(&scheme)).map_err(input_err)?;
     let resolved = crate::lockbox::resolve_retired(lockbox_arg.as_deref(), lockbox_embargo_arg.as_deref(), &data_path, retired_arg.as_deref()).map_err(|e| (e.exit, e.message))?;
@@ -2737,7 +2898,26 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
     if !locked_test && (ledger_path.is_some() || sealed_path.is_some()) {
         return Err(usage_err("--ledger and --sealed apply to --locked-test only".to_string()));
     }
+    // #1304: the baseline read of a sealed list is spent on whatever data it reads.
+    if let Some(m) = locked_test.then(|| crate::permute_labels::marker(&data_path)).flatten() {
+        return Err(usage_err(crate::permute_labels::refusal(&data_path, &m, "a sealed baseline read of it would spend a lockbox read on null data")));
+    }
     let mut read: Option<(protocol::Ledger, String, protocol::LockedRange)> = None;
+    let mut bound_opts = opts.clone();
+    if let Some(sr) = &mut bound_opts.sr_run {
+        sr.run.path.clear();
+    }
+    let read_binding = protocol::binding_digest(&[
+        format!("{:?}", bound_opts),
+        format!("{:?}", rows),
+        format!("{:?}/{:?}/{:?}/{:?}/{:?}", target, ret, time, group, features),
+        format!("{}/{}/{}", scheme, resolved.embargo.seconds, purge_source),
+        format!(
+            "{:?}/{:?}/{:?}/{:?}/{:?}/{}",
+            resolved.range, resolved.source, resolved.also, resolved.embargo, resolved.retired, allow_in_sample
+        ),
+        resolved.hashed_report_fields(0, locked_test, true),
+    ]);
     if locked_test {
         let (Some(ledger), Some(sealed)) = (&ledger_path, &sealed_path) else {
             return Err(usage_err("--locked-test needs --ledger and --sealed".to_string()));
@@ -2761,13 +2941,16 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
         let l = protocol::Ledger::new(ledger);
         let current = protocol::LockedRange::new(&d.lockbox, d.source);
         let binding = protocol::RangeBinding { current: &current, allow_unbound };
+        let data_sha = crate::manifest::sha256_file(&data_path).map_err(input_err)?;
         if verify_read {
-            l.authorize_baseline_verify(std::path::Path::new(sealed), Some(binding)).map_err(input_err)?;
+            l.authorize_baseline_verify(std::path::Path::new(sealed), &data_sha, Some(binding)).map_err(input_err)?;
+            l.require_read_marker(&data_path).map_err(input_err)?;
+            l.check_verify_binding(None, &read_binding).map_err(input_err)?;
         } else {
             l.authorize_baseline_read(std::path::Path::new(sealed), Some(binding)).map_err(input_err)?;
         }
         l.check_read_marker(&data_path).map_err(input_err)?;
-        read = Some((l, crate::manifest::sha256_file(&data_path).map_err(input_err)?, current));
+        read = Some((l, data_sha, current));
     }
     // A sealed read opens the primary range; every other declared range stays sealed.
     let guard: Vec<(f64, f64)> = resolved
@@ -2784,12 +2967,18 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
         group,
         features,
     };
-    let panel = load_panel(&inp, &opts).map_err(input_err)?;
+    opts.gate_barriers = guard
+        .iter()
+        .map(|&(s, e)| crate::regime_gate::Barrier { start: s, end: e + (resolved.embargo.seconds as f64).max(opts.purge_seconds), kind: crate::regime_gate::BarrierKind::Locked })
+        .collect();
+    let mut panel = load_panel(&inp, &opts).map_err(input_err)?;
+    let rows_rule = labelled_rows(&inp, &opts);
+    keep_labelled_rows(&mut panel, &rows_rule);
     let mut folds = make_folds(&panel, &rows, opts.purge_seconds, &guard, resolved.embargo.seconds as f64).map_err(input_err)?;
     if let Some(sr) = &mut opts.sr_run {
-        let labelled: Vec<(String, f64)> = folds.iter().map(|f| (f.label.clone(), f.test_start)).collect();
-        let oof = sr.run.oof_flags(&labelled, allow_in_sample).map_err(|e| input_err(format!("--sr-run {}: {}", sr.run.path, e)))?;
-        sr.fold_oof = labelled.iter().map(|(l, _)| l.clone()).zip(oof.iter().copied()).collect();
+        let labelled: Vec<(String, f64, f64)> = folds.iter().map(|f| (f.label.clone(), f.test_start, f.test_end)).collect();
+        let oof = sr.run.oof_flags_windows(&labelled, allow_in_sample).map_err(|e| input_err(format!("--sr-run {}: {}", sr.run.path, e)))?;
+        sr.fold_oof = labelled.iter().map(|(l, _, _)| l.clone()).zip(oof.iter().copied()).collect();
         let mut keep = oof.iter();
         folds.retain(|_| *keep.next().unwrap());
         if folds.is_empty() {
@@ -2811,15 +3000,16 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
         .as_ref()
         .and_then(|s| crate::target::label_report_for(&data_path, &s.column))
         .and_then(|r| crate::labels::fit_label_json(&r))
-        .map(|f| format!(",\"split\":{{\"fit_label\":{}}}", f))
+        .map(|f| format!("\"fit_label\":{},", f))
         .unwrap_or_default();
+    let split = format!(",\"split\":{{{}\"labelled_rows\":{}}}", fit_label, rows_rule.json());
     let finish = |json: String, hashed: bool| {
         let json = format!(
             "{},\"purge_seconds\":{},\"purge_source\":\"{}\"{}}}",
             json.trim_end().strip_suffix('}').unwrap_or(json.trim_end()),
             opts.purge_seconds,
             purge_source,
-            if hashed { "" } else { fit_label.as_str() }
+            if hashed { "" } else { split.as_str() }
         );
         if hashed {
             resolved.splice_hashed_report(&json, in_scope, locked_test, true)
@@ -2861,7 +3051,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
                 &files,
                 || {
                     ledger.write_read_marker(&data_path, "baseline_read", report_sha)?;
-                    ledger.record_baseline_read(data_sha, report_sha, Some(current))
+                    ledger.record_baseline_read_bound(data_sha, report_sha, Some(current), Some(&read_binding))
                 },
                 None,
             )
@@ -2883,7 +3073,11 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
 
 /// Equal-weight period net returns of `pos` on `rows` (one block, in
 /// `(group, time)` order): the block starts flat and pays its final exit.
-pub fn period_net(p: &Panel, rows: &[usize], pos: &[f64], side: f64) -> Vec<f64> {
+/// With a declared `width` (1 s to a year, as in `Pool`) a period is the bucket
+/// `floor(t / width)`; otherwise it is one timestamp.
+pub fn period_net(p: &Panel, rows: &[usize], pos: &[f64], side: f64, width: Option<f64>) -> Vec<f64> {
+    let width = width.filter(|s| *s >= 1.0 && *s <= SECONDS_PER_YEAR);
+    let key_of = |t: f64| width.map_or(t, |s| (t / s).floor());
     let r: Vec<f64> = rows.iter().map(|&i| p.ret[i]).collect();
     let g: Vec<u64> = rows.iter().map(|&i| p.group[i]).collect();
     let net = baselines::net_rows(pos, &r, &g, side);
@@ -2892,7 +3086,7 @@ pub fn period_net(p: &Panel, rows: &[usize], pos: &[f64], side: f64) -> Vec<f64>
     let mut out: Vec<f64> = Vec::new();
     let (mut sum, mut cnt, mut last) = (0.0, 0usize, f64::NAN);
     for &k in &order {
-        let t = p.time[rows[k]];
+        let t = key_of(p.time[rows[k]]);
         if cnt > 0 && t != last {
             out.push(sum / cnt as f64);
             sum = 0.0;

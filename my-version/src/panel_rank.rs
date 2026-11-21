@@ -132,6 +132,7 @@ fn xs_spec(name: &str, column: &str, source: &TargetSpec) -> TargetSpec {
         return_column: Some(column.to_string()),
         return_units: source.return_units.clone(),
         horizon_seconds: source.horizon_seconds,
+        stride_seconds: source.stride_seconds,
         entry_offset_seconds: source.entry_offset_seconds,
         delay_seconds: source.delay_seconds,
         entry_price: source.entry_price.clone(),

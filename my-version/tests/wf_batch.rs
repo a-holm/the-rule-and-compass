@@ -137,6 +137,7 @@ fn scalar_cells(
                 thr[c][w],
                 COST_SIDE,
                 &mut previous,
+                rcsr::trading::MissingScore::Flat,
             ));
         }
     }
@@ -319,7 +320,7 @@ fn flattened_row_order_invents_no_trades_352_not_456() {
     assert_eq!(flat.strategy.trades, 456, "flattened order invents trades");
     // The scalar evaluator agrees with the batch on the grouped book.
     let mut previous = HashMap::new();
-    let reference = walkforward::reference_cell(&time, &group, &target, &scores, 0.0, 0.0005, &mut previous);
+    let reference = walkforward::reference_cell(&time, &group, &target, &scores, 0.0, 0.0005, &mut previous, rcsr::trading::MissingScore::Flat);
     assert_eq!(reference.trades, 352);
 }
 
@@ -347,7 +348,7 @@ fn non_finite_score_cells_use_the_scalar_evaluator() {
             .map(|i| if poisoned(2, w, i) { f64::NAN } else { score(2, w, i) })
             .collect();
         let want = walkforward::reference_cell(
-            &win.time, &win.group, &win.target, &s, thr[2][w], COST_SIDE, &mut previous,
+            &win.time, &win.group, &win.target, &s, thr[2][w], COST_SIDE, &mut previous, rcsr::trading::MissingScore::Flat,
         );
         let got = r.cell(2, w);
         assert_eq!(got.provenance, EXACT_CPU);
@@ -384,6 +385,7 @@ fn dropped_target_rows_are_priced_like_the_evaluator() {
                 thr[c][w],
                 COST_SIDE,
                 &mut HashMap::new(),
+                rcsr::trading::MissingScore::Flat,
             );
             assert_totals_close(&r.cell(c, w).totals, &want, &format!("c{c} w{w}"));
             let kept = win.target.iter().filter(|t| t.is_finite()).count();
@@ -652,7 +654,7 @@ fn bench_batch_vs_scalar() {
             let s: Vec<f64> = (0..win.time.len()).map(|i| score(c, w, i)).collect();
             let mut previous = HashMap::new();
             let t = walkforward::reference_cell(
-                &win.time, &win.group, &win.target, &s, thr[c][w], COST_SIDE, &mut previous,
+                &win.time, &win.group, &win.target, &s, thr[c][w], COST_SIDE, &mut previous, rcsr::trading::MissingScore::Flat,
             );
             scalar_net += t.net;
         }

@@ -434,7 +434,7 @@ fn resume_needs_the_same_book() {
     assert_eq!(key(&straight), key(&resumed));
 
     let other_cost = run(&data, &spec, &["--fitness", "pnl", "--generations", "20", "--resume", &cp, "--cost-bps", "7"]);
-    usage_error(&other_cost, "fitness");
+    usage_error(&other_cost, "--cost-bps");
     let no_flag = run(&data, &spec, &["--generations", "20", "--resume", &cp]);
     usage_error(&no_flag, "--fitness pnl");
 }
@@ -539,7 +539,7 @@ fn block_flags_name_their_reason() {
     let spec = write_spec(&dir);
     usage_error(&run(&data, &spec, &["--pnl-blocks", "4"]), "--pnl-blocks needs --fitness pnl");
     usage_error(&run(&data, &spec, &["--pnl-block-lambda", "2"]), "--pnl-block-lambda needs --fitness pnl");
-    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-blocks", "9"]), "--pnl-blocks must be");
+    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-blocks", "65"]), "--pnl-blocks must be");
     usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-blocks", "0"]), "--pnl-blocks must be");
     usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-block-lambda", "-1"]), "--pnl-block-lambda must be");
     usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-block-lambda", "nan"]), "--pnl-block-lambda must be");
@@ -558,7 +558,134 @@ fn resume_needs_the_same_blocks() {
     let resumed = json(&run(&data, &spec, &[&blocked[..], &["--generations", "20", "--resume", &cp]].concat()));
     assert_eq!(members(&straight), members(&resumed));
     let other = run(&data, &spec, &["--fitness", "pnl", "--pnl-blocks", "4", "--generations", "20", "--resume", &cp]);
-    usage_error(&other, "fitness");
+    usage_error(&other, "--pnl-blocks");
+}
+
+// ---- #1178: up to 64 blocks and the block statistic ----
+
+fn block_regrets(m: &Json) -> Vec<f64> {
+    match at(m, &["fitness", "block_regret"]) {
+        Json::Arr(a) => a.iter().map(|v| v.as_f64().unwrap()).collect(),
+        _ => panic!("block_regret is not an array"),
+    }
+}
+
+#[test]
+fn block_stat_flags_name_their_reason() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, 900);
+    let spec = write_spec(&dir);
+    usage_error(&run(&data, &spec, &["--pnl-stat", "cvar"]), "--pnl-stat needs --fitness pnl");
+    usage_error(&run(&data, &spec, &["--pnl-cvar-q", "0.5"]), "--pnl-cvar-q needs --fitness pnl");
+    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-stat", "median"]), "--pnl-stat must be mean-sd, mean-semi or cvar");
+    for q in ["0", "-0.1", "1.5", "nan", "x"] {
+        usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-stat", "cvar", "--pnl-cvar-q", q]), "--pnl-cvar-q must be");
+    }
+    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-cvar-q", "0.5"]), "--pnl-cvar-q needs --pnl-stat cvar");
+    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-stat", "mean-semi", "--pnl-cvar-q", "0.5"]), "--pnl-cvar-q needs --pnl-stat cvar");
+    usage_error(
+        &run(&data, &spec, &["--fitness", "pnl", "--pnl-stat", "cvar", "--pnl-block-lambda", "2"]),
+        "--pnl-block-lambda has no effect under --pnl-stat cvar",
+    );
+    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-blocks", "65"]), "--pnl-blocks must be an integer from 1 to 64");
+    // 80 rows leave fewer than 64 distinct training timestamps.
+    let short = write_csv_rows(&dir, 900, 80);
+    usage_error(&run(&short, &spec, &["--fitness", "pnl", "--pnl-blocks", "64"]), "distinct training timestamps");
+}
+
+/// The acceptance run: 48 blocks, 20 generations, `search_fitness.stat`, and
+/// every member's fitness is the statistic of its 48 block regrets.
+#[test]
+fn k48_search_writes_the_stat() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv_rows(&dir, 900, 2000);
+    let spec = write_spec(&dir);
+    for (extra, stat) in [
+        (&["--pnl-blocks", "48"][..], "mean-sd"),
+        (&["--pnl-blocks", "48", "--pnl-stat", "mean-semi", "--pnl-block-lambda", "2"][..], "mean-semi"),
+        (&["--pnl-blocks", "48", "--pnl-stat", "cvar", "--pnl-cvar-q", "0.25"][..], "cvar"),
+    ] {
+        let j = json(&run(&data, &spec, &[&["--fitness", "pnl"][..], extra].concat()));
+        assert_eq!(num(&j, &["generations_run"]), 20.0, "{stat}");
+        let f = at(&j, &["search_fitness"]);
+        assert_eq!(f.get("stat").and_then(Json::as_str), Some(stat));
+        assert_eq!(num(f, &["blocks"]), 48.0);
+        match at(f, &["block_bounds"]) {
+            Json::Arr(a) => assert!(a.len() == 48 && a.iter().all(|v| v.as_f64().unwrap() > 0.0)),
+            _ => panic!("block_bounds is not an array"),
+        }
+        assert_eq!(f.get("cvar_q").and_then(Json::as_f64), (stat == "cvar").then_some(0.25), "{stat}");
+        let lambda = num(f, &["lambda"]);
+        let mut finite = 0;
+        for m in pareto(&j) {
+            let r = block_regrets(m);
+            assert_eq!(r.len(), 48);
+            let fit = num(m, &["fitness", "train_regret"]);
+            let mean = r.iter().sum::<f64>() / 48.0;
+            let want = match stat {
+                "mean-sd" => mean + lambda * (r.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / 47.0).sqrt(),
+                "mean-semi" => mean + lambda * (r.iter().map(|v| (v - 1.0).max(0.0).powi(2)).sum::<f64>() / 48.0).sqrt(),
+                _ => {
+                    let mut s = r.clone();
+                    s.sort_by(|a, b| b.total_cmp(a));
+                    s[..12].iter().sum::<f64>() / 12.0
+                }
+            };
+            assert!((fit - want).abs() <= 1e-9, "{stat}: {fit} vs {want}");
+            finite += 1;
+        }
+        assert!(finite > 0, "{stat}: an empty front");
+    }
+}
+
+#[test]
+fn block_stat_search_is_thread_invariant() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv_rows(&dir, 900, 2000);
+    let spec = write_spec(&dir);
+    let args = ["--fitness", "pnl", "--pnl-blocks", "20", "--pnl-stat", "cvar", "--pnl-cvar-q", "0.3"];
+    let one = json(&run(&data, &spec, &[&args[..], &["--threads", "1"]].concat()));
+    let four = json(&run(&data, &spec, &[&args[..], &["--threads", "4"]].concat()));
+    assert_eq!(members(&one), members(&four));
+}
+
+/// A run without the new flags reports no `stat`, and `--pnl-stat mean-sd`
+/// spelled out is that run.
+#[test]
+fn explicit_mean_sd_is_the_default_run() {
+    let (_scratch, dir) = scratch();
+    let data = write_regime_csv(&dir);
+    let spec = write_spec(&dir);
+    for blocks in ["1", "4", "8"] {
+        let plain = run(&data, &spec, &["--fitness", "pnl", "--pnl-blocks", blocks]);
+        let spelled = run(&data, &spec, &["--fitness", "pnl", "--pnl-blocks", blocks, "--pnl-stat", "mean-sd"]);
+        let (a, b) = (json(&plain), json(&spelled));
+        assert_eq!(members(&a), members(&b), "{blocks} blocks");
+        let (fa, fb) = (at(&a, &["search_fitness"]), at(&b, &["search_fitness"]));
+        assert_eq!(fa.get("book_hash"), fb.get("book_hash"));
+        assert!(fa.get("stat").is_none() && fa.get("cvar_q").is_none(), "{blocks} blocks");
+        assert_eq!(without_digits(&plain), without_digits(&spelled), "{blocks} blocks");
+    }
+}
+
+/// A resume with another block count, statistic or q exits 2.
+#[test]
+fn book_hash_covers_block_stat() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv_rows(&dir, 900, 2000);
+    let spec = write_spec(&dir);
+    let cp = dir.join("stat.rcsr").to_string_lossy().into_owned();
+    let saved = ["--fitness", "pnl", "--pnl-blocks", "12", "--pnl-stat", "cvar", "--pnl-cvar-q", "0.25"];
+    let first = run(&data, &spec, &[&saved[..], &["--generations", "10", "--save", &cp]].concat());
+    assert_eq!(code(&first), 0, "{}", stderr(&first));
+    let straight = json(&run(&data, &spec, &[&saved[..], &["--generations", "20"]].concat()));
+    let resumed = json(&run(&data, &spec, &[&saved[..], &["--generations", "20", "--resume", &cp]].concat()));
+    assert_eq!(members(&straight), members(&resumed));
+    let resume = |extra: &[&str]| run(&data, &spec, &[&["--fitness", "pnl", "--generations", "20", "--resume", &cp][..], extra].concat());
+    usage_error(&resume(&["--pnl-blocks", "10", "--pnl-stat", "cvar", "--pnl-cvar-q", "0.25"]), "--pnl-cvar-q");
+    usage_error(&resume(&["--pnl-blocks", "12", "--pnl-stat", "mean-semi"]), "--pnl-stat");
+    usage_error(&resume(&["--pnl-blocks", "12", "--pnl-stat", "cvar", "--pnl-cvar-q", "0.5"]), "fitness");
+    usage_error(&resume(&["--pnl-blocks", "12"]), "--pnl-blocks");
 }
 
 #[test]
@@ -1227,9 +1354,9 @@ fn resume_refuses_changed_band_units() {
     let first = run(&data, &spec, &[&saved[..], &["--generations", "10", "--save", &cp]].concat());
     assert_eq!(code(&first), 0, "{}", stderr(&first));
     let resume = |extra: &[&str]| run(&data, &spec, &[&["--fitness", "pnl", "--generations", "20", "--resume", &cp][..], extra].concat());
-    usage_error(&resume(&["--band", "0.5", "--min-holding", "2", "--band-units", "sd"]), "fitness");
-    usage_error(&resume(&["--band", "0.4", "--min-holding", "2"]), "fitness");
-    usage_error(&resume(&["--band", "0.5", "--min-holding", "3"]), "fitness");
+    usage_error(&resume(&["--band", "0.5", "--min-holding", "2", "--band-units", "sd"]), "--band-units");
+    usage_error(&resume(&["--band", "0.4", "--min-holding", "2"]), "--band");
+    usage_error(&resume(&["--band", "0.5", "--min-holding", "3"]), "--min-holding");
     usage_error(&resume(&[]), "fitness");
     let same = resume(&["--band", "0.5", "--min-holding", "2"]);
     assert_eq!(code(&same), 0, "{}", stderr(&same));
@@ -1540,6 +1667,1997 @@ fn band_sd_robust_selection_uses_member_bands() {
     );
 }
 
+// ---- #1084: book-space QD descriptor ----
+
+const BOOK_QD: [&str; 5] = ["--fitness", "pnl", "--qd-policy", "--qd-descriptor", "book"];
+
+fn front_key(j: &Json) -> Vec<(String, u64)> {
+    pareto(j)
+        .iter()
+        .map(|m| (at(m, &["expression"]).as_str().unwrap().to_string(), num(m, &["fitness", "train_regret"]).to_bits()))
+        .collect()
+}
+
+#[test]
+fn qd_book_descriptor_cpu_run_reports_book_without_fallbacks() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, 900);
+    let spec = write_spec(&dir);
+    let book = json(&run(&data, &spec, &BOOK_QD));
+    let q = at(&book, &["qd"]);
+    assert_eq!(q.get("descriptor").and_then(Json::as_str), Some("book"));
+    assert_eq!(num(q, &["descriptor_fallbacks"]), 0.0);
+    assert!(num(q, &["occupied"]) > 1.0, "{q:?}");
+    assert_eq!(num(q, &["reachable"]), num(q, &["cells"]));
+    let moments = json(&run(&data, &spec, &["--fitness", "pnl", "--qd-policy"]));
+    assert!(at(&moments, &["qd"]).get("descriptor").is_none(), "the moments report keeps its keys");
+    assert_ne!(at(&moments, &["qd"]), q, "the two kinds key the archive differently");
+}
+
+#[test]
+fn qd_book_descriptor_is_deterministic_and_thread_independent() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, 900);
+    let spec = write_spec(&dir);
+    let with = |threads: &str| {
+        let mut args = BOOK_QD.to_vec();
+        args.extend(["--threads", threads]);
+        json(&run(&data, &spec, &args))
+    };
+    let (one, again, four) = (with("1"), with("1"), with("4"));
+    for other in [&again, &four] {
+        assert_eq!(at(&one, &["qd"]), at(other, &["qd"]));
+        assert_eq!(front_key(&one), front_key(other));
+        assert_eq!(
+            num(&one, &["search", "candidates_evaluated"]),
+            num(other, &["search", "candidates_evaluated"])
+        );
+    }
+}
+
+#[test]
+fn a_passive_book_descriptor_keeps_the_front() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, 900);
+    let spec = write_spec(&dir);
+    let plain = json(&run(&data, &spec, &["--fitness", "pnl"]));
+    let passive = json(&run(&data, &spec, &["--fitness", "pnl", "--qd", "--qd-descriptor", "book"]));
+    assert_eq!(front_key(&plain), front_key(&passive));
+    assert_eq!(at(&passive, &["qd", "descriptor"]).as_str(), Some("book"));
+    assert_eq!(num(&passive, &["qd", "descriptor_fallbacks"]), 0.0);
+}
+
+#[test]
+fn qd_book_descriptor_refusals_name_their_reason() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, 900);
+    let spec = write_spec(&dir);
+    usage_error(&run(&data, &spec, &["--qd", "--qd-descriptor", "book"]), "--qd-descriptor book needs --fitness pnl");
+    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--qd-descriptor", "book"]), "--qd-descriptor book needs a QD archive");
+    usage_error(
+        &run(&data, &spec, &["--fitness", "pnl", "--qd", "--qd-descriptor", "usage"]),
+        "--qd-descriptor must be moments or book",
+    );
+}
+
+#[test]
+fn qd_book_descriptor_is_saved_and_resumes() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, 900);
+    let spec = write_spec(&dir);
+    let cp = dir.join("book.rcsr").to_string_lossy().into_owned();
+    let passive = ["--fitness", "pnl", "--qd", "--qd-descriptor", "book"];
+    let mut first = passive.to_vec();
+    first.extend(["--generations", "10", "--save", &cp]);
+    let saved = run(&data, &spec, &first);
+    assert_eq!(code(&saved), 0, "{}", stderr(&saved));
+    assert!(std::fs::read_to_string(&cp).unwrap().contains("\nconfig qd_descriptor book\n"));
+
+    let straight = json(&run(&data, &spec, &passive));
+    let resumed = json(&run(&data, &spec, &["--fitness", "pnl", "--resume", &cp]));
+    assert_eq!(at(&resumed, &["qd", "descriptor"]).as_str(), Some("book"));
+    assert_eq!(front_key(&straight), front_key(&resumed));
+    usage_error(
+        &run(&data, &spec, &["--fitness", "pnl", "--resume", &cp, "--qd-descriptor", "moments"]),
+        "--qd-descriptor moments (saved qd_descriptor is book)",
+    );
+
+    let moments_cp = dir.join("moments.rcsr").to_string_lossy().into_owned();
+    let m = run(&data, &spec, &["--fitness", "pnl", "--qd", "--generations", "2", "--save", &moments_cp]);
+    assert_eq!(code(&m), 0, "{}", stderr(&m));
+    assert!(!std::fs::read_to_string(&moments_cp).unwrap().contains("qd_descriptor"));
+}
+
+/// #1023: a two-symbol panel with four time blocks gives eight sub-book cases;
+/// every generation of `--selection lexicase` selects on all of them, and the
+/// run resumes to the uninterrupted front.
+#[test]
+fn lexicase_selects_on_two_symbols_times_four_blocks() {
+    let (_scratch, dir) = scratch();
+    let mut text = String::from("t,sym,x1,x2,r,y\n");
+    for s in 0..2 {
+        for i in 0..300 {
+            let f = (i + 1000 * s) as f64;
+            let x1 = frac(f * 0.618_033_988_749_894_9) - 0.5;
+            let x2 = frac(f * 0.754_877_666_246_692_7) - 0.5;
+            let noise = frac(f * 0.324_717_957_244_746) - 0.5;
+            let r = 0.01 * x1 + 0.0005 * noise;
+            text.push_str(&format!("{},{},{},{},{},{}\n", T0 + 900 * i as i64, ["a", "b"][s], x1, x2, r, r + 0.05 * x2));
+        }
+    }
+    let data = dir.join("panel.csv");
+    std::fs::write(&data, text).unwrap();
+    let data = data.to_string_lossy().into_owned();
+    let spec = write_spec(&dir);
+    let log = dir.join("dev.ndjson").to_string_lossy().into_owned();
+    let cp = dir.join("lex.rcsr").to_string_lossy().into_owned();
+    let lex = |extra: &[&str]| {
+        let mut args = vec![
+            "--data", &data, "--target", "y", "--vars", "x1,x2", "--time", "t", "--group-by", "sym", "--split",
+            "temporal", "--target-spec", &spec, "--cpu", "--seed", "3", "--pop", "48", "--metric", "squared",
+            "--json", "--quiet", "--objective", "pnl", "--cost-bps", "5", "--validation-frac", "0.3", "--fitness",
+            "pnl", "--pnl-blocks", "4", "--selection", "lexicase",
+        ];
+        args.extend_from_slice(extra);
+        rcsr_cmd::rcsr().args(&args).output().expect("run rcsr")
+    };
+    let full = json(&lex(&["--generations", "12", "--dev-log", &log]));
+    assert_eq!(num(at(&full, &["search_fitness"]), &["blocks"]), 4.0);
+    let cases: Vec<f64> = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .filter(|l| l.contains("\"event\":\"generation\""))
+        .map(|l| num(&Json::parse(l).expect("dev-log line"), &["selection", "cases"]))
+        .collect();
+    assert!(!cases.is_empty() && cases.iter().all(|&c| c == 8.0), "{cases:?}");
+
+    let saved = lex(&["--generations", "6", "--no-dev-log", "--save", &cp]);
+    assert_eq!(code(&saved), 0, "{}", stderr(&saved));
+    let resumed = json(&lex(&["--generations", "12", "--no-dev-log", "--resume", &cp]));
+    // A resumed run reports the front rebuilt on every row, which takes the
+    // canonical tree among equal regrets; compare the regrets.
+    let regrets = |j: &Json| pareto(j).iter().map(|m| num(m, &["fitness", "train_regret"]).to_bits()).collect::<Vec<_>>();
+    assert_eq!(regrets(&full), regrets(&resumed));
+    usage_error(&lex(&["--generations", "12", "--no-dev-log", "--resume", &cp, "--lexicase-cases", "4"]), "--lexicase-cases 4 (saved lexicase_cases is 256)");
+}
+
+/// #1166: a `--qd-policy --qd-descriptor book` run resumed at generation 4
+/// equals the 8-generation run: front, QD report and exit checkpoint apart
+/// from the `build` lines.
+#[test]
+fn a_qd_book_policy_run_and_its_resume_match_exactly() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, 900);
+    let spec = write_spec(&dir);
+    let path = |name: &str| dir.join(name).to_string_lossy().into_owned();
+    let (straight_cp, half_cp, resumed_cp) = (path("straight.rcsr"), path("half.rcsr"), path("resumed.rcsr"));
+    let mut straight = BOOK_QD.to_vec();
+    straight.extend(["--generations", "8", "--save", &straight_cp]);
+    let a = json(&run(&data, &spec, &straight));
+    let mut half = BOOK_QD.to_vec();
+    half.extend(["--generations", "4", "--save", &half_cp]);
+    json(&run(&data, &spec, &half));
+    let b = json(&run(&data, &spec, &["--fitness", "pnl", "--generations", "8", "--resume", &half_cp, "--save", &resumed_cp]));
+    assert_eq!(at(&a, &["qd", "descriptor"]).as_str(), Some("book"));
+    assert_eq!(at(&a, &["pareto"]), at(&b, &["pareto"]));
+    assert_eq!(at(&a, &["qd"]), at(&b, &["qd"]));
+    let read = |p: &str| -> String {
+        std::fs::read_to_string(p).unwrap().lines().filter(|l| !l.starts_with("build ")).map(|l| format!("{l}\n")).collect()
+    };
+    assert!(read(&half_cp).contains("\nqd_archive 1 cvt "), "the book checkpoint carries the archive");
+    assert_eq!(read(&straight_cp), read(&resumed_cp));
+}
+
+// ---- #1180: regime-masked fitness ----
+
+use trading::BookMask;
+
+/// On in alternate `run`-row runs, counted from the first row of each group.
+fn alternate_mask(s: &TradingSlice, run: usize) -> Vec<bool> {
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    for i in 0..s.ret.len() {
+        if i > 0 && s.rows.group[i] != s.rows.group[i - 1] {
+            at = 0;
+        }
+        out.push((at / run) % 2 == 0);
+        at += 1;
+    }
+    out
+}
+
+fn masked(s: &TradingSlice, sp: &TradingSpec, blocks: usize, on: &[bool]) -> Result<FitnessBook, String> {
+    FitnessBook::with_segments(s, sp, 900.0, blocks, 1.0, &[], Some(BookMask { on, identity: "test-gate" }))
+}
+
+/// The maximal on-runs as `(group, start, end)` row ranges.
+fn on_runs(s: &TradingSlice, on: &[bool]) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut start: Option<usize> = None;
+    for i in 0..=on.len() {
+        let live = i < on.len() && on[i] && (i == 0 || s.rows.group[i] == s.rows.group[i - 1] || start.is_none());
+        let seam = i > 0 && i < on.len() && s.rows.group[i] != s.rows.group[i - 1];
+        if let Some(a) = start {
+            if !live || seam {
+                runs.push((a, i));
+                start = None;
+            }
+        }
+        if i < on.len() && on[i] && start.is_none() {
+            start = Some(i);
+        }
+    }
+    runs
+}
+
+fn sub_slice(s: &TradingSlice, a: usize, b: usize) -> TradingSlice {
+    TradingSlice {
+        rows: TradingRows { time: s.rows.time[a..b].to_vec(), group: vec![0; b - a], funding: Vec::new() },
+        ret: s.ret[a..b].to_vec(),
+    }
+}
+
+#[test]
+fn all_on_mask_book_is_the_plain_book() {
+    let s = slice(&[300, 280]);
+    let all = vec![true; s.ret.len()];
+    let pred = prediction(&s);
+    let specs = [spec(), TradingSpec { min_holding: 3, band: trading::BandSpec::score(0.1), ..spec() }];
+    for sp in &specs {
+        for blocks in [1usize, 3] {
+            let plain = FitnessBook::with_blocks(&s, sp, 900.0, blocks, 1.0).unwrap();
+            let all_on = masked(&s, sp, blocks, &all).unwrap();
+            assert!(!all_on.is_masked());
+            assert_eq!(plain.hash(), all_on.hash());
+            assert_eq!(plain.flags(), all_on.flags());
+            assert_eq!(plain.bound().to_bits(), all_on.bound().to_bits());
+            assert_eq!(plain.regret(&pred).to_bits(), all_on.regret(&pred).to_bits());
+        }
+    }
+}
+
+#[test]
+fn mask_runs_are_book_segments() {
+    let s = slice(&[400, 400]);
+    let pred = prediction(&s);
+    let on = alternate_mask(&s, 50);
+    let runs = on_runs(&s, &on);
+    assert_eq!(runs.len(), 8);
+    let specs = [spec(), TradingSpec { min_holding: 3, band: trading::BandSpec::score(0.1), ..spec() }];
+    for sp in &specs {
+        let book = masked(&s, sp, 1, &on).unwrap();
+        assert!(book.is_masked());
+        assert_eq!(book.masked_rows(), on.iter().filter(|&&o| !o).count());
+        let (mut net, mut bound, mut flips, mut exits, mut long_rows) = (0.0f64, 0.0f64, 0u64, 0u64, 0u64);
+        for &(a, b) in &runs {
+            let part = FitnessBook::new(&sub_slice(&s, a, b), sp, 900.0).unwrap();
+            let t = part.totals(&pred[a..b]);
+            net += part.net_of(&t);
+            bound += part.bound();
+            flips += t.flips;
+            exits += t.exits;
+            long_rows += t.long_rows;
+        }
+        let t = book.totals(&pred);
+        assert_eq!((t.flips, t.exits, t.long_rows), (flips, exits, long_rows));
+        let masked_net = book.net_of(&t);
+        assert!((masked_net - net).abs() <= 1e-12, "{masked_net} vs {net}");
+        assert!((book.bound() - bound).abs() <= 1e-12, "{} vs {bound}", book.bound());
+        let regret = (bound - net) / bound;
+        assert!((book.regret(&pred) - regret).abs() <= 1e-12, "{} vs {regret}", book.regret(&pred));
+    }
+}
+
+#[test]
+fn masked_book_is_the_plain_book_with_the_rows_outside_forced_flat() {
+    let s = slice(&[400, 400]);
+    let sp = spec();
+    let on = alternate_mask(&s, 50);
+    let book = masked(&s, &sp, 1, &on).unwrap();
+    let plain = FitnessBook::new(&s, &sp, 900.0).unwrap();
+    let pred = prediction(&s);
+    let forced: Vec<f64> = pred.iter().zip(&on).map(|(&p, &o)| if o { p } else { -1.0 }).collect();
+    let (m, p) = (book.totals(&pred), plain.totals(&forced));
+    assert_eq!(m.gross.to_bits(), p.gross.to_bits());
+    assert_eq!(m.flips + m.exits, p.flips + p.exits, "a seam exit replaces the flip to flat");
+    assert_eq!(book.net_of(&m).to_bits(), plain.net_of(&p).to_bits());
+    assert_eq!(m.long_rows, p.long_rows);
+}
+
+#[test]
+fn masked_bound_matches_brute_force() {
+    let s = slice(&[24, 24]);
+    let sp = spec();
+    let side = sp.per_side_bps() * 1e-4;
+    let mut on = vec![false; 48];
+    for i in (5..13).chain(18..24).chain(24..31).chain(36..44) {
+        on[i] = true;
+    }
+    let book = masked(&s, &sp, 1, &on).unwrap();
+    let runs = on_runs(&s, &on);
+    assert_eq!(runs.len(), 4);
+    let mut want = 0.0f64;
+    for &(a, b) in &runs {
+        let m = b - a;
+        let mut best = f64::NEG_INFINITY;
+        for bits in 0u32..(1 << m) {
+            let mut net = 0.0;
+            let mut prev = 0.0;
+            for k in 0..m {
+                let p = ((bits >> k) & 1) as f64;
+                net += p * s.ret[a + k] - side * (p - prev).abs();
+                prev = p;
+            }
+            net -= side * prev;
+            best = best.max(net);
+        }
+        want += best;
+    }
+    assert!((book.bound() - want).abs() <= 1e-12, "{} vs {want}", book.bound());
+}
+
+#[test]
+fn a_mask_changes_the_hash_and_refuses_what_it_cannot_price() {
+    let s = slice(&[300]);
+    let sp = spec();
+    let on = alternate_mask(&s, 50);
+    let plain = FitnessBook::new(&s, &sp, 900.0).unwrap();
+    let a = FitnessBook::with_segments(&s, &sp, 900.0, 1, 1.0, &[], Some(BookMask { on: &on, identity: "a" })).unwrap();
+    let b = FitnessBook::with_segments(&s, &sp, 900.0, 1, 1.0, &[], Some(BookMask { on: &on, identity: "b" })).unwrap();
+    assert_ne!(a.hash(), plain.hash());
+    assert_ne!(a.hash(), b.hash());
+    assert!(masked(&s, &sp, 1, &on[1..]).unwrap_err().contains("regime mask has"));
+    let none = vec![false; 300];
+    assert!(masked(&s, &sp, 1, &none).unwrap_err().contains("masked"));
+    let first_third: Vec<bool> = (0..300).map(|i| i < 100).collect();
+    let e = masked(&s, &sp, 3, &first_third).unwrap_err();
+    assert!(e.contains("time block 2 of 3") && e.contains("regime mask"), "{e}");
+}
+
+#[test]
+fn a_non_finite_score_outside_the_mask_is_ignored() {
+    let s = slice(&[400, 400]);
+    let sp = spec();
+    let on = alternate_mask(&s, 50);
+    let book = masked(&s, &sp, 1, &on).unwrap();
+    let pred = prediction(&s);
+    let off = on.iter().position(|&o| !o).unwrap();
+    let on_row = on.iter().position(|&o| o).unwrap();
+    let mut bad_off = pred.clone();
+    bad_off[off] = f64::NAN;
+    assert_eq!(book.regret(&bad_off).to_bits(), book.regret(&pred).to_bits());
+    let mut bad_on = pred.clone();
+    bad_on[on_row] = f64::NAN;
+    assert_eq!(book.regret(&bad_on), f64::INFINITY);
+}
+
+#[test]
+fn masked_cases_hold_on_rows_only_and_the_sd_band_reads_them() {
+    let s = slice(&[400, 400]);
+    let on = alternate_mask(&s, 50);
+    let sp = band_spec(0.5, trading::BandUnits::Sd, 1);
+    let book = masked(&s, &sp, 2, &on).unwrap();
+    let cases = book.cases();
+    assert!(!cases.kept.is_empty());
+    for &c in &cases.kept {
+        let (a, b) = cases.ranges[c];
+        assert!(on[a..b].iter().all(|&o| o), "case {c} holds an off row");
+    }
+    let pred = prediction(&s);
+    assert_eq!(book.case_errors(&pred).len(), cases.kept.len());
+    let on_scores: Vec<f64> = pred.iter().zip(&on).filter(|(_, &o)| o).map(|(&p, _)| p).collect();
+    let want = 0.5 * trading::score_sd(&on_scores).sd.unwrap();
+    assert_eq!(book.resolve_band(&pred).to_bits(), want.to_bits());
+}
+
+#[test]
+fn masked_fitness_is_thread_independent() {
+    let s = slice(&[400, 400]);
+    let on = alternate_mask(&s, 50);
+    let book = masked(&s, &spec(), 4, &on).unwrap();
+    let pred = prediction(&s);
+    let want = book.regret(&pred).to_bits();
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..4).map(|_| scope.spawn(|| book.regret(&pred).to_bits())).collect();
+        for h in handles {
+            assert_eq!(h.join().unwrap(), want);
+        }
+    });
+}
+
+/// `g` is +1 in alternate 60-row runs and -1 between them; `lbl_h24a_y` is a
+/// label-family column that no gate may read.
+fn write_gate_csv(dir: &std::path::Path) -> String {
+    let mut text = String::from("t,x1,x2,r,y,g,lbl_h24a_y\n");
+    for i in 0..N {
+        let f = i as f64;
+        let x1 = frac(f * 0.618_033_988_749_894_9) - 0.5;
+        let x2 = frac(f * 0.754_877_666_246_692_7) - 0.5;
+        let noise = frac(f * 0.324_717_957_244_746) - 0.5;
+        let r = 0.01 * x1 + 0.0005 * noise;
+        let g = if (i / 60) % 2 == 0 { 1 } else { -1 };
+        text.push_str(&format!("{},{},{},{},{},{},{}\n", T0 + 900 * i as i64, x1, x2, r, r + 0.05 * x2, g, r));
+    }
+    let path = dir.join("gate.csv");
+    std::fs::write(&path, text).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+#[test]
+fn all_on_mask_is_the_plain_run() {
+    let (_scratch, dir) = scratch();
+    let data = write_gate_csv(&dir);
+    let spec = write_spec(&dir);
+    let plain = run(&data, &spec, &["--fitness", "pnl", "--pnl-blocks", "3"]);
+    let all_on = run(&data, &spec, &["--fitness", "pnl", "--pnl-blocks", "3", "--pnl-mask", "1"]);
+    let (a, b) = (json(&plain), json(&all_on));
+    assert_eq!(members(&a), members(&b));
+    assert_eq!(at(&a, &["search_fitness"]).get("book_hash"), at(&b, &["search_fitness"]).get("book_hash"));
+    assert!(at(&b, &["search_fitness"]).get("mask").is_none());
+    assert_eq!(at(&a, &["objective", "validation"]).get("net_pnl"), at(&b, &["objective", "validation"]).get("net_pnl"));
+    assert_eq!(at(&a, &["objective", "test"]).get("net_pnl"), at(&b, &["objective", "test"]).get("net_pnl"));
+    let (la, lb) = (dir.join("plain.jsonl"), dir.join("mask1.jsonl"));
+    assert_eq!(code(&run_logged(&data, &spec, &la, &["--fitness", "pnl", "--pnl-blocks", "3"])), 0);
+    assert_eq!(code(&run_logged(&data, &spec, &lb, &["--fitness", "pnl", "--pnl-blocks", "3", "--pnl-mask", "1"])), 0);
+    assert_eq!(archive_hash(&la), archive_hash(&lb));
+}
+
+#[test]
+fn mask_refuses_label_columns() {
+    let (_scratch, dir) = scratch();
+    let data = write_gate_csv(&dir);
+    let spec = write_spec(&dir);
+    for col in ["y", "r", "lbl_h24a_y", "x1 + lbl_h24a_y"] {
+        let o = run(&data, &spec, &["--fitness", "pnl", "--pnl-mask", col]);
+        assert_eq!(code(&o), 5, "{col}: {}", stderr(&o));
+        assert!(stderr(&o).contains("D13") && stderr(&o).contains("--pnl-mask"), "{}", stderr(&o));
+    }
+    let ok = run(&data, &spec, &["--fitness", "pnl", "--pnl-mask", "g"]);
+    assert_eq!(code(&ok), 0, "{}", stderr(&ok));
+}
+
+#[test]
+fn mask_flags_name_their_reason() {
+    let (_scratch, dir) = scratch();
+    let data = write_gate_csv(&dir);
+    let spec = write_spec(&dir);
+    usage_error(&run(&data, &spec, &["--pnl-mask", "g"]), "--pnl-mask needs --fitness pnl");
+    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-mask-band", "0.1"]), "--pnl-mask-band needs --pnl-mask");
+    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-mask-dwell", "3"]), "--pnl-mask-dwell needs --pnl-mask");
+    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-mask", "g", "--pnl-mask-band", "-1"]), "--pnl-mask-band must be");
+    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-mask", "g", "--pnl-mask-dwell", "0"]), "--pnl-mask-dwell must be");
+    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-mask", "mean(g)"]), "aggregate");
+    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-mask", "g +"]), "--pnl-mask");
+    let missing = run(&data, &spec, &["--fitness", "pnl", "--pnl-mask", "nope"]);
+    assert_eq!(code(&missing), 3, "{}", stderr(&missing));
+    assert!(stderr(&missing).contains("mask column") && stderr(&missing).contains("nope"), "{}", stderr(&missing));
+    usage_error(
+        &run(&data, &spec, &["--fitness", "pnl", "--pnl-mask", "g", "--band", "0.5", "--band-units", "sd", "--gpu"]),
+        "--pnl-mask with --band-units sd and --gpu",
+    );
+    usage_error(&run(&data, &spec, &["--fitness", "pnl", "--pnl-mask", "0 - g", "--position", "top_tercile"]), "top_tercile");
+}
+
+#[test]
+fn a_masked_search_reports_the_mask_and_is_thread_independent() {
+    let (_scratch, dir) = scratch();
+    let data = write_gate_csv(&dir);
+    let spec = write_spec(&dir);
+    let args = ["--fitness", "pnl", "--pnl-mask", "g", "--pnl-mask-band", "0.5", "--pnl-mask-dwell", "5"];
+    let one = json(&run(&data, &spec, &[&args[..], &["--threads", "1"]].concat()));
+    let four = json(&run(&data, &spec, &[&args[..], &["--threads", "4"]].concat()));
+    assert_eq!(members(&one), members(&four));
+    let sf = at(&one, &["search_fitness"]);
+    assert_eq!(at(sf, &["mask", "expr"]).as_str(), Some("g"));
+    assert_eq!(num(sf, &["mask", "band"]), 0.5);
+    assert_eq!(num(sf, &["mask", "dwell"]), 5.0);
+    assert!(num(sf, &["mask", "off_rows"]) > 0.0);
+    for slot in ["validation", "test"] {
+        let b = at(&one, &["objective", slot]);
+        let share = num(b, &["mask", "on_share"]);
+        assert!(share > 0.0 && share < 1.0, "{slot} on_share {share}");
+        assert!(num(b, &["mask", "runs"]) >= 1.0);
+        assert!(at(b, &["unmasked_net_pnl"]).as_f64().is_some(), "{slot}");
+    }
+    let plain = json(&run(&data, &spec, &["--fitness", "pnl"]));
+    assert_ne!(
+        at(&one, &["search_fitness"]).get("book_hash"),
+        at(&plain, &["search_fitness"]).get("book_hash")
+    );
+}
+
+#[test]
+fn resume_needs_the_same_mask() {
+    let (_scratch, dir) = scratch();
+    let data = write_gate_csv(&dir);
+    let spec = write_spec(&dir);
+    let cp = dir.join("mask.rcsr").to_string_lossy().into_owned();
+    let saved = ["--fitness", "pnl", "--pnl-mask", "g", "--pnl-mask-band", "0.5", "--pnl-mask-dwell", "5"];
+    let first = run(&data, &spec, &[&saved[..], &["--generations", "10", "--save", &cp]].concat());
+    assert_eq!(code(&first), 0, "{}", stderr(&first));
+    let straight = json(&run(&data, &spec, &[&saved[..], &["--generations", "20"]].concat()));
+    let resumed = json(&run(&data, &spec, &[&saved[..], &["--generations", "20", "--resume", &cp]].concat()));
+    assert_eq!(members(&straight), members(&resumed));
+    let resume = |extra: &[&str]| run(&data, &spec, &[&["--fitness", "pnl", "--generations", "20", "--resume", &cp][..], extra].concat());
+    usage_error(&resume(&["--pnl-mask", "0 - g", "--pnl-mask-band", "0.5", "--pnl-mask-dwell", "5"]), "--pnl-mask");
+    usage_error(&resume(&["--pnl-mask", "g", "--pnl-mask-band", "0.4", "--pnl-mask-dwell", "5"]), "--pnl-mask-band");
+    usage_error(&resume(&["--pnl-mask", "g", "--pnl-mask-band", "0.5", "--pnl-mask-dwell", "6"]), "--pnl-mask-dwell");
+    usage_error(&resume(&[]), "fitness");
+}
+
+/// #1203: the validation and test books (`trading::evaluate`) and the walk-forward test book
+/// apply one missing-score rule; the search fitness book prices no missing score.
+#[test]
+fn missing_score_rule_is_shared_by_search_and_walkforward() {
+    use rcsr::trading::MissingScore;
+    // Two groups; each has a leading, two inner and a trailing stretch with no finite prediction.
+    let s = slice(&[120, 120]);
+    let mut pred = prediction(&s);
+    for (i, p) in pred.iter_mut().enumerate() {
+        let k = i % 120;
+        if k < 3 || (40..47).contains(&k) || k == 60 || k >= 117 {
+            *p = f64::NAN;
+        }
+    }
+    let ppy = rcsr::walkforward::SECONDS_PER_YEAR / 900.0;
+    let mut nets = Vec::new();
+    for rule in [MissingScore::Flat, MissingScore::Hold] {
+        let sp = TradingSpec { cost_bps: 7.5, min_trades: 0, missing_score: rule, ..TradingSpec::default() };
+        let got = trading::evaluate(&pred, &s.ret, &s.rows, &sp).unwrap();
+        let want = rcsr::walkforward::reference_metrics(&s.rows.time, &s.rows.group, &s.ret, &pred, 0.0, 7.5e-4, ppy, rule);
+        assert_eq!(format!("{:?}", got.period), format!("{:?}", want), "{rule:?}");
+        nets.push(got.net_pnl);
+    }
+    assert_ne!(nets[0], nets[1], "the two rules price different books");
+    let book = FitnessBook::new(&s, &spec(), 900.0).unwrap();
+    assert_eq!(book.regret(&pred), f64::INFINITY, "a non-finite prediction is refused by the fitness");
+}
+
+// ---- #1179: the cross-sectional excess (`--pnl-excess xs-mean`) ----
+
+use trading::PnlExcess;
+
+fn xs_spec() -> TradingSpec {
+    TradingSpec { pnl_excess: PnlExcess::XsMean, ..spec() }
+}
+
+/// `groups` symbols on `steps` shared timestamps 900 s apart, in canonical
+/// (group, time) order.
+fn panel(groups: usize, steps: usize, ret: impl Fn(usize, usize) -> f64) -> TradingSlice {
+    let mut rows = TradingRows::default();
+    let mut out = Vec::new();
+    for g in 0..groups {
+        for t in 0..steps {
+            rows.group.push(g as u64);
+            rows.time.push(1.6e9 + 900.0 * t as f64);
+            out.push(ret(g, t));
+        }
+    }
+    TradingSlice { rows, ret: out }
+}
+
+/// The mean of the finite returns of the rows `admit` takes at each row's
+/// timestamp, by a scan over every row.
+fn hand_means(s: &TradingSlice, admit: impl Fn(usize) -> bool) -> Vec<f64> {
+    let n = s.ret.len();
+    (0..n)
+        .map(|i| {
+            let (mut sum, mut count) = (0.0, 0usize);
+            for j in 0..n {
+                if s.rows.time[j] == s.rows.time[i] && s.ret[j].is_finite() && admit(j) {
+                    sum += s.ret[j];
+                    count += 1;
+                }
+            }
+            if count == 0 { f64::NAN } else { sum / count as f64 }
+        })
+        .collect()
+}
+
+const DYADIC: f64 = 1.0 / 1024.0;
+
+/// A rising market path; every value is a multiple of 2^-12, so sums and means
+/// over four symbols are exact.
+fn common(t: usize) -> f64 {
+    ((t * 7) % 11) as f64 * DYADIC / 4.0
+}
+
+/// Four symbols' dispersion around their timestamp mean, multiples of 2^-12.
+fn spread(g: usize, t: usize) -> f64 {
+    let base = |g: usize| ((g * 5 + t * 3 + (g * t) % 4) % 9) as f64;
+    let mean = (0..4).map(base).sum::<f64>() / 4.0;
+    (base(g) - mean) * DYADIC
+}
+
+#[test]
+fn xs_mean_removes_common_drift() {
+    // The same return path for every symbol leaves no relative return: no
+    // profitable path, exit 2 at the CLI.
+    let same = panel(4, 64, |_, t| common(t));
+    assert!(FitnessBook::new(&same, &xs_spec(), 900.0).unwrap_err().contains("no profitable"));
+    // The common path over a dispersion is the book of the dispersion alone, bit for bit.
+    let drift = panel(4, 64, |g, t| common(t) + spread(g, t));
+    let book = FitnessBook::new(&drift, &xs_spec(), 900.0).unwrap();
+    let alone = FitnessBook::new(&panel(4, 64, spread), &xs_spec(), 900.0).unwrap();
+    let bits = |b: &FitnessBook| b.excess().iter().map(|e| e.to_bits()).collect::<Vec<_>>();
+    assert_eq!(bits(&book), bits(&alone));
+    assert_eq!(book.bound().to_bits(), alone.bound().to_bits());
+    assert_eq!(book.hash(), alone.hash());
+    let n = drift.ret.len();
+    assert_eq!(book.regret(&vec![-1.0; n]).to_bits(), 1.0f64.to_bits(), "all-flat is exactly 1");
+    // A market-timing rule holds every symbol or none at a timestamp: its gross
+    // is exactly 0, so no such tree scores below 1.
+    for seed in 0..32usize {
+        let pred: Vec<f64> = (0..n).map(|i| if ((i % 64) * 13 + seed * 7) % 5 < 2 + seed % 3 { 1.0 } else { -1.0 }).collect();
+        assert_eq!(book.totals(&pred).gross, 0.0, "seed {seed}");
+        assert!(book.regret(&pred) >= 1.0, "seed {seed}: {}", book.regret(&pred));
+    }
+    // Without the flag the always-long book earns the drift; with it, it pays its costs.
+    let long = vec![1.0; n];
+    assert!(FitnessBook::new(&drift, &spec(), 900.0).unwrap().regret(&long) < 1.0);
+    assert!(book.regret(&long) > 1.0);
+    assert_ne!(book.hash(), FitnessBook::new(&drift, &spec(), 900.0).unwrap().hash());
+}
+
+#[test]
+fn xs_mean_rewards_relative_edge() {
+    // Symbol 0 beats the cross-section by `a` on every row of a rising market.
+    let a = 2.0 * DYADIC;
+    let s = panel(4, 48, |g, t| common(t) + if g == 0 { a } else { 0.0 });
+    let book = FitnessBook::new(&s, &xs_spec(), 900.0).unwrap();
+    let side = spec().per_side_bps() * 1e-4;
+    for (i, &e) in book.excess().iter().enumerate() {
+        assert_eq!(e, if i < 48 { 0.75 * a } else { -0.25 * a }, "row {i}");
+    }
+    // The bound holds symbol 0 on all 48 rows and every other symbol flat.
+    let bound = 36.0 * a - 2.0 * side;
+    assert!((book.bound() - bound).abs() <= 1e-12, "bound {} vs {bound}", book.bound());
+    let n = s.ret.len();
+    let rule = |steps: usize| -> Vec<f64> { (0..n).map(|i| if i < steps { 1.0 } else { -1.0 }).collect() };
+    let full = book.regret(&rule(48));
+    assert!(full.abs() <= 1e-12, "long symbol 0 throughout reaches the bound: {full}");
+    let half = book.regret(&rule(24));
+    let hand = 18.0 * a / bound;
+    assert!(half < 1.0 && (half - hand).abs() <= 1e-12, "long symbol 0 for 24 rows: {half} vs {hand}");
+    let long = book.regret(&vec![1.0; n]);
+    assert!((long - (1.0 + 8.0 * side / bound)).abs() <= 1e-12, "long every symbol: {long}");
+}
+
+#[test]
+fn xs_mean_bound_matches_brute_force() {
+    // Rows (group, time): (0, t0), (0, t1), (1, t0), (1, t1).
+    let base = TradingSlice {
+        rows: TradingRows { time: vec![1.6e9, 1.6e9 + 900.0, 1.6e9, 1.6e9 + 900.0], group: vec![0, 0, 1, 1], funding: Vec::new() },
+        ret: vec![0.010, -0.004, -0.002, 0.006],
+    };
+    let mut funded = base.clone();
+    funded.rows.funding = vec![0.0001, 0.0002, 0.0003, 0.0004];
+    let side = spec().per_side_bps() * 1e-4;
+    for s in [&base, &funded] {
+        let f = |i: usize| if s.rows.funding.is_empty() { 0.0 } else { s.rows.funding[i] };
+        let m = [(s.ret[0] + s.ret[2]) / 2.0, (s.ret[1] + s.ret[3]) / 2.0];
+        let e: Vec<f64> = (0..4).map(|i| (s.ret[i] - m[i % 2]) - f(i)).collect();
+        // The best net over all 16 paths; each run starts flat and pays its exit.
+        let best = |runs: &[&[usize]]| -> f64 {
+            (0..16u32)
+                .map(|bits| {
+                    let p = |i: usize| ((bits >> i) & 1) as f64;
+                    runs.iter()
+                        .map(|run| {
+                            let (mut prev, mut net) = (0.0, 0.0);
+                            for &i in run.iter() {
+                                net += p(i) * e[i] - side * (p(i) - prev).abs();
+                                prev = p(i);
+                            }
+                            net - side * prev
+                        })
+                        .sum::<f64>()
+                })
+                .fold(f64::NEG_INFINITY, f64::max)
+        };
+        let want = best(&[&[0, 1], &[2, 3]]);
+        assert!(want > 0.0);
+        let book = FitnessBook::new(s, &xs_spec(), 900.0).unwrap();
+        assert!((book.bound() - want).abs() <= 1e-15, "bound {} vs brute force {want}", book.bound());
+        let blocked = FitnessBook::with_blocks(s, &xs_spec(), 900.0, 2, 1.0).unwrap();
+        let want_blocks = [best(&[&[0], &[2]]), best(&[&[1], &[3]])];
+        assert_eq!(blocked.block_bounds().len(), 2);
+        for (b, w) in want_blocks.iter().enumerate() {
+            assert!((blocked.block_bounds()[b] - w).abs() <= 1e-15, "block {b}: {} vs {w}", blocked.block_bounds()[b]);
+        }
+    }
+}
+
+/// The search books keep the absolute net; `xs_excess_net` is the net of the same
+/// book on the returns minus their timestamp mean, under both missing-score rules
+/// and with interval segments, and it equals the fitness net on training rows.
+#[test]
+fn xs_excess_net_is_the_net_over_the_timestamp_mean() {
+    use rcsr::trading::MissingScore;
+    let mut s = slice(&[150, 150, 120, 1]);
+    s.rows.funding = (0..s.ret.len()).map(|i| 0.0001 * frac(i as f64 * 0.31)).collect();
+    for i in [5, 151, 152, 400] {
+        s.ret[i] = f64::NAN;
+    }
+    let mut pred = prediction(&s);
+    for i in [7, 8, 9, 200, 301] {
+        pred[i] = f64::NAN;
+    }
+    let m = hand_means(&s, |_| true);
+    let demeaned: Vec<f64> = s.ret.iter().zip(&m).map(|(r, m)| r - m).collect();
+    let starts = [1.6e9 + 900.0 * 60.0, 1.6e9 + 900.0 * 100.0];
+    for rule in [MissingScore::Flat, MissingScore::Hold] {
+        for segments in [&[][..], &starts[..]] {
+            let sp = TradingSpec { missing_score: rule, segment_starts: segments.to_vec(), ..spec() };
+            let plain = trading::evaluate(&pred, &s.ret, &s.rows, &sp).unwrap();
+            let xs = trading::evaluate(&pred, &s.ret, &s.rows, &TradingSpec { pnl_excess: PnlExcess::XsMean, ..sp.clone() }).unwrap();
+            assert_eq!(plain.xs_excess_net, None);
+            assert_eq!(xs.net_pnl.to_bits(), plain.net_pnl.to_bits(), "{rule:?}: the reported net stays absolute");
+            assert_eq!(xs.json().replace(&format!(",\"xs_excess_net\":{}", rcsr::devlog::num(xs.xs_excess_net.unwrap())), ""), plain.json());
+            let want = trading::evaluate(&pred, &demeaned, &s.rows, &sp).unwrap().net_pnl;
+            let got = xs.xs_excess_net.unwrap();
+            assert!((got - want).abs() <= 1e-12, "{rule:?} {segments:?}: {got} vs {want}");
+            assert!((got - xs.net_pnl).abs() > 1e-6, "{rule:?}: the timestamp mean moves the net");
+        }
+    }
+    let t = slice(&[150, 150, 120, 1]);
+    let pred = prediction(&t);
+    for segments in [&[][..], &starts[..]] {
+        let book = FitnessBook::with_segments(&t, &xs_spec(), 900.0, 1, 1.0, segments, None).unwrap();
+        let stats = trading::evaluate(&pred, &t.ret, &t.rows, &TradingSpec { segment_starts: segments.to_vec(), ..xs_spec() }).unwrap();
+        let net = book.net_of(&book.totals(&pred));
+        assert!((net - stats.xs_excess_net.unwrap()).abs() <= 1e-12, "{segments:?}: fitness net {net} vs {:?}", stats.xs_excess_net);
+    }
+}
+
+#[test]
+fn xs_mean_composes_with_the_mask_and_interval_segments() {
+    let s = slice(&[300, 280, 260]);
+    let pred = prediction(&s);
+    let n = s.ret.len();
+    let plain = FitnessBook::new(&s, &xs_spec(), 900.0).unwrap();
+    let all_on = masked(&s, &xs_spec(), 1, &vec![true; n]).unwrap();
+    assert_eq!(plain.hash(), all_on.hash());
+    assert_eq!(plain.regret(&pred).to_bits(), all_on.regret(&pred).to_bits());
+    // Under a mask the timestamp mean reads the rows with the gate on; rows outside earn nothing.
+    let on: Vec<bool> = (0..n).map(|i| (i / 37 + s.rows.group[i] as usize) % 3 != 0).collect();
+    let book = masked(&s, &xs_spec(), 1, &on).unwrap();
+    let m = hand_means(&s, |j| on[j]);
+    for i in 0..n {
+        let want = if on[i] { s.ret[i] - m[i] } else { 0.0 };
+        assert!((book.excess()[i] - want).abs() <= 1e-15, "row {i}: {} vs {want}", book.excess()[i]);
+    }
+    assert_ne!(book.hash(), masked(&s, &spec(), 1, &on).unwrap().hash());
+    // Interval segments cut by time, so the timestamp means stay and the bound
+    // and the net are the sums over the separately built segments.
+    let cut = 1.6e9 + 900.0 * 140.0;
+    let seg = FitnessBook::with_segments(&s, &xs_spec(), 900.0, 1, 1.0, &[1.6e9, cut], None).unwrap();
+    let (mut bound, mut net) = (0.0, 0.0);
+    for before in [true, false] {
+        let keep: Vec<usize> = (0..n).filter(|&i| (s.rows.time[i] < cut) == before).collect();
+        let part = TradingSlice {
+            rows: TradingRows {
+                time: keep.iter().map(|&i| s.rows.time[i]).collect(),
+                group: keep.iter().map(|&i| s.rows.group[i]).collect(),
+                funding: Vec::new(),
+            },
+            ret: keep.iter().map(|&i| s.ret[i]).collect(),
+        };
+        let b = FitnessBook::new(&part, &xs_spec(), 900.0).unwrap();
+        let p: Vec<f64> = keep.iter().map(|&i| pred[i]).collect();
+        bound += b.bound();
+        net += b.net_of(&b.totals(&p));
+    }
+    assert!((seg.bound() - bound).abs() <= 1e-12, "bound {} vs {bound}", seg.bound());
+    assert!((seg.net_of(&seg.totals(&pred)) - net).abs() <= 1e-12);
+}
+
+// -- CLI --
+
+const PANEL_SYMBOLS: usize = 4;
+const PANEL_STEPS: usize = 400;
+
+/// Four symbols on 400 shared timestamps, rows in time order. `r = c_t + 0.01 x1
+/// + noise`: `c_t` is a market path that rises, then falls; `x2` is a market
+/// feature (`c_t` scaled, the same for every symbol at a timestamp); `x1` is a
+/// symbol feature.
+fn write_panel_csv(dir: &std::path::Path) -> String {
+    let mut text = String::from("t,sym,x1,x2,r,y\n");
+    for t in 0..PANEL_STEPS {
+        let c = if t < PANEL_STEPS / 2 { 0.003 } else { -0.003 } * (0.5 + frac(t as f64 * 0.414_213_562_373_095));
+        for k in 0..PANEL_SYMBOLS {
+            let f = (t * PANEL_SYMBOLS + k) as f64;
+            let x1 = frac(f * 0.618_033_988_749_894_9) - 0.5;
+            let noise = frac(f * 0.324_717_957_244_746) - 0.5;
+            let r = c + 0.01 * x1 + 0.0005 * noise;
+            text.push_str(&format!("{},S{},{},{},{},{}\n", T0 + 900 * t as i64, k, x1, c / 0.003, r, r));
+        }
+    }
+    let path = dir.join("panel.csv");
+    std::fs::write(&path, text).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+/// The spec of `write_spec` with the entry at the label time, so the test block
+/// starts at the split.
+fn write_panel_spec(dir: &std::path::Path) -> String {
+    let text = std::fs::read_to_string(write_spec(dir)).unwrap().replace("\"entry_offset_seconds\":900", "\"entry_offset_seconds\":0");
+    let path = dir.join("panel-spec.json");
+    std::fs::write(&path, text).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+fn run_panel(data: &str, spec: &str, extra: &[&str]) -> Output {
+    run(data, spec, &[&["--group-by", "sym"][..], extra].concat())
+}
+
+#[test]
+fn xs_mean_reports_absolute_net() {
+    let (_scratch, dir) = scratch();
+    let data = write_panel_csv(&dir);
+    let spec = write_panel_spec(&dir);
+    let out = run_panel(&data, &spec, &["--fitness", "pnl", "--pnl-excess", "xs-mean"]);
+    let j = json(&out);
+    assert_eq!(at(&j, &["search_fitness", "excess"]).as_str(), Some("xs_mean"));
+    assert_eq!(at(&j, &["objective", "spec", "pnl_excess"]).as_str(), Some("xs_mean"));
+    for slot in ["validation", "test"] {
+        let b = at(&j, &["objective", slot]);
+        let (net, xs) = (num(b, &["net_pnl"]), num(b, &["xs_excess_net"]));
+        assert!(net.is_finite() && xs.is_finite() && net != xs, "{slot}: net {net} xs {xs}");
+    }
+    let run_path = dir.join("run.json");
+    std::fs::write(&run_path, &out.stdout).unwrap();
+    let run = run_path.to_string_lossy().into_owned();
+    let step = |k: usize| (T0 + 900 * k as i64).to_string();
+    let w = format!("v,{},{},{},{}", step(0), step(299), step(300), step(PANEL_STEPS));
+    let wf_path = dir.join("wf.json").to_string_lossy().into_owned();
+    let wf = rcsr_cmd::rcsr()
+        .args(["walkforward", "--data", &data, "--time", "t", "--group-by", "sym", "--from-run", &run, "--window", &w, "--out", &wf_path])
+        .output()
+        .unwrap();
+    assert_eq!(code(&wf), 0, "{}", stderr(&wf));
+    let wf_json = Json::parse(std::fs::read_to_string(&wf_path).unwrap().trim()).unwrap();
+    let m = match at(&wf_json, &["windows"]) {
+        Json::Arr(a) => at(&a[0], &["metrics"]).clone(),
+        _ => panic!("windows is not an array"),
+    };
+    let test = at(&j, &["objective", "test"]);
+    for key in ["rows", "trades", "entries", "total_cost", "exposure"] {
+        assert!((num(&m, &[key]) - num(test, &[key])).abs() <= 1e-12, "{key}: walkforward {} objective {}", num(&m, &[key]), num(test, &[key]));
+    }
+    let wf_net = num(&m, &["mean_return"]) * num(&m, &["periods"]) * PANEL_SYMBOLS as f64;
+    assert!((wf_net - num(test, &["net_pnl"])).abs() <= 1e-12, "walkforward net {wf_net} objective {}", num(test, &["net_pnl"]));
+}
+
+#[test]
+fn explicit_none_is_the_default_run() {
+    let (_scratch, dir) = scratch();
+    let data = write_panel_csv(&dir);
+    let spec = write_panel_spec(&dir);
+    let plain = run_panel(&data, &spec, &["--fitness", "pnl"]);
+    let none = run_panel(&data, &spec, &["--fitness", "pnl", "--pnl-excess", "none"]);
+    let (a, b) = (json(&plain), json(&none));
+    assert_eq!(members(&a), members(&b));
+    assert_eq!(at(&a, &["search_fitness"]).get("book_hash"), at(&b, &["search_fitness"]).get("book_hash"));
+    assert_eq!(without_digits(&plain), without_digits(&none));
+    assert!(at(&b, &["search_fitness"]).get("excess").is_none());
+    assert!(at(&b, &["objective", "spec"]).get("pnl_excess").is_none());
+    assert!(at(&b, &["objective", "test"]).get("xs_excess_net").is_none());
+    let (la, lb) = (dir.join("plain.jsonl"), dir.join("none.jsonl"));
+    let logged = |log: &std::path::Path, extra: &[&str]| run_logged(&data, &spec, log, &[&["--group-by", "sym"][..], extra].concat());
+    assert_eq!(code(&logged(&la, &["--fitness", "pnl"])), 0);
+    assert_eq!(code(&logged(&lb, &["--fitness", "pnl", "--pnl-excess", "none"])), 0);
+    assert_eq!(archive_hash(&la), archive_hash(&lb));
+    let xs = json(&run_panel(&data, &spec, &["--fitness", "pnl", "--pnl-excess", "xs-mean"]));
+    assert_ne!(at(&a, &["search_fitness"]).get("book_hash"), at(&xs, &["search_fitness"]).get("book_hash"));
+}
+
+#[test]
+fn xs_mean_flags_name_their_reason() {
+    let (_scratch, dir) = scratch();
+    let data = write_panel_csv(&dir);
+    let spec = write_panel_spec(&dir);
+    usage_error(&run_panel(&data, &spec, &["--pnl-excess", "xs-mean"]), "--pnl-excess needs --fitness pnl");
+    usage_error(&run_panel(&data, &spec, &["--fitness", "pnl", "--pnl-excess", "beta"]), "--pnl-excess must be none or xs-mean");
+    usage_error(
+        &run_panel(&data, &spec, &["--fitness", "pnl", "--pnl-excess", "xs-mean", "--cash-return", "0.0001"]),
+        "--pnl-excess xs-mean needs --cash-return 0",
+    );
+    // One symbol: every timestamp has one row, so no row has a relative return.
+    let single = write_csv(&dir, 900);
+    usage_error(&run(&single, &write_spec(&dir), &["--fitness", "pnl", "--pnl-excess", "xs-mean"]), "no profitable long/flat path");
+}
+
+/// #1232: `rcsr switch` and `rcsr compose` take the fitness flags; without
+/// their inputs they exit 2 for the missing input, not for the flag.
+#[test]
+fn compose_and_switch_accept_pnl_excess() {
+    for (sub, missing) in [("switch", "--a <expr|flat> is required"), ("compose", "--gates <menu.json> is required")] {
+        for flags in [&["--pnl-excess", "xs-mean"][..], &["--pnl-stat", "mean-semi"], &["--pnl-stat", "cvar", "--pnl-cvar-q", "0.5"]] {
+            let o = rcsr_cmd::rcsr().arg(sub).args(flags).output().unwrap();
+            usage_error(&o, missing);
+            assert!(!stderr(&o).contains(&format!("{}:", flags[0])), "{sub} {flags:?}: {}", stderr(&o));
+        }
+    }
+}
+
+#[test]
+fn resume_needs_the_same_excess() {
+    let (_scratch, dir) = scratch();
+    let data = write_panel_csv(&dir);
+    let spec = write_panel_spec(&dir);
+    let cp = dir.join("xs.rcsr").to_string_lossy().into_owned();
+    let saved = ["--fitness", "pnl", "--pnl-excess", "xs-mean"];
+    let first = run_panel(&data, &spec, &[&saved[..], &["--generations", "10", "--save", &cp]].concat());
+    assert_eq!(code(&first), 0, "{}", stderr(&first));
+    let straight = json(&run_panel(&data, &spec, &[&saved[..], &["--generations", "20"]].concat()));
+    let resumed = json(&run_panel(&data, &spec, &[&saved[..], &["--generations", "20", "--resume", &cp]].concat()));
+    assert_eq!(members(&straight), members(&resumed));
+    let resume = |extra: &[&str]| run_panel(&data, &spec, &[&["--fitness", "pnl", "--generations", "20", "--resume", &cp][..], extra].concat());
+    usage_error(&resume(&[]), "fitness");
+    usage_error(&resume(&["--pnl-excess", "none"]), "--pnl-excess");
+}
+
+/// An interval split (two training segments, a validation and a test interval)
+/// with a regime mask: the xs-mean fitness, the masked books and `xs_excess_net`.
+#[test]
+fn xs_mean_runs_with_a_split_table_and_a_mask() {
+    let (_scratch, dir) = scratch();
+    let data = write_panel_csv(&dir);
+    let spec = write_panel_spec(&dir);
+    let step = |k: i64| T0 + 900 * k;
+    let table = dir.join("splits.csv");
+    std::fs::write(
+        &table,
+        format!(
+            "split_id,role,start,end\na,train,{},{}\na,validation,{},{}\na,train,{},{}\na,test,{},{}\n",
+            step(0),
+            step(150),
+            step(150),
+            step(200),
+            step(200),
+            step(300),
+            step(300),
+            step(400)
+        ),
+    )
+    .unwrap();
+    let table = table.to_string_lossy().into_owned();
+    let out = rcsr_cmd::rcsr()
+        .args([
+            "--data", &data, "--target", "y", "--vars", "x1,x2", "--time", "t", "--group-by", "sym", "--split-table", &table,
+            "--split-id", "a", "--target-spec", &spec, "--cpu", "--no-dev-log", "--seed", "3", "--generations", "10", "--pop",
+            "32", "--metric", "squared", "--json", "--quiet", "--objective", "pnl", "--cost-bps", "5", "--fitness", "pnl",
+            "--pnl-excess", "xs-mean", "--pnl-mask", "x1 + 0.3",
+        ])
+        .output()
+        .unwrap();
+    let j = json(&out);
+    assert_eq!(at(&j, &["split", "mode"]).as_str(), Some("temporal-intervals"));
+    assert_eq!(at(&j, &["search_fitness", "excess"]).as_str(), Some("xs_mean"));
+    assert!(num(&j, &["search_fitness", "mask", "off_rows"]) > 0.0);
+    for slot in ["validation", "test"] {
+        let b = at(&j, &["objective", slot]);
+        assert!(num(b, &["xs_excess_net"]).is_finite(), "{slot}");
+        assert!(num(b, &["mask", "on_share"]) < 1.0, "{slot}");
+    }
+}
+
+// ---- #1246: one masked sd definition ----
+
+const MASKED_SD_ARGS: [&str; 10] = ["--fitness", "pnl", "--pnl-mask", "g", "--band", "0.5", "--band-units", "sd", "--min-holding", "2"];
+
+/// The gate-on training rows of the `g` column of `write_gate_csv`, as `(x1, x2)` and the scores of `exact` on them.
+fn masked_train_scores(j: &Json, data: &str, exact: &str) -> Vec<f64> {
+    let tree = rcsr::parse::parse(exact, &["x1".to_string(), "x2".to_string()]).unwrap();
+    let (lo, hi) = time_range(j, "train_time");
+    let text = std::fs::read_to_string(data).unwrap();
+    text.lines()
+        .skip(1)
+        .map(|l| l.split(',').map(|c| c.parse::<f64>().unwrap()).collect::<Vec<f64>>())
+        .filter(|v| v[0] >= lo && v[0] <= hi && v[5] > 0.0)
+        .map(|v| rcsr::expr::eval(&tree, &[v[1], v[2]]))
+        .collect()
+}
+
+#[test]
+fn masked_sd_run_reports_the_training_band() {
+    let (_scratch, dir) = scratch();
+    let data = write_gate_csv(&dir);
+    let spec = write_spec(&dir);
+    let j = json(&run(&data, &spec, &MASKED_SD_ARGS));
+    let mut seen = 0;
+    for m in pareto(&j) {
+        let v = at(m, &["validation_book"]);
+        let Some(sd) = v.get("band_sd").and_then(Json::as_f64) else { continue };
+        let on = masked_train_scores(&j, &data, at(m, &["expression_exact"]).as_str().unwrap());
+        let want = trading::score_sd(&on).sd.unwrap();
+        assert!(close(sd, want), "{} rows {} sd {sd} want {want}", at(m, &["expression_exact"]).as_str().unwrap(), on.len());
+        assert!(close(num(v, &["band_resolved"]), 0.5 * want));
+        seen += 1;
+    }
+    assert!(seen >= 2, "{seen} members with an sd");
+    let exact = at(&j, &["objective", "finalist", "expression_exact"]).as_str().unwrap();
+    let on = masked_train_scores(&j, &data, exact);
+    let sd = trading::score_sd(&on);
+    assert_eq!(num(&j, &["objective", "spec", "band_sd_rows"]), on.len() as f64);
+    let band = num(&j, &["objective", "spec", "band_resolved"]).to_bits();
+    assert_eq!(num(&j, &["objective", "spec", "band_sd_rows"]), sd.rows as f64);
+    assert!(close(f64::from_bits(band), 0.5 * sd.sd.unwrap()));
+    let member = pareto(&j).iter().find(|m| at(m, &["expression_exact"]).as_str() == Some(exact)).expect("the finalist is on the front");
+    assert_eq!(num(at(member, &["validation_book"]), &["band_resolved"]).to_bits(), band);
+}
+
+#[test]
+fn walkforward_from_masked_sd_run_uses_the_training_band() {
+    let (_scratch, dir) = scratch();
+    let data = write_gate_csv(&dir);
+    let spec = write_spec(&dir);
+    let out = run(&data, &spec, &MASKED_SD_ARGS);
+    let j = json(&out);
+    let run_path = dir.join("run.json").to_string_lossy().into_owned();
+    std::fs::write(&run_path, &out.stdout).unwrap();
+    let (tlo, thi) = time_range(&j, "train_time");
+    let (vlo, vhi) = time_range(&j, "validation_time");
+    let window = format!("v,{tlo},{thi},{vlo},{vhi}");
+    let wf_path = dir.join("wf.json").to_string_lossy().into_owned();
+    let wf = rcsr_cmd::rcsr()
+        .args(["walkforward", "--data", &data, "--time", "t", "--from-run", &run_path, "--window", &window, "--allow-in-sample-windows", "--out", &wf_path])
+        .output()
+        .unwrap();
+    assert_eq!(code(&wf), 0, "{}", stderr(&wf));
+    let report = Json::parse(std::fs::read_to_string(&wf_path).unwrap().trim()).unwrap();
+    let exact = at(&j, &["objective", "finalist", "expression_exact"]).as_str().unwrap();
+    let want = 0.5 * trading::score_sd(&masked_train_scores(&j, &data, exact)).sd.unwrap();
+    let Json::Arr(windows) = at(&report, &["windows"]) else { panic!("windows") };
+    assert_eq!(num(&windows[0], &["band", "band_width"]).to_bits(), num(&j, &["objective", "spec", "band_resolved"]).to_bits());
+    assert!(close(num(&windows[0], &["band", "band_width"]), want));
+}
+
+/// The book hash of a masked sd-unit book on `slice(&[400, 400])` before #1246.
+const MASKED_SD_HASH_BEFORE: u64 = 0xc99ea16df2e72a3a;
+const MASKED_SCORE_HASH: u64 = 0xc4f6750e164e983d;
+const UNMASKED_SD_HASH: u64 = 0xc12c5650f2d4ac73;
+const MASKED_SD_CHECKPOINT_HASH_BEFORE: u64 = 0xe2ff12ae5c721c6d;
+
+#[test]
+fn book_hash_unmasked_sd_unchanged() {
+    let s = slice(&[400, 400]);
+    let book = FitnessBook::new(&s, &band_spec(0.5, trading::BandUnits::Sd, 1), 900.0).unwrap();
+    assert_eq!(book.hash(), UNMASKED_SD_HASH, "{:#x}", book.hash());
+}
+
+#[test]
+fn book_hash_masked_score_unchanged() {
+    let s = slice(&[400, 400]);
+    let on = alternate_mask(&s, 50);
+    let book = masked(&s, &band_spec(0.5, trading::BandUnits::Score, 1), 2, &on).unwrap();
+    assert_eq!(book.hash(), MASKED_SCORE_HASH, "{:#x}", book.hash());
+}
+
+#[test]
+fn masked_sd_book_hash_names_the_masked_definition() {
+    let s = slice(&[400, 400]);
+    let on = alternate_mask(&s, 50);
+    let book = masked(&s, &band_spec(0.5, trading::BandUnits::Sd, 1), 2, &on).unwrap();
+    assert_ne!(book.hash(), MASKED_SD_HASH_BEFORE, "{:#x}", book.hash());
+}
+
+#[test]
+fn masked_sd_checkpoint_from_before_the_fix_refuses_resume() {
+    let (_scratch, dir) = scratch();
+    let data = write_gate_csv(&dir);
+    let spec = write_spec(&dir);
+    let cp = dir.join("masked-sd.rcsr").to_string_lossy().into_owned();
+    let first = run(&data, &spec, &[&MASKED_SD_ARGS[..], &["--generations", "10", "--save", &cp]].concat());
+    assert_eq!(code(&first), 0, "{}", stderr(&first));
+    let hash = saved_book_hash(&cp);
+    assert_ne!(hash, MASKED_SD_CHECKPOINT_HASH_BEFORE, "{hash:#x}");
+    let before = unfnv_u64(hash, 1);
+    assert_eq!(before, MASKED_SD_CHECKPOINT_HASH_BEFORE, "{hash:#x} {before:#x}");
+    let resume = |path: &str| run(&data, &spec, &[&MASKED_SD_ARGS[..], &["--generations", "20", "--resume", path]].concat());
+    let same = resume(&cp);
+    assert_eq!(code(&same), 0, "{}", stderr(&same));
+    let text = std::fs::read_to_string(&cp).unwrap().replace(&format!("long_pnl:{hash:016x}"), &format!("long_pnl:{before:016x}"));
+    let block: String = text.lines().filter(|l| l.starts_with("config ")).map(|l| format!("{l}\n")).collect();
+    let config_hash = format!("config_hash {:016x}", rcsr::checkpoint::hash_config_text(&block));
+    let old: String = text.lines().map(|l| if l.starts_with("config_hash ") { format!("{config_hash}\n") } else { format!("{l}\n") }).collect();
+    let old_cp = dir.join("before.rcsr");
+    std::fs::write(&old_cp, old).unwrap();
+    usage_error(&resume(&old_cp.to_string_lossy()), "fitness");
+}
+
+#[test]
+fn masked_sd_band_is_one_definition_across_books() {
+    let s = slice(&[400, 400]);
+    let on = alternate_mask(&s, 50);
+    let scores: Vec<f64> = (0..s.ret.len()).map(|i| if on[i] { if i % 2 == 0 { 5.0 } else { -5.0 } } else { 0.0 }).collect();
+    let sp = band_spec(0.5, trading::BandUnits::Sd, 1);
+    let book = masked(&s, &sp, 2, &on).unwrap();
+    let off_bits: Vec<bool> = book.flags().iter().map(|f| f & trading::FITNESS_MASK_OFF != 0).collect();
+    assert_eq!(off_bits, on.iter().map(|o| !o).collect::<Vec<bool>>());
+    let member = BandSpec::from_training_masked(BandUnits::Sd, 0.5, &scores, &s.rows.time, book.flags());
+    let on_scores: Vec<f64> = scores.iter().zip(&on).filter(|(_, &o)| o).map(|(&p, _)| p).collect();
+    let want = trading::score_sd(&on_scores);
+    assert_eq!(member.sd.map(f64::to_bits), want.sd.map(f64::to_bits));
+    assert_eq!(member.sd_rows, Some(on_scores.len()));
+    assert_eq!(book.resolve_band(&scores).to_bits(), member.resolved.to_bits());
+    assert_eq!(member.resolved.to_bits(), (0.5 * want.sd.unwrap()).to_bits());
+    let last_on = (0..on.len()).rev().find(|&i| on[i]).unwrap();
+    assert_eq!(member.sd_max_time, Some(s.rows.time[last_on]));
+    let all = BandSpec::from_training(BandUnits::Sd, 0.5, &scores, &s.rows.time);
+    assert_ne!(all.resolved.to_bits(), member.resolved.to_bits());
+}
+
+#[test]
+fn masked_sd_edge_cases_give_no_band() {
+    let time: Vec<f64> = (0..6).map(|i| i as f64).collect();
+    let band = |scores: &[f64], flags: &[u8]| BandSpec::from_training_masked(BandUnits::Sd, 1.0, scores, &time, flags);
+    let off = trading::FITNESS_MASK_OFF;
+    let all_off = band(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[off; 6]);
+    assert_eq!((all_off.sd, all_off.resolved, all_off.sd_rows, all_off.sd_max_time), (None, 0.0, Some(0), None));
+    let one_on = band(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[off, off, 0, off, off, off]);
+    assert_eq!((one_on.sd, one_on.resolved, one_on.sd_rows), (None, 0.0, Some(1)));
+    let constant = band(&[9.0, 1.0, 4.0, 4.0, 4.0, 2.0], &[off, off, 0, 0, 0, off]);
+    assert_eq!((constant.sd, constant.resolved, constant.sd_rows), (None, 0.0, Some(3)));
+    let score = BandSpec::from_training_masked(BandUnits::Score, 0.3, &[1.0], &time, &[0]);
+    assert_eq!(score, BandSpec::score(0.3));
+}
+
+/// The interpreter and the test recomputation may differ by a rounding in a score.
+fn close(a: f64, b: f64) -> bool {
+    (a - b).abs() <= 1e-12 * a.abs().max(b.abs())
+}
+
+// ---- #1268: the training mask follows rcsr-gate-state/1 ----
+
+use rcsr::regime_gate::{self, Barrier, BarrierKind, GateSpec};
+
+const HOUR: i64 = 3600;
+const DAY: i64 = 86_400;
+const STRIDED_DAYS: usize = 160;
+const STRIDED_ARGS: [&str; 10] = ["--group-by", "s", "--fill", "drop", "--fitness", "pnl", "--pnl-mask", "g", "--pnl-mask-dwell", "168"];
+
+/// A gate that changes sign every 10 days, a day later for symbol b.
+fn ten_day_gate(h: i64, j: usize) -> f64 {
+    if ((h + 24 * j as i64) / 240) % 2 == 0 { 1.0 } else { -1.0 }
+}
+
+/// A gate that changes sign every 3 days, a day later for symbol b.
+fn three_day_gate(h: i64, j: usize) -> f64 {
+    if ((h + 24 * j as i64) / 72) % 2 == 0 { 1.0 } else { -1.0 }
+}
+
+/// Hourly rows of symbols a and b over `days` days with the gate `g = gate(hour, symbol)`. The label
+/// `y` and the return `r` are finite at hour 0 of each day only (a stride-24 label), so `--fill drop`
+/// keeps one row per symbol and day.
+fn strided_text(days: usize, gate: fn(i64, usize) -> f64) -> String {
+    strided_text_every(days, gate, 24)
+}
+
+/// [`strided_text`] with the label and the return finite at every `stride`-th hour.
+fn strided_text_every(days: usize, gate: fn(i64, usize) -> f64, stride: i64) -> String {
+    let mut text = String::from("t,s,x1,x2,g,r,y\n");
+    for h in 0..(days * 24) as i64 {
+        for (j, sym) in ["a", "b"].iter().enumerate() {
+            let f = (2 * h + j as i64) as f64;
+            let x1 = frac(f * 0.618_033_988_749_894_9) - 0.5;
+            let x2 = frac(f * 0.754_877_666_246_692_7) - 0.5;
+            let noise = frac(f * 0.324_717_957_244_746) - 0.5;
+            let r = 0.01 * x1 + 0.0005 * noise;
+            let (r, y) = if h % stride == 0 { (r.to_string(), (r + 0.05 * x2).to_string()) } else { (String::new(), String::new()) };
+            text.push_str(&format!("{},{},{},{},{},{},{}\n", T0 + HOUR * h, sym, x1, x2, gate(h, j), r, y));
+        }
+    }
+    text
+}
+
+fn write_strided_csv(dir: &std::path::Path, gate: fn(i64, usize) -> f64) -> String {
+    let path = dir.join("strided.csv");
+    std::fs::write(&path, strided_text(STRIDED_DAYS, gate)).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+/// A one-day forward-return label on `y` with return column `r`.
+fn write_daily_spec(dir: &std::path::Path) -> String {
+    write_horizon_spec(dir, DAY)
+}
+
+/// A forward-return label on `y` with return column `r` and a horizon of `seconds`.
+fn write_horizon_spec(dir: &std::path::Path, seconds: i64) -> String {
+    let text = format!(
+        "{{\"schema\":\"rcsr-target-spec/1\",\"targets\":[{{\"column\":\"y\",\"name\":\"raw_target\",\
+         \"kind\":\"forward_return\",\"deprecated\":false,\"return_column\":\"r\",\"return_units\":\"log\",\
+         \"horizon_seconds\":{seconds},\"entry_offset_seconds\":0,\"delay_seconds\":0,\
+         \"entry_price\":\"open\",\"exit_price\":\"close\",\"offset\":0.0,\
+         \"scale\":{{\"kind\":\"constant\",\"value\":1.0}},\"clip\":null,\"units\":\"log_return\",\
+         \"cost_bps\":null,\"cost_in_label\":false,\"construction_columns\":[],\"note\":null}}]}}"
+    );
+    let path = dir.join(format!("h{seconds}.json"));
+    std::fs::write(&path, text).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+/// The strided fixture prepared like a `--fitness pnl` run with `--fill drop` and a temporal split.
+fn strided_prepared(text: &str, gate: &GateSpec) -> (rcsr::data::Table, rcsr::data::Prepared) {
+    use rcsr::data::{FillMethod, PrepSpec, SplitMode, SplitSpec, TradingColumns};
+    let table = rcsr::data::parse_table(text).unwrap();
+    let cols = TradingColumns { return_column: Some("r".to_string()), log_returns: true, train: true, mask: Some(gate.clone()), ..Default::default() };
+    let spec = SplitSpec {
+        mode: SplitMode::Temporal,
+        time_col: Some(0),
+        group_col: Some(1),
+        test_frac: 0.25,
+        validation_frac: 0.25,
+        trading: Some(cols),
+        canonical_train_order: true,
+        ..SplitSpec::default()
+    };
+    let prep = PrepSpec { fill: FillMethod::Drop, ..PrepSpec::default() };
+    let vars = ["x1".to_string(), "x2".to_string()];
+    let p = rcsr::data::prepare_full_with(&table, &vars, "y", &spec, &mut rcsr::rng::Mt::new(1), &prep).unwrap();
+    (table, p)
+}
+
+/// The file row of every slice row, matched on group and time.
+fn file_rows(table: &rcsr::data::Table, rows: &TradingRows) -> Vec<usize> {
+    let time = rcsr::data::time_keys(table, 0).to_f64();
+    let group = rcsr::data::group_ids(table, 1).0;
+    let row_at: std::collections::HashMap<(u64, u64), usize> = (0..time.len()).map(|r| ((group[r] as u64, time[r].to_bits()), r)).collect();
+    (0..rows.time.len()).map(|i| row_at[&(rows.group[i], rows.time[i].to_bits())]).collect()
+}
+
+/// The `rcsr-gate-state/1` states of `gate` on `rows`: the kernel over every row of the file, not
+/// reading rows from `barrier_from` on (the selection barrier of a temporal split).
+fn evaluation_states(table: &rcsr::data::Table, gate: &GateSpec, barrier_from: Option<f64>, rows: &TradingRows) -> Vec<bool> {
+    let time = rcsr::data::time_keys(table, 0).to_f64();
+    let group: Vec<u64> = rcsr::data::group_ids(table, 1).0.into_iter().map(|g| g as u64).collect();
+    let g = table.col(table.index_of("g").unwrap()).to_vec();
+    let barriers: Vec<Barrier> = barrier_from.map(|start| Barrier { start, end: f64::INFINITY, kind: BarrierKind::Test }).into_iter().collect();
+    regime_gate::prefix_states(gate, &group, &time, &[g], &barriers, &file_rows(table, rows)).unwrap()
+}
+
+/// The kernel over the slice rows alone, per group: the training rule before #1268.
+fn slice_kernel_states(table: &rcsr::data::Table, gate: &GateSpec, rows: &TradingRows) -> Vec<bool> {
+    let g = table.col(table.index_of("g").unwrap());
+    let values: Vec<f64> = file_rows(table, rows).into_iter().map(|r| g[r]).collect();
+    regime_gate::gate_states(gate, &rows.group, &rows.time, &[values]).unwrap()
+}
+
+/// `search_fitness.mask.off_rows`; the block is absent when every training row is on.
+fn off_rows(run: &Json) -> f64 {
+    at(run, &["search_fitness"]).get("mask").map_or(0.0, |m| num(m, &["off_rows"]))
+}
+
+/// `(group, time)` of the first row of every maximal on-run of a group.
+fn on_run_starts(rows: &TradingRows, on: &[bool]) -> Vec<(u64, f64)> {
+    (0..on.len()).filter(|&i| on[i] && (i == 0 || rows.group[i] != rows.group[i - 1] || !on[i - 1])).map(|i| (rows.group[i], rows.time[i])).collect()
+}
+
+#[test]
+fn training_mask_equals_the_evaluation_states_on_a_strided_label() {
+    let gate = GateSpec::parse("g", 0.0, 168).unwrap();
+    let (table, p) = strided_prepared(&strided_text(STRIDED_DAYS, ten_day_gate), &gate);
+    let split = p.trading.as_ref().expect("trading split");
+    let masks = split.masks.as_ref().expect("masks");
+    let rows = &split.train.as_ref().expect("training rows").rows;
+    assert!(rows.time.windows(2).zip(rows.group.windows(2)).all(|(t, g)| g[0] != g[1] || t[1] - t[0] == DAY as f64), "one training row per symbol and day");
+    let test_start = split.test.rows.time.iter().copied().fold(f64::INFINITY, f64::min);
+    let want = evaluation_states(&table, &gate, Some(test_start), rows);
+    assert!(want.iter().any(|&o| o) && want.iter().any(|&o| !o));
+    assert_ne!(slice_kernel_states(&table, &gate, rows), want, "the fixture separates the row sets: 168 training rows are 168 days");
+    assert_eq!(masks.train.as_deref(), Some(&want[..]), "training rows");
+    let validation = &split.validation.as_ref().expect("validation rows").rows;
+    assert_eq!(masks.validation.as_deref(), Some(&evaluation_states(&table, &gate, Some(test_start), validation)[..]), "validation rows");
+    assert_eq!(masks.test, evaluation_states(&table, &gate, None, &split.test.rows), "test rows");
+}
+
+#[test]
+fn training_on_runs_match_the_evaluation_rule() {
+    let gate = GateSpec::parse("g", 0.0, 168).unwrap();
+    let (table, p) = strided_prepared(&strided_text(STRIDED_DAYS, three_day_gate), &gate);
+    let split = p.trading.as_ref().expect("trading split");
+    let rows = &split.train.as_ref().expect("training rows").rows;
+    let test_start = split.test.rows.time.iter().copied().fold(f64::INFINITY, f64::min);
+    let want = on_run_starts(rows, &evaluation_states(&table, &gate, Some(test_start), rows));
+    for g in 0..2u64 {
+        assert!(want.iter().filter(|s| s.0 == g).count() >= 2, "group {g}: {want:?}");
+    }
+    assert_ne!(on_run_starts(rows, &slice_kernel_states(&table, &gate, rows)), want, "the fixture separates the row sets");
+    let train = split.masks.as_ref().and_then(|m| m.train.as_deref()).expect("training mask");
+    assert_eq!(on_run_starts(rows, train), want);
+}
+
+/// Every row of the strided CSV as `(time, symbol, labelled, state)`: the state from the kernel over
+/// every row of the file per symbol (no barrier lies before the test block).
+fn strided_row_states(path: &str, dwell: usize) -> Vec<(f64, u64, bool, bool)> {
+    let text = std::fs::read_to_string(path).unwrap();
+    let rows: Vec<Vec<&str>> = text.lines().skip(1).map(|l| l.split(',').collect()).collect();
+    let group: Vec<u64> = rows.iter().map(|r| u64::from(r[1] == "b")).collect();
+    let gate: Vec<f64> = rows.iter().map(|r| r[4].parse().unwrap()).collect();
+    let states = regime_gate::hysteresis_states(&gate, &group, 0.0, dwell);
+    rows.iter().zip(&group).zip(&states).map(|((r, &g), &s)| (r[0].parse().unwrap(), g, !r[6].is_empty(), s)).collect()
+}
+
+#[test]
+fn strided_training_states_agree_with_validation_and_walkforward() {
+    let (_scratch, dir) = scratch();
+    let data = write_strided_csv(&dir, three_day_gate);
+    let spec = write_daily_spec(&dir);
+    let out = run(&data, &spec, &STRIDED_ARGS);
+    let j = json(&out);
+    let run_path = dir.join("strided.run.json").to_string_lossy().into_owned();
+    std::fs::write(&run_path, &out.stdout).unwrap();
+    let rows = strided_row_states(&data, 168);
+    let labelled = |lo: f64, hi: f64| -> Vec<(f64, u64, bool, bool)> { rows.iter().copied().filter(|r| r.2 && r.0 >= lo && r.0 <= hi).collect() };
+    let (tlo, thi) = time_range(&j, "train_time");
+    let train = labelled(tlo, thi);
+    assert_eq!(train.len() as f64, num(&j, &["train_rows"]));
+    let off = train.iter().filter(|r| !r.3).count();
+    assert!(off > 0 && off < train.len(), "{off} of {}", train.len());
+    assert_eq!(off_rows(&j), off as f64, "training off rows");
+    let (vlo, vhi) = time_range(&j, "validation_time");
+    let validation = labelled(vlo, vhi);
+    let on = validation.iter().filter(|r| r.3).count();
+    let vm = at(&j, &["objective", "validation", "mask"]);
+    assert!((num(vm, &["on_share"]) - on as f64 / validation.len() as f64).abs() <= 1e-12, "validation on share");
+    let runs: usize = (0..2u64)
+        .map(|g| {
+            let on: Vec<bool> = validation.iter().filter(|r| r.1 == g).map(|r| r.3).collect();
+            (0..on.len()).filter(|&i| on[i] && (i == 0 || !on[i - 1])).count()
+        })
+        .sum();
+    assert_eq!(num(vm, &["runs"]), runs as f64, "validation on-runs");
+    // An in-sample walk-forward window over the second half of the training days prices the rows the
+    // training mask holds on.
+    let mid = tlo + (DAY * ((thi - tlo) as i64 / DAY / 2)) as f64;
+    let window = format!("w,{},{},{},{}", tlo, mid - (2 * DAY) as f64, mid, thi + 1.0);
+    let wf = rcsr_cmd::rcsr()
+        .args(["walkforward", "--data", &data, "--time", "t", "--group-by", "s", "--from-run", &run_path, "--window", &window, "--allow-in-sample-windows", "--json"])
+        .output()
+        .unwrap();
+    let report = json(&wf);
+    let Json::Arr(windows) = at(&report, &["windows"]) else { panic!("windows") };
+    let priced = labelled(mid, thi).iter().filter(|r| r.3).count();
+    assert!(priced > 0);
+    assert_eq!(num(&windows[0], &["metrics", "rows"]), priced as f64, "walk-forward rows on");
+}
+
+/// The book hash of `STRIDED_ARGS` with `--generations 10` on the three-day strided fixture under the
+/// training rule before #1268: the kernel over the training rows alone.
+const STRIDED_MASK_HASH_BEFORE: u64 = 0xe370_75dd_e50d_5673;
+
+/// A copy of checkpoint `cp` at `out` whose book hash is `to`, with its config hash recomputed.
+fn with_book_hash(cp: &str, to: u64, out: &std::path::Path) {
+    let from = saved_book_hash(cp);
+    let text = std::fs::read_to_string(cp).unwrap().replace(&format!("long_pnl:{from:016x}"), &format!("long_pnl:{to:016x}"));
+    let block: String = text.lines().filter(|l| l.starts_with("config ")).map(|l| format!("{l}\n")).collect();
+    let config_hash = format!("config_hash {:016x}", rcsr::checkpoint::hash_config_text(&block));
+    let edited: String = text.lines().map(|l| if l.starts_with("config_hash ") { format!("{config_hash}\n") } else { format!("{l}\n") }).collect();
+    std::fs::write(out, edited).unwrap();
+}
+
+#[test]
+fn a_masked_checkpoint_of_the_training_row_rule_refuses_resume() {
+    let (_scratch, dir) = scratch();
+    let data = write_strided_csv(&dir, three_day_gate);
+    let spec = write_daily_spec(&dir);
+    let cp = dir.join("strided.rcsr").to_string_lossy().into_owned();
+    let first = run(&data, &spec, &[&STRIDED_ARGS[..], &["--generations", "10", "--save", &cp]].concat());
+    assert_eq!(code(&first), 0, "{}", stderr(&first));
+    let hash = saved_book_hash(&cp);
+    assert_ne!(hash, STRIDED_MASK_HASH_BEFORE, "{hash:#x}: the training mask still reads the training rows alone");
+    let resume = |path: &str| run(&data, &spec, &[&STRIDED_ARGS[..], &["--generations", "20", "--resume", path]].concat());
+    let same = resume(&cp);
+    assert_eq!(code(&same), 0, "{}", stderr(&same));
+    let old = dir.join("before.rcsr");
+    with_book_hash(&cp, STRIDED_MASK_HASH_BEFORE, &old);
+    usage_error(&resume(&old.to_string_lossy()), "--pnl-mask");
+}
+
+// ---- #1278: the masked book skips unlabelled rows ----
+
+use rcsr::lockbox::{self, Lockbox};
+
+const BAND_SD: [&str; 6] = ["--band", "0.5", "--band-units", "sd", "--min-holding", "2"];
+const DENSE_DAYS: usize = 60;
+
+/// The strided fixture of [`three_day_gate`] over `days` days with the label every `stride` hours.
+fn write_strided_every(dir: &std::path::Path, name: &str, days: usize, stride: i64) -> String {
+    let path = dir.join(name);
+    std::fs::write(&path, strided_text_every(days, three_day_gate, stride)).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+/// The windows whose test blocks are the validation and the test rows of run `j` on the strided
+/// fixture. The test rows are the last `test_rows / 2` labelled stamps, the same for both symbols.
+fn strided_block_windows(j: &Json, days: usize, stride: i64, test_rows: f64) -> [(&'static str, String); 2] {
+    let (vlo, vhi) = time_range(j, "validation_time");
+    let (vlo, vhi) = (vlo as i64, vhi as i64);
+    let stamps = (days as i64 * 24 + stride - 1) / stride;
+    let start = T0 + HOUR * stride * (stamps - test_rows as i64 / 2);
+    let end = T0 + DAY * days as i64;
+    // A training range that ends two label strides (at least two days) before the test block.
+    let gap = (2 * HOUR * stride).max(2 * DAY);
+    [("validation", format!("v,{T0},{},{vlo},{}", vlo - gap, vhi + 1)), ("test", format!("t,{T0},{},{start},{end}", start - gap))]
+}
+
+/// Window 0 of `walkforward --from-run run` on `data` with `window`, `extra` added.
+fn walk_window(data: &str, run: &str, window: &str, extra: &[&str]) -> Json {
+    let mut args = vec!["walkforward", "--data", data, "--time", "t", "--group-by", "s", "--from-run", run, "--window", window, "--json"];
+    args.extend_from_slice(extra);
+    let report = json(&rcsr_cmd::rcsr().args(&args).output().unwrap());
+    match at(&report, &["windows"]) {
+        Json::Arr(a) => a[0].clone(),
+        _ => panic!("windows is not an array"),
+    }
+}
+
+/// The rows of symbol `sym` of the CSV `data`, written beside it.
+fn symbol_csv(data: &str, sym: &str) -> String {
+    let text = std::fs::read_to_string(data).unwrap();
+    let mut lines = text.lines();
+    let mut out = format!("{}\n", lines.next().unwrap());
+    for line in lines.filter(|l| l.split(',').nth(1) == Some(sym)) {
+        out.push_str(line);
+        out.push('\n');
+    }
+    let path = format!("{data}.{sym}.csv");
+    std::fs::write(&path, out).unwrap();
+    path
+}
+
+/// The net of a walk-forward window of one symbol: one priced row per period.
+fn symbol_net(w: &Json) -> f64 {
+    let m = at(w, &["metrics"]);
+    if num(m, &["rows"]) == 0.0 {
+        0.0
+    } else {
+        num(m, &["mean_return"]) * num(m, &["periods"])
+    }
+}
+
+/// A JSON value in the engine's text form (`devlog::num` keeps every bit).
+fn json_text(j: &Json) -> String {
+    match j {
+        Json::Null => "null".to_string(),
+        Json::Bool(b) => b.to_string(),
+        Json::Num(v) => rcsr::devlog::num(*v),
+        Json::Str(v) => rcsr::devlog::text(v),
+        Json::Arr(a) => format!("[{}]", a.iter().map(json_text).collect::<Vec<_>>().join(",")),
+        Json::Obj(o) => format!("{{{}}}", o.iter().map(|(k, v)| format!("{}:{}", rcsr::devlog::text(k), json_text(v))).collect::<Vec<_>>().join(",")),
+    }
+}
+
+/// Walk-forward of the validation and the test block of run `j` (`run` on `data`) gives the run's
+/// books: the rows, trades, entries and cost of the two-symbol window, and the net as the sum of
+/// the windows of each symbol alone (a period return is the mean over the rows priced at its stamp,
+/// so the two-symbol net is not a multiple of it when the symbols' gates differ).
+fn assert_blocks_reproduced(tag: &str, j: &Json, data: &str, run: &str, days: usize, stride: i64, test_rows: f64) {
+    let one = [symbol_csv(data, "a"), symbol_csv(data, "b")];
+    for (slot, window) in strided_block_windows(j, days, stride, test_rows) {
+        let want = at(j, &["objective", slot]);
+        let m = at(&walk_window(data, run, &window, &["--allow-in-sample-windows"]), &["metrics"]).clone();
+        for key in ["rows", "trades", "entries"] {
+            assert_eq!(num(&m, &[key]), num(want, &[key]), "{tag} {slot} {key}");
+        }
+        assert!((num(&m, &["total_cost"]) - num(want, &["total_cost"])).abs() <= 1e-12, "{tag} {slot} total_cost");
+        let net: f64 = one.iter().map(|d| symbol_net(&walk_window(d, run, &window, &["--allow-in-sample-windows"]))).sum();
+        assert!((net - num(want, &["net_pnl"])).abs() <= 1e-12, "{tag} {slot}: walkforward net {net} vs objective {}", num(want, &["net_pnl"]));
+    }
+}
+
+#[test]
+fn strided_masked_walkforward_reproduces_objective_test() {
+    let (_scratch, dir) = scratch();
+    let band: Vec<&str> = [&STRIDED_ARGS[..], &BAND_SD[..]].concat();
+    for (stride, days) in [(24i64, STRIDED_DAYS), (72, 2 * STRIDED_DAYS)] {
+        // A label horizon equal to the stride: one period per labelled row.
+        let spec = write_horizon_spec(&dir, HOUR * stride);
+        let data = write_strided_every(&dir, &format!("strided{stride}.csv"), days, stride);
+        for (book, args) in [("unmasked", &STRIDED_ARGS[..6]), ("threshold", &STRIDED_ARGS[..]), ("band", &band[..])] {
+            let tag = format!("stride {stride} {book}");
+            let out = run(&data, &spec, args);
+            let j = json(&out);
+            if book != "unmasked" {
+                assert!(num(&j, &["objective", "test", "mask", "runs"]) >= 2.0, "{tag}: the mask must cut several runs");
+            }
+            assert!(num(&j, &["objective", "test", "trades"]) > 0.0, "{tag}: the book must trade");
+            let run_path = dir.join(format!("strided{stride}-{book}.run.json")).to_string_lossy().into_owned();
+            std::fs::write(&run_path, &out.stdout).unwrap();
+            assert_blocks_reproduced(&tag, &j, &data, &run_path, days, stride, num(&j, &["test_rows"]));
+        }
+    }
+}
+
+/// #1278: rows whose fit label is missing and whose book return is finite stay in the book
+/// (`--book-target`, #948). The fit label `y` is missing on every fifth labelled day; the book label
+/// `yb` shares the return column `r`, so walk-forward prices the rows the search prices.
+#[test]
+fn strided_masked_book_keeps_rows_without_a_fit_label() {
+    let (_scratch, dir) = scratch();
+    let mut text = String::from("t,s,x1,x2,g,r,y,yb\n");
+    for line in strided_text(STRIDED_DAYS, three_day_gate).lines().skip(1) {
+        let c: Vec<&str> = line.split(',').collect();
+        let day = (c[0].parse::<i64>().unwrap() - T0) / DAY;
+        let y = if day % 5 == 2 { "" } else { c[6] };
+        text.push_str(&format!("{},{},{},{},{},{},{},{}\n", c[0], c[1], c[2], c[3], c[4], c[5], y, c[6]));
+    }
+    let data = dir.join("book.csv").to_string_lossy().into_owned();
+    std::fs::write(&data, text).unwrap();
+    let entry = |column: &str| {
+        format!(
+            "{{\"column\":\"{column}\",\"name\":\"{column}\",\"kind\":\"forward_return\",\"deprecated\":false,\"return_column\":\"r\",\
+             \"return_units\":\"log\",\"horizon_seconds\":86400,\"entry_offset_seconds\":0,\"delay_seconds\":0,\"entry_price\":\"open\",\
+             \"exit_price\":\"close\",\"offset\":0.0,\"scale\":{{\"kind\":\"constant\",\"value\":1.0}},\"clip\":null,\"units\":\"log_return\",\
+             \"cost_bps\":null,\"cost_in_label\":false,\"construction_columns\":[],\"note\":null}}"
+        )
+    };
+    let spec = dir.join("book.json").to_string_lossy().into_owned();
+    std::fs::write(&spec, format!("{{\"schema\":\"rcsr-target-spec/1\",\"targets\":[{},{}]}}", entry("y"), entry("yb"))).unwrap();
+    let mut book_rows = 0.0;
+    for (book, mask) in [("unmasked", &[][..]), ("masked", &STRIDED_ARGS[6..])] {
+        let args: Vec<&str> = [&STRIDED_ARGS[..6], mask, &["--book-target", "yb"][..]].concat();
+        let out = run(&data, &spec, &args);
+        let j = json(&out);
+        if book == "unmasked" {
+            book_rows = num(&j, &["objective", "test", "rows"]);
+            assert!(book_rows > num(&j, &["test_rows"]), "the test book holds rows without a fit label");
+        }
+        let run_path = dir.join(format!("book-{book}.run.json")).to_string_lossy().into_owned();
+        std::fs::write(&run_path, &out.stdout).unwrap();
+        assert_blocks_reproduced(book, &j, &data, &run_path, STRIDED_DAYS, 24, book_rows);
+    }
+}
+
+/// #1278: on hourly labels (every row labelled) the books are unchanged: `objective.validation`,
+/// `objective.test` and the walk-forward metrics of both blocks of the unmasked, the masked
+/// threshold and the masked band book of two symbols, pinned to the bytes of the base build.
+#[test]
+fn dense_masked_books_are_pinned() {
+    let (_scratch, dir) = scratch();
+    let spec = write_horizon_spec(&dir, HOUR);
+    let data = write_strided_every(&dir, "dense.csv", DENSE_DAYS, 1);
+    let band: Vec<&str> = [&STRIDED_ARGS[..], &BAND_SD[..]].concat();
+    let mut got: Vec<String> = Vec::new();
+    for (book, args) in [("unmasked", &STRIDED_ARGS[..6]), ("threshold", &STRIDED_ARGS[..]), ("band", &band[..])] {
+        let out = run(&data, &spec, args);
+        let j = json(&out);
+        let run_path = dir.join(format!("dense-{book}.run.json")).to_string_lossy().into_owned();
+        std::fs::write(&run_path, &out.stdout).unwrap();
+        for (slot, window) in strided_block_windows(&j, DENSE_DAYS, 1, num(&j, &["test_rows"])) {
+            let w = walk_window(&data, &run_path, &window, &["--allow-in-sample-windows"]);
+            for (part, text) in [("objective", json_text(at(&j, &["objective", slot]))), ("walkforward", json_text(at(&w, &["metrics"])))] {
+                got.push(format!("{book}.{slot}.{part} {}", rcsr::manifest::sha256_hex(text.as_bytes())));
+            }
+        }
+    }
+    let all = rcsr::manifest::sha256_hex(got.join("\n").as_bytes());
+    assert_eq!(all, PINNED_DENSE_BOOKS, "{}", got.join("\n"));
+}
+
+const PINNED_DENSE_BOOKS: &str = "4ab830e2ea9b23584cca27e12f9a366c37e3582c7d4c51a46bd6024e50a9459b";
+
+/// #1278: the sealed read prices the masked book of a strided label like the search: a synthetic
+/// lock over the run's test block, a development window on the validation rows, a final seal and
+/// one locked read of the test block.
+#[test]
+fn sealed_read_prices_the_strided_masked_book() {
+    let (_scratch, dir) = scratch();
+    let spec = write_daily_spec(&dir);
+    let data = write_strided_csv(&dir, three_day_gate);
+    let out = run(&data, &spec, &STRIDED_ARGS);
+    let j = json(&out);
+    let run_path = dir.join("sealed.run.json").to_string_lossy().into_owned();
+    std::fs::write(&run_path, &out.stdout).unwrap();
+    let [(_, validation_window), (_, test_window)] = strided_block_windows(&j, STRIDED_DAYS, 24, num(&j, &["test_rows"]));
+    let field = |w: &str, k: usize| -> i64 { w.split(',').nth(k).unwrap().parse().unwrap() };
+    let (vlo, start) = (field(&validation_window, 3), field(&test_window, 3));
+    let lock_end = T0 + DAY * STRIDED_DAYS as i64;
+    let locked = write_strided_every(&dir, "locked.csv", STRIDED_DAYS, 24);
+    lockbox::write_sidecar(&locked, &Lockbox { start, end: lock_end }, "test").unwrap();
+    let ledger = dir.join("ledger.jsonl").to_string_lossy().into_owned();
+    let sealed = dir.join("sealed.json").to_string_lossy().into_owned();
+    let dev = format!("dev,{T0},{},{vlo},{}", vlo - 2 * DAY, vlo + 10 * DAY);
+    walk_window(&locked, &run_path, &dev, &["--ledger", &ledger, "--allow-in-sample-windows"]);
+    let seal = rcsr_cmd::rcsr().args(["protocol", "seal", "--final", "--ledger", &ledger, "--out", &sealed]).output().unwrap();
+    assert_eq!(code(&seal), 0, "{}", stderr(&seal));
+    let read = walk_window(&locked, &run_path, &test_window, &["--ledger", &ledger, "--allow-in-sample-windows", "--locked-test", "--sealed", &sealed]);
+    let open = walk_window(&data, &run_path, &test_window, &["--allow-in-sample-windows"]);
+    let m = at(&read, &["metrics"]);
+    assert_eq!(json_text(m), json_text(at(&open, &["metrics"])), "the sealed read prices the open book");
+    let want = at(&j, &["objective", "test"]);
+    for key in ["rows", "trades", "entries"] {
+        assert_eq!(num(m, &[key]), num(want, &[key]), "{key}");
+    }
+    assert!((num(m, &["total_cost"]) - num(want, &["total_cost"])).abs() <= 1e-12);
+}
+
+/// #1278: a row the masked book cannot price (no finite return: an unlabelled row of a strided
+/// label) neither starts nor ends an on-run, whatever its gate state: `masked_slice` over every row
+/// prices the book of `masked_slice` over the priced rows alone.
+#[test]
+fn masked_slice_skips_rows_without_a_return() {
+    let mut seed = 0x1278u64;
+    let mut uniform = move || {
+        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        (seed >> 11) as f64 / (1u64 << 53) as f64
+    };
+    let spec = TradingSpec { cost_bps: 5.0, threshold: 0.0, min_trades: 0, ..TradingSpec::default() };
+    let mut inside = 0usize;
+    for case in 0..200 {
+        let groups = 1 + case % 3;
+        let mut full = TradingSlice { rows: TradingRows::default(), ret: Vec::new() };
+        let (mut on, mut pred) = (Vec::new(), Vec::new());
+        for k in 0..40 {
+            for g in 0..groups {
+                full.rows.time.push(1.6e9 + 3600.0 * k as f64);
+                full.rows.group.push(g as u64);
+                full.ret.push(if uniform() < 0.4 { f64::NAN } else { 0.01 * (uniform() - 0.45) });
+                on.push(uniform() < 0.7);
+                pred.push(uniform() - 0.4);
+            }
+        }
+        let keep: Vec<usize> = (0..full.ret.len()).filter(|&i| full.ret[i].is_finite()).collect();
+        for g in 0..groups as u64 {
+            let rows: Vec<usize> = (0..full.ret.len()).filter(|&i| full.rows.group[i] == g).collect();
+            inside += rows.windows(3).filter(|w| on[w[0]] && !on[w[1]] && on[w[2]] && full.ret[w[0]].is_finite() && !full.ret[w[1]].is_finite() && full.ret[w[2]].is_finite()).count();
+        }
+        let pick = |v: &[f64]| -> Vec<f64> { keep.iter().map(|&i| v[i]).collect() };
+        let sub = TradingSlice {
+            rows: TradingRows { time: pick(&full.rows.time), group: keep.iter().map(|&i| full.rows.group[i]).collect(), funding: Vec::new() },
+            ret: pick(&full.ret),
+        };
+        let sub_on: Vec<bool> = keep.iter().map(|&i| on[i]).collect();
+        let a_book = regime_gate::masked_slice(&full, &on);
+        let b_book = regime_gate::masked_slice(&sub, &sub_on);
+        let a = trading::evaluate(&pred, &a_book.ret, &a_book.rows, &spec);
+        let b = trading::evaluate(&pick(&pred), &b_book.ret, &b_book.rows, &spec);
+        match (a, b) {
+            (Ok(a), Ok(b)) => {
+                assert_eq!(a.net_pnl.to_bits(), b.net_pnl.to_bits(), "case {case}: net {} vs {}", a.net_pnl, b.net_pnl);
+                assert_eq!((a.rows, a.trades, a.entries), (b.rows, b.trades, b.entries), "case {case}");
+            }
+            (Err(_), Err(_)) => {}
+            (a, b) => panic!("case {case}: {:?} vs {:?}", a.map(|s| s.net_pnl), b.map(|s| s.net_pnl)),
+        }
+    }
+    assert!(inside > 0, "the cases put an off row without a return inside an on-run");
+}
+
+// ---- #1273: --cash-return train-mean ----
+
+const TRAIN_MEAN: [&str; 4] = ["--fitness", "pnl", "--cash-return", "train-mean"];
+
+/// Simple return of every `write_panel_csv` row with a time in `[lo, hi]`.
+fn panel_returns(data: &str, lo: f64, hi: f64) -> Vec<f64> {
+    std::fs::read_to_string(data)
+        .unwrap()
+        .lines()
+        .skip(1)
+        .map(|l| l.split(',').collect::<Vec<_>>())
+        .filter(|c| (lo..=hi).contains(&c[0].parse::<f64>().unwrap()))
+        .map(|c| c[4].parse::<f64>().unwrap().exp_m1())
+        .collect()
+}
+
+fn cash_of(j: &Json) -> f64 {
+    assert_eq!(at(j, &["search_fitness", "cash_return_source"]).as_str(), Some("train_mean"));
+    num(j, &["search_fitness", "cash_return"])
+}
+
+/// Reports stay at cash 0: the spec, the cash books and the walk-forward book.
+fn assert_reports_at_cash_zero(j: &Json) {
+    assert_eq!(num(j, &["objective", "spec", "cash_return"]), 0.0);
+    for slot in ["validation", "test"] {
+        let cash = at(at(j, &["objective", slot]), &["cash"]);
+        assert_eq!(num(cash, &["net_pnl"]), 0.0, "{slot} cash book");
+    }
+}
+
+#[test]
+fn cash_return_train_mean_is_the_training_mean() {
+    let (_scratch, dir) = scratch();
+    let data = write_panel_csv(&dir);
+    let spec = write_panel_spec(&dir);
+    let j = json(&run_panel(&data, &spec, &TRAIN_MEAN));
+    let (lo, hi) = time_range(&j, "train_time");
+    let rows = panel_returns(&data, lo, hi);
+    assert_eq!(num(&j, &["search_fitness", "rows"]), rows.len() as f64);
+    let want = rows.iter().sum::<f64>() / rows.len() as f64;
+    let got = cash_of(&j);
+    assert!(want != 0.0 && (got - want).abs() <= 1e-15, "m {got} hand mean {want}");
+    assert_reports_at_cash_zero(&j);
+    let plain = json(&run_panel(&data, &spec, &["--fitness", "pnl"]));
+    assert!(at(&plain, &["search_fitness"]).get("cash_return").is_none());
+    assert!(at(&plain, &["search_fitness"]).get("cash_return_source").is_none());
+}
+
+#[test]
+fn cash_return_train_mean_prices_like_the_constant_in_the_fitness() {
+    let (_scratch, dir) = scratch();
+    let data = write_panel_csv(&dir);
+    let spec = write_panel_spec(&dir);
+    let mean = json(&run_panel(&data, &spec, &TRAIN_MEAN));
+    let m = cash_of(&mean);
+    let constant = json(&run_panel(&data, &spec, &["--fitness", "pnl", "--cash-return", &format!("{m:e}")]));
+    for key in ["rows", "groups", "bound", "cost_per_side", "threshold", "min_trades"] {
+        assert_eq!(at(&mean, &["search_fitness", key]), at(&constant, &["search_fitness", key]), "{key}");
+    }
+    assert_eq!(members(&mean), members(&constant));
+    assert_ne!(at(&mean, &["search_fitness", "book_hash"]), at(&constant, &["search_fitness", "book_hash"]));
+    assert_eq!(num(&constant, &["objective", "spec", "cash_return"]), m);
+    assert_reports_at_cash_zero(&mean);
+}
+
+#[test]
+fn cash_return_train_mean_reads_training_rows_only() {
+    let (_scratch, dir) = scratch();
+    let data = write_panel_csv(&dir);
+    let spec = write_panel_spec(&dir);
+    let step = |k: i64| T0 + 900 * k;
+    let table = dir.join("splits.csv");
+    std::fs::write(
+        &table,
+        format!(
+            "split_id,role,start,end\na,train,{},{}\na,validation,{},{}\na,train,{},{}\na,test,{},{}\n",
+            step(0),
+            step(150),
+            step(150),
+            step(200),
+            step(200),
+            step(300),
+            step(300),
+            step(400)
+        ),
+    )
+    .unwrap();
+    let table = table.to_string_lossy().into_owned();
+    // Same file with every validation and test return replaced.
+    let edited = dir.join("edited.csv");
+    let text: String = std::fs::read_to_string(&data)
+        .unwrap()
+        .lines()
+        .enumerate()
+        .map(|(i, l)| {
+            let c: Vec<&str> = l.split(',').collect();
+            let t = if i == 0 { 0 } else { (c[0].parse::<i64>().unwrap() - T0) / 900 };
+            if i > 0 && ((150..200).contains(&t) || t >= 300) {
+                format!("{},{},{},{},{},{}\n", c[0], c[1], c[2], c[3], 0.02 + 0.001 * (t % 7) as f64, 0.02)
+            } else {
+                format!("{l}\n")
+            }
+        })
+        .collect();
+    std::fs::write(&edited, text).unwrap();
+    let edited = edited.to_string_lossy().into_owned();
+    let go = |d: &str| {
+        let out = rcsr_cmd::rcsr()
+            .args([
+                "--data", d, "--target", "y", "--vars", "x1,x2", "--time", "t", "--group-by", "sym", "--split-table", &table,
+                "--split-id", "a", "--target-spec", &spec, "--cpu", "--no-dev-log", "--seed", "3", "--generations", "10", "--pop",
+                "32", "--metric", "squared", "--json", "--quiet", "--objective", "pnl", "--cost-bps", "5", "--fitness", "pnl",
+                "--cash-return", "train-mean",
+            ])
+            .output()
+            .unwrap();
+        json(&out)
+    };
+    let (a, b) = (go(&data), go(&edited));
+    assert_ne!(cash_of(&a), 0.0);
+    assert_eq!(cash_of(&a).to_bits(), cash_of(&b).to_bits());
+    assert_eq!(at(&a, &["search_fitness", "book_hash"]), at(&b, &["search_fitness", "book_hash"]));
+    assert_ne!(num(at(&a, &["objective", "test"]), &["net_pnl"]), num(at(&b, &["objective", "test"]), &["net_pnl"]));
+}
+
+#[test]
+fn cash_return_train_mean_keeps_reports_at_cash_zero() {
+    let (_scratch, dir) = scratch();
+    let data = write_panel_csv(&dir);
+    let spec = write_panel_spec(&dir);
+    let out = run_panel(&data, &spec, &TRAIN_MEAN);
+    let j = json(&out);
+    assert_reports_at_cash_zero(&j);
+    let run_path = dir.join("run.json");
+    std::fs::write(&run_path, &out.stdout).unwrap();
+    let run = run_path.to_string_lossy().into_owned();
+    let step = |k: usize| (T0 + 900 * k as i64).to_string();
+    let w = format!("v,{},{},{},{}", step(0), step(299), step(300), step(PANEL_STEPS));
+    let wf_path = dir.join("wf.json").to_string_lossy().into_owned();
+    let wf = rcsr_cmd::rcsr()
+        .args(["walkforward", "--data", &data, "--time", "t", "--group-by", "sym", "--from-run", &run, "--window", &w, "--out", &wf_path])
+        .output()
+        .unwrap();
+    assert_eq!(code(&wf), 0, "{}", stderr(&wf));
+    let wf_json = Json::parse(std::fs::read_to_string(&wf_path).unwrap().trim()).unwrap();
+    let m = match at(&wf_json, &["windows"]) {
+        Json::Arr(a) => at(&a[0], &["metrics"]).clone(),
+        _ => panic!("windows is not an array"),
+    };
+    let test = at(&j, &["objective", "test"]);
+    let wf_net = num(&m, &["mean_return"]) * num(&m, &["periods"]) * PANEL_SYMBOLS as f64;
+    assert!((wf_net - num(test, &["net_pnl"])).abs() <= 1e-12, "walkforward net {wf_net} objective {}", num(test, &["net_pnl"]));
+}
+
+#[test]
+fn cash_return_train_mean_flags_name_their_reason() {
+    let (_scratch, dir) = scratch();
+    let data = write_panel_csv(&dir);
+    let spec = write_panel_spec(&dir);
+    usage_error(&run_panel(&data, &spec, &["--cash-return", "train-mean"]), "--cash-return train-mean needs --fitness pnl");
+    usage_error(
+        &run_panel(&data, &spec, &["--fitness", "pnl", "--pnl-excess", "xs-mean", "--cash-return", "train-mean"]),
+        "--pnl-excess xs-mean needs --cash-return 0",
+    );
+    usage_error(&run_panel(&data, &spec, &["--fitness", "pnl", "--cash-return", "mean"]), "--cash-return");
+}
+
+#[test]
+fn resume_needs_the_same_cash_mode() {
+    let (_scratch, dir) = scratch();
+    let data = write_panel_csv(&dir);
+    let spec = write_panel_spec(&dir);
+    let cp = dir.join("cash.rcsr").to_string_lossy().into_owned();
+    let first = run_panel(&data, &spec, &[&TRAIN_MEAN[..], &["--generations", "10", "--save", &cp]].concat());
+    assert_eq!(code(&first), 0, "{}", stderr(&first));
+    let m = cash_of(&json(&first));
+    let straight = json(&run_panel(&data, &spec, &[&TRAIN_MEAN[..], &["--generations", "20"]].concat()));
+    let resumed = json(&run_panel(&data, &spec, &[&TRAIN_MEAN[..], &["--generations", "20", "--resume", &cp]].concat()));
+    assert_eq!(members(&straight), members(&resumed));
+    let resume = |extra: &[&str]| run_panel(&data, &spec, &[&["--fitness", "pnl", "--generations", "20", "--resume", &cp][..], extra].concat());
+    usage_error(&resume(&[]), "fitness");
+    usage_error(&resume(&["--cash-return", &format!("{m:e}")]), "--cash-return");
+}
+
+// ---- #1229: the resume conflict names the flags of the book hash ----
+
+/// The hash of the base book with the input `id` of [`trading::BOOK_INPUTS`] changed.
+fn hash_with_input_changed(id: &str) -> u64 {
+    let rows = 100;
+    let on: Vec<bool> = (0..rows).map(|i| i % 7 != 0).collect();
+    let mut s = slice(&[50, 50]);
+    s.rows.funding = vec![0.0; rows];
+    let base_spec = TradingSpec { band: trading::BandSpec::score(0.5), ..spec() };
+    let build = |s: &TradingSlice, spec: &TradingSpec, blocks: usize, lambda: f64, segments: &[f64], mask: &str| {
+        FitnessBook::with_segments(s, spec, 900.0, blocks, lambda, segments, Some(trading::BookMask { on: &on, identity: mask })).unwrap()
+    };
+    let base = |s: &TradingSlice, spec: &TradingSpec| build(s, spec, 3, 1.0, &[], "g|0|1");
+    let changed = match id {
+        "cost" => base(&s, &TradingSpec { cost_bps: 6.0, ..base_spec.clone() }),
+        "cash" => base(&s, &TradingSpec { cash_return: 0.0001, ..base_spec.clone() }),
+        "funding" => {
+            let mut f = s.clone();
+            f.rows.funding[5] = 0.0001;
+            base(&f, &base_spec)
+        }
+        "excess" => base(&s, &TradingSpec { pnl_excess: trading::PnlExcess::XsMean, ..base_spec.clone() }),
+        "threshold" => base(&s, &TradingSpec { threshold: 0.1, ..base_spec.clone() }),
+        "min_trades" => base(&s, &TradingSpec { min_trades: 2, ..base_spec.clone() }),
+        "band" => base(&s, &TradingSpec { band: trading::BandSpec::score(0.6), ..base_spec.clone() }),
+        "band_units" => {
+            let mut band = trading::BandSpec::score(0.5);
+            band.units = trading::BandUnits::Sd;
+            base(&s, &TradingSpec { band, ..base_spec.clone() })
+        }
+        "min_hold" => base(&s, &TradingSpec { min_holding: 2, ..base_spec.clone() }),
+        "blocks" => build(&s, &base_spec, 4, 1.0, &[], "g|0|1"),
+        "lambda" => build(&s, &base_spec, 3, 2.0, &[], "g|0|1"),
+        "stat" => base(&s, &base_spec).with_stat(trading::BlockStat::Cvar(0.5)).unwrap(),
+        "mask" => build(&s, &base_spec, 3, 1.0, &[], "g|0.5|1"),
+        "segments" => build(&s, &base_spec, 3, 1.0, &[1.6e9 + 900.0 * 20.0, 1.6e9 + 900.0 * 40.0], "g|0|1"),
+        "rows" => {
+            let mut m = s.clone();
+            m.ret[3] += 1e-6;
+            base(&m, &base_spec)
+        }
+        other => panic!("BOOK_INPUTS has the input '{other}' and this test has no change for it"),
+    };
+    changed.hash()
+}
+
+/// Every row of the table changes the hash, so a flag listed there is a real
+/// resume input. The count pins the hashed inputs: a new `fnv_u64` input needs a
+/// `BOOK_INPUTS` row and a case in `hash_with_input_changed`.
+#[test]
+fn every_book_input_changes_the_hash() {
+    let s = slice(&[50, 50]);
+    let mut with_funding = s.clone();
+    with_funding.rows.funding = vec![0.0; 100];
+    let on: Vec<bool> = (0..100).map(|i| i % 7 != 0).collect();
+    let base = FitnessBook::with_segments(
+        &with_funding,
+        &TradingSpec { band: trading::BandSpec::score(0.5), ..spec() },
+        900.0,
+        3,
+        1.0,
+        &[],
+        Some(trading::BookMask { on: &on, identity: "g|0|1" }),
+    )
+    .unwrap()
+    .hash();
+    for input in trading::BOOK_INPUTS {
+        assert_ne!(base, hash_with_input_changed(input.id), "{}", input.id);
+        assert!(!input.flags.is_empty(), "{}", input.id);
+    }
+    let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/trading.rs")).unwrap();
+    // `with_layer` joins the hash of a gate-search book, which has no checkpoint and no --resume.
+    let book_source = &source[..source.find("pub fn with_layer").unwrap()];
+    let hashed = book_source.lines().filter(|l| l.contains("fnv_u64(&mut hash") || l.contains("fnv_u64(&mut self.hash")).count();
+    assert_eq!(hashed, 23, "the hash inputs changed: update BOOK_INPUTS, hash_with_input_changed and this count");
+}
+
+/// Every flag of the table is a flag of `rcsr --help`.
+#[test]
+fn book_input_flags_are_cli_flags() {
+    let help = rcsr_cmd::rcsr().arg("--help").output().unwrap();
+    let help = String::from_utf8_lossy(&help.stdout).into_owned() + &String::from_utf8_lossy(&help.stderr);
+    for input in trading::BOOK_INPUTS {
+        for flag in input.flags {
+            assert!(help.contains(&format!("{flag} ")) || help.contains(&format!("{flag}\n")), "{flag}");
+        }
+    }
+}
+
+/// A conflicting resume names every flag of the table, and those given now.
+#[test]
+fn resume_conflict_names_every_book_flag() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, 900);
+    let spec = write_spec(&dir);
+    let cp = dir.join("cp.rcsr").to_string_lossy().into_owned();
+    let first = run(&data, &spec, &["--fitness", "pnl", "--generations", "10", "--save", &cp]);
+    assert_eq!(code(&first), 0, "{}", stderr(&first));
+    let other = run(&data, &spec, &["--fitness", "pnl", "--generations", "20", "--resume", &cp, "--threshold", "0.1"]);
+    assert_eq!(code(&other), 2, "{}", stderr(&other));
+    let err = stderr(&other);
+    for input in trading::BOOK_INPUTS {
+        for flag in input.flags {
+            assert!(err.contains(flag), "{flag} missing from: {err}");
+        }
+    }
+    let given = err.split("flags given now: ").nth(1).expect("the given flags");
+    assert!(given.contains("--threshold") && !given.contains("--pnl-mask"), "{given}");
+}
+
+#[test]
+fn resume_names_the_block_lambda_and_the_split_table() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, 900);
+    let spec = write_spec(&dir);
+    let cp = dir.join("lambda.rcsr").to_string_lossy().into_owned();
+    let saved = ["--fitness", "pnl", "--pnl-blocks", "3", "--pnl-block-lambda", "1"];
+    let first = run(&data, &spec, &[&saved[..], &["--generations", "10", "--save", &cp]].concat());
+    assert_eq!(code(&first), 0, "{}", stderr(&first));
+    let resume = |extra: &[&str]| run(&data, &spec, &[&["--fitness", "pnl", "--pnl-blocks", "3", "--generations", "20", "--resume", &cp][..], extra].concat());
+    usage_error(&resume(&["--pnl-block-lambda", "2"]), "--pnl-block-lambda");
+
+    let panel = write_panel_csv(&dir);
+    let pspec = write_panel_spec(&dir);
+    let step = |k: i64| T0 + 900 * k;
+    let table = dir.join("splits.csv");
+    let row = |id: &str, role: &str, a: i64, b: i64| format!("{id},{role},{},{}\n", step(a), step(b));
+    std::fs::write(
+        &table,
+        ["split_id,role,start,end\n".to_string(), row("a", "train", 0, 150), row("a", "validation", 150, 200), row("a", "train", 200, 300), row("a", "test", 300, 400),
+         row("b", "train", 0, 120), row("b", "validation", 120, 200), row("b", "train", 200, 300), row("b", "test", 300, 400)]
+        .concat(),
+    )
+    .unwrap();
+    let table = table.to_string_lossy().into_owned();
+    let panel_run = |id: &str, extra: &[&str]| {
+        let args = [
+            "--data", &panel, "--target", "y", "--vars", "x1,x2", "--time", "t", "--group-by", "sym", "--split-table", &table,
+            "--split-id", id, "--target-spec", &pspec, "--cpu", "--no-dev-log", "--seed", "3", "--pop", "32", "--metric", "squared",
+            "--json", "--quiet", "--objective", "pnl", "--cost-bps", "5", "--fitness", "pnl",
+        ];
+        rcsr_cmd::rcsr().args(args).args(extra).output().unwrap()
+    };
+    let scp = dir.join("split.rcsr").to_string_lossy().into_owned();
+    let saved = panel_run("a", &["--generations", "10", "--save", &scp]);
+    assert_eq!(code(&saved), 0, "{}", stderr(&saved));
+    usage_error(&panel_run("b", &["--generations", "20", "--resume", &scp]), "--split-table");
+}
+
 // ---- #1082: book signatures, the distinct-book count and the same-book guard ----
 
 /// Returns where only rows 2 and 3 of each 10-row group move, so a long row
@@ -1621,6 +3739,48 @@ fn regret_signed_returns_the_regret_bits() {
     }
 }
 
+/// The signature reads the totals the regret reads: after the regime mask
+/// (#1180), on every block count up to the wide books (#1178) and under every
+/// block statistic.
+#[test]
+fn book_signatures_follow_the_masked_and_blocked_book() {
+    let s = slice(&[400, 400]);
+    let sp = spec();
+    let pred = prediction(&s);
+    let on = alternate_mask(&s, 10);
+    let plain = FitnessBook::new(&s, &sp, 900.0).unwrap();
+    let book = masked(&s, &sp, 1, &on).unwrap();
+    let off = (0..on.len()).find(|&i| !on[i] && pred[i] <= book.threshold()).expect("a flat row outside the mask");
+    let mut moved = pred.clone();
+    moved[off] = book.threshold() + 1.0;
+    assert_eq!(signed(&book, &pred), signed(&book, &moved), "a row outside the mask is flat in the masked book");
+    assert_ne!(signed(&plain, &pred), signed(&plain, &moved), "the unmasked book holds that row");
+    let stats = [trading::BlockStat::MeanSd, trading::BlockStat::MeanSemi, trading::BlockStat::Cvar(0.25)];
+    for blocks in [1usize, 4, 12] {
+        for (k, &stat) in stats.iter().enumerate() {
+            let books = [
+                FitnessBook::with_blocks(&s, &sp, 900.0, blocks, 1.0).unwrap().with_stat(stat).unwrap(),
+                masked(&s, &sp, blocks, &on).unwrap().with_stat(stat).unwrap(),
+            ];
+            for (m, b) in books.iter().enumerate() {
+                let label = format!("blocks {blocks}, stat {k}, masked {m}");
+                let (regret, sig) = b.regret_signed(&pred);
+                assert!(regret.is_finite(), "{label}");
+                assert_eq!(regret.to_bits(), b.regret(&pred).to_bits(), "{label}");
+                let (r, shape, s2) = b.regret_shape_signed(&pred);
+                assert_eq!(r.to_bits(), regret.to_bits(), "{label}");
+                assert_eq!(shape, b.regret_and_shape(&pred).1, "{label}");
+                assert_eq!(s2, sig, "{label}");
+                let totals = if blocks == 1 && stat == trading::BlockStat::MeanSd { vec![b.totals(&pred)] } else { b.block_totals(&pred) };
+                assert_eq!(totals.len(), blocks, "{label}");
+                let long_rows = totals.iter().map(|t| t.long_rows).sum();
+                assert_eq!(sig, Some(trading::book_signature(long_rows, &totals)), "{label}");
+            }
+            assert_ne!(books[0].regret_signed(&pred).1, books[1].regret_signed(&pred).1, "blocks {blocks}, stat {k}: the mask is another book");
+        }
+    }
+}
+
 fn generation_records(log: &std::path::Path) -> Vec<Json> {
     std::fs::read_to_string(log)
         .expect("the development log exists")
@@ -1675,6 +3835,10 @@ fn same_book_guard_refusals_name_their_reason() {
         "--same-book-guard is not supported with --selection afp",
     );
     usage_error(
+        &run(&data, &spec, &["--fitness", "pnl", "--same-book-guard", "--selection", "lexicase"]),
+        "--same-book-guard is not supported with --selection lexicase",
+    );
+    usage_error(
         &run(&data, &spec, &["--fitness", "pnl", "--same-book-guard", "--qd-policy"]),
         "--same-book-guard is not supported with --qd-policy",
     );
@@ -1682,13 +3846,6 @@ fn same_book_guard_refusals_name_their_reason() {
         &run(&data, &spec, &["--fitness", "pnl", "--same-book-guard", "--variation", "postfix"]),
         "--same-book-guard is not supported with --variation postfix",
     );
-}
-
-fn front_key(j: &Json) -> Vec<(String, u64)> {
-    pareto(j)
-        .iter()
-        .map(|m| (at(m, &["expression"]).as_str().unwrap().to_string(), num(m, &["fitness", "train_regret"]).to_bits()))
-        .collect()
 }
 
 #[test]
@@ -1724,7 +3881,7 @@ fn same_book_guard_resume_matches_the_uninterrupted_run() {
     let first = run(&data, &spec, &[&guard[..], &["--generations", "10", "--save", &cp]].concat());
     assert_eq!(code(&first), 0, "{}", stderr(&first));
     let text = std::fs::read_to_string(&cp).unwrap();
-    assert!(text.lines().any(|l| l == "config same_book_guard on"));
+    assert!(text.lines().any(|l| l == "config same_book_guard true"));
     let islands = text.lines().filter(|l| l.starts_with("rng ") && !l.starts_with("rng main ")).count();
     assert!(islands >= 1);
     assert_eq!(text.lines().filter(|l| l.starts_with("books ")).count(), islands, "one books record per island");

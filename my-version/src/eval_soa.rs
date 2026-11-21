@@ -464,6 +464,51 @@ fn apply_binary(ins: Instr, a: f64, b: f64) -> f64 {
     }
 }
 
+/// #1257: one operator over operand rows, `out[i] = op(a[i], b[i])` (a unary
+/// operator reads `a` only), each row the same `f64` operation as every
+/// evaluator of this module, so a tree whose children were evaluated apart has
+/// the bits of the whole tree. Returns `false` for a leaf, a ternary operator
+/// or an operator outside [`supports`].
+pub fn apply_rows(op: Op, a: &[f64], b: &[f64], out: &mut [f64]) -> bool {
+    #[inline(always)]
+    fn map1(out: &mut [f64], a: &[f64], f: impl Fn(f64) -> f64) {
+        for (o, &x) in out.iter_mut().zip(a) {
+            *o = f(x);
+        }
+    }
+    #[inline(always)]
+    fn map2(out: &mut [f64], a: &[f64], b: &[f64], f: impl Fn(f64, f64) -> f64) {
+        for ((o, &x), &y) in out.iter_mut().zip(a).zip(b) {
+            *o = f(x, y);
+        }
+    }
+    macro_rules! unary {
+        ($ins:expr, $($i:ident),*) => {
+            match $ins {
+                $(Instr::$i => map1(out, a, |x| apply_unary(Instr::$i, x)),)*
+                _ => return false,
+            }
+        };
+    }
+    macro_rules! binary {
+        ($ins:expr, $($i:ident),*) => {
+            match $ins {
+                $(Instr::$i => map2(out, a, b, |x, y| apply_binary(Instr::$i, x, y)),)*
+                _ => return false,
+            }
+        };
+    }
+    let Some(ins) = instr_for(op) else {
+        return false;
+    };
+    match ins.arity() {
+        1 => unary!(ins, Neg, Exp, Ln, Abs, Sqrt, Sin, Cos, Tan, Sinh, Cosh, Tanh, Logistic, Step, Gauss, Square, Cube, Floor, Ceil, Round, Sign),
+        2 => binary!(ins, Add, Sub, Mul, Div, Pow, Min, Max),
+        _ => return false,
+    }
+    true
+}
+
 /// `cols[var][row]`, or `NaN` when the column or row is absent. This mirrors
 /// `expr::eval`'s `Input` rule: an index outside the row is `NaN`.
 #[inline(always)]
@@ -1239,5 +1284,28 @@ mod tests {
             }
         }
         assert!(checked > 100_000, "{checked}");
+    }
+
+    /// #1257: one operator over operand rows has the bits of the tree
+    /// `op(x0, x1)` evaluated whole, for every unary and binary operator.
+    #[test]
+    fn apply_rows_matches_the_whole_tree() {
+        let (rows, mut r) = (3 * TILE + 37, Rng(0x9e37_79b9_7f4a_7c15));
+        let cols: Vec<Vec<f64>> = (0..2).map(|_| (0..rows).map(|_| r.value()).collect()).collect();
+        let mut scratch = Scratch::new();
+        let same = |a: f64, b: f64| a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan());
+        for op in UNARY.iter().chain(BINARY.iter()).copied() {
+            let kids = if op.arity() == 1 { vec![input(0)] } else { vec![input(0), input(1)] };
+            let p = compile(&node(op, kids)).unwrap();
+            let mut whole = vec![0.0; rows];
+            eval_batch_into(&p, &cols, rows, &mut whole, &mut scratch);
+            let mut apart = vec![0.0; rows];
+            assert!(apply_rows(op, &cols[0], &cols[1], &mut apart), "{op:?}");
+            for i in 0..rows {
+                assert!(same(apart[i], whole[i]), "{op:?} row {i}: {} vs {}", apart[i], whole[i]);
+            }
+        }
+        assert!(!apply_rows(Op::If, &cols[0], &cols[1], &mut vec![0.0; rows]));
+        assert!(!apply_rows(Op::Input, &cols[0], &cols[1], &mut vec![0.0; rows]));
     }
 }

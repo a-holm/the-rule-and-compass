@@ -1166,6 +1166,30 @@ pub fn finish_output(out: &str, declared: Option<&Lockbox>, wrote: &[&str]) -> R
     Ok(())
 }
 
+/// A writer that declares `also` next to `declared` must not leave another carrier of `out` that declares
+/// the same primary range without it: readers refuse that pair as conflicting declarations.
+pub fn check_also_carriers(out: &str, declared: Option<&Lockbox>, also: Option<&Lockbox>) -> Result<(), ResolveError> {
+    let Some(declared) = declared else { return Ok(()) };
+    for ext in CARRIERS {
+        if ext == "enrich.json" {
+            continue;
+        }
+        let file = format!("{}.{}", out, ext);
+        let Ok(text) = std::fs::read_to_string(&file) else { continue };
+        let Some(old) = Lockbox::from_declaration(&text) else { continue };
+        if &old == declared && Lockbox::also_from_declaration(&text).as_ref() != also {
+            return Err(input(format!(
+                "stale {}: it declares the locked test {} without the second range {} that {} now declares; remove it",
+                file,
+                span(&old),
+                also.map_or("none".to_string(), span),
+                out
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// The second range the input declares, when `declared` is the range it declares.
 pub fn inherited_also(input: &str, declared: Option<&Lockbox>) -> Result<Option<Lockbox>, String> {
     Ok(stored_all(input)

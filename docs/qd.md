@@ -17,6 +17,8 @@ With QD disabled the trajectory is bit-identical to before (pinned by
 
 ## Descriptors
 
+The default pair (`--qd-descriptor moments`):
+
 | axis | definition | range |
 |---|---|---|
 | variable usage | distinct input columns read by the tree, divided by the number of inputs | `[0, 1]` |
@@ -49,6 +51,26 @@ Measured descriptor cost (`cargo test --release --lib qd::tests::descriptor_cost
 -- --nocapture`): **2.5 µs/candidate on 41 rows** and **46 µs/candidate on 800
 rows**, including the tree evaluation in the convenience path. The in-pass form
 adds only the moment accumulation to a sweep the search already performs.
+
+### Book descriptor (`--qd-descriptor book`, #1084)
+
+Under `--fitness pnl` the two axes above say little about what the fitness separates: two trees with different usage and skew can hold the same long/flat book. `--qd-descriptor book` keys the archive by the book itself, so a cell means "trades rarely, holds long" against "trades often, holds short". The default stays `moments`.
+
+| axis | definition | map to `[0, 1]` |
+|---|---|---|
+| log exposure | `x = long_rows / rows` | `ln(x / 1e-4) / ln(1e4)` |
+| log mean holding length | `h = long_rows / max(1, entries)` rows, `entries = (flips + exits) / 2` | `ln(h) / ln(1e4)` |
+
+* **One position rule.** The counts come from `FitnessBook::regret_and_shape`, the reduction that gives the regret: the threshold rule, the `--band`/`--min-holding` automaton and the `--pnl-blocks` seams. A position held across a block seam is two round trips, as the blocked regret charges it. Every run of the book starts flat, so each entry is closed by one flip or by the exit at the run's last row, and `flips + exits = 2 * entries`.
+* **Fixed bounds.** Exposure resolves `[1e-4, 1]` and holding `[1, 1e4]` rows, four decades each, clamped. The bounds are constants, so a book maps to the same point on every panel and the CVT's Halton seeds cover the same box in every run; CVT-MAP-Elites places its centroids inside user-fixed bounds (Vassiliades, Chatzilygeroudis and Mouret 2016, arXiv:1610.05729). A flat book is `(0, 0)`; an exposure below `1e-4` maps to 0, a holding of one row to 0, a holding above `1e4` rows to 1.
+* **Binning and ties** are the archive's: a grid cell is `floor(u * bins)` clamped to the last bin, a CVT cell the nearest centroid with ties to the lower index, Lloyd updates unchanged.
+* **Determinism.** The inputs are integer counts and the map is a fixed expression, so the descriptor is a pure function of the book; archive order is the fixed island and population order, so `--threads` changes nothing.
+* **Reachable cells.** The book axes have no lattice like variable usage, so every cell counts as reachable and `reachable_coverage` equals `coverage`. Corners such as very low exposure with very long holding cannot be reached (`h <= long_rows`), so treat coverage as a diagnostic.
+* **CPU and device.** On the CPU the descriptor comes out of the scoring pass, so `descriptor_fallbacks` is `0`. A device-scored member arrives without one; the archive and the migration victim then evaluate it once on the CPU with the same reduction, so a tree lands in the same cell on both backends, and `descriptor_fallbacks` counts the archive evaluations. Restart and immigrant probes are random trees and are always evaluated on the CPU, as under `moments`. The device totals of #1082 are not read.
+* **Refusals.** `book` needs `--fitness pnl` and a QD archive (`--qd`, `--qd-cells` or `--qd-policy`); otherwise the run exits 2.
+* **Report.** The text line reads `# qd (cvt, book descriptor): ...` and `--json` adds `"descriptor":"book"` after `mode`. A moments run keeps its bytes: neither appears.
+
+The book descriptor is an experiment. #120 stays parked until a pre-registered bench shows a gain: `--qd-policy` with the book descriptor against the plain search and the `--qd-random` control on the campaign-like panel (#1084). That bench is not run.
 
 ## Archive
 
@@ -84,6 +106,14 @@ occupied cell equally likely, and `--qd-random` hashes descriptors to random
 cells so the partition has no behavioural information. A gain that survives
 only the proposed policy, not the controls, is search capacity rather than
 niche diversity.
+
+Under `--restart-policy island` an island inside its isolation window takes
+none of these draws: no cell parent and no global-front parent. It breeds from
+its own members by the island tournament until the window closes (#1067).
+An explore island (`--explore-islands`, #1100) takes none of them for its whole
+life. `--front-scope island` (#1070) is refused with `--qd-policy`: the QD
+archive is one parent pool for every island, so the search would not be
+island-local.
 
 Migration keeps the ring but replaces the individual nearest the
 **least-visited cell's centroid** instead of the globally worst error.
@@ -213,11 +243,16 @@ trial families and a candidate-to-P&L mapping, which is outside the QD layer.
 ## Checkpoints and exactness
 
 `--save` writes `qd_bins`, `qd_cell_cap`, `qd_cvt` and `qd_policy` into the
-checkpoint. The archive itself is rebuilt from the resumed search's evaluated
-candidates; it is reporting state, not trajectory state. The passive layer never
-changes the Pareto front. With the layer disabled, the exactness fixtures are
-unchanged — `tests/qd.rs::qd_is_off_by_default_and_does_not_change_the_front`
-and the pinned archive/checkpoint tests cover this.
+checkpoint, and `qd_descriptor book` under the book descriptor (absent means
+`moments`; a resume refuses a different `--qd-descriptor`).
+
+What happens to the archive itself depends on the policy:
+
+* Under `--qd-policy` (and its controls `--qd-uniform` and `--qd-random`) the archive is trajectory state: it chooses parents, migration victims and restart aims. `--save` writes it as `qd_*` records (docs/checkpoint.md): every cell's local front with its descriptors, the CVT centroids, the per-cell offer counts, the Lloyd sample, the offer and fallback counters, and the descriptor cache. `--resume` restores it, so a resumed run gives the same front, `qd` report and exit checkpoint as the uninterrupted run, for both descriptor kinds and every archive (`tests/checkpoint.rs::a_qd_policy_run_resumed_at_every_generation_matches_exactly`, `a_qd_policy_run_and_its_resume_match_exactly`, `tests/pnl_fitness.rs::a_qd_book_policy_run_and_its_resume_match_exactly`). The exit checkpoint saves the archive of the last generation, before the end-of-run refit of the reported cell elites.
+* A `--qd-policy` checkpoint without the archive records (written before #1166) is refused on resume with exit 2, `cannot resume: this --qd-policy checkpoint has no QD archive`: an empty archive would continue a different trajectory. Rerun such a search from generation 0.
+* Under the passive `--qd` the archive is reporting state, not trajectory state: the checkpoint does not carry it, and a resumed run rebuilds it from the candidates it evaluates, so its `qd` report covers the resumed generations only. The passive layer never changes the Pareto front.
+
+With the layer disabled, the exactness fixtures are unchanged: `tests/qd.rs::qd_is_off_by_default_and_does_not_change_the_front` and the pinned archive/checkpoint tests cover this. QD-off and `--qd` checkpoints have no `qd_*` records (`tests/checkpoint.rs::the_qd_archive_is_saved_only_under_qd_policy`).
 
 ## Benchmark and controls
 

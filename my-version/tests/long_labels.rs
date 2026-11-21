@@ -1103,3 +1103,42 @@ fn label_report_and_lockbox_check_drop_the_same_rows() {
         assert!(lockbox.check_times("training split", "ts", &[boundary + HOUR], purge).is_err(), "h{h}");
     }
 }
+
+fn spec_of(src: &str) -> target::TargetSpec {
+    LongLabelSpec::parse(src, HOUR).unwrap().target_spec("lbl_y", "lbl_fwd")
+}
+
+#[test]
+fn target_spec_records_stride_seconds() {
+    let wide = spec_of("long:1,name=h1s24,fee=0,stride=24,anchor=2021-01-04");
+    assert_eq!(wide.horizon_seconds, 3600.0);
+    assert_eq!(wide.stride_seconds, Some(86_400.0));
+    assert_eq!(wide.period_width_seconds(), 86_400.0);
+    let text = format!("{{\"schema\":\"{}\",\"targets\":[{{{}}}]}}", target::SCHEMA, wide.file_json());
+    assert!(text.contains("\"stride_seconds\":86400"), "{text}");
+    let back = target::parse_file(&text).unwrap();
+    assert_eq!(back, vec![wide.clone()]);
+    assert_eq!(back[0].sha256(), wide.sha256());
+    let odd = spec_of("long:24,name=h24s36,fee=0,stride=36");
+    assert_eq!(odd.stride_seconds, Some(129_600.0));
+    assert_eq!(odd.period_width_seconds(), 129_600.0);
+}
+
+#[test]
+fn target_spec_without_wider_stride_has_no_stride_field() {
+    for src in ["long:1,name=h1,fee=0", "long:24,name=h24,fee=0,stride=24", "long:24,name=h24o,fee=0,stride=24,anchor=2021-01-04", "long:4,name=h4,fee=0,stride=2"] {
+        let s = spec_of(src);
+        assert_eq!(s.stride_seconds, None, "{src}");
+        assert_eq!(s.period_width_seconds(), s.horizon_seconds, "{src}");
+        assert!(!s.canonical_json().contains("stride_seconds"), "{src}");
+        assert!(!s.file_json().contains("stride_seconds"), "{src}");
+    }
+}
+
+#[test]
+fn target_spec_refuses_a_stride_below_the_horizon() {
+    let s = spec_of("long:24,name=h24,fee=0,stride=24");
+    let text = format!("{{\"schema\":\"{}\",\"targets\":[{{{}}}]}}", target::SCHEMA, s.file_json());
+    let bad = text.replace("\"long_only\":true", "\"long_only\":true,\"stride_seconds\":3600");
+    assert!(target::parse_file(&bad).unwrap_err().contains("stride_seconds"), "{bad}");
+}
