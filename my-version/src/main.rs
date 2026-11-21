@@ -14601,7 +14601,8 @@ fn finish_import(
     quiet: bool,
     time_col: Option<usize>,
 ) -> ! {
-    if let Err(e) = store::write_store_with_time_marked(output, table, group_rows, time_col, rcsr::permute_labels::marker(input).as_deref()) {
+    let marker = rcsr::permute_labels::marker(input);
+    if let Err(e) = store::write_store_with_time_marked(output, table, group_rows, time_col, marker.as_deref()) {
         eprintln!("error: {}", e);
         std::process::exit(EXIT_INPUT);
     }
@@ -14611,12 +14612,13 @@ fn finish_import(
             .map(|c| format!(", time='{}' as i64", table.names[c]))
             .unwrap_or_default();
         println!(
-            "imported {} rows x {} columns to {} (group_rows={}{})",
+            "imported {} rows x {} columns to {} (group_rows={}{}){}",
             table.len(),
             table.n_cols(),
             output,
             group_rows,
-            stored
+            stored,
+            marker.as_deref().and_then(rcsr::devlog::Json::parse).map_or(String::new(), |j| format!("; {}", rcsr::permute_labels::describe(&j)))
         );
     }
     std::process::exit(EXIT_OK);
