@@ -14590,17 +14590,18 @@ fn run_import(args: &[String]) -> ! {
         },
         None => None,
     };
-    finish_import(&output, &table, group_rows, quiet, time_col);
+    finish_import(&input, &output, &table, group_rows, quiet, time_col);
 }
 
 fn finish_import(
+    input: &str,
     output: &str,
     table: &data::Table,
     group_rows: usize,
     quiet: bool,
     time_col: Option<usize>,
 ) -> ! {
-    if let Err(e) = store::write_store_with_time(output, table, group_rows, time_col) {
+    if let Err(e) = store::write_store_with_time_marked(output, table, group_rows, time_col, rcsr::permute_labels::marker(input).as_deref()) {
         eprintln!("error: {}", e);
         std::process::exit(EXIT_INPUT);
     }
