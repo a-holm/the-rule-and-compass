@@ -663,7 +663,28 @@ pub(crate) fn refuse_locked(j: &Json, path: &str, locked: &[(f64, f64)]) -> Res<
     }
 }
 
+/// #1272: exit 2 for a report priced on a null store (`null_store`, written by `rcsr panel permute-labels`).
+pub(crate) fn refuse_null_store(j: &Json, path: &str) -> Res<()> {
+    match j.get("null_store") {
+        Some(m) => usage(format!(
+            "{} is priced on a null store (null_store label {}, seed {}); a null store is never a candidate: pass it with --null-wf",
+            path,
+            m.get("label").and_then(Json::as_str).unwrap_or("?"),
+            m.get("seed").and_then(Json::as_f64).map_or("?".to_string(), jnum)
+        )),
+        None => Ok(()),
+    }
+}
+
+/// A development report of real data: [`refuse_locked`] and [`refuse_null_store`].
 fn read_checked(path: &str, locked: &[(f64, f64)]) -> Res<Json> {
+    let j = read_null(path, locked)?;
+    refuse_null_store(&j, path)?;
+    Ok(j)
+}
+
+/// A `--null-wf` report: a development report, of real data or of a null store.
+fn read_null(path: &str, locked: &[(f64, f64)]) -> Res<Json> {
     let j = trials::read_report(path)?;
     refuse_locked(&j, path, locked)?;
     Ok(j)
@@ -1407,7 +1428,7 @@ fn table(o: &Options, t: &TableArgs, rule: &Rule, rule_sha: &str, rule_source: &
     // The null set, the baseline and the occam runs.
     let mut null_sharpes: Vec<f64> = Vec::new();
     for p in &t.null_wf {
-        let j = read_checked(p, &t.locked)?;
+        let j = read_null(p, &t.locked)?;
         let w = trials::wf_entry(&j, &j, "pooled", p, trials::label_of(p))?;
         trials::require_same(&first.wf, &w, o.threshold_arms)?;
         null_sharpes.push(crate::walkforward::sharpe(&w.net, w.ppy));

@@ -124,7 +124,9 @@ counts the sibling horizon tables. Output rcsr-trials-table/1.\n\
   --diversity-rho <R>    skip a row whose net series correlates at R or more with a picked row (default 1)\n\
   --min-front <M>        keep the first fronts until at least M rows remain (default 0: every front)\n\
   --cost-multiples <m,..> net<bps> metrics at m x cost_model.per_side_bps (default 1,2: net10 and net20 at 10 bp)\n\
-  --null-wf <files...>   null walk-forward reports; null_q = share of their annual Sharpes below the row's\n\
+  --null-wf <files...>   null walk-forward reports; null_q = share of their annual Sharpes below the row's. A report\n\
+                         priced on a null store (null_store, rcsr panel permute-labels, #1272) is read only here: as\n\
+                         --wf, --baseline-wf or a freeze population path it exits 2\n\
   --prior-trials <N0>    add N0 earlier trials to the nominal N of the picked rows' DSR\n\
   --family-table <files...> rcsr trials --table outputs of the sibling horizons over the same development span\n\
                          (#1269, repeatable). DSR, DSR 10 N_eff and MinBTL use N_eff plus each sibling's own\n\

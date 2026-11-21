@@ -404,6 +404,7 @@ fn load_population(row: &MapRow, rule: &FreezeRule, map: &str, locked: &[(f64, f
         let text = String::from_utf8_lossy(&bytes);
         let j = Json::parse(text.trim()).ok_or_else(|| (3, format!("{}: not a JSON report", f)))?;
         crate::trials_table::refuse_locked(&j, f, locked)?;
+        crate::trials_table::refuse_null_store(&j, f)?;
         if j.get("mode").and_then(Json::as_str) != Some("cpcv_path") {
             return usage(format!(
                 "field 'mode' is not cpcv_path in {}: the population of configuration {} holds the path reports of rcsr trials --cpcv-assemble",

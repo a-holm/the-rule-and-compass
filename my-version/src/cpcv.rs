@@ -831,6 +831,8 @@ struct SplitReport {
     entry_times: Option<f64>,
     /// #1237: `selection.composite.type` of a report of a composed run.
     composite: Option<String>,
+    /// #1272: the `null_store` marker of a report priced on a null store.
+    null_store: Option<String>,
 }
 
 fn whole(x: Option<f64>) -> Option<i64> {
@@ -902,7 +904,8 @@ fn load_report(path: &str) -> Result<SplitReport, Fail> {
             None => return usage(format!("field 'selection.composite.type' is missing in {}: a composite marker names its type", path)),
         },
     };
-    Ok(SplitReport { path: path.to_string(), sha256: crate::manifest::sha256_hex(text.as_bytes()), json, windows, time, net, rows, extra, entry_times, composite })
+    let null_store = json.get("null_store").map(to_json);
+    Ok(SplitReport { path: path.to_string(), sha256: crate::manifest::sha256_hex(text.as_bytes()), json, windows, time, net, rows, extra, entry_times, composite, null_store })
 }
 
 /// #1236: `pooled.entry_times` of a report. A report with it gives every window its count
@@ -1142,6 +1145,13 @@ in every split or in none",
             reports[a].path, reports[b].path
         ));
     }
+    if let Some(r) = reports.iter().find(|r| r.null_store != reports[0].null_store) {
+        return usage(format!(
+            "split reports differ in field 'null_store': {} vs {}; the split reports of one assembly are priced on one store (a null store or real data)",
+            reports[0].path, r.path
+        ));
+    }
+    let null_member = reports[0].null_store.as_ref().map_or(String::new(), |m| format!("\"null_store\":{},", m));
     let ppy = at(&reports[0].json, &["annualization", "periods_per_year"]).and_then(Json::as_f64).unwrap_or(f64::NAN);
     // Group series of every split, as index lists into its pooled series.
     let mut parts: Vec<Vec<Vec<usize>>> = Vec::with_capacity(count);
@@ -1291,7 +1301,7 @@ in every split or in none",
             copy("threshold"),
             copy("policy"),
             at(first, crate::trials::MISSING_SCORE).map_or("null".to_string(), to_json),
-            composite_json(&reports, p),
+            composite_json(&reports, p) + &null_member,
             jstr(&scheme_sha),
             jstr(&splits_sha),
             n,
