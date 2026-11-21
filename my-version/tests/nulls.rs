@@ -277,8 +277,15 @@ fn p(dir: &Path, name: &str) -> String {
 /// Hourly rows of three symbols from `T0` for `hours` hours, time-major, without the hours
 /// `skip` names. The label `h24` sits on the daily grid of `T0` (stride 24) and is NaN between;
 /// `BBB` has a NaN `y`, `exit_ret`, `m_net` and `m_barrier` on every 5th grid day while its
-/// `fwd`, `long_net`, `action`, `t1` and `weight` stay finite. Every finite `y` is distinct.
+/// `fwd`, `long_net`, `action`, `t1` and `weight` stay finite. Every finite `y` and every finite
+/// `fwd` is distinct.
 fn write_null_panel(dir: &Path, name: &str, hours: i64, skip: &dyn Fn(i64) -> bool) -> String {
+    write_warm_panel(dir, name, hours, 0, skip)
+}
+
+/// [`write_null_panel`] whose first `warmup` grid days of every symbol have a NaN `y`, `exit_ret`,
+/// `m_net` and `m_barrier` and a finite return (the warm-up of a label's volatility window).
+fn write_warm_panel(dir: &Path, name: &str, hours: i64, warmup: i64, skip: &dyn Fn(i64) -> bool) -> String {
     let mut text = format!("ts,symbol,r16,r96,{}\n", KINDS.map(lbl).join(","));
     let mut id = 0u64;
     for i in 0..hours {
@@ -297,7 +304,7 @@ fn write_null_panel(dir: &Path, name: &str, hours: i64, skip: &dyn Fn(i64) -> bo
                 let exit = 0.5 * fwd + 0.001;
                 let bit = |b: bool| if b { 1.0 } else { 0.0 };
                 v = [fwd, fwd / 0.01, fwd - 0.002, bit(fwd > 0.002), (ts + 25 * HOUR) as f64, exit, bit(exit > 0.002), bit(r96 > 0.0), 1.0 + 0.1 * frac(f * 0.5)];
-                if k == 1 && (i / 24) % 5 == 2 {
+                if (k == 1 && (i / 24) % 5 == 2) || i / 24 < warmup {
                     for kind in ["y", "exit_ret", "m_net", "m_barrier"] {
                         v[KINDS.iter().position(|x| *x == kind).unwrap()] = f64::NAN;
                     }
@@ -383,14 +390,17 @@ fn permute_labels_moves_values_within_each_symbol() {
     assert_eq!(symbols_of(&out), syms);
     let live: Vec<usize> = (0..y.len()).filter(|&i| y[i].is_finite()).collect();
     assert_eq!(live.len(), 3 * 60 - 12, "60 grid days of 3 symbols, 12 NaN y days of BBB");
+    let fwd = floats(&src, &lbl("fwd"));
     for kind in MOVED {
         let (a, b) = (floats(&src, &lbl(kind)), floats(&out, &lbl(kind)));
         for sym in SYMBOLS {
             let rows: Vec<usize> = live.iter().copied().filter(|&i| syms[i] == sym).collect();
             assert_eq!(sorted_bits(rows.iter().map(|&i| a[i])), sorted_bits(rows.iter().map(|&i| b[i])), "{kind} of {sym}");
+            let gap: Vec<usize> = (0..y.len()).filter(|&i| syms[i] == sym && !y[i].is_finite() && fwd[i].is_finite()).collect();
+            assert_eq!(sorted_bits(gap.iter().map(|&i| a[i])), sorted_bits(gap.iter().map(|&i| b[i])), "{kind} of the gap rows of {sym}");
         }
-        for i in (0..y.len()).filter(|&i| !y[i].is_finite()) {
-            assert_eq!(a[i].to_bits(), b[i].to_bits(), "{kind} row {i} has a NaN y and keeps its value");
+        for i in (0..y.len()).filter(|&i| !y[i].is_finite() && !fwd[i].is_finite()) {
+            assert_eq!(a[i].to_bits(), b[i].to_bits(), "{kind} row {i} has no label and keeps its value");
         }
     }
     let y_out = floats(&out, &lbl("y"));
@@ -533,6 +543,18 @@ fn permute_labels_keeps_every_value_on_its_side_of_the_lock() {
         }
     }
     assert!(banded >= 6, "the fixture holds label rows in the purge and embargo bands, got {banded}");
+    // Gap rows (a NaN y and a finite return) stay on their side of the lock too.
+    let (fwd, fwd_out) = (&src_cols[0], &out_cols[0]);
+    let by_fwd: BTreeMap<u64, usize> = fwd.iter().enumerate().filter(|(_, v)| v.is_finite()).map(|(i, v)| (v.to_bits(), i)).collect();
+    let gaps: Vec<usize> = (0..y.len()).filter(|&r| !y[r].is_finite() && fwd[r].is_finite()).collect();
+    assert!(!gaps.is_empty(), "the fixture holds gap rows");
+    for &r in &gaps {
+        let from = by_fwd[&fwd_out[r].to_bits()];
+        assert_eq!(side(time[from]), side(time[r]), "gap row {r} ({}) takes a return from row {from} ({})", side(time[r]), side(time[from]));
+        if matches!(side(time[r]), "purge" | "embargo") {
+            assert_eq!(from, r, "gap row {r} in the {} band keeps its return", side(time[r]));
+        }
+    }
     let o = run(&["lock", "check", "--record", &record, &p(dir, "out")]);
     assert_eq!(code(&o), 0, "{}{}", String::from_utf8_lossy(&o.stdout), stderr(&o));
 
@@ -545,6 +567,52 @@ fn permute_labels_keeps_every_value_on_its_side_of_the_lock() {
     assert_eq!(code(&o), 3, "{}", stderr(&o));
     assert!(stderr(&o).contains("inside the locked range"), "{}", stderr(&o));
     assert!(!Path::new(&refused).exists());
+}
+
+/// Rows with a NaN `y` and a finite return (8 warm-up days per symbol, BBB's gap days) move in a
+/// pool of their own: the priced rows of the null store are those of the source, and no such row
+/// keeps its source return. The pools hold 8, 14 and 8 rows, at least two blocks of 3. A circular-
+/// block order can map a whole block onto itself, so the last property holds for this fixture and
+/// seed 1 (checked against a standalone copy of the order), not for every seed.
+#[test]
+fn permute_labels_moves_gap_rows_in_their_own_pool() {
+    let s = Scratch::new("permute-gap");
+    let dir = s.path();
+    let src = write_warm_panel(dir, "src.rcsb", 40 * 24, 8, &|_| false);
+    let spec = write_text(dir, "src.targets.json", SPEC);
+    let out = p(dir, "n.rcsb");
+    let o = permute(&src, &spec, &out, "3", "1", &[]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let syms = symbols_of(&src);
+    let (y, y_out) = (floats(&src, &lbl("y")), floats(&out, &lbl("y")));
+    let (fwd, fwd_out) = (floats(&src, &lbl("fwd")), floats(&out, &lbl("fwd")));
+    let priced = |v: &[f64]| (0..v.len()).filter(|&i| v[i].is_finite()).collect::<Vec<_>>();
+    assert_eq!(priced(&fwd_out), priced(&fwd), "the null book prices the rows of the real book");
+    assert_eq!(priced(&y_out), priced(&y), "the fit rows are those of the source");
+    let by_fwd: BTreeMap<u64, usize> = fwd.iter().enumerate().filter(|(_, v)| v.is_finite()).map(|(i, v)| (v.to_bits(), i)).collect();
+    assert_eq!(by_fwd.len(), priced(&fwd).len(), "the fixture gives every finite return its own value");
+    let gaps: Vec<usize> = (0..y.len()).filter(|&i| !y[i].is_finite() && fwd[i].is_finite()).collect();
+    assert_eq!(gaps.len(), 8 + 14 + 8);
+    let src_cols: Vec<Vec<f64>> = MOVED.iter().map(|k| floats(&src, &lbl(k))).collect();
+    let out_cols: Vec<Vec<f64>> = MOVED.iter().map(|k| floats(&out, &lbl(k))).collect();
+    for &r in &gaps {
+        assert_ne!(fwd_out[r].to_bits(), fwd[r].to_bits(), "gap row {r} ({}) keeps its source return", syms[r]);
+        let from = by_fwd[&fwd_out[r].to_bits()];
+        assert!(gaps.contains(&from) && syms[from] == syms[r], "gap row {r} takes the return of row {from}, not a gap row of {}", syms[r]);
+        for (k, kind) in MOVED.iter().enumerate() {
+            assert_eq!(out_cols[k][r].to_bits(), src_cols[k][from].to_bits(), "gap row {r}: {kind} comes from row {from}");
+        }
+    }
+    let m = read_json(&format!("{out}.manifest.json"));
+    let pools = match at(&m, &["null", "pools"]) {
+        Json::Arr(a) => a.clone(),
+        _ => panic!("null.pools is not a list"),
+    };
+    for (sym, label_rows, gap_rows) in [("AAA", 32.0, 8.0), ("BBB", 26.0, 14.0), ("CCC", 32.0, 8.0)] {
+        let pool = pools.iter().find(|p| at(p, &["symbol"]).as_str() == Some(sym)).unwrap_or_else(|| panic!("no pool of {sym}"));
+        assert_eq!(at(pool, &["label_rows"]).as_f64(), Some(label_rows), "{sym}");
+        assert_eq!(at(pool, &["gap_rows"]).as_f64(), Some(gap_rows), "{sym}");
+    }
 }
 
 /// A `--fitness pnl` search, `walkforward --from-run` and `trials --table --null-wf` on the
