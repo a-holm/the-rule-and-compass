@@ -668,3 +668,154 @@ fn null_store_runs_search_walkforward_and_the_table() {
         assert!(e.contains(nul.as_str()) && e.contains("null store") && e.contains("--null-wf"), "{e}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// #1304: the marker travels with the store; the ledger and plain `trials` refuse it
+// ---------------------------------------------------------------------------
+
+/// `walkforward --expr r16` on `data` over one window of the 90-day fixture, plus `extra`.
+fn wf_expr(data: &str, spec: &str, out: &str, extra: &[&str]) -> Output {
+    let window = format!("v,{},{},{},{}", T0, T0 + 60 * DAY, T0 + 62 * DAY, T0 + 90 * DAY);
+    let mut args = vec![
+        "walkforward", "--data", data, "--target", "lbl_h24_y", "--target-spec", spec, "--expr", "r16", "--time", "ts", "--group-by", "symbol",
+        "--window", &window, "--emit-series", "--out", out,
+    ];
+    args.extend_from_slice(extra);
+    run(&args)
+}
+
+/// The 90-day source store, its spec and the null store of label h24 (block 5, seed 1).
+fn null_fixture(dir: &Path) -> (String, String, String) {
+    let src = write_null_panel(dir, "src.rcsb", 90 * 24, &|_| false);
+    let spec = write_text(dir, "src.targets.json", SPEC);
+    let null = p(dir, "null/n1.rcsb");
+    let o = permute(&src, &spec, &null, "5", "1", &[]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    (src, spec, null)
+}
+
+#[test]
+fn null_marker_survives_store_copy() {
+    let s = Scratch::new("null-copy");
+    let dir = s.path();
+    let (src, spec, null) = null_fixture(dir);
+    let copy = p(dir, "copy.rcsb");
+    std::fs::copy(&null, &copy).unwrap();
+    assert!(!Path::new(&format!("{copy}.manifest.json")).exists(), "the copy has no sidecar");
+    assert_eq!(rcsr::manifest::sha256_file(&copy).unwrap(), rcsr::manifest::sha256_file(&null).unwrap());
+    let manifest_null = at(&read_json(&format!("{null}.manifest.json")), &["null"]).clone();
+    let marker = rcsr::permute_labels::marker(&copy).expect("the copy of a null store is marked");
+    assert_eq!(Json::parse(&marker).expect("the marker is JSON"), manifest_null, "the store header carries the manifest's null object");
+    assert_eq!(rcsr::permute_labels::marker(&src), None, "the source store is real data");
+
+    let out = p(dir, "copy.wf.json");
+    let o = wf_expr(&copy, &spec, &out, &[]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let report = read_json(&out);
+    let m = report.get("null_store").expect("a report priced on the copy carries null_store");
+    assert_eq!(at(m, &["label"]).as_str(), Some("h24"));
+    assert_eq!(at(m, &["seed"]).as_f64(), Some(1.0));
+    assert_eq!(at(m, &["block"]).as_f64(), Some(5.0));
+    assert_eq!(at(m, &["source_sha256"]).as_str(), Some(rcsr::manifest::sha256_file(&src).unwrap().as_str()));
+    let real = p(dir, "real.wf.json");
+    let o = wf_expr(&src, &spec, &real, &[]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(read_json(&real).get("null_store").is_none(), "a report of real data has no marker");
+}
+
+#[test]
+fn walkforward_ledger_refuses_null_store() {
+    let s = Scratch::new("null-ledger");
+    let dir = s.path();
+    let (src, spec, null) = null_fixture(dir);
+    let copy = p(dir, "copy.rcsb");
+    std::fs::copy(&null, &copy).unwrap();
+    let ledger = p(dir, "ledger.jsonl");
+    let o = wf_expr(&src, &spec, &p(dir, "real.wf.json"), &["--ledger", &ledger]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let before = std::fs::read(&ledger).unwrap();
+    assert_eq!(before.iter().filter(|&&b| b == b'\n').count(), 1, "the real store adds one candidate");
+    for data in [&null, &copy] {
+        let out = p(dir, "null.wf.json");
+        let o = wf_expr(data, &spec, &out, &["--ledger", &ledger]);
+        assert_eq!(code(&o), 2, "{data}: {}{}", String::from_utf8_lossy(&o.stdout), stderr(&o));
+        let e = stderr(&o);
+        assert!(e.contains(data.as_str()) && e.contains("null store") && e.contains("label h24, seed 1") && e.contains("--ledger"), "{e}");
+        assert!(std::fs::read(&ledger).unwrap() == before, "{data}: the ledger keeps its bytes");
+        assert!(!Path::new(&out).exists(), "{data}: no report is written");
+    }
+}
+
+/// A null store written before #1304 is marked by its manifest only. A candidate registered
+/// on it while unmarked and sealed is still refused a sealed read: the read would spend a
+/// lockbox read on null data.
+#[test]
+fn walkforward_locked_test_refuses_null_store() {
+    let s = Scratch::new("null-locked");
+    let dir = s.path();
+    let mut csv = String::from("ts,x,target\n");
+    for i in 0..300 {
+        let x = ((i * 37) % 17) as f64 - 8.0;
+        let _ = writeln!(csv, "{},{},{}", i, x, 0.0003 * x + (((i * 13) % 7) as f64 - 3.0) * 0.0004);
+    }
+    let data = write_text(dir, "d.csv", &csv);
+    let (ledger, sealed) = (p(dir, "ledger.jsonl"), p(dir, "locked_candidates.json"));
+    let wf = |extra: &[&str]| -> Output {
+        let mut a = vec![
+            "walkforward", "--data", &data, "--target", "target", "--expr", "x", "--time", "ts", "--horizon", "1", "--cost-bps", "5",
+            "--lockbox", "200,300", "--ledger", &ledger, "--periods-per-year", "365", "--json",
+        ];
+        a.extend_from_slice(extra);
+        run(&a)
+    };
+    let o = wf(&["--window", "dev,0,60,70,150"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let o = run(&["protocol", "seal", "--ledger", &ledger, "--out", &sealed]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let manifest = format!(
+        "{{\"schema\":\"rcsr-null-store/1\",\"tool\":\"rcsr panel permute-labels\",\"null\":{{\"label\":\"h24\",\"block\":5,\"seed\":7,\"order\":\"per_symbol\"}},\"output_sha256\":\"{}\"}}\n",
+        rcsr::manifest::sha256_file(&data).unwrap()
+    );
+    write_text(dir, "d.csv.manifest.json", &manifest);
+    let before = std::fs::read(&ledger).unwrap();
+    let o = wf(&["--locked-test", "--sealed", &sealed, "--window", "locked,0,150,210,300"]);
+    assert_eq!(code(&o), 2, "stdout: {} stderr: {}", String::from_utf8_lossy(&o.stdout), stderr(&o));
+    let e = stderr(&o);
+    assert!(e.contains("null store") && e.contains("label h24, seed 7") && e.contains("lockbox read"), "{e}");
+    assert!(std::fs::read(&ledger).unwrap() == before, "the ledger records no read");
+    assert!(!Path::new(&rcsr::protocol::marker_path(&data)).exists(), "no read marker is written");
+    let o = wf(&["--window", "dev2,0,50,60,140"]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).contains("never a protocol candidate"), "{}", stderr(&o));
+    assert!(std::fs::read(&ledger).unwrap() == before, "the ledger adds no candidate");
+}
+
+#[test]
+fn trials_wf_refuses_null_report() {
+    let s = Scratch::new("null-trials");
+    let dir = s.path();
+    let (src, spec, null) = null_fixture(dir);
+    let (real, nul) = (p(dir, "real.wf.json"), p(dir, "null.wf.json"));
+    for (data, out) in [(&src, &real), (&null, &nul)] {
+        let o = wf_expr(data, &spec, out, &[]);
+        assert_eq!(code(&o), 0, "{}", stderr(&o));
+    }
+    assert!(read_json(&nul).get("null_store").is_some());
+    let o = run(&["trials", "--wf", &real, "--draws", "20"]);
+    assert_eq!(code(&o), 0, "a real report: {}", stderr(&o));
+    let refused: [Vec<&str>; 4] = [
+        vec!["trials", "--wf", &nul, "--draws", "20"],
+        vec!["trials", "--wf", &real, &nul, "--draws", "20"],
+        vec!["trials", "--wf", &nul, "--members", "all", "--draws", "20"],
+        vec!["trials", "--compare", &real, &nul, "--draws", "20"],
+    ];
+    for args in refused {
+        let o = run(&args);
+        assert_eq!(code(&o), 2, "{args:?}: {}{}", String::from_utf8_lossy(&o.stdout), stderr(&o));
+        let e = stderr(&o);
+        assert!(e.contains(nul.as_str()) && e.contains("null_store") && e.contains("label h24") && e.contains("seed 1"), "{args:?}: {e}");
+        assert!(o.stdout.is_empty(), "{args:?}: no output");
+    }
+    let o = run(&["trials", "--wf", &real, "--table", "--null-wf", &nul, "--draws", "20"]);
+    assert_eq!(code(&o), 0, "--null-wf still reads a null report: {}", stderr(&o));
+}
