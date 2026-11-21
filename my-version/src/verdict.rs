@@ -173,10 +173,10 @@ pub fn remove_member(text: &str, path: &[&str]) -> Result<String, String> {
 
 /// The text whose SHA-256 is `protocol.report_sha256` of a walk-forward report file: the
 /// file without the members outside the reproduction hash (`protocol`, `batch_timings`,
-/// `scan`, `ledger`, the file paths `selection.run` and `split.fit_label`).
+/// `scan`, `ledger`, the file path `selection.run`, `split.fit_label` and `split.labelled_rows`).
 pub fn hashed_report_text(text: &str) -> Result<String, String> {
     let mut t = text.trim().to_string();
-    for path in [&["protocol"][..], &["batch_timings"], &["scan"], &["ledger"], &["selection", "run"], &["split", "fit_label"]] {
+    for path in [&["protocol"][..], &["batch_timings"], &["scan"], &["ledger"], &["selection", "run"], &["split", "fit_label"], &["split", "labelled_rows"]] {
         t = remove_member(&t, path)?;
     }
     Ok(t)
