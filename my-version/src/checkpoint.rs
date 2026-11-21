@@ -37,6 +37,8 @@
 //! | `mix <i> <numbers>` | #471: adaptive edit counts of island i, 14 numbers per generation |
 //! | `rng <i|main> <idx> <624 words>` | exact MT19937 state |
 //! | `ind <i> <error> <complexity> <tree>` | one population member |
+//! | `qd_archive 1 <mode> <cells> <records> <fallbacks> <known_tag> <observed> <entries> <known>` | #1166: QD archive header, written only under `--qd-policy` |
+//! | `qd_visits` / `qd_centroid` / `qd_observed` / `qd_entry` / `qd_known` | #1166: the archive's visit counts, centroids, Lloyd sample, cell fronts and descriptor cache |
 //!
 //! Trees are encoded recursively as `op_index val arity child...`, where
 //! `op_index` is [`Op::index`] and `val` is the exact floating-point value
@@ -53,6 +55,7 @@ use crate::expr::{AggKind, Node, Op};
 use crate::metrics::Metric;
 use crate::pareto::{Archive, Sol};
 use crate::provenance::BuildIdentity;
+use crate::qd::{Descriptor, QdEntry, QdMode, QdState};
 use crate::rng::Mt;
 use crate::search::Config;
 // #25: units are part of the saved search settings, so a resumed run keeps the
@@ -67,6 +70,13 @@ pub const FORMAT_LINE: &str = "rcsr-checkpoint v1";
 
 /// MT19937 state words carried by every `rng` record.
 const STATE_WORDS: usize = 624;
+
+/// #1166: the version field of the `qd_archive` header this build reads and writes.
+const QD_ARCHIVE_VERSION: u32 = 1;
+
+/// #1166: why a `--qd-policy` checkpoint without the archive records does not resume.
+pub const QD_ARCHIVE_MISSING: &str =
+    "cannot resume: this --qd-policy checkpoint has no QD archive (written before #1166); rerun from generation 0";
 
 /// One population member, as stored in a checkpoint.
 #[derive(Clone, Debug)]
@@ -265,9 +275,18 @@ pub struct Checkpoint {
     /// #345: sha256 of the declared target spec the run used, or `None` for a
     /// run without one. A resume must present the same spec.
     pub target_spec: Option<String>,
+    /// #1173: fingerprint of the resolved splits-table intervals, purge and
+    /// embargo, or `None` for a run without `--split-table`. A resume must
+    /// present the same intervals.
+    pub split_intervals: Option<String>,
     /// #482: offspring scored up to this checkpoint, so a resumed run keeps
     /// counting. `0` for a file written before the count existed.
     pub candidates_evaluated: u64,
+    /// #1166: the QD archive of a `--qd-policy` run, where it chooses parents,
+    /// migration victims and restart aims. `None` for every other run, and for
+    /// a `--qd-policy` file written before the archive was saved (a resume
+    /// refuses that file).
+    pub qd: Option<QdState>,
 }
 
 /// The operators in [`Op::index`] order. The array index is exactly
@@ -585,12 +604,17 @@ pub fn hash_config_text(text: &str) -> u64 {
 impl Checkpoint {
     /// Serialise the checkpoint to the versioned text format.
     pub fn to_text(&self) -> String {
-        self.to_text_for(self.target_spec.as_deref())
+        self.to_text_with(self.target_spec.as_deref(), self.split_intervals.as_deref())
     }
 
     /// [`Checkpoint::to_text`] recording `target_spec` (the sha256 of the
     /// declared target spec of the writing run) instead of the stored one.
     pub fn to_text_for(&self, target_spec: Option<&str>) -> String {
+        self.to_text_with(target_spec, None)
+    }
+
+    /// [`Checkpoint::to_text_for`] that also records the split intervals (#1173).
+    pub fn to_text_with(&self, target_spec: Option<&str>, split_intervals: Option<&str>) -> String {
         let mut out = String::new();
         writeln!(out, "{}", FORMAT_LINE).unwrap();
         write_config(&self.config, &mut out);
@@ -617,6 +641,9 @@ impl Checkpoint {
         }
         if let Some(sha) = target_spec {
             writeln!(out, "target_spec {}", sha).unwrap();
+        }
+        if let Some(fp) = split_intervals {
+            writeln!(out, "split_intervals {}", fp).unwrap();
         }
         writeln!(out, "candidates_evaluated {}", self.candidates_evaluated).unwrap();
         writeln!(out, "archive_hash {:016x}", self.archive.hash()).unwrap();
@@ -708,6 +735,9 @@ impl Checkpoint {
                 writeln!(out, "ages {} {}", i, ages.join(" ")).unwrap();
             }
         }
+        if let Some(q) = &self.qd {
+            write_qd(q, &mut out); // #1166
+        }
         out
     }
 
@@ -755,8 +785,10 @@ impl Checkpoint {
         let mut build_fields: BTreeMap<String, String> = BTreeMap::new();
         let mut target_spec: Option<String> = None;
         let mut candidates_evaluated: Option<u64> = None;
+        let mut split_intervals: Option<String> = None;
         let mut final_header: Option<(usize, usize, u64)> = None;
         let mut final_sols: Vec<Sol> = Vec::new();
+        let mut qd = QdReader::default(); // #1166
 
         for (lineno, line) in lines.enumerate() {
             let lineno = lineno + 2; // first line is line 1
@@ -911,6 +943,12 @@ impl Checkpoint {
                         .get(1)
                         .ok_or_else(|| format!("line {}: target_spec has no value", lineno))?;
                     set_once(&mut target_spec, v.to_string(), "target_spec", lineno)?;
+                }
+                "split_intervals" => {
+                    let v = parts
+                        .get(1)
+                        .ok_or_else(|| format!("line {}: split_intervals has no value", lineno))?;
+                    set_once(&mut split_intervals, v.to_string(), "split_intervals", lineno)?;
                 }
                 "final" => {
                     let members = parse_num::<usize>(&parts, 1, lineno, "final members")?;
@@ -1087,6 +1125,7 @@ impl Checkpoint {
                         return Err(format!("line {}: duplicate ages record for island {}", lineno, i));
                     }
                 }
+                other if other.starts_with("qd_") => qd.record(&parts, lineno)?, // #1166
                 other => {
                     return Err(format!(
                         "line {}: unknown checkpoint record '{}'",
@@ -1097,6 +1136,7 @@ impl Checkpoint {
         }
 
         let config = build_config(&config_fields)?;
+        let qd = qd.finish(config.qd_policy)?; // #1166
         let refit_band_unknown = !config_fields.contains_key("refit_band");
         let calibration_record = config_fields.get("calibration_source").map(|s| CalibrationRecord {
             source: s.clone(),
@@ -1287,6 +1327,7 @@ impl Checkpoint {
         };
         Ok(Checkpoint {
             target_spec,
+            split_intervals,
             candidates_evaluated: candidates_evaluated.unwrap_or(0),
             config,
             backend,
@@ -1307,6 +1348,7 @@ impl Checkpoint {
             error_kind: error_kind.unwrap_or(ErrorKind::Unknown),
             final_archive,
             identity,
+            qd,
         })
     }
 
@@ -1342,6 +1384,27 @@ impl Checkpoint {
         let text = self.to_text_for(target_spec);
         crate::atomic::write_atomic(path, text.as_bytes(), crate::atomic::Fault::None)
             .map_err(|e| format!("cannot write checkpoint '{}': {}", path.display(), e))
+    }
+
+    /// [`Checkpoint::save_for`] that also records the split intervals (#1173).
+    pub fn save_with_split(&self, path: impl AsRef<Path>, target_spec: Option<&str>, split_intervals: Option<&str>) -> Result<(), String> {
+        let path = path.as_ref();
+        let text = self.to_text_with(target_spec, split_intervals);
+        crate::atomic::write_atomic(path, text.as_bytes(), crate::atomic::Fault::None)
+            .map_err(|e| format!("cannot write checkpoint '{}': {}", path.display(), e))
+    }
+
+    /// #1173: refuse a resume under other split intervals; `None` is a run
+    /// without `--split-table`.
+    pub fn check_split_intervals(&self, current: Option<&str>) -> Result<(), String> {
+        if self.split_intervals.as_deref() == current {
+            return Ok(());
+        }
+        Err(format!(
+            "checkpoint split intervals mismatch: saved {}, this run {}; refusing to resume a search under other --split-table intervals, purge or embargo",
+            self.split_intervals.as_deref().unwrap_or("none"),
+            current.unwrap_or("none")
+        ))
     }
 
     /// [`Checkpoint::save`] with a deliberate fault, for the crash-safety test.
@@ -1520,7 +1583,6 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "ops",
         "init_depth",
         "fit_iters",
-        "dedup",
         "time_budget",
         "predictor_samples",
     ];
@@ -1533,7 +1595,6 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "units.target",
         "require_dimensions",
         "fit_samples",
-        "front_parents", // #76
         "fit_strategy",  // #116: missing means `exact`
         "fit_admission", // #223: missing means `screened`
         "fit_polish",    // #496: missing means `f64`
@@ -1599,13 +1660,6 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
     };
     let num_f64 = |key: &str| -> Result<f64, String> {
         decode_f64(required(fields, key)?)
-    };
-    let bool_val = |key: &str| -> Result<bool, String> {
-        match required(fields, key)? {
-            "true" => Ok(true),
-            "false" => Ok(false),
-            other => Err(format!("config '{}' must be true or false, got '{}'", key, other)),
-        }
     };
 
     let metric = Metric::parse_opt(required(fields, "metric")?)
@@ -1749,17 +1803,6 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
             ))
         }
     };
-    // #76: missing means on, the default since the feature was introduced.
-    let front_parents = match fields.get("front_parents").map(|s| s.as_str()) {
-        None | Some("true") => true,
-        Some("false") => false,
-        Some(other) => {
-            return Err(format!(
-                "config 'front_parents' must be true or false, got '{}'",
-                other
-            ))
-        }
-    };
     // #116: missing means `exact`, byte-identical to a checkpoint written
     // before the solver portfolio existed.
     let fit_strategy = match fields.get("fit_strategy").map(|s| s.as_str()) {
@@ -1882,7 +1925,6 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         fit_polish, // #496
         fit_irls, // #611
         fit_report: false,
-        dedup: bool_val("dedup")?,
         time_budget,
         interim_chunk: false,
         predictor_samples,
@@ -1893,7 +1935,6 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         refit_band, // #495
         // #116: a disk row source is a path choice, not saved search state.
         fit_stream_source: None,
-        front_parents, // #76
         units,
         require_dimensions,
         qd_bins,
@@ -1987,7 +2028,7 @@ fn write_config(cfg: &Config, out: &mut String) {
     }
     // #122: absent means auto (the historical path for every old checkpoint).
     crate::settings::write(crate::settings::Group::Engine, cfg, out);
-    writeln!(out, "config dedup {}", cfg.dedup).unwrap();
+    crate::settings::write(crate::settings::Group::Dedup, cfg, out);
     writeln!(
         out,
         "config time_budget {}",
@@ -2014,11 +2055,7 @@ fn write_config(cfg: &Config, out: &mut String) {
     }
     crate::settings::write(crate::settings::Group::Island, cfg, out); // #1083
     crate::settings::write(crate::settings::Group::Variation, cfg, out);
-    // #76: only write the field when front feedback is off, so an on run's
-    // checkpoint stays byte-identical to one written before the flag existed.
-    if !cfg.front_parents {
-        writeln!(out, "config front_parents false").unwrap();
-    }
+    crate::settings::write(crate::settings::Group::FrontParents, cfg, out);
     crate::settings::write(crate::settings::Group::Filter, cfg, out); // #1083
     crate::settings::write(crate::settings::Group::Fit, cfg, out);
     // #25: only write these when units are active, so a units-free checkpoint
@@ -2035,6 +2072,224 @@ fn write_config(cfg: &Config, out: &mut String) {
         writeln!(out, "config qd_cvt {}", cfg.qd_cvt).unwrap();
         writeln!(out, "config qd_policy {}", cfg.qd_policy).unwrap();
         writeln!(out, "config qd_control {}", cfg.qd_control).unwrap();
+    }
+    crate::settings::write(crate::settings::Group::Qd, cfg, out); // #1084
+}
+
+/// #1166: the `qd_*` records of a `--qd-policy` checkpoint, header first.
+fn write_qd(q: &QdState, out: &mut String) {
+    let entries: usize = q.cells.iter().map(Vec::len).sum();
+    writeln!(
+        out,
+        "qd_archive {} {} {} {} {} {:016x} {} {} {}",
+        QD_ARCHIVE_VERSION,
+        q.mode.name(),
+        q.cells.len(),
+        q.records,
+        q.fallbacks,
+        q.known_tag,
+        q.observed.len(),
+        entries,
+        q.known.len()
+    )
+    .unwrap();
+    let visits: Vec<String> = q.visits.iter().map(u64::to_string).collect();
+    writeln!(out, "qd_visits {}", visits.join(" ")).unwrap();
+    for (i, c) in q.centroids.iter().enumerate() {
+        writeln!(out, "qd_centroid {} {} {}", i, encode_f64(c.usage), encode_f64(c.skew)).unwrap();
+    }
+    for d in &q.observed {
+        writeln!(out, "qd_observed {} {}", encode_f64(d.usage), encode_f64(d.skew)).unwrap();
+    }
+    for (cell, list) in q.cells.iter().enumerate() {
+        for e in list {
+            writeln!(
+                out,
+                "qd_entry {} {} {} {} {} {}",
+                cell,
+                encode_f64(e.descriptor.usage),
+                encode_f64(e.descriptor.skew),
+                encode_f64(e.error),
+                encode_f64(e.cost),
+                encode_tree(&e.tree)
+            )
+            .unwrap();
+        }
+    }
+    for (hash, d) in &q.known {
+        writeln!(out, "qd_known {:016x} {} {}", hash, encode_f64(d.usage), encode_f64(d.skew)).unwrap();
+    }
+}
+
+/// #1166: the `qd_archive` header fields.
+struct QdHeader {
+    mode: QdMode,
+    cells: usize,
+    records: usize,
+    fallbacks: usize,
+    known_tag: u64,
+    observed: usize,
+    entries: usize,
+    known: usize,
+}
+
+/// #1166: collects the `qd_*` records of one checkpoint.
+#[derive(Default)]
+struct QdReader {
+    header: Option<QdHeader>,
+    visits: Option<Vec<u64>>,
+    centroids: Vec<Option<Descriptor>>,
+    observed: Vec<Descriptor>,
+    entries: Vec<(usize, QdEntry)>,
+    known: Vec<(u64, Descriptor)>,
+}
+
+fn parse_hex_at(parts: &[&str], at: usize, lineno: usize, what: &str) -> Result<u64, String> {
+    let raw = parts.get(at).ok_or_else(|| format!("line {}: {} is missing", lineno, what))?;
+    u64::from_str_radix(raw, 16).map_err(|_| format!("line {}: bad {} '{}'", lineno, what, raw))
+}
+
+fn parse_descriptor_at(parts: &[&str], at: usize, lineno: usize, what: &str) -> Result<Descriptor, String> {
+    Ok(Descriptor {
+        usage: parse_f64_at(parts, at, lineno, &format!("{} usage", what))?,
+        skew: parse_f64_at(parts, at + 1, lineno, &format!("{} skew", what))?,
+    })
+}
+
+impl QdReader {
+    fn record(&mut self, parts: &[&str], lineno: usize) -> Result<(), String> {
+        let kind = parts[0];
+        if kind == "qd_archive" {
+            let version = parse_num::<u32>(parts, 1, lineno, "qd_archive version")?;
+            if version != QD_ARCHIVE_VERSION {
+                return Err(format!(
+                    "line {}: qd_archive version {} is not supported; this build reads version {}",
+                    lineno, version, QD_ARCHIVE_VERSION
+                ));
+            }
+            let mode_text = parts.get(2).ok_or_else(|| format!("line {}: qd_archive mode is missing", lineno))?;
+            let mode = QdMode::parse(mode_text).ok_or_else(|| {
+                format!("line {}: qd_archive mode must be grid, cvt or random, got '{}'", lineno, mode_text)
+            })?;
+            let header = QdHeader {
+                mode,
+                cells: parse_num(parts, 3, lineno, "qd_archive cells")?,
+                records: parse_num(parts, 4, lineno, "qd_archive records")?,
+                fallbacks: parse_num(parts, 5, lineno, "qd_archive fallbacks")?,
+                known_tag: parse_hex_at(parts, 6, lineno, "qd_archive known_tag")?,
+                observed: parse_num(parts, 7, lineno, "qd_archive observed")?,
+                entries: parse_num(parts, 8, lineno, "qd_archive entries")?,
+                known: parse_num(parts, 9, lineno, "qd_archive known")?,
+            };
+            return set_once(&mut self.header, header, "qd_archive", lineno);
+        }
+        let Some(header) = &self.header else {
+            return Err(format!("line {}: {} record before the qd_archive header", lineno, kind));
+        };
+        match kind {
+            "qd_visits" => {
+                let mut visits = Vec::with_capacity(parts.len().saturating_sub(1));
+                for k in 1..parts.len() {
+                    visits.push(parse_num::<u64>(parts, k, lineno, "qd_visits count")?);
+                }
+                set_once(&mut self.visits, visits, "qd_visits", lineno)
+            }
+            "qd_centroid" => {
+                let i = parse_num::<usize>(parts, 1, lineno, "qd_centroid index")?;
+                let d = parse_descriptor_at(parts, 2, lineno, "qd_centroid")?;
+                set_slot(&mut self.centroids, i, d, "qd_centroid", lineno)
+            }
+            "qd_observed" => {
+                self.observed.push(parse_descriptor_at(parts, 1, lineno, "qd_observed")?);
+                Ok(())
+            }
+            "qd_entry" => {
+                let cell = parse_num::<usize>(parts, 1, lineno, "qd_entry cell")?;
+                if cell >= header.cells {
+                    return Err(format!(
+                        "line {}: qd_entry cell {} is outside the {} cells of the archive",
+                        lineno, cell, header.cells
+                    ));
+                }
+                let descriptor = parse_descriptor_at(parts, 2, lineno, "qd_entry")?;
+                let error = parse_f64_at(parts, 4, lineno, "qd_entry error")?;
+                let cost = parse_f64_at(parts, 5, lineno, "qd_entry cost")?;
+                let tree_text = parts
+                    .get(6..)
+                    .filter(|t| !t.is_empty())
+                    .ok_or_else(|| format!("line {}: qd_entry record has no tree", lineno))?;
+                let tree = decode_tree(&tree_text.join(" ")).map_err(|e| format!("line {}: {}", lineno, e))?;
+                self.entries.push((cell, QdEntry { tree, error, cost, descriptor }));
+                Ok(())
+            }
+            "qd_known" => {
+                let hash = parse_hex_at(parts, 1, lineno, "qd_known hash")?;
+                if self.known.last().is_some_and(|(prev, _)| *prev >= hash) {
+                    return Err(format!("line {}: qd_known records must be in ascending hash order without duplicates", lineno));
+                }
+                self.known.push((hash, parse_descriptor_at(parts, 2, lineno, "qd_known")?));
+                Ok(())
+            }
+            other => Err(format!("line {}: unknown checkpoint record '{}'", lineno, other)),
+        }
+    }
+
+    /// The saved archive, or `None` when the file has no `qd_*` records.
+    fn finish(self, qd_policy: bool) -> Result<Option<QdState>, String> {
+        let Some(h) = self.header else {
+            return Ok(None);
+        };
+        if !qd_policy {
+            return Err("checkpoint has qd_archive records; they are written only under --qd-policy".to_string());
+        }
+        let visits = self
+            .visits
+            .ok_or_else(|| "checkpoint is incomplete: missing 'qd_visits'".to_string())?;
+        if visits.len() != h.cells {
+            return Err(format!(
+                "checkpoint is inconsistent: qd_archive has {} cells but qd_visits {} count(s)",
+                h.cells,
+                visits.len()
+            ));
+        }
+        let want_centroids = if h.mode == QdMode::Cvt { h.cells } else { 0 };
+        let centroids: Vec<Descriptor> = self.centroids.iter().flatten().copied().collect();
+        if self.centroids.len() != want_centroids || centroids.len() != want_centroids {
+            return Err(format!(
+                "checkpoint is truncated or inconsistent: a {} archive of {} cells has {} qd_centroid record(s), found {}",
+                h.mode.name(),
+                h.cells,
+                want_centroids,
+                centroids.len()
+            ));
+        }
+        for (what, want, found) in [
+            ("qd_observed", h.observed, self.observed.len()),
+            ("qd_entry", h.entries, self.entries.len()),
+            ("qd_known", h.known, self.known.len()),
+        ] {
+            if want != found {
+                return Err(format!(
+                    "checkpoint is truncated or inconsistent: qd_archive says {} {} record(s), found {}",
+                    want, what, found
+                ));
+            }
+        }
+        let mut cells: Vec<Vec<QdEntry>> = vec![Vec::new(); h.cells];
+        for (cell, entry) in self.entries {
+            cells[cell].push(entry);
+        }
+        Ok(Some(QdState {
+            mode: h.mode,
+            cells,
+            centroids,
+            visits,
+            observed: self.observed,
+            records: h.records,
+            fallbacks: h.fallbacks,
+            known_tag: h.known_tag,
+            known: self.known,
+        }))
     }
 }
 

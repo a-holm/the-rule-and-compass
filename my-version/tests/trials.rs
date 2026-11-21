@@ -67,11 +67,28 @@ struct Spec {
     window: &'static str,
     time: Vec<f64>,
     net_text: Option<String>,
+    quantile: Option<f64>,
+    fixed: Option<f64>,
+    policy: &'static str,
+    fit: Option<(u32, u32, f64)>,
+    /// #1203: `book.missing_score`; `None` writes no `book` object.
+    book: Option<&'static str>,
 }
 
 impl Spec {
     fn new(n: usize) -> Spec {
-        Spec { cost_bps: 10.0, ppy: PPY, window: "w1", time: grid(n), net_text: None }
+        Spec {
+            cost_bps: 10.0,
+            ppy: PPY,
+            window: "w1",
+            time: grid(n),
+            net_text: None,
+            quantile: Some(0.5),
+            fixed: None,
+            policy: "threshold",
+            fit: None,
+            book: None,
+        }
     }
 }
 
@@ -86,11 +103,19 @@ fn write_report(dir: &Path, name: &str, net: &[f64], s: &Spec) -> String {
 \"purge\":{{\"horizon_seconds\":3600,\"embargo_seconds\":3600}},\
 \"cost_model\":{{\"per_side_bps\":{c},\"round_trip_bps\":{rt}}},\
 \"cost\":{{\"per_side_bps\":{c},\"source\":\"flag\",\"return_units\":\"log\"}},\
-\"policy\":{{\"name\":\"threshold\",\"band_width\":0,\"min_hold\":1}},\
-\"threshold\":{{\"quantile\":0.5,\"fixed\":null}},\
+\"policy\":{{\"name\":\"{policy}\",\"band_width\":0,\"min_hold\":1}},\
+\"threshold\":{{\"quantile\":{quantile},\"fixed\":{fixed}{fit}}},\
 \"annualization\":{{\"periods_per_year\":{ppy},\"method\":\"explicit\"}},\
+{book}\
 \"pooled\":{{\"periods\":{n},\"entries\":10,\"active_rows\":100,\"period_net\":[{net_text}],\"period_time\":[{time}]}}}}",
         w = s.window,
+        policy = s.policy,
+        quantile = s.quantile.map_or("null".to_string(), |q| q.to_string()),
+        fixed = s.fixed.map_or("null".to_string(), |q| q.to_string()),
+        book = s.book.map_or(String::new(), |r| format!("\"book\":{{\"missing_score\":\"{r}\"}},")),
+        fit = s.fit.map_or(String::new(), |(e, b, l)| format!(
+            ",\"fit\":\"fitness\",\"fit_method\":\"text\",\"fit_sources\":[\"fixed\"],\"cut_min_entries\":{e},\"cut_blocks\":{b},\"cut_lambda\":{l}"
+        )),
         c = s.cost_bps,
         rt = s.cost_bps * 2.0,
         ppy = s.ppy,
@@ -552,4 +577,278 @@ fn big_compare(dir: &Path) -> (Json, f64) {
     let o = compare(dir, &ar, &br, &["--block-len", "21", "--draws", "10000", "--seed", "7"]);
     let secs = t.elapsed().as_secs_f64();
     (stdout_json(&o), secs)
+}
+
+// ---------------------------------------------------------------------------
+// #1163: the fitted-cut rule is part of the threshold rule
+// ---------------------------------------------------------------------------
+
+fn strs(j: &Json) -> Vec<&str> {
+    match j {
+        Json::Arr(v) => v.iter().map(|x| x.as_str().unwrap()).collect(),
+        other => panic!("not an array: {other:?}"),
+    }
+}
+
+fn strs_of<'a>(j: &'a Json, key: &str) -> Vec<&'a str> {
+    match j {
+        Json::Arr(v) => v.iter().map(|x| at(x, &[key]).as_str().unwrap()).collect(),
+        other => panic!("not an array: {other:?}"),
+    }
+}
+
+fn fixed_cut(n: usize) -> Spec {
+    Spec { quantile: None, fixed: Some(0.5), ..Spec::new(n) }
+}
+
+fn fitted_cut(n: usize, e: u32, b: u32, l: f64) -> Spec {
+    Spec { fit: Some((e, b, l)), ..fixed_cut(n) }
+}
+
+fn arm_pair(dir: &Path) -> (String, String) {
+    let fitted = write_report(dir, "fitted", &noise(N, 1, 0.01), &fitted_cut(N, 30, 4, 1.0));
+    let fixed = write_report(dir, "fixed", &noise(N, 2, 0.01), &fixed_cut(N));
+    (fitted, fixed)
+}
+
+fn assert_refused(o: &Output, field: &str, hint: bool) {
+    assert_eq!(code(o), 2, "{}", stderr(o));
+    let e = stderr(o);
+    assert!(e.contains(&format!("'{field}'")), "{e}");
+    assert_eq!(e.contains("--threshold-arms"), hint, "{e}");
+}
+
+#[test]
+fn trials_refuse_a_fitted_cut_mixed_with_a_fixed_cut() {
+    let (_s, dir) = trials_dir();
+    let (fitted, fixed) = arm_pair(&dir);
+    let o = run(&["trials", "--wf", &fitted, &fixed, "--draws", "50"]);
+    assert_refused(&o, "threshold.fit", true);
+    let o = run(&["trials", "--wf", &fixed, &fitted, "--draws", "50"]);
+    assert_refused(&o, "threshold.fit", true);
+}
+
+#[test]
+fn compare_refuses_a_fitted_cut_mixed_with_a_fixed_cut() {
+    let (_s, dir) = trials_dir();
+    let (fitted, fixed) = arm_pair(&dir);
+    let o = run(&["trials", "--compare", &fitted, &fixed, "--draws", "50"]);
+    assert_refused(&o, "threshold.fit", true);
+}
+
+#[test]
+fn trials_refuse_fitted_cuts_with_other_values() {
+    let (_s, dir) = trials_dir();
+    let base = write_report(&dir, "base", &noise(N, 1, 0.01), &fitted_cut(N, 30, 4, 1.0));
+    let cases = [
+        ("entries", fitted_cut(N, 5, 4, 1.0), "threshold.cut_min_entries"),
+        ("blocks", fitted_cut(N, 30, 1, 1.0), "threshold.cut_blocks"),
+        ("lambda", fitted_cut(N, 30, 4, 2.0), "threshold.cut_lambda"),
+    ];
+    for (name, spec, field) in cases {
+        let other = write_report(&dir, name, &noise(N, 2, 0.01), &spec);
+        assert_refused(&run(&["trials", "--wf", &base, &other, "--draws", "50"]), field, true);
+        assert_refused(&run(&["trials", "--compare", &base, &other, "--draws", "50"]), field, true);
+    }
+    let same = write_report(&dir, "same", &noise(N, 3, 0.01), &fitted_cut(N, 30, 4, 1.0));
+    let j = stdout_json(&run(&["trials", "--wf", &base, &same, "--draws", "50", "--block-len", "8"]));
+    assert!(j.get("threshold_arms").is_none());
+}
+
+#[test]
+fn trials_threshold_arms_accepts_the_fit_fields_only() {
+    let (_s, dir) = trials_dir();
+    let (fitted, fixed) = arm_pair(&dir);
+    let j = stdout_json(&run(&["trials", "--wf", &fitted, &fixed, "--threshold-arms", "--draws", "50", "--block-len", "8"]));
+    assert!(matches!(at(&j, &["threshold_arms"]), Json::Bool(true)));
+    assert_eq!(at(&j, &["series"]).as_f64(), Some(2.0));
+    let rules = strs_of(at(&j, &["members"]), "threshold_rule");
+    assert_eq!(rules, ["fitness(min_entries=30,blocks=4,lambda=1)", "fixed"]);
+
+    let j = stdout_json(&run(&["trials", "--compare", &fitted, &fixed, "--threshold-arms", "--draws", "50", "--block-len", "8"]));
+    assert!(matches!(at(&j, &["threshold_arms"]), Json::Bool(true)));
+    assert_eq!(strs(at(&j, &["threshold_rule_a"])), ["fitness(min_entries=30,blocks=4,lambda=1)"]);
+    assert_eq!(strs(at(&j, &["threshold_rule_b"])), ["fixed"]);
+
+    let quantile = write_report(&dir, "quantile", &noise(N, 3, 0.01), &Spec::new(N));
+    let q = stdout_json(&run(&["trials", "--wf", &quantile, "--threshold-arms", "--draws", "50", "--block-len", "8"]));
+    assert_eq!(strs_of(at(&q, &["members"]), "threshold_rule"), ["quantile"]);
+
+    let other_cut = write_report(&dir, "cut", &noise(N, 4, 0.01), &Spec { fixed: Some(0.25), ..fixed_cut(N) });
+    let other_policy = write_report(&dir, "policy", &noise(N, 5, 0.01), &Spec { policy: "band", ..fixed_cut(N) });
+    for (other, field) in [(&other_cut, "threshold.fixed"), (&other_policy, "policy.name")] {
+        assert_refused(&run(&["trials", "--wf", &fitted, other, "--threshold-arms", "--draws", "50"]), field, false);
+        assert_refused(&run(&["trials", "--compare", &fixed, other, "--threshold-arms", "--draws", "50"]), field, false);
+    }
+}
+
+#[test]
+fn trials_without_the_flag_keep_the_old_reports_matching() {
+    let (_s, dir) = trials_dir();
+    let a = write_report(&dir, "old_a", &noise(N, 1, 0.01), &Spec::new(N));
+    let b = write_report(&dir, "old_b", &noise(N, 2, 0.01), &Spec::new(N));
+    let j = stdout_json(&run(&["trials", "--wf", &a, &b, "--draws", "50", "--block-len", "8"]));
+    assert!(j.get("threshold_arms").is_none());
+    assert!(!String::from_utf8_lossy(&run(&["trials", "--wf", &a, &b, "--draws", "50", "--block-len", "8"]).stdout).contains("threshold_rule"));
+}
+
+/// #1199: one walk-forward report of two symbols, hourly over 600 hours; the gate `g` is off
+/// for both symbols on hours 300..380 of the test window.
+fn grid_report(dir: &Path, expr: &str, gate: bool, grid: rcsr::walkforward::PeriodGrid) -> String {
+    use rcsr::walkforward::{self, EvalSpec, Policy, ProtocolOptions, Window};
+    let mut text = String::from("t,sym,x1,x2,g,y\n");
+    for i in 0..600usize {
+        for (k, sym) in ["A", "B"].iter().enumerate() {
+            let f = i as f64 + 0.37 * k as f64;
+            let x1 = frac(f * 0.618_033_988_749_894_9) - 0.5;
+            let x2 = frac(f * 0.754_877_666_246_692_7) - 0.5;
+            let y = 0.01 * (frac(f * 0.324_717_957_244_746) - 0.5) + 0.002 * x1;
+            let g = if (300..380).contains(&i) { -1 } else { 1 };
+            text.push_str(&format!("{},{sym},{x1},{x2},{g},{y}\n", T0 + STEP * i as i64));
+        }
+    }
+    let table = rcsr::data::parse_table(&text).unwrap();
+    let at = |h: i64| (T0 + STEP * h) as f64;
+    let spec = EvalSpec {
+        expression: expr.to_string(),
+        vars: vec!["x1".to_string(), "x2".to_string()],
+        target: "y".to_string(),
+        time: "t".to_string(),
+        group: Some("sym".to_string()),
+        windows: vec![Window { label: "w".to_string(), train_start: at(0), train_end: at(200), test_start: at(200), test_end: at(600) }],
+        horizon: 0.0,
+        embargo: None,
+        cost_bps: 10.0,
+        threshold_quantile: 0.7,
+        threshold_fixed: Some(0.0),
+        validation_frac: 0.0,
+        periods_per_year: Some(PPY),
+        candidates: Vec::new(),
+        band_select: false,
+        pool_reset_flat: true,
+        allow_lockbox: false,
+        device_pnl: false,
+        control_seed: 0,
+        policy: Policy::Threshold,
+        band_width: 0.0,
+        min_hold: 1,
+        gpu: false,
+    };
+    let opts = ProtocolOptions {
+        period_grid: grid,
+        mask: gate.then(|| rcsr::regime_gate::GateSpec::parse("g", 0.0, 1).unwrap()),
+        ..ProtocolOptions::default()
+    };
+    let r = walkforward::run_table_with(&table, &spec, "test", &opts).unwrap();
+    let name = format!("{}-{}-{}.json", expr, if gate { "gated" } else { "plain" }, grid.as_str());
+    let path = dir.join(name);
+    std::fs::write(&path, r.json()).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+#[test]
+fn trials_common_grid_across_configurations() {
+    use rcsr::walkforward::PeriodGrid::{Score, Target};
+    let (_s, dir) = trials_dir();
+    let target: Vec<String> = [("x1", false), ("x2", false), ("x1", true), ("x2", true)]
+        .iter()
+        .map(|&(e, gate)| grid_report(&dir, e, gate, Target))
+        .collect();
+    let mut args = vec!["trials", "--wf"];
+    args.extend(target.iter().map(String::as_str));
+    args.extend_from_slice(&["--draws", "100", "--pbo-blocks", "4"]);
+    let j = stdout_json(&run(&args));
+    assert_eq!(num(&j, &["series"]), 4.0);
+    assert_eq!(num(&j, &["periods"]), 400.0, "every hour of the test window, gate on or off");
+    let pbo = num(&j, &["pbo", "value"]);
+    assert!((0.0..=1.0).contains(&pbo), "{pbo}");
+    // Today's grid: the gated book has no period while the gate is off.
+    let gated_score = grid_report(&dir, "x1", true, Score);
+    let plain_score = grid_report(&dir, "x1", false, Score);
+    let o = run(&["trials", "--wf", &plain_score, &gated_score, "--draws", "50"]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).contains("pooled.period_time"), "{}", stderr(&o));
+    // A score report and a target report never mix.
+    let o = run(&["trials", "--wf", &target[0], &plain_score, "--draws", "50"]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).contains("pooled.grid.rule"), "{}", stderr(&o));
+}
+
+#[test]
+fn trials_refuse_mixed_missing_score_rules() {
+    let (_s, dir) = trials_dir();
+    let rule = |name: &str, seed: u32, book: Option<&'static str>| write_report(&dir, name, &noise(N, seed, 0.01), &Spec { book, ..Spec::new(N) });
+    let flat = rule("flat", 1, Some("flat"));
+    let hold = rule("hold", 2, Some("hold"));
+    let carry = rule("carry", 3, None);
+    for other in [&hold, &carry] {
+        for mode in ["--wf", "--compare"] {
+            let o = run(&["trials", mode, &flat, other, "--draws", "50"]);
+            assert_eq!(code(&o), 2, "{mode}: {}", stderr(&o));
+            assert!(stderr(&o).contains("'book.missing_score'") && stderr(&o).contains("--missing-score"), "{mode}: {}", stderr(&o));
+        }
+    }
+    let same = rule("flat2", 4, Some("flat"));
+    let o = run(&["trials", "--wf", &flat, &same, "--draws", "50", "--block-len", "8"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+}
+
+/// #1176: a `walkforward --front --all-members` report on a 3-symbol panel and a front of 3 members.
+fn members_report(dir: &Path) -> String {
+    let mut csv = String::from("ts,sym,x,target\n");
+    for i in 0..300i64 {
+        for (s, sym) in ["A", "B", "C"].iter().enumerate() {
+            let s = s as i64;
+            let x = ((i * 7 + s * 3) % 11) as f64 - 5.0;
+            let y = (((i * 5 + s * 7) % 13) as f64 - 6.0) / 4096.0;
+            csv.push_str(&format!("{},{},{},{}\n", i * 3600, sym, x, y));
+        }
+    }
+    let data = dir.join("panel.csv");
+    std::fs::write(&data, csv).unwrap();
+    let front = dir.join("run.json");
+    std::fs::write(
+        &front,
+        r#"{"tool":"rcsr","variables":["x"],"target_spec":{"return_column":"target"},
+        "split":{"train_time":[0,356400],"validation_time":[360000,536400],"required_purge_seconds":3600,"purge_seconds":3600},
+        "objective":{"spec":{"threshold":0,"per_side_bps":10}},
+        "pareto":[{"expression":"x"},{"expression":"0.5 - x"},{"expression":"sqrt(x) - 1"}]}"#,
+    )
+    .unwrap();
+    let out = dir.join("wf_members.json");
+    let o = run(&[
+        "walkforward", "--data", data.to_str().unwrap(), "--time", "ts", "--group-by", "sym", "--horizon", "3600",
+        "--periods-per-year", "8760", "--front", front.to_str().unwrap(), "--all-members", "--period-grid", "target",
+        "--window", "w,0,540000,543600,1080000", "--json", "--out", out.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    out.to_string_lossy().into_owned()
+}
+
+#[test]
+fn trials_reads_members() {
+    let (_s, dir) = trials_dir();
+    let report = members_report(&dir);
+    let all = stdout_json(&run(&["trials", "--wf", &report, "--members", "all", "--draws", "50"]));
+    assert_eq!(num(&all, &["series"]), 3.0);
+    let labels: Vec<String> = match at(&all, &["members"]) {
+        Json::Arr(m) => m.iter().map(|e| at(e, &["label"]).as_str().unwrap().to_string()).collect(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(labels, ["wf_members#1", "wf_members#2", "wf_members#3"]);
+    for args in [vec![], vec!["--members", "selected"]] {
+        let one = stdout_json(&run(&[&["trials", "--wf", report.as_str(), "--draws", "50"][..], &args].concat()));
+        assert_eq!(num(&one, &["series"]), 1.0, "{args:?}");
+    }
+    // A report without members, an unknown mode and --compare are refused.
+    let plain = write_report(&dir, "plain", &noise(N, 1, 0.01), &Spec::new(N));
+    let o = run(&["trials", "--wf", &plain, "--members", "all", "--draws", "50"]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).contains("'members'") && stderr(&o).contains("--all-members"), "{}", stderr(&o));
+    let o = run(&["trials", "--wf", &report, "--members", "some", "--draws", "50"]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).contains("--members must be all or selected"), "{}", stderr(&o));
+    let o = run(&["trials", "--compare", &report, &report, "--members", "all", "--draws", "50"]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).contains("--members does not apply to --compare"), "{}", stderr(&o));
 }

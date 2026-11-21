@@ -160,6 +160,22 @@ split.
 
 **Verify.** `tests/selection.rs::selection_overrides_a_temporal_spec_and_says_so`.
 
+### Interval-list splits: purge and embargo at every edge
+
+**Check.** With `--split-table` (#1173) a model trains before and after a test interval, so every edge needs both guards. Before each test interval the label purge drops the training and validation rows whose label window `[t, t + purge)` reaches it. After each test interval the embargo drops the rows in `[end, end + embargo)`; `--embargo auto` takes the longest lookback of the `--vars` columns (rule `rcsr-lookback/1`) or the label purge when that is longer, because a feature of a row after the test interval is computed from test bars. Training rows are purged on both sides of every validation interval. A table interval that reaches a declared locked range exits 3.
+
+**What fails.** Without the embargo, a 28-day return column of a row two weeks after the test interval holds two weeks of test prices: the fit learns from the test path and the test score is optimistic, the leak López de Prado's embargo (AFML 7.4.2) removes. Without the purge, the last training label before the test interval ends inside it. The cost is real: a 200-day column needs a 200-day embargo after every test interval, so long-lookback views lose more training rows under combinatorial splits; that is the price, not a bug.
+
+**Verify.** `tests/interval_split.rs::planted_leaks_are_excluded_from_training` (a feature that reads 500 hours back and a label that crosses the test interval are both left out), `src/intervals.rs::tests::interval_split_purges_and_embargoes_every_edge` (200 random tables at each label horizon 1, 24, 72 and 168 h), `tests/interval_split.rs::embargo_auto_follows_the_lookback`, and `tests/interval_split.rs::interval_guard_allows_cpcv_test_groups` with `interval_guard_refuses_overlap` for the walk-forward guard: a window is in sample when a kept training or validation row of the run reaches it, not when it is earlier than the last training row.
+
+### Combinatorial purged cross-validation: many test periods
+
+**Check.** One walk-forward path tests only the years after its first training window, so a bear market in the first year is never out of sample. `rcsr protocol cpcv --groups N --test-groups k` (#1174) cuts the span into N equal calendar groups at UTC midnights (locked ranges become holes) and writes the C(N, k) splits as a `--split-table`; every group is tested C(N-1, k-1) times and `rcsr trials --cpcv-assemble` joins the test series into C(N-1, k-1) complete paths (López de Prado 2018, ch. 12). The training and validation intervals of the table are already trimmed by the purge before and the lookback embargo after every test group, with the same predicate as `--split-table`. Each group of a path starts flat and pays its final exit, so no position carries from one split's model into another's.
+
+**What fails.** A long lookback costs training rows after every test group: under CPCV(6, 2) the 56-day embargo of `ma_slope672` drops up to 112 days of training rows per split, 56 after each test group. A view whose embargo empties a training group is refused (exit 2) instead of training on a sliver. Paths of configurations with different embargoes still compare: the path's `window_definition` hashes the groups, not the embargo.
+
+**Verify.** `tests/cpcv.rs::cpcv_splits_respect_purge_and_embargo` (random spans, hole layouts and horizons 1, 24, 72 and 168 h: no training or validation interval meets a test group widened by the purge before and the embargo after, and the search's own trim keeps every table row), `cpcv_skips_locked_holes`, `cpcv_6_2_counts`, `cpcv_6_1_counts` and `cpcv_paths_cover_each_group_once`.
+
 ---
 
 ## 2b. Target structure: the label must not encode a column
@@ -419,6 +435,7 @@ it is also used for choices, there is no holdout.
 **Verify.**
 
 * The chosen expression is written down before the lockbox run.
+* Every file the verdict of the locked read uses (the candidate table with its frozen thresholds, a development table, the subwindows and years calendars) is frozen in the ledger with `rcsr protocol freeze` before the final seal. `rcsr protocol verdict` refuses a file whose SHA-256 differs from its freeze event or whose freeze follows the seal, and the lock calendar must be the one `rcsr protocol regimes --after-read` recorded (`docs/overfitting.md` 3.15).
 * `--eval-expr` output names the metric and reports `train_error` / `test_error`
   separately; the test side is the lockbox rows.
 * `tests/reports.rs::json_stays_valid_when_a_report_is_requested` and the
@@ -431,7 +448,9 @@ type-7 quantile of the train/validation scores, not a sketch. `rcsr walkforward`
 selects the two ranks around `h = (n - 1) q` by order-preserving radix count,
 canonicalises `-0` to `+0`, drops NaN/`±inf`, and interpolates in `f64`. The
 window's `threshold_source` is `train_type7`, `validation_type7` or `fixed`
-(a pre-registered `--threshold-fixed` value).
+(a pre-registered `--threshold-fixed` value), or `train_fitness` or
+`validation_fitness` for a cut fitted on the same rows (`--threshold-fit
+fitness`, see `docs/walkforward.md`).
 
 Positions use the shared valid-row mask: a row is usable only when **both** its
 score and target are finite. That matters at the boundary — in the pinned eval
@@ -515,6 +534,26 @@ done
 
 **What fails.** One profitable symbol can carry the mean while the model loses
 on every other symbol. The per-group spread, not the pooled mean, is the result.
+
+### Regime strata (#1175)
+
+A pooled mean hides regimes. Report the strategy per regime with `rcsr walkforward --regimes calendar.csv` or `rcsr trials --regimes calendar.csv`. `rcsr protocol regimes` writes the calendar: bull, bear and sideways (at least 60 days inside a 25 % band).
+
+* The default dating is ex-post: it uses the whole range, so it labels the past with later closes. It is a reporting tool, never a feature.
+* `--mode causal` dates a day from closes at or before it. A planted look-ahead test pins this.
+* Rows of a locked range (purge before, embargo after) are dropped before their price is parsed and written as `not_dated`. Dating the sealed range needs `--after-read` with `--ledger`, `--sealed` and `--expect-reads`: the ledger must hold every read the final seal allows. The ledger records a `regime_dating` event with the calendar hash.
+* Any label set works as a calendar: rows `label,start,end`, UTC half-open, no overlap.
+* An always-long book has zero alpha against the equal-weight benchmark in every stratum. A positive alpha in one stratum and a negative one in another is the result to read, not the pooled mean.
+
+
+### A stateful gate needs the whole readable prefix (#1214)
+
+A regime gate with a hysteresis band or a minimum dwell has state: a value inside the band holds the previous state, so the state of a row can depend on every earlier row of its group. A gate that restarts at each window, slice or fold start ties the state to the split, and one dropped row shifts every later flip of a dwell. The engine therefore reads every gate under one rule, `rcsr-gate-state/1`, in compose, the `--pnl-mask` validation and test books, walk-forward, the ladder, `--reselect-run` and the sealed read:
+
+* The gate rows are every row of the data file with a finite time, per group in file order. The gate reads its own columns only, never a label, and no row filter removes a gate row: the state of a row is the same in every command.
+* The state at a window start comes from one pass over the whole readable prefix. Each window reports it as `gate.start` (warm-up rows, first and last warm-up time, groups, groups on, groups inside a running dwell).
+* A locked range the command does not open, with its lookback embargo, is never read; the state restarts after it. A sealed read opens its own range only, so its warm-up is the development rows before the locked start.
+* A selection read (validation rows, `--reselect-run`) never reads a test interval or its embargo, so a validation interval after a test interval restarts its gate after the embargo. Out-of-sample pricing reads every earlier readable row.
 
 ### Cross-sectional context is a PIT join, not a survivor list
 

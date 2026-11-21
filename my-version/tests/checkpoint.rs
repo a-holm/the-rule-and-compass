@@ -1288,6 +1288,84 @@ fn a_long_pnl_run_resumes_with_the_same_book_and_refuses_another() {
     assert!(err.contains("fitness"), "{err}");
 }
 
+/// #1023: a saved-then-resumed `--selection lexicase` run equals the
+/// uninterrupted run: the metric cases are drawn from the seed and the
+/// generation, and a member's case errors are recomputed from its saved tree.
+#[test]
+fn a_lexicase_run_and_its_resume_match_exactly() {
+    let train = sample(240);
+    let test = sample(80);
+    let lex = |generations| Config {
+        generations,
+        selection: search::Selection::Lexicase,
+        lexicase_cases: 48,
+        gpu: false,
+        ..config(11)
+    };
+    let uninterrupted = search::run(&lex(30), &train, &test);
+    let text = checkpoint_text(&lex(15), &train, &test);
+    assert!(text.contains("config selection lexicase\n") && text.contains("config lexicase_cases 48\n"));
+    let saved = Checkpoint::from_text(&text).expect("parse");
+    let resumed = search::run_resumable(&lex(30), &train, &test, Some(saved), 0, |_| {}).expect("resume");
+    assert_eq!(describe(&uninterrupted), describe(&resumed));
+    assert_eq!(uninterrupted.candidates_evaluated, resumed.candidates_evaluated);
+    assert_eq!(uninterrupted.archive.hash(), resumed.archive.hash());
+    let mut end_a = None;
+    search::run_resumable(&lex(30), &train, &test, None, 0, |cp| end_a = Some(cp.to_text())).expect("full");
+    let mut end_b = None;
+    let saved = Checkpoint::from_text(&text).expect("parse");
+    search::run_resumable(&lex(30), &train, &test, Some(saved), 0, |cp| end_b = Some(cp.to_text())).expect("resume");
+    assert_eq!(end_a, end_b, "the final population and generators must match");
+}
+
+/// #1023: the same under `--fitness pnl` with 2 groups and 2 time blocks
+/// (4 sub-book cases): the resumed members get their sub-book regrets from one
+/// pass over their saved trees, the bits the scoring pass kept.
+#[test]
+fn a_lexicase_long_pnl_run_resumes_exactly() {
+    let train = sample(240);
+    let test = sample(80);
+    let slice = rcsr::data::TradingSlice {
+        rows: rcsr::trading::TradingRows {
+            time: (0..train.len()).map(|i| 900.0 * (i % 120) as f64).collect(),
+            group: (0..train.len()).map(|i| (i / 120) as u64).collect(),
+            funding: Vec::new(),
+        },
+        ret: train.x.iter().map(|r| 0.002 * (r[1] - 0.5)).collect(),
+    };
+    let spec = rcsr::trading::TradingSpec { cost_bps: 2.0, min_trades: 0, ..Default::default() };
+    let book = rcsr::trading::FitnessBook::with_blocks(&slice, &spec, 900.0, 2, 1.0).expect("book");
+    assert_eq!(book.cases().kept.len(), 4);
+    let fitness = search::Fitness::LongPnl(std::sync::Arc::new(book));
+    let lex = |generations| Config {
+        generations,
+        selection: search::Selection::Lexicase,
+        fitness: fitness.clone(),
+        gpu: false,
+        ..config(11)
+    };
+    // The state at the last generation (populations, generators, the search
+    // archive), taken before the resumed run rebuilds its reported front.
+    let last_generation = |resume: Option<Checkpoint>| {
+        let mut texts = Vec::new();
+        let out = search::run_resumable(&lex(24), &train, &test, resume, 1, |cp| texts.push(cp.to_text())).expect("run");
+        assert!(texts.len() >= 2);
+        (out, texts[texts.len() - 2].clone())
+    };
+    let (uninterrupted, full_state) = last_generation(None);
+    let text = checkpoint_text(&lex(12), &train, &test);
+    let (resumed, resumed_state) = last_generation(Some(Checkpoint::from_text(&text).expect("parse")));
+    assert_eq!(full_state, resumed_state, "populations, generators and the search archive must match");
+    // A resumed run reports the front rebuilt on every row, which takes the
+    // canonical member among trees with the same regret bits; an uninterrupted
+    // CPU run reports the search archive. Compare the reported errors and costs.
+    let bits = |o: &Outcome| o.archive.items.iter().map(|s| (s.error.to_bits(), s.cost.to_bits())).collect::<Vec<_>>();
+    assert_eq!(bits(&uninterrupted), bits(&resumed));
+    assert_eq!(uninterrupted.candidates_evaluated, resumed.candidates_evaluated);
+    let lexicographic = search::run(&Config { selection: search::Selection::Lexicographic, ..lex(24) }, &train, &test);
+    assert_ne!(uninterrupted.archive.hash(), lexicographic.archive.hash(), "lexicase must change the trajectory");
+}
+
 /// #598: the pipeline depth is an execution setting. A resume takes the one it
 /// is given, and the archive equals an uninterrupted run at that depth.
 #[cfg(feature = "cuda")]
@@ -2314,6 +2392,33 @@ fn a_killed_chunk_does_not_poison_the_search_backend() {
     assert_eq!(cumulative.get("backend").and_then(|v| v.as_str()), Some("cpu"));
 }
 
+/// #1127: rewrite the saved checkpoint with the identity a fit-only device run writes (the device
+/// defers the fit, the host scores): the one value both snapshot sites take.
+fn stamp_fit_only_device_identity(dir: &std::path::Path) {
+    let path = dir.join("ck.rcsr");
+    let mut cp = Checkpoint::load(path.to_str().expect("utf-8")).expect("checkpoint");
+    cp.backend = search::checkpoint_backend(true, true, false);
+    cp.error_kind = rcsr::checkpoint::ErrorKind::for_backend(cp.backend);
+    cp.save(&path).expect("save checkpoint");
+}
+
+/// #1127: a fit-only device run scores on the host, and a resume computes the backend it will use
+/// from the configuration alone (`cpu` for a metric the device does not score natively). Both
+/// stopping points of the previous chunk, a periodic save (killed chunk) and the exit save, leave a
+/// checkpoint that resumes without `--allow-backend-change`.
+#[test]
+fn a_fit_only_device_run_resumes_from_its_periodic_and_its_exit_checkpoint() {
+    let (_scratch, dir, csv) = cost_scratch("fit-only-identity-periodic");
+    crashed_chunk(&dir, &csv);
+    stamp_fit_only_device_identity(&dir);
+    cost_chunk(&dir, &csv, 1, true);
+
+    let (_scratch, dir, csv) = cost_scratch("fit-only-identity-exit");
+    cost_chunk(&dir, &csv, 0, false);
+    stamp_fit_only_device_identity(&dir);
+    cost_chunk(&dir, &csv, 1, true);
+}
+
 /// #1060: a sidecar already poisoned by an older binary (real example from
 /// campaign #268, generation rewritten to the checkpoint's) is not repaired:
 /// nothing in it says which chunks ran on which backend, so the total stays
@@ -2347,4 +2452,271 @@ fn an_uninterrupted_chunk_keeps_its_exit_sidecar() {
     let text = sidecar_text(&dir);
     assert!(text.starts_with(&format!("{{\"v\":2,\"generation\":{},\"chunks\":1,\"search_seconds\":", cp.generations)), "{text}");
     assert!(text.ends_with("\"ledger_wall_s\":null,\"device_seconds_incl_fit\":null,\"backend\":\"cpu\"}"), "{text}");
+}
+
+// ---- #1166: under --qd-policy the QD archive is trajectory state ----
+
+/// A small `--qd-policy` search that migrates and restarts every few
+/// generations, so the archive drives parent draws, migration victims and
+/// restart aims inside the run.
+fn qd_policy_config(generations: usize) -> Config {
+    Config {
+        generations,
+        islands: 3,
+        pop: 24,
+        max_complexity: 10,
+        fit_iters: 2,
+        migration_interval: 2,
+        restart_interval: 3,
+        restart_policy: search::RestartPolicy::Island,
+        restart_isolation: 2,
+        patience: 0,
+        seed: 7,
+        qd_bins: 16,
+        qd_cell_cap: 2,
+        qd_cvt: true,
+        qd_policy: true,
+        ..Default::default()
+    }
+}
+
+/// Every checkpoint of one run in generation order, the exit checkpoint last,
+/// and the migrants and restarts the run made.
+fn every_qd_checkpoint(cfg: &Config, train: &Sample, test: &Sample) -> (Outcome, Vec<String>, usize, u64) {
+    let seen = std::sync::Arc::new(std::sync::Mutex::new((0usize, 0u64)));
+    let sink = seen.clone();
+    let cfg = Config {
+        dev_log: Some(std::sync::Arc::new(move |r: &rcsr::devlog::GenRecord| {
+            let mut s = sink.lock().unwrap();
+            s.0 += r.migrants;
+            s.1 = r.restarts_total;
+        })),
+        ..cfg.clone()
+    };
+    let mut texts = Vec::new();
+    let out = search::run_resumable(&cfg, train, test, None, 1, |cp| texts.push(cp.to_text())).expect("qd policy run");
+    let (migrants, restarts) = *seen.lock().unwrap();
+    (out, texts, migrants, restarts)
+}
+
+fn qd_centroid_lines(text: &str) -> Vec<&str> {
+    text.lines().filter(|l| l.starts_with("qd_centroid ")).collect()
+}
+
+/// A `--qd-policy` run resumed from the checkpoint of any generation gives the
+/// same front, QD report and exit checkpoint as the uninterrupted run, for the
+/// CVT, grid and random archives, and for the uniform control on screened
+/// rows (every member then reaches the archive through its descriptor cache).
+#[test]
+fn a_qd_policy_run_resumed_at_every_generation_matches_exactly() {
+    let train = sample(240);
+    let test = sample(80);
+    let arms = [
+        ("cvt", qd_policy_config(12)),
+        ("grid", Config { qd_cvt: false, qd_bins: 4, ..qd_policy_config(12) }),
+        ("random", Config { qd_cvt: false, qd_control: 2, ..qd_policy_config(12) }),
+        ("uniform, screened", Config { qd_control: 1, fit_samples: 120, ..qd_policy_config(12) }),
+    ];
+    let mut cvt_texts = Vec::new();
+    for (what, cfg) in &arms {
+        let (full, texts, migrants, restarts) = every_qd_checkpoint(cfg, &train, &test);
+        assert!(migrants > 0, "{what}: the fixture migrates, so the archive picks migration victims");
+        if *what == "cvt" {
+            assert!(restarts > 0, "{what}: the fixture restarts an island, so the archive aims a restart");
+        }
+        assert_eq!(texts.len(), cfg.generations + 1, "{what}: one save per generation and the exit save");
+        let exit = texts.last().expect("exit checkpoint");
+        // Generation 0 saves an empty archive.
+        let mut zero: Option<String> = None;
+        search::run_resumable(&Config { generations: 0, ..cfg.clone() }, &train, &test, None, 0, |cp| zero = Some(cp.to_text()))
+            .expect("generation 0 run");
+        let zero = zero.expect("generation 0 checkpoint");
+        for text in std::iter::once(&zero).chain(&texts[..cfg.generations - 1]) {
+            let saved = Checkpoint::from_text(text).expect("parse saved checkpoint");
+            let at = saved.generations;
+            let mut resumed_exit: Option<String> = None;
+            let resumed = search::run_resumable(cfg, &train, &test, Some(saved), 0, |cp| resumed_exit = Some(cp.to_text()))
+                .expect("resume");
+            assert_eq!(describe(&full), describe(&resumed), "{what}: front after a resume at generation {at}");
+            assert_eq!(full.qd, resumed.qd, "{what}: QD report after a resume at generation {at}");
+            assert_eq!(exit, &resumed_exit.expect("exit checkpoint"), "{what}: exit checkpoint after a resume at generation {at}");
+        }
+        if *what == "cvt" {
+            cvt_texts = texts;
+        }
+    }
+    // A Lloyd step moves the CVT centroids in generation 4 on this fixture, so
+    // the resume at generation 3 runs it as its first generation.
+    assert_ne!(qd_centroid_lines(&cvt_texts[2]), qd_centroid_lines(&cvt_texts[3]), "centroids at generations 3 and 4");
+}
+
+/// The `qd_*` records save and load every field of the archive state (cells,
+/// descriptors, centroids, visits, Lloyd sample, counters, descriptor cache)
+/// bit for bit, the text is a fixed point, and a malformed block is refused.
+#[test]
+fn the_qd_archive_records_round_trip_exactly() {
+    let train = sample(240);
+    let test = sample(80);
+    let arms = [
+        ("cvt", qd_policy_config(5)),
+        ("grid", Config { qd_cvt: false, qd_bins: 4, ..qd_policy_config(5) }),
+        ("random", Config { qd_cvt: false, qd_control: 2, ..qd_policy_config(5) }),
+        ("uniform, screened", Config { qd_control: 1, fit_samples: 120, ..qd_policy_config(5) }),
+    ];
+    let mut cvt_text = String::new();
+    for (what, cfg) in &arms {
+        let mut live: Option<(rcsr::qd::QdState, String)> = None;
+        search::run_resumable(cfg, &train, &test, None, 0, |cp| live = Some((cp.qd.clone().expect("qd state"), cp.to_text())))
+            .expect("qd policy run");
+        let (state, text) = live.expect("exit checkpoint");
+        assert!(state.cells.iter().any(|c| c.len() == 2), "{what}: a cell at its cap");
+        assert!(!state.known.is_empty() && !state.observed.is_empty(), "{what}");
+        if *what == "uniform, screened" {
+            assert!(state.fallbacks > 0, "{what}: screened members reach the archive without a descriptor");
+        }
+        assert_eq!(state.centroids.len(), if cfg.qd_cvt && cfg.qd_control != 2 { 16 } else { 0 }, "{what}");
+        let loaded = Checkpoint::from_text(&text).expect("parse");
+        assert_eq!(format!("{:?}", loaded.qd.expect("loaded qd")), format!("{state:?}"), "{what}");
+        assert_eq!(Checkpoint::from_text(&text).expect("parse").to_text(), text, "{what}: fixed point");
+        if *what == "cvt" {
+            cvt_text = text;
+        }
+    }
+    let refused = |text: String, needle: &str| {
+        let err = expect_err(Checkpoint::from_text(&text), needle);
+        assert!(err.contains(needle), "{needle}: {err}");
+    };
+    refused(cvt_text.replace("\nqd_archive 1 ", "\nqd_archive 2 "), "qd_archive version 2 is not supported");
+    let last_known = cvt_text.rfind("\nqd_known ").expect("qd_known record");
+    let truncated = format!("{}{}", &cvt_text[..last_known + 1], &cvt_text[last_known + 1..].split_once('\n').expect("line").1);
+    refused(truncated, "qd_known record(s)");
+    let header = cvt_text.lines().find(|l| l.starts_with("qd_archive ")).expect("header");
+    refused(cvt_text.replace(&format!("{header}\n"), ""), "record before the qd_archive header");
+    refused(cvt_text.replace("config qd_policy true\n", "config qd_policy false\n"), "written only under --qd-policy");
+}
+
+/// The archive records do not depend on the thread count, and a resume under
+/// another count continues the same trajectory.
+#[test]
+fn a_qd_policy_search_does_not_depend_on_the_thread_count() {
+    let train = sample(2600);
+    let test = sample(300);
+    assert_thread_free(&qd_policy_config(6), "qd policy", &train, &test);
+}
+
+const CLEAN_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/clean.csv");
+
+/// One CPU run on `tests/fixtures/clean.csv` with `--seed 3 --islands 2 --pop 40`.
+fn clean_run(extra: &[&str]) -> Output {
+    let mut args = vec![
+        "--data", CLEAN_CSV, "--target", "y", "--vars", "x", "--seed", "3", "--islands", "2", "--pop", "40", "--cpu",
+        "--no-dev-log", "--quiet", "--json",
+    ];
+    args.extend_from_slice(extra);
+    rcsr(&args)
+}
+
+fn clean_json(extra: &[&str]) -> String {
+    let out = clean_run(extra);
+    assert!(out.status.success(), "rcsr {extra:?}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8(out.stdout).expect("utf-8 json")
+}
+
+fn from_pareto(json: &str) -> &str {
+    &json[json.find("\"pareto\":").expect("pareto field")..]
+}
+
+fn qd_object(json: &str) -> &str {
+    let rest = &json[json.find("\"qd\":").expect("qd field")..];
+    &rest[..rest.find(",\"seeds\"").expect("seeds after qd")]
+}
+
+fn without_build_lines(text: &str) -> String {
+    text.lines().filter(|l| !l.starts_with("build ")).map(|l| format!("{l}\n")).collect()
+}
+
+/// 8 generations straight against 4 generations saved and resumed to 8: the
+/// JSON from `"pareto":`, the `qd` object and the exit checkpoints apart from
+/// the `build` lines are equal.
+fn assert_clean_qd_resume_matches(tag: &str, flags: &[&str]) {
+    let scratch = Scratch::new(tag);
+    let path = |name: &str| scratch.join(name).to_str().expect("utf-8 path").to_string();
+    let (straight_cp, half_cp, resumed_cp) = (path("straight.rcsr"), path("half.rcsr"), path("resumed.rcsr"));
+    let mut straight = flags.to_vec();
+    straight.extend(["--generations", "8", "--save", &straight_cp]);
+    let a = clean_json(&straight);
+    let mut half = flags.to_vec();
+    half.extend(["--generations", "4", "--save", &half_cp]);
+    clean_json(&half);
+    let b = clean_json(&["--generations", "8", "--resume", &half_cp, "--save", &resumed_cp]);
+    assert!(!qd_object(&a).contains("null"), "{tag}: {}", qd_object(&a));
+    assert_eq!(from_pareto(&a), from_pareto(&b), "{tag}: front");
+    assert_eq!(qd_object(&a), qd_object(&b), "{tag}: qd report");
+    let read = |p: &str| without_build_lines(&std::fs::read_to_string(p).expect("checkpoint"));
+    assert_eq!(read(&straight_cp), read(&resumed_cp), "{tag}: exit checkpoint");
+}
+
+#[test]
+fn a_qd_policy_run_and_its_resume_match_exactly() {
+    assert_clean_qd_resume_matches("qd-policy", &["--qd-policy"]);
+}
+
+#[test]
+fn a_qd_uniform_run_and_its_resume_match_exactly() {
+    assert_clean_qd_resume_matches("qd-uniform", &["--qd-policy", "--qd-uniform"]);
+}
+
+#[test]
+fn a_qd_random_run_and_its_resume_match_exactly() {
+    assert_clean_qd_resume_matches("qd-random", &["--qd-policy", "--qd-random"]);
+}
+
+/// A resume at the final generation runs no generation and still reports the
+/// saved archive.
+#[test]
+fn a_qd_policy_resume_at_the_final_generation_reports_the_saved_archive() {
+    let scratch = Scratch::new("qd-final");
+    let cp = scratch.join("final.rcsr").to_str().expect("utf-8 path").to_string();
+    let a = clean_json(&["--qd-policy", "--generations", "6", "--save", &cp]);
+    let b = clean_json(&["--resume", &cp]);
+    assert_eq!(from_pareto(&a), from_pareto(&b), "front");
+    assert_eq!(qd_object(&a), qd_object(&b), "qd report");
+}
+
+/// The archive records are written only under `--qd-policy`: a QD-off and a
+/// passive `--qd` checkpoint keep their bytes.
+#[test]
+fn the_qd_archive_is_saved_only_under_qd_policy() {
+    let scratch = Scratch::new("qd-records");
+    let saved = |name: &str, flags: &[&str]| {
+        let cp = scratch.join(name).to_str().expect("utf-8 path").to_string();
+        let mut args = flags.to_vec();
+        args.extend(["--generations", "3", "--save", &cp]);
+        clean_json(&args);
+        std::fs::read_to_string(&cp).expect("checkpoint")
+    };
+    for (name, flags) in [("off.rcsr", &[][..]), ("passive.rcsr", &["--qd"][..])] {
+        let text = saved(name, flags);
+        assert!(!text.lines().any(|l| l.starts_with("qd_")), "{name} has QD archive records");
+    }
+    let policy = saved("policy.rcsr", &["--qd-policy"]);
+    assert_eq!(policy.lines().filter(|l| l.starts_with("qd_archive 1 cvt ")).count(), 1, "{policy}");
+}
+
+/// A `--qd-policy` checkpoint without the archive records (written before
+/// #1166) is refused on resume with exit 2 and a message naming the archive.
+#[test]
+fn a_qd_policy_checkpoint_without_the_archive_is_refused() {
+    let scratch = Scratch::new("qd-old");
+    let cp = scratch.join("new.rcsr").to_str().expect("utf-8 path").to_string();
+    let old = scratch.join("old.rcsr").to_str().expect("utf-8 path").to_string();
+    clean_json(&["--qd-policy", "--generations", "4", "--save", &cp]);
+    let text = std::fs::read_to_string(&cp).expect("checkpoint");
+    let stripped: String = text.lines().filter(|l| !l.starts_with("qd_")).map(|l| format!("{l}\n")).collect();
+    assert_ne!(stripped, text, "the checkpoint carries archive records");
+    std::fs::write(&old, stripped).expect("write old checkpoint");
+    let refused = clean_run(&["--generations", "8", "--resume", &old]);
+    let err = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(refused.status.code(), Some(2), "{err}");
+    assert!(err.contains("has no QD archive"), "{err}");
 }

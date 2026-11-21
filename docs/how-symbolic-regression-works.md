@@ -110,6 +110,11 @@ Any candidate producing a non-finite prediction is treated as a hard failure.
   approximations, and individuals that are no better than the mean model are
   dropped by their rank. Parents are then drawn by Pareto rank and crowding
   distance.
+- **Lexicase parent selection** (`--selection lexicase`, #1023) keeps the generational replacement and the elite but replaces the island tournament by semi-dynamic epsilon-lexicase (La Cava, Spector and Danai, GECCO 2016; La Cava, Helmuth, Spector and Moore, Evolutionary Computation 27(3), 2019, Algorithm 3). The aggregate error ranks a formula that is best on half of the data below the aggregate winner; lexicase rewards a formula that is best somewhere. Each generation draws `K = --lexicase-cases` cases (default 256) from the seed and the generation alone (down-sampled lexicase, Hernandez, Lalejini, Dolson and Ofria, GECCO 2019 companion):
+  - under the metric fitness a case is one row of the generation's sample and its error is the metric's row loss (`(p - y)^2` for squared and the information criteria, `|p - y|` for absolute, `ln(1 + (p - y)^2)` for log_squashed, the classification row loss for log_loss, brier and the hinge forms). A row value depends on its own row only, so these are the bits the fitness pass computed. A metric without a per-row loss, a weighted sample, several targets or an implicit model exit 2;
+  - under `--fitness pnl` a case is one `(group, time block)` sub-book of the long/flat book (`--pnl-blocks`) with a positive hindsight bound, and its error is the sub-book regret `(B_c - net_c) / B_c` from the prediction vector that scored the candidate. When there are more sub-books than `K`, `K` are drawn per generation. A sub-book has no trade floor: a flat one scores exactly 1.
+
+  For each case, epsilon is the median absolute deviation of the island's finite errors on it. One selection visits the cases in a random order (the island generator) and keeps every survivor within epsilon of the best survivor on that case; it stops at one survivor. The survivors after the last case are narrowed to the lowest complexity and one is drawn uniformly. The 15 % front draw stays in front of it. A selection costs at most `pool x K` comparisons; `pop x K` above 2^24 exits 2, and so do sub-book vectors above 2^28 values (islands x pop x sub-books). Lexicase runs on the CPU node path: `--gpu` (device cases: #1169 for the metric fitness, #1031 for the P&L fitness) and `--variation postfix` exit 2, and a CUDA build without `--gpu` notes the reason and stays on the CPU. Nothing new enters the checkpoint except `lexicase_cases` off its default: the cases are a function of the seed and the generation, and a resumed member's sub-book errors are recomputed from its saved tree. Every generation line of the development log carries `"selection":{"mode":"lexicase","cases":N}`.
 - **Variation** has two parts:
   - *mutation* — the edit kind is drawn first (25 % point change, 35 %
     constant/input perturb, 40 % subtree grow/shrink) and the site is chosen
@@ -122,8 +127,10 @@ Any candidate producing a non-finite prediction is treated as a hard failure.
     0.20, terminal 0.30, subtree 0.20, insert 0.10, delete 0.10, swap 0.05,
     rotate 0.05. `--adaptive-mix` lets each island reweight the seven kinds
     from the success rate (a child beats its first parent) over the last 10
-    generations, `w = max(0.02, (s + 1) / (a + 2))`, normalised; it learns
-    from CPU-scored generations only;
+    generations, `w = max(0.02, (s + 1) / (a + 2))`, normalised. It learns on both backends: the CPU path counts a child as
+    soon as it is scored; with device scoring the counts are taken at the
+    generation barrier, after every offspring has its score, by the same win
+    rule. Only a screening subset (`--fit-samples`) keeps the base weights;
   - *crossover* — swap subtrees between two parents; `--crossover-internal P`
     picks an internal node as the cut point with probability `P`;
 - **Constant fitting** tunes the numeric constants of a candidate by local
@@ -197,6 +204,17 @@ Any candidate producing a non-finite prediction is treated as a hard failure.
   every member of every island each generation, so the report, patience and
   the restart rules read it unchanged. `--qd-policy` is refused with `island`:
   its QD archive is one parent pool for every island.
+- **QD descriptor** (`--qd-descriptor moments|book`, #1084, default
+  `moments`). The quality-diversity archive (`--qd`, `--qd-policy`, #120) keys
+  its cells by two behaviour axes. `moments` reads variable usage and
+  prediction skewness. Under `--fitness pnl` those axes do not separate the
+  books the fitness separates, so `book` reads the long/flat book of the
+  fitness from the reduction that gives the regret: the log exposure (long rows
+  over rows) and the log mean holding length (long rows per round trip), each
+  mapped from fixed bounds (`1e-4` to 1, 1 to `1e4` rows) onto `[0, 1]`. A cell
+  then means "trades rarely, holds long" against "trades often, holds short".
+  The parent draws, migration victims and restart aims of `--qd-policy` follow
+  those cells. Details in `docs/qd.md`.
 - Termination is by generation count or a time/effort budget.
 
 ## 7. Simplification and presentation

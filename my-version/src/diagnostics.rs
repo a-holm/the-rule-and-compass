@@ -1321,7 +1321,7 @@ fn gamma_cf(a: f64, x: f64) -> f64 {
 }
 
 /// Logarithm of the gamma function, Lanczos approximation (g = 7, n = 9).
-fn ln_gamma(x: f64) -> f64 {
+pub(crate) fn ln_gamma(x: f64) -> f64 {
     const G: [f64; 9] = [
         0.999_999_999_999_809_93,
         676.520_368_121_885_1,

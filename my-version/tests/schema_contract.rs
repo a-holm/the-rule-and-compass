@@ -156,3 +156,11 @@ fn trials_default_names_every_mode() {
         }
     }
 }
+
+#[test]
+fn schema_lists_the_append_budget_variables() {
+    let doc = schema::json();
+    for name in ["RCSR_APPEND_BATCH_GROUPS", "RCSR_APPEND_BUDGET_MIB"] {
+        assert!(doc.contains(name), "schema does not mention {name}");
+    }
+}

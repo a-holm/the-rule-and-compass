@@ -430,6 +430,15 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
     h
 }
 
+/// The destination row ranges of one group in the table columns, one entry per
+/// projection column. A column that has no such block holds `None`.
+struct GroupDst<'a> {
+    group: usize,
+    f64s: Vec<Option<&'a mut [f64]>>,
+    ints: Vec<Option<&'a mut [i64]>>,
+    codes: Vec<Option<&'a mut [u32]>>,
+}
+
 /// Statistics from one projected group read. Incremented at the `pread` site.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ProjectedReadStats {
@@ -848,21 +857,6 @@ impl FileStore {
         int_scratch: &mut Vec<i64>,
         byte_scratch: &mut Vec<u8>,
     ) -> Result<ProjectedReadStats, String> {
-        self.read_group_projected_impl(group, projection, out, int_scratch, byte_scratch, None)
-    }
-
-    /// Shared body of the projected group read. With `keep`, the exact `i64`
-    /// block of every `I64` column is appended in projection order, so the
-    /// time column is read once.
-    fn read_group_projected_impl(
-        &self,
-        group: usize,
-        projection: &Projection,
-        out: &mut [f64],
-        int_scratch: &mut Vec<i64>,
-        byte_scratch: &mut Vec<u8>,
-        mut keep: Option<&mut Vec<Vec<i64>>>,
-    ) -> Result<ProjectedReadStats, String> {
         if group >= self.header.n_groups() {
             return Err(format!(
                 "{}: group {} is out of range ({} groups)",
@@ -894,9 +888,6 @@ impl FileStore {
                 }
                 DType::I64 => {
                     read_i64_block(&self.file, &self.path, off, int_scratch, byte_scratch)?;
-                    if let Some(k) = keep.as_deref_mut() {
-                        k.push(int_scratch.clone());
-                    }
                     for (dst, &v) in out[lo..hi].iter_mut().zip(int_scratch.iter()) {
                         *dst = if v == i64::MIN { f64::NAN } else { v as f64 };
                     }
@@ -994,71 +985,32 @@ impl FileStore {
         let n = self.header.n_rows;
         let n_groups = self.header.n_groups();
         let readers = readers.min(n_groups).max(1);
+        // Every element is overwritten by the group reads below, so the zeroed
+        // allocation is never filled a second time.
         let mut values: Vec<Vec<f64>> = projection
             .columns()
             .iter()
-            .map(|c| {
-                if c.width == 0 {
-                    Vec::new()
-                } else {
-                    let mut v = Vec::with_capacity(n);
-                    v.resize(n, f64::NAN);
-                    v
-                }
-            })
+            .map(|c| if c.width == 0 { Vec::new() } else { vec![0.0f64; n] })
             .collect();
         let mut ints: Vec<Option<Vec<i64>>> = projection
             .columns()
             .iter()
-            .map(|c| {
-                if c.dtype == DType::I64 {
-                    let mut v = Vec::with_capacity(n);
-                    v.resize(n, i64::MIN);
-                    Some(v)
-                } else {
-                    None
-                }
-            })
+            .map(|c| (c.dtype == DType::I64).then(|| vec![i64::MIN; n]))
             .collect();
         let mut codes: Vec<Option<Vec<u32>>> = projection
             .columns()
             .iter()
-            .map(|c| {
-                if c.dtype == DType::U32 {
-                    Some(vec![0u32; n])
-                } else {
-                    None
-                }
-            })
+            .map(|c| (c.dtype == DType::U32).then(|| vec![0u32; n]))
             .collect();
-        if readers == 1 {
-            let mut group = ProjectedGroup::new();
-            for g in 0..n_groups {
-                self.read_group_projected(g, projection, &mut group)?;
-                let base = g * self.header.group_rows;
-                let len = group.len();
-                for (c, col) in projection.columns().iter().enumerate() {
-                    if col.width > 0 {
-                        values[c][base..base + len].copy_from_slice(group.col(c));
-                    }
-                    if let Some(dst) = ints[c].as_mut() {
-                        let exact = self.read_i64(g, col.index)?;
-                        dst[base..base + len].copy_from_slice(&exact);
-                    }
-                    if let Some(dst) = codes[c].as_mut() {
-                        let exact = self.read_codes(g, col.index)?;
-                        dst[base..base + len].copy_from_slice(&exact);
-                    }
+        if n_groups > 0 {
+            let mut work = self.group_destinations(projection, &mut values, &mut ints, &mut codes);
+            if readers == 1 {
+                for dst in &mut work {
+                    self.read_group_into(projection, dst)?;
                 }
+            } else {
+                self.read_groups_concurrently(projection, readers, work)?;
             }
-        } else {
-            self.read_groups_concurrently(
-                projection,
-                readers,
-                &mut values,
-                &mut ints,
-                &mut codes,
-            )?;
         }
         let names = projection.names();
         let numeric: Vec<bool> = projection
@@ -1085,116 +1037,143 @@ impl FileStore {
         Ok(Table::from_parts(names, numeric, columns, n, 0))
     }
 
+    /// Split every projected column into its per-group row ranges and collect
+    /// the ranges of one group into one work item, in group order.
+    fn group_destinations<'a>(
+        &self,
+        projection: &Projection,
+        values: &'a mut [Vec<f64>],
+        ints: &'a mut [Option<Vec<i64>>],
+        codes: &'a mut [Option<Vec<u32>>],
+    ) -> Vec<GroupDst<'a>> {
+        let rows = self.header.group_rows.max(1);
+        let n_cols = projection.len();
+        let mut work: Vec<GroupDst<'a>> = (0..self.header.n_groups())
+            .map(|group| GroupDst {
+                group,
+                f64s: Vec::with_capacity(n_cols),
+                ints: Vec::with_capacity(n_cols),
+                codes: Vec::with_capacity(n_cols),
+            })
+            .collect();
+        for v in values.iter_mut() {
+            if v.is_empty() {
+                work.iter_mut().for_each(|w| w.f64s.push(None));
+            } else {
+                for (w, chunk) in work.iter_mut().zip(v.chunks_mut(rows)) {
+                    w.f64s.push(Some(chunk));
+                }
+            }
+        }
+        for v in ints.iter_mut() {
+            match v {
+                Some(v) => {
+                    for (w, chunk) in work.iter_mut().zip(v.chunks_mut(rows)) {
+                        w.ints.push(Some(chunk));
+                    }
+                }
+                None => work.iter_mut().for_each(|w| w.ints.push(None)),
+            }
+        }
+        for v in codes.iter_mut() {
+            match v {
+                Some(v) => {
+                    for (w, chunk) in work.iter_mut().zip(v.chunks_mut(rows)) {
+                        w.codes.push(Some(chunk));
+                    }
+                }
+                None => work.iter_mut().for_each(|w| w.codes.push(None)),
+            }
+        }
+        work
+    }
+
+    /// Read the projected blocks of one group straight into its destination
+    /// slices. An `i64` column is read once into `ints` and converted into the
+    /// `f64` view from there.
+    fn read_group_into(
+        &self,
+        projection: &Projection,
+        dst: &mut GroupDst<'_>,
+    ) -> Result<(), String> {
+        let mut scratch = Vec::new();
+        for (c, col) in projection.columns().iter().enumerate() {
+            let meta = &self.header.columns[col.index];
+            let off = self.data_start + meta.offsets[dst.group];
+            match meta.dtype {
+                DType::F64 => read_f64_block(
+                    &self.file,
+                    &self.path,
+                    off,
+                    dst.f64s[c].as_deref_mut().ok_or("missing f64 destination")?,
+                    &mut scratch,
+                )?,
+                DType::I64 => {
+                    let exact = dst.ints[c].as_deref_mut().ok_or("missing i64 destination")?;
+                    read_i64_block(&self.file, &self.path, off, exact, &mut scratch)?;
+                    let vals = dst.f64s[c].as_deref_mut().ok_or("missing f64 destination")?;
+                    for (v, &i) in vals.iter_mut().zip(exact.iter()) {
+                        *v = if i == i64::MIN { f64::NAN } else { i as f64 };
+                    }
+                }
+                DType::U32 => read_u32_block(
+                    &self.file,
+                    &self.path,
+                    self.data_start + meta.code_offsets[dst.group],
+                    dst.codes[c].as_deref_mut().ok_or("missing code destination")?,
+                    &mut scratch,
+                )?,
+            }
+        }
+        Ok(())
+    }
+
     /// Reader pool of [`FileStore::to_table_projected_with_readers`]: workers
-    /// claim group indices, read them through their own handle and send them
-    /// to the calling thread, which copies each into its disjoint row range.
-    /// Emptied group buffers return to the workers.
+    /// take the next group's destination slices, read through their own handle
+    /// and write the blocks into them. The error of the lowest failing group
+    /// is returned: groups are claimed in order and a claimed group is always
+    /// finished, so every group below a failing one has been read.
     fn read_groups_concurrently(
         &self,
         projection: &Projection,
         readers: usize,
-        values: &mut [Vec<f64>],
-        ints: &mut [Option<Vec<i64>>],
-        codes: &mut [Option<Vec<u32>>],
+        work: Vec<GroupDst<'_>>,
     ) -> Result<(), String> {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::{mpsc, Mutex};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Mutex;
 
-        struct Loaded {
-            group: usize,
-            values: ProjectedGroup,
-            ints: Vec<Vec<i64>>,
-            codes: Vec<Vec<u32>>,
-        }
-
-        let n_groups = self.header.n_groups();
-        let next = AtomicUsize::new(0);
-        let (tx, rx) = mpsc::sync_channel::<Result<Loaded, String>>(readers);
-        let (free_tx, free_rx) = mpsc::channel::<ProjectedGroup>();
-        let free_rx = Mutex::new(free_rx);
-        let handles: Vec<Result<FileStore, String>> =
-            (0..readers).map(|_| self.try_clone()).collect();
+        let handles = (0..readers)
+            .map(|_| self.try_clone())
+            .collect::<Result<Vec<FileStore>, String>>()?;
+        let queue = Mutex::new(work.into_iter());
+        let failed: Mutex<Option<(usize, String)>> = Mutex::new(None);
+        let stop = AtomicBool::new(false);
         std::thread::scope(|s| {
-            for handle in handles {
-                let tx = tx.clone();
-                let next = &next;
-                let free_rx = &free_rx;
+            for fs in &handles {
+                let queue = &queue;
+                let failed = &failed;
+                let stop = &stop;
                 s.spawn(move || {
-                    let fs = match handle {
-                        Ok(f) => f,
-                        Err(e) => {
-                            let _ = tx.send(Err(e));
-                            return;
-                        }
-                    };
-                    loop {
-                        let g = next.fetch_add(1, Ordering::Relaxed);
-                        if g >= n_groups {
-                            break;
-                        }
-                        let mut pg = free_rx
-                            .lock()
-                            .map(|r| r.try_recv().unwrap_or_default())
-                            .unwrap_or_default();
-                        let len = fs.header.group_len(g);
-                        pg.prepare(len, projection.len());
-                        let mut kept_ints = Vec::new();
-                        let item = fs
-                            .read_group_projected_impl(
-                                g,
-                                projection,
-                                &mut pg.values,
-                                &mut pg.int_scratch,
-                                &mut pg.byte_scratch,
-                                Some(&mut kept_ints),
-                            )
-                            .and_then(|_| {
-                                let mut kept_codes = Vec::new();
-                                for col in projection.columns() {
-                                    if col.dtype == DType::U32 {
-                                        kept_codes.push(fs.read_codes(g, col.index)?);
-                                    }
+                    while !stop.load(Ordering::Relaxed) {
+                        let next = queue.lock().map(|mut q| q.next()).unwrap_or(None);
+                        let Some(mut dst) = next else { break };
+                        if let Err(e) = fs.read_group_into(projection, &mut dst) {
+                            if let Ok(mut slot) = failed.lock() {
+                                if slot.as_ref().map_or(true, |(g, _)| dst.group < *g) {
+                                    *slot = Some((dst.group, e));
                                 }
-                                Ok(kept_codes)
-                            })
-                            .map(|kept_codes| Loaded {
-                                group: g,
-                                values: pg,
-                                ints: kept_ints,
-                                codes: kept_codes,
-                            });
-                        if tx.send(item).is_err() {
-                            break;
+                            }
+                            stop.store(true, Ordering::Relaxed);
                         }
                     }
                 });
             }
-            drop(tx);
-            for item in rx {
-                let mut loaded = item?;
-                let base = loaded.group * self.header.group_rows;
-                let len = loaded.values.len();
-                let mut int_blocks = loaded.ints.drain(..);
-                let mut code_blocks = loaded.codes.drain(..);
-                for (c, col) in projection.columns().iter().enumerate() {
-                    if col.width > 0 {
-                        values[c][base..base + len].copy_from_slice(loaded.values.col(c));
-                    }
-                    if let Some(dst) = ints[c].as_mut() {
-                        let block = int_blocks.next().ok_or("missing i64 block")?;
-                        dst[base..base + len].copy_from_slice(&block);
-                    }
-                    if let Some(dst) = codes[c].as_mut() {
-                        let block = code_blocks.next().ok_or("missing code block")?;
-                        dst[base..base + len].copy_from_slice(&block);
-                    }
-                }
-                drop(int_blocks);
-                drop(code_blocks);
-                let _ = free_tx.send(loaded.values);
-            }
-            Ok(())
-        })
+        });
+        match failed.into_inner() {
+            Ok(Some((_, e))) => Err(e),
+            Ok(None) => Ok(()),
+            Err(_) => Err(format!("{}: a reader thread panicked", self.path)),
+        }
     }
 
     /// Load the whole store into the resident column-major image. This is the
@@ -1758,14 +1737,18 @@ pub fn write_store_appending(
     extras: &[AppendColumn],
 ) -> Result<(), String> {
     let mut file = File::create(path).map_err(|e| format!("{}: {}", path, e))?;
-    write_store_appending_to(&mut file, path, source, extras)
+    let batch = append_batch_groups(source, extras.len());
+    let mut out = std::io::BufWriter::with_capacity(APPEND_WRITE_BUFFER, &mut file);
+    write_store_appending_to(&mut out, path, source, extras, batch, &mut AppendStats::default())?;
+    out.flush().map_err(|e| format!("{}: {}", path, e))
 }
 
 /// Like [`write_store_appending`], but also return the SHA-256 of the bytes it
 /// wrote.
 ///
-/// Hashing happens while the blocks stream to disk, so the caller does not have
-/// to read a multi-gigabyte output a second time just to checksum it.
+/// The hash runs on its own thread while the blocks stream to disk, so the
+/// caller does not have to read a multi-gigabyte output a second time just to
+/// checksum it and the writer never waits for the digest.
 ///
 /// The bytes go to `<path>.tmp-<pid>` and are renamed to `path` on success, so
 /// a failed write leaves no file at `path` and no temporary file.
@@ -1774,22 +1757,171 @@ pub fn write_store_appending_hashed(
     source: &FileStore,
     extras: &[AppendColumn],
 ) -> Result<String, String> {
+    write_store_appending_hashed_stats(path, source, extras).map(|(sha, _)| sha)
+}
+
+/// [`write_store_appending_hashed`] that also returns where the time went.
+pub fn write_store_appending_hashed_stats(
+    path: &str,
+    source: &FileStore,
+    extras: &[AppendColumn],
+) -> Result<(String, AppendStats), String> {
+    let batch = append_batch_groups(source, extras.len());
+    write_store_appending_hashed_with(path, source, extras, batch)
+}
+
+/// Where the append pass spends its time. The three timers partition the pass:
+/// temp-column and source reads, file writes, and time the writer is blocked
+/// on the hash thread (its queue is full, or the digest is still draining at
+/// the end). The call counts exist in unit tests only.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AppendStats {
+    pub read_s: f64,
+    pub write_s: f64,
+    pub hash_wait_s: f64,
+    #[cfg(test)]
+    pub extra_reads: u64,
+    #[cfg(test)]
+    pub read_calls: u64,
+    #[cfg(test)]
+    pub read_bytes: u64,
+    #[cfg(test)]
+    pub write_calls: u64,
+    #[cfg(test)]
+    pub write_bytes: u64,
+}
+
+/// Size of the buffer in front of the output file.
+const APPEND_WRITE_BUFFER: usize = 4 << 20;
+/// Memory the staged temp-column batch may use by default.
+const APPEND_BUDGET_MIB_DEFAULT: usize = 1024;
+/// Bounds of `RCSR_APPEND_BUDGET_MIB`.
+const APPEND_BUDGET_MIB_RANGE: std::ops::RangeInclusive<usize> = 64..=65536;
+/// Most groups one batch stages.
+const APPEND_BATCH_MAX: usize = 16;
+/// Blocks queued for the hash thread.
+const APPEND_HASH_QUEUE: usize = 8;
+
+/// Groups staged per temp-column read: `RCSR_APPEND_BATCH_GROUPS` when set
+/// (1 reads one group at a time), else as many as fit the budget. Either way
+/// the result is at most 16, at most the group count, and at most what
+/// `RCSR_APPEND_BUDGET_MIB` (default 1024) holds, with 1 as the floor.
+fn append_batch_groups(source: &FileStore, n_extras: usize) -> usize {
+    let (batch, note) = parse_append_batch(
+        std::env::var("RCSR_APPEND_BATCH_GROUPS").ok().as_deref(),
+        std::env::var("RCSR_APPEND_BUDGET_MIB").ok().as_deref(),
+        source.header.group_rows,
+        source.header.n_groups(),
+        n_extras,
+    );
+    if let Some(note) = note {
+        eprintln!("{}", note);
+    }
+    batch
+}
+
+/// The batch size and, when the budget or the maximum lowered it, the stderr
+/// note that says so.
+fn parse_append_batch(
+    value: Option<&str>,
+    budget_mib: Option<&str>,
+    group_rows: usize,
+    n_groups: usize,
+    n_extras: usize,
+) -> (usize, Option<String>) {
+    let n_groups = n_groups.max(1);
+    let mib = budget_mib
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map_or(APPEND_BUDGET_MIB_DEFAULT, |m| {
+            m.clamp(*APPEND_BUDGET_MIB_RANGE.start(), *APPEND_BUDGET_MIB_RANGE.end())
+        });
+    let budget = mib << 20;
+    let per_group = n_extras.max(1).saturating_mul(group_rows.max(1)).saturating_mul(8);
+    let by_budget = budget / per_group;
+    let cap = by_budget.clamp(1, APPEND_BATCH_MAX).min(n_groups);
+    let floor_note = (by_budget == 0).then(|| {
+        format!(
+            "one group ({} MiB) exceeds the append budget ({} MiB); staging 1 group",
+            per_group.div_ceil(1 << 20),
+            mib
+        )
+    });
+    match value.and_then(|v| v.trim().parse::<usize>().ok()) {
+        Some(n) => {
+            let want = n.clamp(1, n_groups);
+            let got = want.min(cap);
+            let note = if got >= want {
+                None
+            } else if by_budget == 0 {
+                floor_note
+            } else if by_budget < APPEND_BATCH_MAX {
+                Some(format!(
+                    "RCSR_APPEND_BATCH_GROUPS={} clamped to {} by the {} MiB append budget",
+                    n, got, mib
+                ))
+            } else {
+                Some(format!(
+                    "RCSR_APPEND_BATCH_GROUPS={} clamped to {} by the maximum batch",
+                    n, got
+                ))
+            };
+            (got, note)
+        }
+        None => (cap, floor_note),
+    }
+}
+
+pub(crate) fn write_store_appending_hashed_with(
+    path: &str,
+    source: &FileStore,
+    extras: &[AppendColumn],
+    batch: usize,
+) -> Result<(String, AppendStats), String> {
+    write_store_appending_hashed_over(path, source, extras, batch, |file| file)
+}
+
+/// [`write_store_appending_hashed_with`] with `wrap` applied to the temporary
+/// file; the bytes go through the wrapper.
+fn write_store_appending_hashed_over<W: Write>(
+    path: &str,
+    source: &FileStore,
+    extras: &[AppendColumn],
+    batch: usize,
+    wrap: impl FnOnce(File) -> W,
+) -> Result<(String, AppendStats), String> {
+    let mut stats = AppendStats::default();
     let tmp = format!("{}.tmp-{}", path, std::process::id());
     let guard = TempGuard(tmp.clone());
-    let mut file = File::create(&tmp).map_err(|e| format!("{}: {}", tmp, e))?;
-    let mut hasher = crate::manifest::Sha256Hasher::new();
+    let mut file = wrap(File::create(&tmp).map_err(|e| format!("{}: {}", tmp, e))?);
+    let (sha, tail) = with_hash_thread(&mut file, path, |out| {
+        write_store_appending_to(out, path, source, extras, batch, &mut stats)
+    })?;
+    stats.write_s += tail.write_s;
+    stats.hash_wait_s += tail.hash_wait_s;
+    #[cfg(test)]
     {
-        let mut out = HashWriter {
-            inner: &mut file,
-            hasher: &mut hasher,
-        };
-        write_store_appending_to(&mut out, path, source, extras)?;
-        out.flush().map_err(|e| format!("{}: {}", path, e))?;
+        stats.write_calls += tail.calls;
+        stats.write_bytes += tail.bytes;
     }
     drop(file);
     std::fs::rename(&tmp, path).map_err(|e| format!("{}: {}", path, e))?;
     std::mem::forget(guard);
-    Ok(hasher.finalize())
+    Ok((sha, stats))
+}
+
+/// Test hook: the hash thread of the append to this path panics at this block.
+#[cfg(test)]
+static APPEND_HASH_PANIC: std::sync::Mutex<Option<(String, usize)>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn append_hash_hook(path: &str, block: usize) {
+    let hit = matches!(
+        &*APPEND_HASH_PANIC.lock().unwrap_or_else(|e| e.into_inner()),
+        Some((p, n)) if p == path && *n == block
+    );
+    if hit {
+        panic!("injected hash thread panic at block {}", block);
+    }
 }
 
 /// Removes its file on drop; forgotten once the file has been renamed away.
@@ -1801,16 +1933,44 @@ impl Drop for TempGuard {
     }
 }
 
-/// `Write` adapter that feeds every byte to a SHA-256 state.
-struct HashWriter<'a> {
-    inner: &'a mut File,
-    hasher: &'a mut crate::manifest::Sha256Hasher,
+/// Write-side counters of [`HashingWriter`].
+#[derive(Default)]
+struct WriterStats {
+    write_s: f64,
+    hash_wait_s: f64,
+    #[cfg(test)]
+    calls: u64,
+    #[cfg(test)]
+    bytes: u64,
 }
 
-impl Write for HashWriter<'_> {
+/// `Write` adapter: writes to the file and hands a copy of every block to the
+/// hash thread. Emptied blocks come back through `free` for reuse.
+struct HashingWriter<'a, W: Write> {
+    inner: &'a mut W,
+    tx: std::sync::mpsc::SyncSender<Vec<u8>>,
+    free: std::sync::mpsc::Receiver<Vec<u8>>,
+    stats: WriterStats,
+}
+
+impl<W: Write> Write for HashingWriter<'_, W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let t = std::time::Instant::now();
         let n = self.inner.write(buf)?;
-        self.hasher.update(&buf[..n]);
+        self.stats.write_s += t.elapsed().as_secs_f64();
+        #[cfg(test)]
+        {
+            self.stats.calls += 1;
+            self.stats.bytes += n as u64;
+        }
+        let mut block = self.free.try_recv().unwrap_or_default();
+        block.clear();
+        block.extend_from_slice(&buf[..n]);
+        let t = std::time::Instant::now();
+        self.tx
+            .send(block)
+            .map_err(|_| std::io::Error::other("hash thread ended"))?;
+        self.stats.hash_wait_s += t.elapsed().as_secs_f64();
         Ok(n)
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -1818,11 +1978,51 @@ impl Write for HashWriter<'_> {
     }
 }
 
-fn write_store_appending_to<W: Write>(
+/// Runs `body` with a buffered writer over `file` whose bytes are also hashed
+/// on a second thread. Returns the digest of everything written and the
+/// writer's own counters (time still waiting for the digest included).
+fn with_hash_thread<W: Write, R>(
+    file: &mut W,
+    path: &str,
+    body: impl FnOnce(&mut std::io::BufWriter<HashingWriter<'_, W>>) -> Result<R, String>,
+) -> Result<(String, WriterStats), String> {
+    std::thread::scope(|scope| {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(APPEND_HASH_QUEUE);
+        let (free_tx, free) = std::sync::mpsc::channel::<Vec<u8>>();
+        let digest = scope.spawn(move || {
+            let mut hasher = crate::manifest::Sha256Hasher::new();
+            for (_i, block) in rx.into_iter().enumerate() {
+                #[cfg(test)]
+                append_hash_hook(path, _i);
+                hasher.update(&block);
+                let _ = free_tx.send(block);
+            }
+            hasher.finalize()
+        });
+        let mut out = std::io::BufWriter::with_capacity(
+            APPEND_WRITE_BUFFER,
+            HashingWriter { inner: file, tx, free, stats: WriterStats::default() },
+        );
+        let run = body(&mut out).and_then(|_| out.flush().map_err(|e| format!("{}: {}", path, e)));
+        let mut stats = match out.into_inner() {
+            Ok(w) => w.stats,
+            Err(_) => WriterStats::default(),
+        };
+        let t = std::time::Instant::now();
+        let sha = digest.join().map_err(|_| "hash thread panicked".to_string());
+        stats.hash_wait_s += t.elapsed().as_secs_f64();
+        run?;
+        Ok((sha?, stats))
+    })
+}
+
+fn write_store_appending_to<W: Write + ?Sized>(
     out: &mut W,
     path: &str,
     source: &FileStore,
     extras: &[AppendColumn],
+    batch: usize,
+    stats: &mut AppendStats,
 ) -> Result<(), String> {
     if extras.is_empty() {
         return Err("append needs at least one column".to_string());
@@ -1950,42 +2150,68 @@ fn write_store_appending_to<W: Write>(
         .and_then(|_| file.write_all(json.as_bytes()))
         .map_err(|e| format!("{}: {}", path, e))?;
 
+    let batch = batch.clamp(1, n_groups.max(1));
+    let mut stage: Vec<Vec<u8>> = vec![Vec::new(); extras.len()];
     let mut buf: Vec<u8> = Vec::new();
-    for g in 0..n_groups {
-        let lo = g * group_rows;
-        let len = group_len(n_rows, group_rows, g);
-        for (ci, col) in header.columns.iter().enumerate() {
-            if let Some(ei) = extra_of[ci] {
-                let bytes = len * 8;
-                buf.resize(bytes, 0);
-                read_exact_at(&extras_files[ei], &mut buf, (lo as u64) * 8).map_err(|e| {
-                    format!("{}: reading appended column '{}': {}", path, col.name, e)
-                })?;
-                file.write_all(&buf).map_err(|e| format!("{}: {}", path, e))?;
-                continue;
+    for g0 in (0..n_groups).step_by(batch) {
+        let g1 = (g0 + batch).min(n_groups);
+        let batch_lo = g0 * group_rows;
+        let batch_hi = (g1 * group_rows).min(n_rows);
+        for (ei, block) in stage.iter_mut().enumerate() {
+            block.resize((batch_hi - batch_lo) * 8, 0);
+            let t = std::time::Instant::now();
+            read_exact_at(&extras_files[ei], block, (batch_lo as u64) * 8).map_err(|e| {
+                format!("{}: reading appended column '{}': {}", path, extras[ei].name, e)
+            })?;
+            stats.read_s += t.elapsed().as_secs_f64();
+            #[cfg(test)]
+            {
+                stats.extra_reads += 1;
+                stats.read_calls += 1;
+                stats.read_bytes += block.len() as u64;
             }
-            let src = &source.header.columns[ci];
-            let bytes = len as u64 * source.header.value_width(ci);
-            if bytes > 0 {
-                buf.resize(bytes as usize, 0);
-                read_exact_at(
-                    &source.file,
-                    &mut buf,
-                    source.data_start + src.offsets[g],
-                )
-                .map_err(|e| format!("{}: copying column '{}': {}", path, src.name, e))?;
-                file.write_all(&buf).map_err(|e| format!("{}: {}", path, e))?;
-            }
-            if src.has_codes {
-                let bytes = len * 4;
-                buf.resize(bytes, 0);
-                read_exact_at(
-                    &source.file,
-                    &mut buf,
-                    source.data_start + src.code_offsets[g],
-                )
-                .map_err(|e| format!("{}: copying codes for '{}': {}", path, src.name, e))?;
-                file.write_all(&buf).map_err(|e| format!("{}: {}", path, e))?;
+        }
+        for g in g0..g1 {
+            let lo = g * group_rows;
+            let len = group_len(n_rows, group_rows, g);
+            for (ci, _) in header.columns.iter().enumerate() {
+                if let Some(ei) = extra_of[ci] {
+                    let from = (lo - batch_lo) * 8;
+                    file.write_all(&stage[ei][from..from + len * 8])
+                        .map_err(|e| format!("{}: {}", path, e))?;
+                    continue;
+                }
+                let src = &source.header.columns[ci];
+                let bytes = len as u64 * source.header.value_width(ci);
+                if bytes > 0 {
+                    buf.resize(bytes as usize, 0);
+                    let t = std::time::Instant::now();
+                    read_exact_at(&source.file, &mut buf, source.data_start + src.offsets[g])
+                        .map_err(|e| format!("{}: copying column '{}': {}", path, src.name, e))?;
+                    stats.read_s += t.elapsed().as_secs_f64();
+                    #[cfg(test)]
+                    {
+                        stats.read_calls += 1;
+                        stats.read_bytes += bytes;
+                    }
+                    file.write_all(&buf).map_err(|e| format!("{}: {}", path, e))?;
+                }
+                if src.has_codes {
+                    let bytes = len * 4;
+                    buf.resize(bytes, 0);
+                    let t = std::time::Instant::now();
+                    read_exact_at(&source.file, &mut buf, source.data_start + src.code_offsets[g])
+                        .map_err(|e| {
+                            format!("{}: copying codes for '{}': {}", path, src.name, e)
+                        })?;
+                    stats.read_s += t.elapsed().as_secs_f64();
+                    #[cfg(test)]
+                    {
+                        stats.read_calls += 1;
+                        stats.read_bytes += bytes as u64;
+                    }
+                    file.write_all(&buf).map_err(|e| format!("{}: {}", path, e))?;
+                }
             }
         }
     }
@@ -2071,6 +2297,47 @@ fn read_u32(file: &mut File, path: &str) -> Result<u32, String> {
     Ok(u32::from_le_bytes(b))
 }
 
+/// Types with no invalid bit pattern and no padding; private, so only this module can add one.
+#[cfg(target_endian = "little")]
+trait PlainBytes: Copy {}
+#[cfg(target_endian = "little")]
+impl PlainBytes for f64 {}
+#[cfg(target_endian = "little")]
+impl PlainBytes for i64 {}
+#[cfg(target_endian = "little")]
+impl PlainBytes for u32 {}
+
+/// The bytes of a value slice, for a positional read straight into it.
+#[cfg(target_endian = "little")]
+fn bytes_of_mut<T: PlainBytes>(out: &mut [T]) -> &mut [u8] {
+    // SAFETY: `PlainBytes` is implemented only for f64, i64 and u32, which have no invalid bit
+    // patterns and no padding; u8 has alignment 1; the view covers exactly the bytes of `out`
+    // and borrows it.
+    unsafe {
+        std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, std::mem::size_of_val(out))
+    }
+}
+
+fn block_error(path: &str, bytes: usize, offset: u64, e: std::io::Error) -> String {
+    format!(
+        "{}: reading {} bytes at offset {}: {}",
+        path, bytes, offset, e
+    )
+}
+
+#[cfg(target_endian = "little")]
+fn read_f64_block(
+    file: &File,
+    path: &str,
+    offset: u64,
+    out: &mut [f64],
+    _scratch: &mut Vec<u8>,
+) -> Result<(), String> {
+    let bytes = out.len() * 8;
+    read_exact_at(file, bytes_of_mut(out), offset).map_err(|e| block_error(path, bytes, offset, e))
+}
+
+#[cfg(not(target_endian = "little"))]
 fn read_f64_block(
     file: &File,
     path: &str,
@@ -2080,12 +2347,8 @@ fn read_f64_block(
 ) -> Result<(), String> {
     let bytes = out.len() * 8;
     scratch.resize(bytes, 0);
-    read_exact_at(file, &mut scratch[..], offset).map_err(|e| {
-        format!(
-            "{}: reading {} bytes at offset {}: {}",
-            path, bytes, offset, e
-        )
-    })?;
+    read_exact_at(file, &mut scratch[..], offset)
+        .map_err(|e| block_error(path, bytes, offset, e))?;
     for (dst, src) in out.iter_mut().zip(scratch.chunks_exact(8)) {
         let mut b = [0u8; 8];
         b.copy_from_slice(src);
@@ -2094,6 +2357,19 @@ fn read_f64_block(
     Ok(())
 }
 
+#[cfg(target_endian = "little")]
+fn read_i64_block(
+    file: &File,
+    path: &str,
+    offset: u64,
+    out: &mut [i64],
+    _scratch: &mut Vec<u8>,
+) -> Result<(), String> {
+    let bytes = out.len() * 8;
+    read_exact_at(file, bytes_of_mut(out), offset).map_err(|e| block_error(path, bytes, offset, e))
+}
+
+#[cfg(not(target_endian = "little"))]
 fn read_i64_block(
     file: &File,
     path: &str,
@@ -2103,12 +2379,8 @@ fn read_i64_block(
 ) -> Result<(), String> {
     let bytes = out.len() * 8;
     scratch.resize(bytes, 0);
-    read_exact_at(file, &mut scratch[..], offset).map_err(|e| {
-        format!(
-            "{}: reading {} bytes at offset {}: {}",
-            path, bytes, offset, e
-        )
-    })?;
+    read_exact_at(file, &mut scratch[..], offset)
+        .map_err(|e| block_error(path, bytes, offset, e))?;
     for (dst, src) in out.iter_mut().zip(scratch.chunks_exact(8)) {
         let mut b = [0u8; 8];
         b.copy_from_slice(src);
@@ -2117,6 +2389,19 @@ fn read_i64_block(
     Ok(())
 }
 
+#[cfg(target_endian = "little")]
+fn read_u32_block(
+    file: &File,
+    path: &str,
+    offset: u64,
+    out: &mut [u32],
+    _scratch: &mut Vec<u8>,
+) -> Result<(), String> {
+    let bytes = out.len() * 4;
+    read_exact_at(file, bytes_of_mut(out), offset).map_err(|e| block_error(path, bytes, offset, e))
+}
+
+#[cfg(not(target_endian = "little"))]
 fn read_u32_block(
     file: &File,
     path: &str,
@@ -2126,12 +2411,8 @@ fn read_u32_block(
 ) -> Result<(), String> {
     let bytes = out.len() * 4;
     scratch.resize(bytes, 0);
-    read_exact_at(file, &mut scratch[..], offset).map_err(|e| {
-        format!(
-            "{}: reading {} bytes at offset {}: {}",
-            path, bytes, offset, e
-        )
-    })?;
+    read_exact_at(file, &mut scratch[..], offset)
+        .map_err(|e| block_error(path, bytes, offset, e))?;
     for (dst, src) in out.iter_mut().zip(scratch.chunks_exact(4)) {
         let mut b = [0u8; 4];
         b.copy_from_slice(src);
@@ -2581,5 +2862,465 @@ mod tests {
         let text = header_json(&h);
         let back = parse_header(&text, VERSION).unwrap();
         assert_eq!(h, back);
+    }
+
+    fn write_raw(tag: &str, bytes: &[u8]) -> (std::path::PathBuf, File) {
+        let path = std::env::temp_dir().join(format!(
+            "rcsr-1076-{}-{}.bin",
+            tag,
+            std::process::id()
+        ));
+        std::fs::write(&path, bytes).unwrap();
+        let file = File::open(&path).unwrap();
+        (path, file)
+    }
+
+    #[test]
+    fn direct_block_reads_match_the_decode_loop() {
+        let f64s = [
+            f64::NAN,
+            f64::from_bits(0x7ff8_0000_dead_beef),
+            f64::from_bits(0xfff4_0000_0000_0001),
+            -0.0,
+            0.0,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MIN_POSITIVE / 8.0,
+            1.5e300,
+            -3.25,
+        ];
+        let i64s = [i64::MIN, i64::MAX, 0, -1, 1_700_000_000_000_000_000, 42];
+        let u32s = [0u32, 1, u32::MAX, 7, 0x8000_0000];
+        let mut raw: Vec<u8> = vec![0xAA; 3];
+        for v in f64s {
+            raw.extend_from_slice(&v.to_le_bytes());
+        }
+        let i_off = raw.len() as u64;
+        for v in i64s {
+            raw.extend_from_slice(&v.to_le_bytes());
+        }
+        let u_off = raw.len() as u64;
+        for v in u32s {
+            raw.extend_from_slice(&v.to_le_bytes());
+        }
+        let (path, file) = write_raw("blocks", &raw);
+        let p = path.to_string_lossy().into_owned();
+        let mut scratch = Vec::new();
+
+        let mut got = vec![0.0f64; f64s.len()];
+        read_f64_block(&file, &p, 3, &mut got, &mut scratch).unwrap();
+        let want: Vec<u64> = raw[3..]
+            .chunks_exact(8)
+            .take(f64s.len())
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()).to_bits())
+            .collect();
+        assert_eq!(got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), want);
+        assert_eq!(
+            got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            f64s.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+
+        let mut got = vec![0i64; i64s.len()];
+        read_i64_block(&file, &p, i_off, &mut got, &mut scratch).unwrap();
+        let want: Vec<i64> = raw[i_off as usize..]
+            .chunks_exact(8)
+            .take(i64s.len())
+            .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(got, want);
+        assert_eq!(got, i64s);
+
+        let mut got = vec![0u32; u32s.len()];
+        read_u32_block(&file, &p, u_off, &mut got, &mut scratch).unwrap();
+        let want: Vec<u32> = raw[u_off as usize..]
+            .chunks_exact(4)
+            .take(u32s.len())
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(got, want);
+        assert_eq!(got, u32s);
+
+        let mut short = vec![0.0f64; f64s.len() + 40];
+        let e = read_f64_block(&file, &p, 3, &mut short, &mut scratch).unwrap_err();
+        assert!(e.contains("reading 400 bytes at offset 3"), "{}", e);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_failed_group_read_reports_the_lowest_group() {
+        let rows = 5 * 16usize;
+        let mut text = String::from("ts,sym,a,b\n");
+        for r in 0..rows {
+            text.push_str(&format!(
+                "{},{},{},{}\n",
+                1_700_000_000i64 + r as i64,
+                ["P", "Q"][r % 2],
+                r as f64 * 0.5,
+                r as f64 - 3.0
+            ));
+        }
+        let table = crate::data::parse_table_with_time(&text, false, Some("ts")).unwrap();
+        let path = std::env::temp_dir()
+            .join(format!("rcsr-1076-trunc-{}.rcsb", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        write_store_with_time(&path, &table, 16, Some(0)).unwrap();
+        let fs = FileStore::open(&path).unwrap();
+        assert_eq!(fs.n_groups(), 5);
+        let proj = Projection::resolve(&fs, &["ts", "sym", "a", "b"]).unwrap();
+        let cut = fs.data_start + fs.header.columns[2].offsets[3] + 8;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(cut)
+            .unwrap();
+        let expect = format!(
+            "reading 128 bytes at offset {}",
+            fs.data_start + fs.header.columns[2].offsets[3]
+        );
+        for readers in [1usize, 2, 4, 64] {
+            for _ in 0..8 {
+                let e = fs
+                    .to_table_projected_with_readers(&proj, readers)
+                    .err()
+                    .expect("truncated store");
+                assert!(e.contains(&expect), "{} readers: {}", readers, e);
+            }
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    const APPEND_GOLDEN_SHA256: &str = "68d592c2c632cf7e9d8ff04485425fd7e648ab0a294cb7dbeaab5ab7ee355ff6";
+    const APPEND_GROUPS: usize = 7;
+    const APPEND_EXTRAS: usize = 40;
+
+    fn splitmix(mut x: u64) -> u64 {
+        x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        x ^ (x >> 31)
+    }
+
+    struct AppendFixture {
+        groups: usize,
+        rows: usize,
+        dir: std::path::PathBuf,
+        source: FileStore,
+        extras: Vec<AppendColumn>,
+    }
+
+    impl Drop for AppendFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// 24 numeric columns, a time column and a dictionary column over seven
+    /// groups of 16 rows (the last one short), plus 40 temp columns of
+    /// arbitrary bit patterns, one of which replaces `a3`.
+    fn append_fixture(
+        tag: &str,
+        groups: usize,
+        group_rows: usize,
+        a_cols: usize,
+        n_extras: usize,
+    ) -> AppendFixture {
+        let rows = groups * group_rows - group_rows / 3;
+        let mut text = String::from("ts,sym");
+        for c in 0..a_cols {
+            text.push_str(&format!(",a{}", c));
+        }
+        text.push('\n');
+        for r in 0..rows {
+            text.push_str(&format!("{},{}", 1_700_000_000i64 + r as i64, ["P", "Q", "R"][r % 3]));
+            for c in 0..a_cols {
+                text.push_str(&format!(",{}", r as f64 * 0.25 - c as f64));
+            }
+            text.push('\n');
+        }
+        let table = crate::data::parse_table_with_time(&text, false, Some("ts")).unwrap();
+        let dir = std::env::temp_dir().join(format!("rcsr-1037-{}-{}", tag, std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.rcsb").to_string_lossy().into_owned();
+        write_store_with_time(&src, &table, group_rows, Some(0)).unwrap();
+        let source = FileStore::open(&src).unwrap();
+        assert_eq!(source.n_groups(), groups);
+        let mut extras = Vec::new();
+        for e in 0..n_extras {
+            let file = dir.join(format!("extra{}.bin", e));
+            let mut bytes = Vec::with_capacity(rows * 8);
+            for r in 0..rows {
+                bytes.extend_from_slice(&splitmix((e * 1_000_003 + r) as u64).to_le_bytes());
+            }
+            std::fs::write(&file, bytes).unwrap();
+            extras.push(AppendColumn {
+                name: if e == 3 { "a3".to_string() } else { format!("f{}", e) },
+                file,
+                replace: e == 3,
+            });
+        }
+        AppendFixture { groups, rows, dir, source, extras }
+    }
+
+    fn run_append(fx: &AppendFixture, name: &str, batch: Option<usize>) -> (Vec<u8>, String, AppendStats) {
+        let batch = batch.unwrap_or_else(|| append_batch_groups(&fx.source, fx.extras.len()));
+        let out = fx.dir.join(name).to_string_lossy().into_owned();
+        let (sha, stats) =
+            write_store_appending_hashed_with(&out, &fx.source, &fx.extras, batch).unwrap();
+        (std::fs::read(&out).unwrap(), sha, stats)
+    }
+
+    #[test]
+    fn append_output_matches_the_golden_digest() {
+        let fx = append_fixture("golden", APPEND_GROUPS, 16, 24, APPEND_EXTRAS);
+        let (bytes, sha, _) = run_append(&fx, "out.rcsb", Some(1));
+        assert_eq!(sha, crate::manifest::sha256_hex(&bytes));
+        assert_eq!(sha, APPEND_GOLDEN_SHA256);
+    }
+
+    #[test]
+    fn append_batched_reads_are_byte_identical() {
+        let fx = append_fixture("batches", APPEND_GROUPS, 16, 24, APPEND_EXTRAS);
+        let (b1, s1, _) = run_append(&fx, "b1.rcsb", Some(1));
+        for (i, batch) in [Some(2), Some(APPEND_GROUPS), Some(100), None].into_iter().enumerate() {
+            let (b, s, _) = run_append(&fx, &format!("b{}.rcsb", i + 2), batch);
+            assert!(b == b1, "batch {:?} changed the bytes", batch);
+            assert_eq!(s, s1);
+        }
+        assert_eq!(s1, crate::manifest::sha256_hex(&b1));
+    }
+
+
+    #[test]
+    fn append_batching_cuts_the_temp_column_reads() {
+        let fx = append_fixture("reads", APPEND_GROUPS, 16, 24, APPEND_EXTRAS);
+        let (_, _, one) = run_append(&fx, "b1.rcsb", Some(1));
+        let (_, _, two) = run_append(&fx, "b2.rcsb", Some(2));
+        let (_, _, dflt) = run_append(&fx, "bd.rcsb", None);
+        assert_eq!(one.extra_reads as usize, APPEND_EXTRAS * APPEND_GROUPS);
+        assert_eq!(two.extra_reads as usize, APPEND_EXTRAS * APPEND_GROUPS.div_ceil(2));
+        assert_eq!(dflt.extra_reads as usize, APPEND_EXTRAS);
+    }
+
+    #[test]
+    fn append_batch_default_follows_the_budget() {
+        assert_eq!(batch_of(None, None, 65_536, 292, 427), 4);
+        assert_eq!(batch_of(None, None, 65_536, 292, 1), 16);
+        assert_eq!(batch_of(None, None, 65_536, 3, 1), 3);
+        assert_eq!(batch_of(None, None, 65_536, 292, 100_000), 1);
+        assert_eq!(batch_of(Some("1"), None, 65_536, 292, 427), 1);
+        assert_eq!(batch_of(Some("1000"), None, 65_536, 292, 427), 4);
+        assert_eq!(batch_of(Some("0"), None, 65_536, 292, 427), 1);
+        assert_eq!(batch_of(Some("x"), None, 65_536, 292, 427), 4);
+    }
+
+    /// Deterministic I/O proxy on a store shaped like the C2 append: 17 source
+    /// columns, 427 temp columns, 292 groups. Rows per group are tiny; the
+    /// call counts depend only on the shape.
+    #[test]
+    fn append_io_proxy_on_the_c2_shape() {
+        let fx = append_fixture("proxy", 292, 4, 15, 427);
+        let src_cols = fx.source.n_cols();
+        assert_eq!(src_cols, 17);
+        let mut counts = Vec::new();
+        let mut first: Option<Vec<u8>> = None;
+        for batch in [1usize, 4, 16] {
+            let (bytes, _, st) = run_append(&fx, &format!("p{}.rcsb", batch), Some(batch));
+            assert_eq!(st.extra_reads as usize, 427 * 292usize.div_ceil(batch));
+            assert_eq!(st.write_bytes, bytes.len() as u64);
+            assert_eq!(st.write_calls, (bytes.len() as u64).div_ceil(APPEND_WRITE_BUFFER as u64));
+            let out_len = bytes.len();
+            match &first {
+                None => first = Some(bytes),
+                Some(f) => assert!(*f == bytes),
+            }
+            counts.push((batch, st, out_len));
+        }
+        let old_write_calls = 292 * (src_cols + 427 + 1);
+        for (batch, st, out_len) in &counts {
+            eprintln!(
+                "proxy c2-shape batch={} read_calls={} read_bytes={} write_calls={} (per-block writer: {}) out_bytes={} read_calls_per_MiB_out={:.2}",
+                batch,
+                st.read_calls,
+                st.read_bytes,
+                st.write_calls,
+                old_write_calls,
+                out_len,
+                st.read_calls as f64 / (*out_len as f64 / 1048576.0)
+            );
+        }
+        assert_eq!(fx.groups, 292);
+        assert!(fx.rows > 0);
+    }
+
+    #[test]
+    fn hashing_writer_digest_matches_in_memory() {
+        let total = 20usize << 20;
+        let data: Vec<u8> = (0..total).map(|i| (splitmix(i as u64 / 7) >> 5) as u8 ^ i as u8).collect();
+        let dir = std::env::temp_dir().join(format!("rcsr-1037-hw-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.bin");
+        let mut file = File::create(&path).unwrap();
+        let (sha, _) = with_hash_thread(&mut file, "out.bin", |out| {
+            let mut at = 0;
+            let mut sizes = [1usize, 4095, 4096, 65_537, 5_000_000].iter().cycle();
+            while at < data.len() {
+                let n = (*sizes.next().unwrap()).min(data.len() - at);
+                out.write_all(&data[at..at + n]).map_err(|e| e.to_string())?;
+                at += n;
+            }
+            Ok(())
+        })
+        .unwrap();
+        drop(file);
+        assert_eq!(sha, crate::manifest::sha256_hex(&data));
+        assert!(std::fs::read(&path).unwrap() == data);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_append_leaves_no_output_and_joins_the_hash_thread() {
+        let fx = append_fixture("fail", 3, 16, 4, 2);
+        std::fs::write(&fx.extras[1].file, [0u8; 8]).unwrap();
+        let out = fx.dir.join("never.rcsb").to_string_lossy().into_owned();
+        let err = write_store_appending_hashed_stats(&out, &fx.source, &fx.extras).unwrap_err();
+        assert!(err.contains("temporary column"), "{}", err);
+        assert!(!std::path::Path::new(&out).exists());
+        assert!(!std::path::Path::new(&format!("{}.tmp-{}", out, std::process::id())).exists());
+    }
+
+    fn batch_of(value: Option<&str>, mib: Option<&str>, rows: usize, groups: usize, cols: usize) -> usize {
+        parse_append_batch(value, mib, rows, groups, cols).0
+    }
+
+    #[test]
+    fn append_batch_override_is_clamped_to_the_budget() {
+        for v in [Some("16"), Some("292"), None] {
+            assert_eq!(batch_of(v, None, 65_536, 292, 427), 4, "{:?}", v);
+        }
+        let (n, note) = parse_append_batch(Some("16"), None, 65_536, 292, 427);
+        assert_eq!(n, 4);
+        assert_eq!(
+            note.as_deref(),
+            Some("RCSR_APPEND_BATCH_GROUPS=16 clamped to 4 by the 1024 MiB append budget")
+        );
+        assert_eq!(parse_append_batch(None, None, 65_536, 292, 427).1, None);
+        assert_eq!(batch_of(Some("1"), None, 65_536, 292, 427), 1);
+        assert_eq!(batch_of(Some("0"), None, 65_536, 292, 427), 1);
+        assert_eq!(batch_of(Some("x"), None, 65_536, 292, 427), 4);
+        assert_eq!(batch_of(Some("500"), None, 16, 7, 24), 7);
+        assert_eq!(batch_of(Some("500"), None, 16, 700, 24), APPEND_BATCH_MAX);
+        assert_eq!(batch_of(None, None, 0, 5, 0), 5);
+        assert_eq!(batch_of(None, None, 16, 0, 24), 1);
+    }
+
+    #[test]
+    fn append_batch_floor_is_one_group() {
+        let (n, note) = parse_append_batch(None, None, 65_536, 292, 3_000);
+        assert_eq!(n, 1);
+        assert_eq!(
+            note.as_deref(),
+            Some("one group (1500 MiB) exceeds the append budget (1024 MiB); staging 1 group")
+        );
+        let (n, note) = parse_append_batch(Some("16"), None, 65_536, 292, 3_000);
+        assert_eq!(n, 1);
+        assert!(note.unwrap().contains("exceeds the append budget"));
+    }
+
+    #[test]
+    fn append_budget_env_is_parsed_and_clamped() {
+        assert_eq!(batch_of(None, Some("64"), 65_536, 292, 427), 1);
+        assert_eq!(batch_of(None, Some("1"), 65_536, 292, 427), 1);
+        assert_eq!(batch_of(Some("16"), Some("65536"), 65_536, 292, 427), 16);
+        assert_eq!(batch_of(Some("16"), Some("999999999"), 65_536, 292, 427), 16);
+        for bad in ["", "garbage", "-5", "1.5"] {
+            assert_eq!(batch_of(Some("16"), Some(bad), 65_536, 292, 427), 4, "{:?}", bad);
+        }
+        let (n, note) = parse_append_batch(Some("16"), Some("64"), 65_536, 292, 427);
+        assert_eq!(n, 1);
+        assert!(note.unwrap().contains("exceeds the append budget (64 MiB)"));
+    }
+
+    /// Passes `limit` bytes through, then fails every write.
+    struct FailAfter<W: Write> {
+        inner: W,
+        limit: usize,
+    }
+
+    impl<W: Write> Write for FailAfter<W> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.limit == 0 {
+                return Err(std::io::Error::other("injected write failure"));
+            }
+            let n = buf.len().min(self.limit);
+            let n = self.inner.write(&buf[..n])?;
+            self.limit -= n;
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    fn assert_no_output(out: &str) {
+        assert!(!std::path::Path::new(out).exists(), "{} exists", out);
+        let tmp = format!("{}.tmp-{}", out, std::process::id());
+        assert!(!std::path::Path::new(&tmp).exists(), "{} remains", tmp);
+    }
+
+    #[test]
+    fn append_mid_stream_write_error_leaves_no_output() {
+        for batch in [1, 3] {
+            let fx = append_fixture(&format!("wfail{}", batch), 4, 16, 4, 2);
+            let out = fx.dir.join("never.rcsb").to_string_lossy().into_owned();
+            let err = write_store_appending_hashed_over(&out, &fx.source, &fx.extras, batch, |file| {
+                FailAfter { inner: file, limit: 700 }
+            })
+            .map(|_| ())
+            .unwrap_err();
+            assert_eq!(err, format!("{}: injected write failure", out));
+            assert_no_output(&out);
+            let _ = std::fs::remove_dir_all(&fx.dir);
+        }
+    }
+
+    #[test]
+    fn append_mid_stream_read_error_leaves_no_output() {
+        for batch in [1, 3] {
+            let fx = append_fixture(&format!("rfail{}", batch), 4, 16, 4, 2);
+            let keep = fx.source.data_start + fx.source.header.columns[0].offsets[3];
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&fx.source.path)
+                .unwrap()
+                .set_len(keep)
+                .unwrap();
+            let out = fx.dir.join("never.rcsb").to_string_lossy().into_owned();
+            let err = write_store_appending_hashed_with(&out, &fx.source, &fx.extras, batch)
+                .map(|_| ())
+                .unwrap_err();
+            assert!(
+                err.starts_with(&format!("{}: copying column 'ts': ", out)),
+                "{}",
+                err
+            );
+            assert_no_output(&out);
+            let _ = std::fs::remove_dir_all(&fx.dir);
+        }
+    }
+
+    #[test]
+    fn append_hash_thread_panic_leaves_no_output() {
+        for batch in [1, 3] {
+            let fx = append_fixture(&format!("hpanic{}", batch), 4, 16, 4, 2);
+            let out = fx.dir.join("never.rcsb").to_string_lossy().into_owned();
+            *APPEND_HASH_PANIC.lock().unwrap() = Some((out.clone(), 0));
+            let res = write_store_appending_hashed_with(&out, &fx.source, &fx.extras, batch);
+            *APPEND_HASH_PANIC.lock().unwrap() = None;
+            assert_eq!(res.map(|_| ()).unwrap_err(), "hash thread panicked");
+            assert_no_output(&out);
+            let _ = std::fs::remove_dir_all(&fx.dir);
+        }
     }
 }

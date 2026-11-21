@@ -1507,6 +1507,8 @@ pub enum SplitMode {
     Temporal,
     Group,
     TemporalGroup,
+    /// #1173: interval roles from a splits table (`--split-table`).
+    TemporalIntervals,
 }
 
 impl SplitMode {
@@ -1516,6 +1518,7 @@ impl SplitMode {
             SplitMode::Temporal => "temporal",
             SplitMode::Group => "group",
             SplitMode::TemporalGroup => "temporal-group",
+            SplitMode::TemporalIntervals => "temporal-intervals",
         }
     }
 
@@ -1525,8 +1528,9 @@ impl SplitMode {
             "temporal" | "time" => Ok(SplitMode::Temporal),
             "group" | "grouped" => Ok(SplitMode::Group),
             "temporal-group" | "temporal_group" | "panel" => Ok(SplitMode::TemporalGroup),
+            "temporal-intervals" | "temporal_intervals" => Ok(SplitMode::TemporalIntervals),
             other => Err(format!(
-                "unknown split mode '{}' (expected random, temporal, group or temporal-group)",
+                "unknown split mode '{}' (expected random, temporal, group, temporal-group or temporal-intervals)",
                 other
             )),
         }
@@ -1585,6 +1589,8 @@ pub struct SplitSpec {
     /// scale statistics are computed, so every train-aligned output is in
     /// canonical order.
     pub canonical_train_order: bool,
+    /// #1173: the resolved splits-table intervals of mode `temporal-intervals`.
+    pub intervals: Option<crate::intervals::IntervalSplit>,
 }
 
 impl SplitSpec {
@@ -1615,6 +1621,7 @@ impl Default for SplitSpec {
             scale_column: None,
             trading: None,
             canonical_train_order: false,
+            intervals: None,
         }
     }
 }
@@ -1687,6 +1694,10 @@ pub struct SplitReport {
     /// the value came from (`store`, `flag` or `protocol_default`).
     pub lockbox_embargo_seconds: i64,
     pub lockbox_embargo_source: &'static str,
+    /// #1173: rows of the table intervals left out by the purge or the embargo,
+    /// and rows outside every interval.
+    pub interval_dropped_rows: usize,
+    pub interval_outside_rows: usize,
 }
 
 pub struct Prepared {
@@ -1748,6 +1759,43 @@ pub struct TradingColumns {
     /// #948: keep rows whose fit label is missing but whose return is finite; they
     /// join the book samples and leave every fit input. Needs `return_column`.
     pub book_rows: bool,
+    /// #1180: the regime gate of `--pnl-mask`: the gate state of every slice row
+    /// is built into [`TradingSplit::masks`].
+    pub mask: Option<crate::regime_gate::GateSpec>,
+    /// #1185: numeric columns whose raw values travel with the training rows
+    /// into [`TradingSplit::train_values`] (`rcsr switch`).
+    pub train_values: Vec<String>,
+    /// #1181: the same columns also travel with the validation and test rows
+    /// (`rcsr compose`).
+    pub slice_values: bool,
+    /// #1214: gates whose `rcsr-gate-state/1` states the validation and test
+    /// slices carry in [`TradingSplit::gate_states`] (`rcsr compose`).
+    pub state_gates: Vec<crate::regime_gate::GateSpec>,
+    /// #1182: columns a gate found after the search may read; their raw values
+    /// on every gate row travel in [`TradingSplit::gate_rows`].
+    pub gate_rows: Vec<String>,
+}
+
+/// #1214: the `rcsr-gate-state/1` states of one gate on the slice rows, and the
+/// warm-up the validation and test slices start from.
+#[derive(Clone, Debug, Default)]
+pub struct SliceGateStates {
+    /// #1268: training rows, read with the selection barriers; `Some` exactly
+    /// when the training slice was requested.
+    pub train: Option<Vec<bool>>,
+    pub validation: Option<Vec<bool>>,
+    pub test: Vec<bool>,
+    pub validation_start: Option<crate::regime_gate::WarmUp>,
+    pub test_start: crate::regime_gate::WarmUp,
+}
+
+/// #1180: the regime mask of each slice, aligned with its trading rows.
+#[derive(Clone, Debug, Default)]
+pub struct TradingMasks {
+    /// Training rows; `Some` exactly when [`TradingColumns::train`] is set.
+    pub train: Option<Vec<bool>>,
+    pub validation: Option<Vec<bool>>,
+    pub test: Vec<bool>,
 }
 
 /// #948: the rows the books price, a superset of the fit rows. A row without a fit
@@ -1798,6 +1846,19 @@ pub struct TradingSplit {
     /// walk-forward.
     pub validation_context: Option<TradingContext>,
     pub test_context: Option<TradingContext>,
+    /// #1180: the regime mask of each slice under `--pnl-mask`.
+    pub masks: Option<TradingMasks>,
+    /// #1185: raw values of [`TradingColumns::train_values`] on the training
+    /// rows, one vector per name; empty without names.
+    pub train_values: Vec<Vec<f64>>,
+    /// #1181: the same values on the validation and test rows under
+    /// [`TradingColumns::slice_values`]; empty otherwise.
+    pub validation_values: Vec<Vec<f64>>,
+    pub test_values: Vec<Vec<f64>>,
+    /// #1214: one entry per [`TradingColumns::state_gates`] gate.
+    pub gate_states: Vec<SliceGateStates>,
+    /// #1182: the gate rows of [`TradingColumns::gate_rows`]; `None` without names.
+    pub gate_rows: Option<GateRows>,
 }
 
 /// Feature rows (as in [`Sample::x`]) and trading rows of a cross-section context.
@@ -2038,20 +2099,22 @@ pub struct Filter {
     pub expression: String,
 }
 
+/// Distinct `Input` indices of a row expression, in order of first use.
+fn filter_inputs(node: &Node, out: &mut Vec<usize>) {
+    if node.op == crate::expr::Op::Input && !out.contains(&(node.val as usize)) {
+        out.push(node.val as usize);
+    }
+    for k in &node.kids {
+        filter_inputs(k, out);
+    }
+}
+
 /// Store columns a row expression reads, in order of first use. `Err` carries
 /// the parse error when the expression does not parse against `names`.
 pub fn row_expr_columns(src: &str, names: &[String]) -> Result<Vec<String>, String> {
-    fn walk(node: &Node, out: &mut Vec<usize>) {
-        if node.op == crate::expr::Op::Input && !out.contains(&(node.val as usize)) {
-            out.push(node.val as usize);
-        }
-        for k in &node.kids {
-            walk(k, out);
-        }
-    }
     let tree = crate::expr::parse(src, names).map_err(|e| e.to_string())?;
     let mut idx = Vec::new();
-    walk(&tree, &mut idx);
+    filter_inputs(&tree, &mut idx);
     Ok(idx.into_iter().map(|i| names[i].clone()).collect())
 }
 
@@ -2123,6 +2186,8 @@ pub struct PrepReport {
     pub time_duplicates: usize,
     /// Rows where the time value decreases relative to the previous row.
     pub time_non_monotonic: usize,
+    /// The duplicate and non-monotonic counts are per group (a panel).
+    pub time_grouped: bool,
     /// Numeric rows rescaled from ms/us/ns to seconds.
     pub time_converted: usize,
     /// #112: the memory guard's estimate for this CSV and its basis. `None`
@@ -2156,6 +2221,7 @@ impl Default for PrepReport {
             time_rows: 0,
             time_duplicates: 0,
             time_non_monotonic: 0,
+            time_grouped: false,
             time_converted: 0,
             memory_estimate: None,
             store_estimate: None,
@@ -2285,17 +2351,19 @@ impl PrepReport {
                 self.time_converted
             ));
             if self.time_duplicates > 0 {
+                let scope = if self.time_grouped { " within a group" } else { "" };
                 out.push(format!(
-                    "# preparation: warning: {} duplicate time instant(s); de-duplicate by \
+                    "# preparation: warning: {} duplicate time instant(s){}; de-duplicate by \
                      instant before a temporal split",
-                    self.time_duplicates
+                    self.time_duplicates, scope
                 ));
             }
             if self.time_non_monotonic > 0 {
+                let scope = if self.time_grouped { " within a group" } else { "" };
                 out.push(format!(
-                    "# preparation: warning: time is not monotonic in row order ({} step(s)); \
+                    "# preparation: warning: time is not monotonic{} in row order ({} step(s)); \
                      rows were ordered for the split, check the source",
-                    self.time_non_monotonic
+                    scope, self.time_non_monotonic
                 ));
             }
         }
@@ -2391,6 +2459,7 @@ struct TimeHazards {
     duplicates: usize,
     non_monotonic: usize,
     converted: usize,
+    grouped: bool,
 }
 
 fn time_hazards(t: &Table, spec: &SplitSpec) -> TimeHazards {
@@ -2400,6 +2469,7 @@ fn time_hazards(t: &Table, spec: &SplitSpec) -> TimeHazards {
         duplicates: 0,
         non_monotonic: 0,
         converted: 0,
+        grouped: false,
     };
     let Some(col) = spec.time_col else {
         return out;
@@ -2456,21 +2526,26 @@ fn time_hazards(t: &Table, spec: &SplitSpec) -> TimeHazards {
             }
         }
     }
-    let mut seen: HashSet<u64> = HashSet::new();
-    let mut prev: Option<f64> = None;
-    for &v in &vals {
+    let groups: Option<Vec<usize>> = spec
+        .group_col
+        .filter(|&gc| gc < t.n_cols())
+        .map(|gc| group_ids(t, gc).0);
+    out.grouped = groups.is_some();
+    let mut seen: HashSet<(usize, u64)> = HashSet::new();
+    let mut prev: HashMap<usize, f64> = HashMap::new();
+    for (r, &v) in vals.iter().enumerate() {
         if !v.is_finite() {
             continue;
         }
-        if !seen.insert(v.to_bits()) {
+        let g = groups.as_ref().map_or(0, |g| g[r]);
+        if !seen.insert((g, v.to_bits())) {
             out.duplicates += 1;
         }
-        if let Some(p) = prev {
+        if let Some(p) = prev.insert(g, v) {
             if v < p {
                 out.non_monotonic += 1;
             }
         }
-        prev = Some(v);
     }
     out.unit = unit.to_string();
     out
@@ -2706,6 +2781,53 @@ pub fn prepare_full_targets_weighted_with_indices(
     prepare_full_targets_weighted_inner(t, vars, targets, weight, spec, rng, prep, true)
 }
 
+// #1074: test-only count of cells a row expression reads.
+#[cfg(test)]
+thread_local! {
+    static FILTER_CELL_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A row expression bound to the columns it reads.
+struct RowFilter<'a> {
+    tree: &'a Node,
+    /// (position in `Filter::vars`, column values) of every input the tree names.
+    inputs: Vec<(usize, &'a [f64])>,
+    /// One slot per `Filter::vars` entry; only the `inputs` positions are written.
+    vals: Vec<f64>,
+}
+
+impl<'a> RowFilter<'a> {
+    fn new(f: &'a Filter, t: &'a Table) -> Result<Self, String> {
+        let cols: Vec<usize> = f
+            .vars
+            .iter()
+            .map(|v| t.index_of(v))
+            .collect::<Result<_, _>>()?;
+        let mut used = Vec::new();
+        filter_inputs(&f.tree, &mut used);
+        let inputs = used
+            .into_iter()
+            .filter(|&p| p < cols.len())
+            .map(|p| (p, t.col(cols[p])))
+            .collect();
+        Ok(RowFilter {
+            tree: &f.tree,
+            inputs,
+            vals: vec![0.0; f.vars.len()],
+        })
+    }
+
+    #[inline]
+    fn holds(&mut self, r: usize) -> bool {
+        for &(p, col) in &self.inputs {
+            self.vals[p] = col.get(r).copied().unwrap_or(f64::NAN);
+        }
+        #[cfg(test)]
+        FILTER_CELL_READS.with(|n| n.set(n.get() + self.inputs.len()));
+        expr::eval(self.tree, &self.vals) > 0.0
+    }
+}
+
 /// The rows that survive `--exclude` and then `--filter`: the population every
 /// split and every cross-validation fold is drawn from.
 pub fn population_mask(t: &Table, spec: &SplitSpec, prep: &PrepSpec) -> Result<Vec<bool>, String> {
@@ -2720,14 +2842,9 @@ fn population_mask_counted(
     let mut excluded_count = 0usize;
     let mut keep_row = vec![true; t.len()];
     if let Some(x) = &spec.exclude {
-        let cols: Vec<usize> = x
-            .vars
-            .iter()
-            .map(|v| t.index_of(v))
-            .collect::<Result<_, _>>()?;
+        let mut rf = RowFilter::new(x, t)?;
         for r in 0..t.len() {
-            let vals: Vec<f64> = cols.iter().map(|&c| t.value(r, c)).collect();
-            if expr::eval(&x.tree, &vals) > 0.0 {
+            if rf.holds(r) {
                 excluded_count += 1;
                 keep_row[r] = false;
             }
@@ -2738,17 +2855,12 @@ fn population_mask_counted(
     }
     let mut filtered_count = 0usize;
     if let Some(f) = &prep.filter {
-        let cols: Vec<usize> = f
-            .vars
-            .iter()
-            .map(|v| t.index_of(v))
-            .collect::<Result<_, _>>()?;
+        let mut rf = RowFilter::new(f, t)?;
         for r in 0..t.len() {
             if !keep_row[r] {
                 continue;
             }
-            let vals: Vec<f64> = cols.iter().map(|&c| t.value(r, c)).collect();
-            let kept = expr::eval(&f.tree, &vals) > 0.0;
+            let kept = rf.holds(r);
             if !kept {
                 keep_row[r] = false;
                 filtered_count += 1;
@@ -2993,7 +3105,16 @@ fn prepare_full_targets_weighted_inner(
         }
         None => None,
     };
-    let (mut train_idx, mut fold_idx, mut report) = build_split(filtered, spec, rng)?;
+    let (mut train_idx, mut fold_idx, mut report, interval_validation) = if spec.mode == SplitMode::TemporalIntervals {
+        if spec.validation_frac > 0.0 {
+            return Err("--split-table sets the validation intervals; drop --validation-frac".to_string());
+        }
+        let (train, validation, folds, report) = interval_split(filtered, spec)?;
+        (train, folds, report, validation)
+    } else {
+        let (train, folds, report) = build_split(filtered, spec, rng)?;
+        (train, folds, report, Vec::new())
+    };
     report.excluded_rows = excluded_count;
     if train_idx.is_empty() {
         return Err("training split is empty (reduce --test-frac)".to_string());
@@ -3003,7 +3124,7 @@ fn prepare_full_targets_weighted_inner(
     // training period. Selection may use train/validation; the test block is a
     // lockbox and never influences which candidate wins. A purge of `gap` rows
     // stands between fit-train and validation, mirroring the test embargo.
-    let mut validation_idx: Vec<usize> = Vec::new();
+    let mut validation_idx: Vec<usize> = interval_validation;
     if spec.validation_frac > 0.0 {
         if !(spec.validation_frac < 1.0) {
             return Err("--validation-frac must be in (0, 1)".to_string());
@@ -3701,6 +3822,7 @@ fn prepare_full_targets_weighted_inner(
             cols,
             spec,
             filtered,
+            (t, &keep_row),
             match &book_idx {
                 Some(b) => (&b.train[..], &b.validation[..], &b.test[..]),
                 None => (&train_idx[..], &validation_idx[..], &test_idx[..]),
@@ -3764,6 +3886,7 @@ fn prepare_full_targets_weighted_inner(
             time_rows: hazards.rows,
             time_duplicates: hazards.duplicates,
             time_non_monotonic: hazards.non_monotonic,
+            time_grouped: hazards.grouped,
             time_converted: hazards.converted,
             memory_estimate: None,
             store_estimate: None,
@@ -4152,6 +4275,124 @@ fn describe_selector(n: usize, train: &[usize], test: &[usize]) -> String {
     )
 }
 
+/// #1173: training, validation and test rows from the splits-table intervals
+/// of [`SplitSpec::intervals`], each in time order (ties by row id). The role is
+/// a function of the stamp, so a timestamp never straddles a boundary. An
+/// interval with no row after the purge and the embargo is refused.
+fn interval_split(t: &Table, spec: &SplitSpec) -> Result<(Vec<usize>, Vec<usize>, Vec<Vec<usize>>, SplitReport), String> {
+    use crate::intervals::Role;
+    let iv = spec
+        .intervals
+        .as_ref()
+        .ok_or("--split temporal-intervals needs --split-table <csv> --split-id <id>")?;
+    let tc = spec.time_col.ok_or("--split-table needs a time column (--time <col>)")?;
+    if let Some(dl) = &spec.declared_lockbox {
+        let floored = label_floored(dl, spec);
+        let purge = boundary_purge(spec);
+        for range in std::iter::once(dl.lockbox).chain(dl.also) {
+            let hit = iv.reaching(range.start, range.end, purge, floored.embargo.seconds);
+            if !hit.is_empty() {
+                return Err(format!(
+                    "the split table interval(s) {} of split '{}' reach the declared locked test {}..{} ({}; label end = stamp + {} s, \
+                     lookback embargo {} s after the end); end every interval at or before {} and start none before {}",
+                    hit.join(", "),
+                    iv.declared.split_id,
+                    crate::protocol::iso(range.start as f64),
+                    crate::protocol::iso(range.end as f64),
+                    dl.origin(),
+                    purge,
+                    floored.embargo.seconds,
+                    crate::protocol::iso(range.first_reaching(purge) as f64),
+                    crate::protocol::iso((range.end + floored.embargo.seconds) as f64)
+                ));
+            }
+        }
+    }
+    let n = t.len();
+    let mut report = SplitReport {
+        mode: spec.mode.name(),
+        rows_total: n,
+        folds: spec.folds.max(1),
+        ..Default::default()
+    };
+    let (keys_f64, trep) = time_keys_with(t, tc, &spec.time)?;
+    report.notes.extend(trep.text_lines());
+    let (lo, hi) = keys_f64
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), v| (a.min(v), b.max(v)));
+    if !crate::lockbox::plausible_epoch_seconds(lo, hi) {
+        return Err("--split-table: the time column is not epoch seconds; the table intervals are UTC seconds".to_string());
+    }
+    let keys = TimeKeys::F64(keys_f64);
+    let order = sorted_by(&keys);
+    let d = &iv.declared;
+    let at = |v: &[(i64, i64)], ts: i64| v.partition_point(|&(a, _)| a <= ts) - 1;
+    let mut hits = [vec![0usize; d.train.len()], vec![0usize; d.validation.len()], vec![0usize; d.test.len()]];
+    let (mut train, mut validation, mut test) = (Vec::new(), Vec::new(), Vec::new());
+    for &i in &order {
+        let k = keys.value(i);
+        if !k.is_finite() {
+            report.interval_outside_rows += 1;
+            continue;
+        }
+        let ts = k.floor() as i64;
+        match iv.role(ts) {
+            Some(Role::Train) => {
+                hits[0][at(&d.train, ts)] += 1;
+                train.push(i);
+            }
+            Some(Role::Validation) => {
+                hits[1][at(&d.validation, ts)] += 1;
+                validation.push(i);
+            }
+            Some(Role::Test) => {
+                hits[2][at(&d.test, ts)] += 1;
+                test.push(i);
+            }
+            None => {
+                let held = |v: &[(i64, i64)]| v.iter().any(|&(a, b)| a <= ts && ts < b);
+                if held(&d.train) || held(&d.validation) {
+                    report.interval_dropped_rows += 1;
+                } else {
+                    report.interval_outside_rows += 1;
+                }
+            }
+        }
+    }
+    for (role, v, h) in [(Role::Train, &d.train, &hits[0]), (Role::Validation, &d.validation, &hits[1]), (Role::Test, &d.test, &hits[2])] {
+        if let Some(k) = h.iter().position(|&c| c == 0) {
+            return Err(format!(
+                "--split-table: the {} interval {}..{} of split '{}' has no rows after the purge ({} s) and the embargo ({} s)",
+                role.as_str(),
+                crate::protocol::iso(v[k].0 as f64),
+                crate::protocol::iso(v[k].1 as f64),
+                d.split_id,
+                iv.purge,
+                iv.embargo
+            ));
+        }
+    }
+    report.notes.push(format!(
+        "split table '{}': {} train / {} validation / {} test row(s); {} row(s) purged or embargoed; {} row(s) outside every interval",
+        d.split_id,
+        train.len(),
+        validation.len(),
+        test.len(),
+        report.interval_dropped_rows,
+        report.interval_outside_rows
+    ));
+    report.train_time_max = train.last().map(|&i| keys.value(i));
+    report.test_time_min = test.first().map(|&i| keys.value(i));
+    let fold_idx = split_blocks(&test, spec.folds.max(1));
+    report.train_rows = train.len();
+    report.test_rows = test.len();
+    report.folds = fold_idx.len();
+    report.selector = describe_selector(n, &train, &test);
+    Ok((train, validation, fold_idx, report))
+}
+
 /// Decide where each row goes. Returns `(train indices, test fold indices, report)`.
 fn build_split(
     t: &Table,
@@ -4174,17 +4415,8 @@ fn build_split(
     // positional modes rather than competing with them.
     if spec.train_select.is_some() || spec.test_select.is_some() {
         let evaluate = |f: &Filter, t: &Table| -> Result<Vec<bool>, String> {
-            let cols: Vec<usize> = f
-                .vars
-                .iter()
-                .map(|v| t.index_of(v))
-                .collect::<Result<_, _>>()?;
-            Ok((0..n)
-                .map(|r| {
-                    let vals: Vec<f64> = cols.iter().map(|&c| t.value(r, c)).collect();
-                    expr::eval(&f.tree, &vals) > 0.0
-                })
-                .collect())
+            let mut rf = RowFilter::new(f, t)?;
+            Ok((0..n).map(|r| rf.holds(r)).collect())
         };
         let tr_mask = spec
             .train_select
@@ -4265,6 +4497,9 @@ fn build_split(
     }
 
     let (train, fold_idx) = match spec.mode {
+        SplitMode::TemporalIntervals => {
+            return Err("--split temporal-intervals assigns rows through the split table".to_string());
+        }
         SplitMode::Random => {
             let mut idx: Vec<usize> = (0..n).collect();
             for i in (1..n).rev() {
@@ -4718,10 +4953,12 @@ fn book_return(spec: &SplitSpec, t: &Table) -> Option<Vec<f64>> {
 }
 
 /// Time, group, return and funding of the validation and test rows (#263).
+#[allow(clippy::too_many_arguments)]
 fn build_trading(
     cols: &TradingColumns,
     spec: &SplitSpec,
     filtered: &Table,
+    gate_rows: (&Table, &[bool]),
     (train_idx, validation_idx, test_idx): (&[usize], &[usize], &[usize]),
     (train, validation, test): (&Sample, Option<&Sample>, &Sample),
     validation_context: (&[usize], Option<&Sample>),
@@ -4774,13 +5011,306 @@ fn build_trading(
             ret,
         }
     };
+    // #1214, #1268: every slice reads the evaluation rule, so a dwell counts
+    // the same rows in the training fitness as in every priced book.
+    let slices = (cols.train.then_some(train_idx), validation.is_some().then_some(validation_idx), test_idx);
+    let masks = match &cols.mask {
+        None => None,
+        Some(gate) => {
+            let s = evaluation_states(gate, spec, gate_rows, slices)?;
+            Some(TradingMasks { train: s.train, validation: s.validation, test: s.test })
+        }
+    };
+    let gate_states = cols.state_gates.iter().map(|g| evaluation_states(g, spec, gate_rows, slices)).collect::<Result<Vec<_>, _>>()?;
+    let deferred_gate_rows = if cols.gate_rows.is_empty() {
+        None
+    } else {
+        Some(GateRows::new(spec, gate_rows, &cols.gate_rows, slices)?)
+    };
+    let mut train_values = Vec::with_capacity(cols.train_values.len());
+    if cols.train {
+        for name in &cols.train_values {
+            let c = numeric(name, if cols.slice_values { "compose" } else { "switch" })?;
+            train_values.push(train_idx.iter().map(|&i| c[i]).collect());
+        }
+    }
+    let (mut validation_values, mut test_values) = (Vec::new(), Vec::new());
+    if cols.slice_values {
+        for name in &cols.train_values {
+            let c = numeric(name, "compose")?;
+            if validation.is_some() {
+                validation_values.push(validation_idx.iter().map(|&i| c[i]).collect());
+            }
+            test_values.push(test_idx.iter().map(|&i| c[i]).collect());
+        }
+    }
     Ok(TradingSplit {
+        masks,
+        train_values,
+        validation_values,
+        test_values,
+        gate_states,
+        gate_rows: deferred_gate_rows,
         train: cols.train.then(|| slice(train_idx, train)),
         validation: validation.map(|v| slice(validation_idx, v)),
         test: slice(test_idx, test),
         validation_context: validation_context.1.map(|s| TradingContext { x: s.x.clone(), slice: slice(validation_context.0, s) }),
         test_context: test_context.1.map(|s| TradingContext { x: s.x.clone(), slice: slice(test_context.0, s) }),
     })
+}
+
+/// #1214: the barriers of `rcsr-gate-state/1` for the search slices. The test
+/// slice is priced: each declared locked range with its lookback embargo. The
+/// validation slice is a selection read: the same plus every test interval of a
+/// split table with the split's embargo, or the test block from its first row.
+fn gate_barriers(spec: &SplitSpec, test_start: f64) -> (Vec<crate::regime_gate::Barrier>, Vec<crate::regime_gate::Barrier>) {
+    use crate::regime_gate::{Barrier, BarrierKind};
+    let mut pricing = Vec::new();
+    if let Some(d) = &spec.declared_lockbox {
+        let floored = label_floored(d, spec);
+        for range in std::iter::once(d.lockbox).chain(d.also) {
+            pricing.push(Barrier { start: range.start as f64, end: (range.end + floored.embargo.seconds) as f64, kind: BarrierKind::Locked });
+        }
+    }
+    let mut selection = pricing.clone();
+    match &spec.intervals {
+        Some(iv) => {
+            for &(s, e) in &iv.declared.test {
+                selection.push(Barrier { start: s as f64, end: (e + iv.embargo) as f64, kind: BarrierKind::Test });
+            }
+        }
+        None if test_start.is_finite() => selection.push(Barrier { start: test_start, end: f64::INFINITY, kind: BarrierKind::Test }),
+        None => {}
+    }
+    (pricing, selection)
+}
+
+/// The row ids of the training (when requested), validation and test slices.
+type SliceIdx<'a> = (Option<&'a [usize]>, Option<&'a [usize]>, &'a [usize]);
+
+/// #1214, #1268: the `rcsr-gate-state/1` states of `gate` on the training and
+/// validation rows (selection barriers) and the test rows (pricing barriers).
+/// The gate rows are every row of the data file (`gate_rows.0`, before any row
+/// filter) with a finite time; `gate_rows.1` marks the rows the filtered table
+/// kept, so slice row `i` is the `i`-th kept row.
+fn evaluation_states(gate: &crate::regime_gate::GateSpec, spec: &SplitSpec, gate_rows: (&Table, &[bool]), slices: SliceIdx) -> Result<SliceGateStates, String> {
+    GateRows::new(spec, gate_rows, &gate.columns, slices)?.states(gate)
+}
+
+/// #1214, #1182: the gate rows of `rcsr-gate-state/1` with the raw values of
+/// some columns, the barriers of the slices and the gate row of every slice
+/// row, so the states of a gate known only later (a gate search finalist)
+/// follow the same rule as a gate known before the rows.
+#[derive(Clone, Debug, Default)]
+pub struct GateRows {
+    time: Vec<f64>,
+    group: Vec<u64>,
+    columns: Vec<String>,
+    values: Vec<Vec<f64>>,
+    pricing: Vec<crate::regime_gate::Barrier>,
+    selection: Vec<crate::regime_gate::Barrier>,
+    /// The gate row of every training, validation and test slice row.
+    train: Option<Vec<usize>>,
+    validation: Option<Vec<usize>>,
+    test: Vec<usize>,
+}
+
+impl GateRows {
+    fn new(spec: &SplitSpec, (table, keep): (&Table, &[bool]), columns: &[String], (train_idx, validation_idx, test_idx): SliceIdx) -> Result<GateRows, String> {
+        let tc = spec.time_col.ok_or("the gate state needs a time column (--time <col>)")?;
+        let n = table.len();
+        let time = time_keys(table, tc).to_f64();
+        let group: Vec<u64> = match spec.group_col {
+            Some(gc) => group_ids(table, gc).0.into_iter().map(|g| g as u64).collect(),
+            None => vec![0u64; n],
+        };
+        let mut values: Vec<Vec<f64>> = Vec::with_capacity(columns.len());
+        for name in columns {
+            let j = table.index_of(name).map_err(|e| format!("mask column: {}", e))?;
+            if !table.numeric[j] {
+                return Err(format!("mask column '{}' is not numeric", name));
+            }
+            values.push(table.col(j).to_vec());
+        }
+        let kept: Vec<usize> = (0..n).filter(|&r| keep.get(r).copied().unwrap_or(true)).collect();
+        let rows = |idx: &[usize]| -> Vec<usize> { idx.iter().map(|&i| kept[i]).collect() };
+        let test = rows(test_idx);
+        let first = test.iter().map(|&r| time[r]).fold(f64::INFINITY, f64::min);
+        let (pricing, selection) = gate_barriers(spec, first);
+        Ok(GateRows { time, group, columns: columns.to_vec(), values, pricing, selection, train: train_idx.map(rows), validation: validation_idx.map(rows), test })
+    }
+
+    /// The states of `gate` on the slice rows and the warm-up of the validation
+    /// and test slices. Every column of the gate must be one of the kept columns.
+    pub fn states(&self, gate: &crate::regime_gate::GateSpec) -> Result<SliceGateStates, String> {
+        use crate::regime_gate::GateTape;
+        let n = self.time.len();
+        let cols: Vec<&[f64]> = gate
+            .columns
+            .iter()
+            .map(|name| {
+                self.columns.iter().position(|c| c == name).map(|k| self.values[k].as_slice()).ok_or_else(|| format!("mask column: no column '{}' among the gate rows", name))
+            })
+            .collect::<Result<_, _>>()?;
+        let first = |rows: &[usize]| rows.iter().map(|&r| self.time[r]).fold(f64::INFINITY, f64::min);
+        // One pass over every gate row per barrier set: 2 marks a row not read.
+        let pass = |barriers: &[crate::regime_gate::Barrier], starts: &[f64]| -> Result<(Vec<u8>, Vec<crate::regime_gate::WarmUp>), String> {
+            let mut tape = GateTape::with_starts(gate, barriers.to_vec(), starts);
+            let mut state: Vec<u8> = vec![2; n];
+            let mut row = vec![0.0f64; cols.len()];
+            for r in 0..n {
+                let s = tape.step_with(self.group[r], self.time[r], || {
+                    for (k, c) in cols.iter().enumerate() {
+                        row[k] = c[r];
+                    }
+                    crate::expr::eval(&gate.tree, &row)
+                })?;
+                if let Some(on) = s {
+                    state[r] = u8::from(on);
+                }
+            }
+            Ok((state, tape.warm_ups()))
+        };
+        let pick = |state: &[u8], rows: &[usize], what: &str| -> Result<Vec<bool>, String> {
+            rows.iter()
+                .map(|&r| match state[r] {
+                    2 => Err(barrier_error(what, self.time[r])),
+                    s => Ok(s == 1),
+                })
+                .collect()
+        };
+        let (priced, priced_start) = pass(&self.pricing, &[first(&self.test)])?;
+        let test = pick(&priced, &self.test, "test")?;
+        let (mut train, mut validation, mut validation_start) = (None, None, None);
+        if self.train.is_some() || self.validation.is_some() {
+            let starts: Vec<f64> = self.validation.iter().map(|rows| first(rows)).collect();
+            let (selected, selected_start) = pass(&self.selection, &starts)?;
+            if let Some(rows) = &self.validation {
+                validation = Some(pick(&selected, rows, "validation")?);
+                validation_start = selected_start.first().copied();
+            }
+            if let Some(rows) = &self.train {
+                train = Some(pick(&selected, rows, "training")?);
+            }
+        }
+        Ok(SliceGateStates { train, validation, test, validation_start, test_start: priced_start[0] })
+    }
+
+    /// #1279: the readable gate rows under the selection barriers, for a search
+    /// that scores many gates on the training rows.
+    pub fn plan(&self) -> Result<GatePlan, String> {
+        let train = self.train.as_ref().ok_or("the gate plan needs the training rows")?;
+        struct Lane {
+            seen: f64,
+            last: f64,
+            id: Option<u32>,
+        }
+        let barred = |t: f64| self.selection.iter().any(|b| b.contains(t));
+        let restarts = |last: f64, t: f64| self.selection.iter().any(|b| last < b.start && b.start <= t);
+        let mut lanes: std::collections::HashMap<u64, Lane> = std::collections::HashMap::new();
+        let (mut rows, mut group, mut groups) = (Vec::new(), Vec::new(), 0u32);
+        let mut at = vec![u32::MAX; self.time.len()];
+        for r in 0..self.time.len() {
+            let t = self.time[r];
+            if !t.is_finite() {
+                continue;
+            }
+            let lane = lanes.entry(self.group[r]).or_insert(Lane { seen: f64::NEG_INFINITY, last: f64::NEG_INFINITY, id: None });
+            if t < lane.seen {
+                return Err(format!("rows of group {} are not in time order at time {}", self.group[r], t));
+            }
+            lane.seen = t;
+            if barred(t) {
+                continue;
+            }
+            if lane.id.is_some() && restarts(lane.last, t) {
+                lane.id = None;
+            }
+            let id = *lane.id.get_or_insert_with(|| {
+                groups += 1;
+                groups - 1
+            });
+            lane.last = t;
+            at[r] = rows.len() as u32;
+            rows.push(r);
+            group.push(id);
+        }
+        let positions = train
+            .iter()
+            .map(|&r| match at[r] {
+                u32::MAX => Err(barrier_error("training", self.time[r])),
+                k => Ok(k as usize),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(GatePlan { rows, group, groups: groups as usize, train_rows: train.clone(), train: positions })
+    }
+
+    /// The gate value of every gate row.
+    pub fn values(&self, gate: &crate::regime_gate::GateSpec) -> Result<Vec<f64>, String> {
+        let cols = gate
+            .columns
+            .iter()
+            .map(|name| self.column(name).map(<[f64]>::to_vec))
+            .collect::<Result<Vec<_>, _>>()?;
+        gate.values(&cols, self.time.len())
+    }
+
+    /// The raw values of column `name` on every gate row.
+    pub fn column(&self, name: &str) -> Result<&[f64], String> {
+        self.columns.iter().position(|c| c == name).map(|k| self.values[k].as_slice()).ok_or_else(|| format!("mask column: no column '{}' among the gate rows", name))
+    }
+}
+
+/// #1279: the gate rows a gate state reads under the selection barriers, in file
+/// order, with a state group per run of readable rows (a barrier restarts the
+/// state of its group), and the position of every training row among them.
+#[derive(Clone, Debug)]
+pub struct GatePlan {
+    /// Gate row of every readable row.
+    rows: Vec<usize>,
+    group: Vec<u32>,
+    groups: usize,
+    /// Gate row of every training row.
+    train_rows: Vec<usize>,
+    /// Position of every training row among the readable rows.
+    train: Vec<usize>,
+}
+
+impl GatePlan {
+    /// Gate rows that are exactly the `group.len()` training rows, all readable.
+    pub fn dense(group: Vec<u32>) -> GatePlan {
+        let n = group.len();
+        GatePlan { rows: (0..n).collect(), groups: group.iter().map(|&g| g as usize + 1).max().unwrap_or(0), group, train_rows: (0..n).collect(), train: (0..n).collect() }
+    }
+
+    pub fn train_len(&self) -> usize {
+        self.train.len()
+    }
+
+    /// The gate rows of the training rows.
+    pub fn train_rows(&self) -> &[usize] {
+        &self.train_rows
+    }
+
+    /// The `rcsr-gate-state/1` states of the training rows of the gate `value(r) - cut`
+    /// over gate rows `r`, into `out` (one entry per training row). `scratch` holds
+    /// the states of every readable row.
+    pub fn train_states(&self, value: impl Fn(usize) -> f64, cut: f64, band: f64, dwell: usize, scratch: &mut Vec<bool>, out: &mut [bool]) {
+        scratch.resize(self.rows.len(), false);
+        crate::regime_gate::hysteresis_states_dense(|k| value(self.rows[k]) - cut, &self.group, self.groups, band, dwell, scratch);
+        for (o, &p) in out.iter_mut().zip(&self.train) {
+            *o = scratch[p];
+        }
+    }
+}
+
+fn barrier_error(what: &str, time: f64) -> String {
+    format!(
+        "the {} row at time {} lies inside a gate barrier: the gate state rule {} needs every training and validation row outside the test block and the test intervals with the split's embargo (a temporal split or a split table) and no slice row inside a locked range",
+        what,
+        time,
+        crate::regime_gate::STATE_RULE
+    )
 }
 
 /// Comparable ordering key for every row of a time column.
@@ -6022,6 +6552,11 @@ mod tests {
                 train,
                 cross_section: false,
                 book_rows: false,
+                mask: None,
+                train_values: Vec::new(),
+                slice_values: false,
+                state_gates: Vec::new(),
+                gate_rows: Vec::new(),
             }),
             canonical_train_order: canonical,
             ..Default::default()
@@ -6201,5 +6736,162 @@ mod tests {
         };
         assert!(slice.check_finite_returns(&[1.0, f64::NAN, 1.0, 1.0]).unwrap_err().starts_with("1 "));
         assert!(slice.check_finite_returns(&[1.0, f64::NAN, f64::NAN, 1.0]).is_ok());
+    }
+
+    fn filter_over(src: &str, names: &[String]) -> Filter {
+        Filter {
+            tree: expr::parse(src, names).unwrap(),
+            vars: names.to_vec(),
+            expression: src.to_string(),
+        }
+    }
+
+    /// The per-row copy of every `Filter::vars` column.
+    fn full_row_holds(f: &Filter, t: &Table, r: usize) -> bool {
+        let vals: Vec<f64> = f
+            .vars
+            .iter()
+            .map(|v| t.value(r, t.index_of(v).unwrap()))
+            .collect();
+        expr::eval(&f.tree, &vals) > 0.0
+    }
+
+    #[test]
+    fn row_filter_reads_only_the_named_columns() {
+        let names: Vec<String> = (0..12).map(|j| format!("c{j}")).collect();
+        let mut csv = names.join(",");
+        csv.push_str(",y\n");
+        for r in 0..1000usize {
+            for j in 0..12usize {
+                csv.push_str(&format!("{},", ((r * (j + 3) + j) % 11) as f64 - 4.0));
+            }
+            csv.push_str(&format!("{}\n", r as f64 * 0.5));
+        }
+        let t = table(&csv);
+        let kept = (0..1000).filter(|&r| t.value(r, 3) <= 0.0).count();
+        assert!(kept > 0 && kept < 1000);
+        let spec = SplitSpec {
+            exclude: Some(filter_over("c3 > 0", &names)),
+            train_select: Some(filter_over("c0 < 5 and c7 > 1", &names)),
+            test_select: Some(filter_over("c0 >= 5", &names)),
+            ..Default::default()
+        };
+        FILTER_CELL_READS.with(|n| n.set(0));
+        prepare_full_targets_weighted_with(
+            &t,
+            &names,
+            &["y"],
+            None,
+            &spec,
+            &mut Mt::new(1),
+            &PrepSpec::default(),
+        )
+        .unwrap();
+        let reads = FILTER_CELL_READS.with(|n| n.get());
+        assert_eq!(reads, 1000 + kept * 2 + kept);
+        assert!(reads < 12 * (1000 + 2 * kept) / 4);
+    }
+
+    #[test]
+    fn row_filter_constant_and_repeated_inputs() {
+        let t = table("a,b\n1,2\n3,4\n5,6\n");
+        let names = vec!["a".to_string(), "b".to_string()];
+        FILTER_CELL_READS.with(|n| n.set(0));
+        let f = filter_over("1", &names);
+        let mut rf = RowFilter::new(&f, &t).unwrap();
+        assert!((0..3).all(|r| rf.holds(r)));
+        assert_eq!(FILTER_CELL_READS.with(|n| n.get()), 0);
+        let f = filter_over("a + a > 2 and a < 5", &names);
+        let mut rf = RowFilter::new(&f, &t).unwrap();
+        let got: Vec<bool> = (0..3).map(|r| rf.holds(r)).collect();
+        assert_eq!(got, vec![false, true, false]);
+        assert_eq!(FILTER_CELL_READS.with(|n| n.get()), 3);
+        let missing = Filter {
+            vars: vec!["a".to_string(), "nope".to_string()],
+            ..filter_over("a > 0", &names)
+        };
+        assert!(RowFilter::new(&missing, &t).is_err());
+    }
+
+    #[test]
+    fn row_filter_matches_the_full_row_evaluation() {
+        // Unused-looking columns carry garbage; `sin` and `abs` collide with
+        // function names; `label` is a text column.
+        let mut csv = String::from("a,b,sin,abs,garbage,label,c\n");
+        let cells = [
+            "NaN", "inf", "-inf", "0", "1", "-2.5", "3", "1e300", "7", "-7", "0.5", "NA",
+        ];
+        for r in 0..200usize {
+            let pick = |k: usize| cells[(r * k + k * k) % cells.len()];
+            csv.push_str(&format!(
+                "{},{},{},{},{},w{},{}\n",
+                pick(3),
+                pick(5),
+                pick(7),
+                pick(11),
+                pick(13),
+                r % 4,
+                r as f64 - 90.0
+            ));
+        }
+        let t = table(&csv);
+        assert!(t.numeric[0] && t.numeric[1] && t.numeric[2] && t.numeric[3] && t.numeric[4]);
+        assert!(!t.numeric[5]);
+        let names: Vec<String> = ["a", "b", "sin", "abs", "garbage", "label", "c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // Two names beyond `Filter::vars` exercise the out-of-range input.
+        let mut parse_names = names.clone();
+        parse_names.push("x7".to_string());
+        parse_names.push("x8".to_string());
+        let atoms = [
+            "a", "b", "sin", "abs", "c", "label", "x7", "x8", "0", "1", "2.5", "sin(a)",
+            "abs(c)", "min(a, b)",
+        ];
+        let cmps = ["<", ">", "<=", ">=", "==", "!="];
+        let mut rng = Mt::new(1074);
+        let mut checked = 0usize;
+        let mut rf_reads = 0usize;
+        for _ in 0..300 {
+            let mut parts = Vec::new();
+            for _ in 0..(1 + rng.usize_below(3)) {
+                let l = atoms[rng.usize_below(atoms.len())];
+                let r = atoms[rng.usize_below(atoms.len())];
+                let c = cmps[rng.usize_below(cmps.len())];
+                let arith = ["+", "-", "*"][rng.usize_below(3)];
+                let s = if rng.bool(0.5) {
+                    format!("({l} {arith} {r}) {c} 1")
+                } else {
+                    format!("{l} {c} {r}")
+                };
+                parts.push(if rng.bool(0.3) { format!("not ({s})") } else { s });
+            }
+            let joined = parts.join(if rng.bool(0.5) { " and " } else { " or " });
+            let Ok(tree) = expr::parse(&joined, &parse_names) else {
+                continue;
+            };
+            let f = Filter {
+                tree,
+                vars: names.clone(),
+                expression: joined.clone(),
+            };
+            let mut rf = RowFilter::new(&f, &t).unwrap();
+            for r in 0..t.len() {
+                assert_eq!(rf.holds(r), full_row_holds(&f, &t, r), "{joined} row {r}");
+            }
+            rf_reads += rf.inputs.len();
+            checked += 1;
+        }
+        assert!(checked >= 200, "only {checked} expressions parsed");
+        assert!(rf_reads > 0);
+        // Zero-column, one-column and many-column expressions are all present.
+        for src in ["1 > 0", "garbage > 0", "a < b and sin > abs or c > 0"] {
+            let f = filter_over(src, &names);
+            let mut rf = RowFilter::new(&f, &t).unwrap();
+            for r in 0..t.len() {
+                assert_eq!(rf.holds(r), full_row_holds(&f, &t, r), "{src} row {r}");
+            }
+        }
     }
 }

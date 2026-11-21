@@ -17,6 +17,10 @@ use rcsr::search::{self, Config};
 use rcsr::settings::{self, Group, Setting};
 use std::collections::BTreeMap;
 
+fn cpu_default() -> Config {
+    Config { gpu: false, ..Config::default() }
+}
+
 fn golden(name: &str, expected: &str, actual: &str) {
     if expected != actual {
         panic!("{name} differs from the pinned bytes; actual:\n<<<{name}\n{actual}>>>{name}\n");
@@ -31,7 +35,8 @@ fn sample(row: &dyn Setting) -> Option<&'static str> {
     }
     Some(match row.flag() {
         "--patience" => "7",
-        "--selection" => "afp",
+        "--selection" => "lexicase",
+        "--lexicase-cases" => "64",
         "--restart-policy" => "island",
         "--restart-isolation" => "7",
         "--migration-interval" => "9",
@@ -43,13 +48,14 @@ fn sample(row: &dyn Setting) -> Option<&'static str> {
         "--crossover-internal" => "0.25",
         "--variation" => "node",
         "--fit-accept" => "fitness",
+        "--qd-descriptor" => "book",
         other => panic!("no sample value for {other}: add one to tests/settings_table.rs"),
     })
 }
 
 /// Every migrated setting off its default.
 fn non_default() -> Config {
-    let mut cfg = Config::default();
+    let mut cfg = cpu_default();
     for row in settings::rows() {
         row.apply_cli(&mut cfg, sample(row)).expect("sample value");
     }
@@ -65,7 +71,7 @@ fn default_config_text_and_hash_are_pinned() {
     golden(
         "default_config",
         include_str!("fixtures/settings/default_config.txt"),
-        &config_text(&Config::default()),
+        &config_text(&cpu_default()),
     );
 }
 
@@ -82,18 +88,18 @@ fn non_default_config_text_and_hash_are_pinned() {
 /// `--restart-policy island`.
 #[test]
 fn restart_isolation_is_read_only_under_the_island_policy() {
-    let cfg = Config { restart_isolation: 7, ..Config::default() };
+    let cfg = Config { restart_isolation: 7, ..cpu_default() };
     golden(
         "default_config",
         include_str!("fixtures/settings/default_config.txt"),
         &config_text(&cfg),
     );
-    assert!(Config::default().search_setting_differences(&cfg).is_empty());
-    assert!(cfg.search_setting_differences(&Config::default()).is_empty());
+    assert!(cpu_default().search_setting_differences(&cfg).is_empty());
+    assert!(cfg.search_setting_differences(&cpu_default()).is_empty());
     let mut named = settings::Explicit::default();
     named.mark(settings::find("--restart-isolation").expect("row"));
     let mut lines = Vec::new();
-    settings::conflicts(Group::Island, &cfg, &Config::default(), &named, &mut lines);
+    settings::conflicts(Group::Island, &cfg, &cpu_default(), &named, &mut lines);
     assert!(lines.is_empty(), "{lines:?}");
 }
 
@@ -163,7 +169,7 @@ fn help() -> String {
 fn help_blocks_of_migrated_settings_are_pinned() {
     let help = help();
     let pinned = blocks(include_str!("fixtures/settings/help_blocks.txt"));
-    assert_eq!(pinned.len(), 5, "help fixture blocks");
+    assert_eq!(pinned.len(), 7, "help fixture blocks");
     for (prev, next, block) in &pinned {
         assert_block(&help, prev, next, block, |flag| format!("  {flag}"));
     }
@@ -175,7 +181,7 @@ fn schema_rows_of_migrated_settings_are_pinned() {
     assert!(out.status.success());
     let schema = String::from_utf8(out.stdout).expect("utf-8 schema");
     let pinned = blocks(include_str!("fixtures/settings/schema_rows.txt"));
-    assert_eq!(pinned.len(), 6, "schema fixture blocks");
+    assert_eq!(pinned.len(), 8, "schema fixture blocks");
     for (prev, next, block) in &pinned {
         assert_block(&schema, prev, next, block, |flag| format!("    {{\"name\":\"{flag}"));
     }
@@ -213,7 +219,9 @@ fn resume_conflict_lines_are_pinned() {
         .args(["--restart-isolation", "7", "--mutation-mix", "extended", "--crossover-internal", "0.25"])
         .args(["--adaptive-mix", "--reject-constant-offspring", "--reject-fixed-position", "--fit-thresholds"])
         .args(["--variation", "node"])
+        .args(["--no-dedup", "--no-front-parents"])
         .args(["--fit-accept", "fitness"])
+        .args(["--qd-descriptor", "book"])
         .output()
         .expect("run the resume");
     assert_eq!(resumed.status.code(), Some(2), "{}", String::from_utf8_lossy(&resumed.stderr));
@@ -222,6 +230,7 @@ fn resume_conflict_lines_are_pinned() {
     assert_eq!(
         lines,
         [
+            "--no-dedup (saved dedup is true)",
             "--patience 7 (saved 40)",
             "--restart-interval 7 (saved restart_interval is 60)",
             "--selection afp (saved lexicographic)",
@@ -230,11 +239,13 @@ fn resume_conflict_lines_are_pinned() {
             "--mutation-mix extended (saved classic)",
             "--crossover-internal 0.25 (saved 0)",
             "--adaptive-mix (saved adaptive_mix is false)",
+            "--no-front-parents (saved front_parents is true)",
             "--reject-constant-offspring (saved reject_constant_offspring is false)",
             "--reject-fixed-position (saved reject_fixed_position is false)",
             "--fit-thresholds (saved fit_thresholds is false)",
             "--fit-accept fitness (saved fit_accept is always)",
             "--variation node (saved variation is auto)",
+            "--qd-descriptor book (saved qd_descriptor is moments)",
         ],
         "{err}"
     );
@@ -251,7 +262,8 @@ fn every_row_has_one_schema_entry_with_its_texts_and_default() {
     for row in settings::rows() {
         let entries: Vec<_> = options.iter().filter(|o| o.0 == row.flag()).collect();
         assert_eq!(entries, [&row.schema_row()], "{}", row.flag());
-        assert_eq!(row.schema_row().2, row.show(&Config::default()), "schema default of {}", row.flag());
+        let default = if row.negative() { "false".to_string() } else { row.show(&cpu_default()) };
+        assert_eq!(row.schema_row().2, default, "schema default of {}", row.flag());
         assert!(schema::has_option(row.flag()));
         assert_eq!(settings::find_key(row.key()).map(|r| r.flag()), Some(row.flag()));
     }
@@ -288,7 +300,7 @@ fn group_text(cfg: &Config) -> String {
 fn every_row_round_trips_and_a_missing_key_reads_its_default() {
     let off = non_default();
     let fields = config_fields(&group_text(&off));
-    let mut back = Config::default();
+    let mut back = cpu_default();
     settings::read(&mut back, &fields).expect("read the rows");
     for row in settings::rows() {
         assert!(!row.differs(&back, &off), "{} does not round-trip", row.flag());
@@ -299,7 +311,7 @@ fn every_row_round_trips_and_a_missing_key_reads_its_default() {
         match settings::read(&mut cfg, &without) {
             Ok(()) => {
                 assert!(!row.required(), "{} is required but loaded without its key", row.flag());
-                assert!(!row.differs(&cfg, &Config::default()), "{} missing is not its default", row.flag());
+                assert!(!row.differs(&cfg, &cpu_default()), "{} missing is not its default", row.flag());
             }
             Err(e) => {
                 assert!(row.required(), "{}: {e}", row.flag());
@@ -307,7 +319,7 @@ fn every_row_round_trips_and_a_missing_key_reads_its_default() {
             }
         }
     }
-    let default_fields = config_fields(&group_text(&Config::default()));
+    let default_fields = config_fields(&group_text(&cpu_default()));
     for row in settings::rows() {
         assert_eq!(default_fields.contains_key(row.key()), row.required() || row.always(), "{} at its default", row.flag());
     }
@@ -341,10 +353,10 @@ fn a_changed_row_is_a_difference_only_while_active() {
     let off = non_default();
     for row in settings::rows() {
         let mut other = off.clone();
-        row.copy(&Config::default(), &mut other);
+        row.copy(&cpu_default(), &mut other);
         assert!(row.active(&off), "{} is inactive in the sample config", row.flag());
         assert_eq!(off.search_setting_differences(&other), [row.key()], "{}", row.flag());
-        let base = Config::default();
+        let base = cpu_default();
         if !row.active(&base) {
             let mut changed = base.clone();
             row.copy(&off, &mut changed);
@@ -358,7 +370,7 @@ fn a_named_row_is_a_resume_conflict_only_while_active() {
     let saved = non_default();
     for row in settings::rows() {
         let mut cfg = saved.clone();
-        row.copy(&Config::default(), &mut cfg);
+        row.copy(&cpu_default(), &mut cfg);
         let mut named = settings::Explicit::default();
         let mut lines = Vec::new();
         for group in Group::ALL {
@@ -371,12 +383,12 @@ fn a_named_row_is_a_resume_conflict_only_while_active() {
         }
         assert_eq!(lines.len(), 1, "{}: {lines:?}", row.flag());
         assert!(lines[0].starts_with(row.flag()), "{}", lines[0]);
-        if !row.active(&Config::default()) {
+        if !row.active(&cpu_default()) {
             let mut quiet = Vec::new();
-            let mut changed = Config::default();
+            let mut changed = cpu_default();
             row.copy(&saved, &mut changed);
             for group in Group::ALL {
-                settings::conflicts(group, &changed, &Config::default(), &named, &mut quiet);
+                settings::conflicts(group, &changed, &cpu_default(), &named, &mut quiet);
             }
             assert!(quiet.is_empty(), "{} conflicts while inactive: {quiet:?}", row.flag());
         }
@@ -386,11 +398,11 @@ fn a_named_row_is_a_resume_conflict_only_while_active() {
 #[test]
 fn bench_rows_round_trip_through_the_knobs() {
     for row in settings::rows().filter(|r| r.bench().is_some()) {
-        let mut cli = Config::default();
+        let mut cli = cpu_default();
         row.apply_cli(&mut cli, sample(row)).expect("sample value");
         let mut knobs = settings::Overrides::default();
         knobs.set(row, sample(row)).expect("knob");
-        let mut applied = Config::default();
+        let mut applied = cpu_default();
         knobs.apply(&mut applied);
         assert!(!row.differs(&applied, &cli), "{} knob", row.flag());
         let mut json = String::new();

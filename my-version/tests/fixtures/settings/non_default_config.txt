@@ -19,11 +19,12 @@ config fit_fallback_max 4096
 config refit_band inf
 config calibration_source anchors
 config variation node
-config dedup true
+config dedup false
 config time_budget none
 config patience 7
 config predictor_samples none
-config selection afp
+config selection lexicase
+config lexicase_cases 64
 config restart_policy island
 config restart_isolation 7
 config explore_islands 1
@@ -32,8 +33,10 @@ config migration_policy ring-tournament
 config mutation_mix extended
 config crossover_internal 0.25
 config adaptive_mix true
+config front_parents false
 config reject_constant_offspring true
 config reject_fixed_position true
 config fit_thresholds true
 config fit_accept fitness
-config_hash 74f8db2e1c59aa27
+config qd_descriptor book
+config_hash c38e92807b3d32c9

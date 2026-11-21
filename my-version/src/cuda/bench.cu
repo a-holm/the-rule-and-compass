@@ -52,7 +52,8 @@
 #define RC_BENCH_BETA 2
 #define RC_BENCH_BETA_CLIPCOV 3
 
-#define RC_MIN_CROSS_MEMBERS 20
+#define RC_MIN_CROSS_FLOOR 5
+#define RC_MAX_CROSS_FLOOR 200
 
 typedef struct RcBenchSeries {
     int nb;
@@ -438,11 +439,12 @@ int rc_bench_column(RcBench *c, int bench, int kind, int a, int use_self,
 
 /* One thread per timestamp group, CPU addition order (order[] is the CPU's
    (time, symbol, row) order). Outputs: mean, breadth, dispersion, ex-self rel.
-   Groups under 20 finite PIT members, and non-member rows, are NaN. */
+   Groups under `min_members` finite PIT members, and non-member rows, are NaN. */
 __global__ void k_market_group(const double *__restrict__ src,
                                const unsigned int *__restrict__ order,
                                const unsigned char *__restrict__ member,
                                const int *__restrict__ off, int groups,
+                               int min_members,
                                double *__restrict__ mean_out,
                                double *__restrict__ breadth_out,
                                double *__restrict__ disp_out,
@@ -461,7 +463,7 @@ __global__ void k_market_group(const double *__restrict__ src,
             ++cnt;
         }
     }
-    if (cnt < RC_MIN_CROSS_MEMBERS) {
+    if (cnt < min_members) {
         for (int k = k0; k < k1; ++k) {
             unsigned int r = order[k];
             mean_out[r] = NAN;
@@ -512,6 +514,7 @@ __global__ void k_market_volume_share(const double *__restrict__ vol,
                                       const long long *__restrict__ times,
                                       const long long *__restrict__ bt,
                                       const double *__restrict__ bvol, int nb,
+                                      int min_members,
                                       double *__restrict__ out)
 {
     int g = blockIdx.x * blockDim.x + threadIdx.x;
@@ -528,7 +531,7 @@ __global__ void k_market_volume_share(const double *__restrict__ vol,
         }
     }
     double share = NAN;
-    if (cnt >= RC_MIN_CROSS_MEMBERS && total > 0.0) {
+    if (cnt >= min_members && total > 0.0) {
         long long t = times[order[k0]];
         int lo = 0, hi = nb;
         while (lo < hi) {
@@ -638,11 +641,11 @@ extern "C" {
 
 /* Group statistics of `src` (host, n doubles). `want` bit k downloads output k
    (0 mean, 1 breadth, 2 dispersion, 3 rel). Requires xs_prepare. */
-int rc_bench_market_group(void *v, const double *src, unsigned int want,
+int rc_bench_market_group(void *v, const double *src, unsigned int want, int min_members,
                           double *mean, double *breadth, double *disp, double *rel)
 {
     RcEnrich *c = (RcEnrich *)v;
-    if (!c || !src || !c->xs_ready) return 1;
+    if (!c || !src || !c->xs_ready || min_members < RC_MIN_CROSS_FLOOR || min_members > RC_MAX_CROSS_FLOOR) return 1;
     double t_start = rc_now_ms();
     size_t n = (size_t)c->n;
     rc_upload(c->d_xs_src, src, n * sizeof(double));
@@ -650,7 +653,7 @@ int rc_bench_market_group(void *v, const double *src, unsigned int want,
     int threads = 128;
     int blocks = blocks_for(c->xs_groups, threads);
     rc_launch("k_market_group", k_market_group, blocks, threads, 0, 0, c->d_xs_src, c->d_xs_order, c->d_xs_member,
-                                        c->d_xs_off, c->xs_groups, c->d_out,
+                                        c->d_xs_off, c->xs_groups, min_members, c->d_out,
                                         c->d_out2, c->d_out3, c->d_d);
     cudaError_t err = cudaGetLastError();
     if (err == cudaSuccess) err = cudaDeviceSynchronize();
@@ -668,10 +671,10 @@ int rc_bench_market_group(void *v, const double *src, unsigned int want,
 
 /* btc_volume_share for the host volume column against the benchmark volume. */
 int rc_bench_market_volume_share(void *v, const double *vol, const long long *bt,
-                                 const double *bvol, int nb, double *out)
+                                 const double *bvol, int nb, int min_members, double *out)
 {
     RcEnrich *c = (RcEnrich *)v;
-    if (!c || !vol || !bt || !bvol || nb <= 0 || !c->xs_ready) return 1;
+    if (!c || !vol || !bt || !bvol || nb <= 0 || !c->xs_ready || min_members < RC_MIN_CROSS_FLOOR || min_members > RC_MAX_CROSS_FLOOR) return 1;
     double t_start = rc_now_ms();
     size_t n = (size_t)c->n;
     long long *d_bt = NULL;
@@ -691,7 +694,7 @@ int rc_bench_market_volume_share(void *v, const double *vol, const long long *bt
     rc_launch("k_market_volume_share", k_market_volume_share, blocks, threads, 0, 0, c->d_xs_src, c->d_xs_order,
                                                c->d_xs_member, c->d_xs_off,
                                                c->xs_groups, c->d_times, d_bt, d_bv,
-                                               nb, c->d_out);
+                                               nb, min_members, c->d_out);
     cudaError_t err = cudaGetLastError();
     if (err == cudaSuccess) err = cudaDeviceSynchronize();
     double t_dl = rc_now_ms();
@@ -705,10 +708,10 @@ int rc_bench_market_volume_share(void *v, const double *vol, const long long *bt
 
 /* Average-correlation proxy: group means of the per-member trailing 96-bar
    correlation with the equal-weight market r1. `r1` is the host r1 column. */
-int rc_bench_market_avg_corr(void *v, const double *r1, double *out)
+int rc_bench_market_avg_corr(void *v, const double *r1, int min_members, double *out)
 {
     RcEnrich *c = (RcEnrich *)v;
-    if (!c || !r1 || !out || !c->xs_ready) return 1;
+    if (!c || !r1 || !out || !c->xs_ready || min_members < RC_MIN_CROSS_FLOOR || min_members > RC_MAX_CROSS_FLOOR) return 1;
     double t_start = rc_now_ms();
     size_t n = (size_t)c->n;
     size_t padded = n + (size_t)c->nseg + 1;
@@ -732,7 +735,7 @@ int rc_bench_market_avg_corr(void *v, const double *r1, double *out)
     int gblocks = blocks_for(c->xs_groups, threads);
     /* Market r1 mean per timestamp (d_out), breadth/dispersion/rel are scratch. */
     rc_launch("k_market_group", k_market_group, gblocks, threads, 0, 0, c->d_xs_src, c->d_xs_order, c->d_xs_member,
-                                         c->d_xs_off, c->xs_groups, c->d_out,
+                                         c->d_xs_off, c->xs_groups, min_members, c->d_out,
                                          c->d_out2, c->d_out3, c->d_d);
     int sblocks = blocks_for(c->nseg, threads);
     rc_launch("k_corr_prefix", k_corr_prefix, sblocks, threads, 0, 0, d_x, c->d_out, c->d_xs_member, c->d_seg_start,
@@ -745,7 +748,7 @@ int rc_bench_market_avg_corr(void *v, const double *r1, double *out)
                                   d_corr);
     /* Mean of the member correlations per timestamp. */
     rc_launch("k_market_group", k_market_group, gblocks, threads, 0, 0, d_corr, c->d_xs_order, c->d_xs_member,
-                                         c->d_xs_off, c->xs_groups, c->d_out,
+                                         c->d_xs_off, c->xs_groups, min_members, c->d_out,
                                          c->d_out2, c->d_out3, c->d_d);
     cudaError_t err = cudaGetLastError();
     if (err == cudaSuccess) err = cudaDeviceSynchronize();

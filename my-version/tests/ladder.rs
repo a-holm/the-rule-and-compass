@@ -132,6 +132,38 @@ fn folds_keep_fit_validation_and_test_apart() {
     }
 }
 
+/// #1291: the ladder prices the rows of the search's books. A row with a finite return and no
+/// finite `--target` leaves every fold, unless the SR run priced `--book-target`, the label is an
+/// `xs_rank` (a top-tercile book in the search) or no target spec names a fit label.
+#[test]
+fn folds_take_only_rows_with_a_fit_label() {
+    use rcsr::walkforward::LabelledRows;
+    let f = fixture(1);
+    let mut panel = f.panel.clone();
+    for i in (0..panel.len()).step_by(3) {
+        panel.y[i] = f64::NAN;
+    }
+    let inp = |target: &str| ladder::Input { data: String::new(), target: target.to_string(), ret: None, time: "t".to_string(), group: None, features: Vec::new() };
+    let o = Options { cost: Some(target::CostDecl::new(Some(&f.spec), 5.0, target::CostSource::Flag)), ..options(&f) };
+    let rule = ladder::labelled_rows(&inp("y"), &o);
+    assert_eq!(rule, LabelledRows::FitLabel("y".to_string()));
+    let no_spec = Options { spec: None, cost: None, ..options(&f) };
+    assert_eq!(ladder::labelled_rows(&ladder::Input { ret: Some("ret".to_string()), ..inp("y") }, &no_spec), LabelledRows::Return, "no target spec, no fit label apart from the return");
+    let xs = Options { spec: Some(target::TargetSpec { kind: target::KIND_XS_RANK.to_string(), ..f.spec.clone() }), ..o.clone() };
+    assert_eq!(ladder::labelled_rows(&inp("y"), &xs), LabelledRows::Return, "an xs_rank label is priced as the top-tercile book");
+    let test_rows = |p: &Panel| -> Vec<usize> { ladder::make_folds(p, &f.rows, 2.0 * STEP, &[], 0.0).unwrap().iter().flat_map(|k| k.fit.iter().chain(&k.valid).chain(&k.test).copied().collect::<Vec<_>>()).collect() };
+    let mut kept = panel.clone();
+    ladder::keep_labelled_rows(&mut kept, &rule);
+    let rows = test_rows(&kept);
+    assert!(rows.iter().all(|&i| kept.y[i].is_finite()));
+    let all = test_rows(&panel);
+    assert_eq!(all.len(), test_rows(&f.panel).len(), "the return rule keeps every finite return");
+    assert_eq!(rows.len(), all.iter().filter(|&&i| panel.y[i].is_finite()).count());
+    let mut book = panel.clone();
+    ladder::keep_labelled_rows(&mut book, &LabelledRows::BookTarget("yd".to_string()));
+    assert_eq!(test_rows(&book), all, "a --book-target run keeps every finite return");
+}
+
 #[test]
 fn controls_are_in_every_table_with_exposure_and_beta() {
     let f = fixture(2);
@@ -998,4 +1030,60 @@ fn ladder_stride_wider_than_step_refused() {
     assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.starts_with("error: stride_seconds 86400") && err.contains("3600"), "{err}");
+}
+
+#[path = "common/masked_run.rs"]
+mod masked_run;
+
+/// #1216: `--sr-run` of a run that priced `--pnl-mask` is refused, because the rung prices the raw formula.
+#[test]
+fn ladder_refuses_a_masked_run() {
+    const START: f64 = 1_600_000_000.0;
+    let (_scratch, dir) = scratch("masked-run");
+    let mut csv = String::from("t,f1,f2,r,y\n");
+    for i in 0..600 {
+        let f = i as f64;
+        let f1 = (f * 0.618_033_988_749_894_9).fract() - 0.5;
+        let f2 = (f * 0.754_877_666_246_692_7).fract() - 0.5;
+        let r = 0.01 * f1 + 0.0005 * ((f * 0.324_717_957_244_746).fract() - 0.5);
+        csv.push_str(&format!("{},{},{},{},{}\n", START as i64 + 900 * i, f1, f2, r, r));
+    }
+    let data = dir.join("d.csv");
+    std::fs::write(&data, csv).unwrap();
+    let iso = |i: i64| protocol::iso(START + 900.0 * i as f64);
+    let windows = dir.join("w.csv");
+    std::fs::write(
+        &windows,
+        format!(
+            "scheme,label,train_start,train_end,validation_start,test_start,test_end\nexpanding,late,{},{},{},{},{}\n",
+            iso(0),
+            iso(250),
+            iso(200),
+            iso(400),
+            iso(600)
+        ),
+    )
+    .unwrap();
+    let go = |masked: bool, out: &str| {
+        let run = dir.join(if masked { "masked.run.json" } else { "plain.run.json" });
+        std::fs::write(&run, masked_run::run_json(masked, START, START + 300.0 * 900.0)).unwrap();
+        rcsr_cmd::rcsr()
+            .args([
+                "ladder", "--data", data.to_str().unwrap(), "--target", "y", "--return-col", "r", "--time", "t",
+                "--features", "f1,f2", "--windows", windows.to_str().unwrap(), "--purge-seconds", "1800", "--draws", "50",
+                "--gbm-trees", "10", "--sr-run", run.to_str().unwrap(), "--out", out,
+            ])
+            .output()
+            .expect("run rcsr ladder")
+    };
+    let out = dir.join("masked.ladder.json");
+    let refused = go(true, out.to_str().unwrap());
+    let err = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(refused.status.code(), Some(2), "{err}");
+    assert!(err.contains("pnl_mask"), "{err}");
+    assert!(!out.exists(), "a refused run writes no report");
+    let plain = dir.join("plain.ladder.json");
+    let ok = go(false, plain.to_str().unwrap());
+    assert_eq!(ok.status.code(), Some(0), "{}", String::from_utf8_lossy(&ok.stderr));
+    assert!(std::fs::read_to_string(&plain).unwrap().contains("\"sr_run\""));
 }

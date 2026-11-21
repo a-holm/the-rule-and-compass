@@ -18,6 +18,7 @@ pub mod dispatch; // #290: per-stage CPU/GPU cost model and route ledger
 pub mod dispatch_plan; // #861: route plan of a calibration over a size grid
 pub mod enrich; // #200: append-only OHLCV feature enrichment
 pub mod enrich_probe; // #778: enrich planner probe for `rcsr calibrate`
+pub mod cross_floor; // #1274: member floor of the cross-section columns
 #[cfg(feature = "cuda")]
 pub mod enrich_gpu; // #200: resident CUDA enrichment kernels
 #[cfg(feature = "cuda")]
@@ -35,6 +36,7 @@ pub mod panel_prep; // #301: exact CPU reference for the panel prep policy
 pub mod panel_v2; // #259: default hourly point-in-time panel (snapshot, base, build, validate)
 pub mod panel_append; // #260: schema sidecar and time-major family append
 pub mod panel_rank; // #493: per-timestamp rank target of a time-major panel
+pub mod permute_labels; // #1272: per-symbol circular-block permuted-label store (search-capacity null)
 pub mod panel_spread; // #261: market-neutral bucket spread of a feature
 pub mod registry; // #260: versioned feature registry, schema sidecar, views
 pub mod derivatives; // reserved, gated funding/OI/basis family
@@ -57,6 +59,8 @@ pub mod genome;
 pub mod gpu;
 pub mod gpu_stats;
 pub mod inference; // #264: block bootstrap, DSR, PBO, SPA, BH-FDR
+pub mod intervals; // #1173: interval-list splits, purge, lookback embargo and the interval guard
+pub mod cpcv; // #1174: CPCV splits and backtest-path assembly
 pub mod gui;
 pub mod implicit;
 pub mod leakage; // #129: differential leakage detectors
@@ -77,6 +81,9 @@ pub mod pareto;
 pub mod postfix;
 pub mod panel; // #145: point-in-time membership and panel
 pub mod parse;
+pub mod regime_gate; // #1180: causal regime gate and the masks it gives
+pub mod regimes; // #1175: regime strata of the per-period series, calendars
+pub mod regime_dating; // #1175: rcsr protocol regimes: threshold dating of development rows
 pub mod provenance; // #256: build-time commit, binary hash, device identity
 pub mod pipeline; // #119: bounded producer/scorer overlap
 pub mod prep; // #123: raw archives -> column store
@@ -93,6 +100,7 @@ pub mod schema;
 pub mod search;
 pub mod settings; // #1083: one table row per search setting
 pub mod selection; // #111: select on train/validation, never the test lockbox
+pub mod occam; // #1184: description length and the Occam-adjusted p-value
 pub mod stability;
 pub mod store;
 pub mod baselines; // #310: long-only baseline ladder (cash, buy-and-hold, constant, matched-exposure random long)
@@ -100,12 +108,19 @@ pub mod ablation; // #266: add-one-family ablation arms, manifests, null columns
 pub mod ladder; // #266: long-only baseline ladder on one panel and one set of folds
 pub mod target; // #254: declared target spec
 pub mod run_book; // #487: the book a search run selected, read back by the evaluators
+pub mod switch; // #1185: gate-cut profile of if(greater(g, c), A, B) and the k-switch bound
+pub mod compose; // #1181: regime-switching composition of specialist pools into one exact formula
+pub mod enumerate; // #1183: exhaustive scoring of a small class, its optimum, the gap of a search and the family null
+pub mod gate_search; // #1182: gate search between two frozen branches (--gate-search)
 pub mod trading; // #263: exact long/flat P&L, Sharpe and log-growth objective
 pub mod trading_gpu; // #304/#305: fused long-only P&L, exact threshold and shared mask
 pub mod units;
 pub mod walkforward;
 pub mod wf_protocol; // #264: economics, block inference and nulls for the walk-forward report
 pub mod trials; // #926: campaign trial accounting and paired run comparison
+pub mod trials_table; // #1177: multi-metric candidate table of rcsr trials --table
+pub mod trials_freeze; // #1237: frozen sealed-read thresholds of the candidate table picks
+pub mod verdict; // #1238: rcsr protocol verdict of the sealed reads against frozen files
 pub mod wf_batch; // #309: batch walk-forward P&L over (candidate, window)
 pub mod protocol; // #264: windows table, candidate ledger, sealed list, one-read lockbox
 pub mod retire; // #924: retire a locked range after its one sealed read

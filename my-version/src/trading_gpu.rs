@@ -117,6 +117,10 @@ pub enum ThresholdSource {
     Fixed,
     /// The top-tercile policy has no threshold (#493).
     None,
+    /// #1094: the cut of lowest block fitness on the training rows.
+    TrainFitness,
+    /// #1094: the cut of lowest block fitness on the validation rows.
+    ValidationFitness,
 }
 
 impl ThresholdSource {
@@ -126,6 +130,8 @@ impl ThresholdSource {
             ThresholdSource::TrainType7 => "train_type7",
             ThresholdSource::ValidationType7 => "validation_type7",
             ThresholdSource::Fixed => "fixed",
+            ThresholdSource::TrainFitness => "train_fitness",
+            ThresholdSource::ValidationFitness => "validation_fitness",
         }
     }
 }

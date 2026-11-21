@@ -296,7 +296,7 @@ pub(crate) mod test_support {
     }
 
     pub(crate) fn plan_of(t: &Node) -> GpuFitPlan {
-        super::super::gpu_fit_plan_reason(t).expect("plan")
+        super::super::gpu_fit_plan_reason(t, false).expect("plan")
     }
 
     pub(crate) fn constants_of(t: &Node) -> Vec<f64> {

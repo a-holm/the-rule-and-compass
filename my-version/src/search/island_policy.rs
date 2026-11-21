@@ -25,7 +25,7 @@
 use super::{
     afp_worst, canonical_front, defers_fit_to_gpu, draw_row_dependent, fit_constants, gate_fit, population_best,
     FitAcceptCounts, FitPath,
-    pre_fit_tree, tournament, Config, EvalSample, FrontScope, Ind, MigrationPolicy, RestartPolicy, Selection,
+    pre_fit_tree, qd_descriptor_of, tournament, Config, EvalSample, FrontScope, Ind, MigrationPolicy, RestartPolicy, Selection,
     FRONT_PARENT_P, MIGRANT_TOURNAMENT,
 };
 use crate::checkpoint::IslandStall;
@@ -590,7 +590,7 @@ impl TreeIslands<'_> {
                             return d;
                         }
                     }
-                    qd::descriptor(&ind.tree, self.gen_train)
+                    qd_descriptor_of(&ind.tree, self.gen_data, self.cfg) // #1084
                 })
                 .collect();
             descriptors
@@ -678,7 +678,7 @@ impl IslandPopulation for TreeIslands<'_> {
     }
 
     fn restart(&mut self, island: usize) {
-        let (cfg, nvars, aggs, gen_train) = (self.cfg, self.nvars, self.aggs, self.gen_train);
+        let (cfg, nvars, aggs, gen_train, gen_data) = (self.cfg, self.nvars, self.aggs, self.gen_train, self.gen_data);
         let mut r = self.rngs[island].clone();
         // #120: aim the restart at the least-visited region by rejection
         // sampling a few cheap descriptor probes.
@@ -690,7 +690,7 @@ impl IslandPopulation for TreeIslands<'_> {
                 let mut t = random_tree_with(&mut r, nvars, &cfg.ops, cfg.init_depth, Some(aggs));
                 if let Some(target) = qd_target {
                     let mut best = t.clone();
-                    let best_d = qd::descriptor(&t, gen_train);
+                    let best_d = qd_descriptor_of(&t, gen_data, cfg); // #1084
                     let mut best_score = if hc && !expr::row_dependent(&t) {
                         f64::INFINITY
                     } else {
@@ -698,7 +698,7 @@ impl IslandPopulation for TreeIslands<'_> {
                     };
                     for _ in 0..3 {
                         let cand = random_tree_with(&mut r, nvars, &cfg.ops, cfg.init_depth, Some(aggs));
-                        let d = qd::descriptor(&cand, gen_train);
+                        let d = qd_descriptor_of(&cand, gen_data, cfg); // #1084
                         let score = (d.usage - target.usage).powi(2) + (d.skew - target.skew).powi(2);
                         if score < best_score && !(hc && !expr::row_dependent(&cand)) {
                             best = cand;
@@ -1338,7 +1338,11 @@ mod tests {
             assert_eq!(name, want_name);
             let (out, text, restarts) = checkpointed(&cfg, None);
             assert!(restarts > 0, "{name}: the run restarts an island, else the pin proves less");
-            let kept = text.lines().filter(|l| !l.starts_with("build ")).fold(0xcbf2_9ce4_8422_2325u64, |h, l| fnv(fnv(h, l.as_bytes()), b"\n"));
+            // #1166: the qd_* records are new; every line the base wrote keeps its bytes.
+            let kept = text
+                .lines()
+                .filter(|l| !l.starts_with("build ") && !l.starts_with("qd_"))
+                .fold(0xcbf2_9ce4_8422_2325u64, |h, l| fnv(fnv(h, l.as_bytes()), b"\n"));
             if (out.archive.hash(), kept) != (want_archive, want_text) {
                 differs.push(format!("(\"{name}\", {:#018x}, {kept:#018x})", out.archive.hash()));
             }
@@ -1633,9 +1637,9 @@ mod tests {
                 .collect();
             (picks, *rng.state().0, rng.state().1)
         };
-        let own = draws(Parents { front: &[], qd: None, source: ParentSource { front_p: 0.0, shared: true } });
+        let own = draws(Parents { front: &[], qd: None, source: ParentSource { front_p: 0.0, shared: true }, cases: None, lexicase: None });
         for control in [0u8, 1] {
-            let pools = |source| Parents { front: &front, qd: Some((Some(&qd), control)), source };
+            let pools = |source| Parents { front: &front, qd: Some((Some(&qd), control)), source, cases: None, lexicase: None };
             assert!(draws(pools(ISOLATED)) == own, "control {control}: an isolated island drew a --qd-policy parent");
             assert!(draws(pools(OPEN)) != own, "control {control}: an open island draws --qd-policy parents");
         }

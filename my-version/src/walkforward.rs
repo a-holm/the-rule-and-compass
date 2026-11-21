@@ -36,11 +36,11 @@
 //! training row per window. A CSV is read as a resident [`Table`]; the same
 //! accumulation rule applies afterwards.
 
-use crate::column::GroupBuf;
 use crate::data::{self, Table};
 use crate::expr::{self, Node};
 use crate::store::{self, FileStore};
 use crate::trading_gpu::{self, Threshold, ThresholdSource, ValidMask};
+use crate::trading::MissingScore;
 use crate::inference;
 use crate::wf_protocol::NullBook;
 use std::collections::HashMap;
@@ -51,6 +51,9 @@ pub const DEFAULT_COST_BPS: f64 = 10.0;
 pub const DEFAULT_QUANTILE: f64 = 0.70;
 /// Seconds in a (crypto) year, used to turn a time step into periods per year.
 pub const SECONDS_PER_YEAR: f64 = 365.0 * 86_400.0;
+
+/// Gate-state rule `apply_mask` reads (#1214: the states of the gate pass); `procedure_spec` names it in the candidate id.
+pub const MASK_STATE_RULE: &str = crate::regime_gate::STATE_RULE;
 
 /// Options of the long-only evaluation protocol. The defaults leave every
 /// existing report value unchanged: the new report sections only add fields,
@@ -82,6 +85,9 @@ pub struct ProtocolOptions {
     /// #309: score every candidate on every window in one batch (device kernel
     /// when available) and report it beside the exact finalists.
     pub batch_pnl: bool,
+    /// #1189: windows from a splits table: the pooled path starts flat at every window
+    /// that does not touch the end of the previous one, and charges no seam there.
+    pub flat_gaps: bool,
     /// #487: where the cost and the return units came from. `None` is the
     /// historical reading: the flag or default cost and simple returns.
     pub cost: Option<crate::target::CostDecl>,
@@ -89,6 +95,8 @@ pub struct ProtocolOptions {
     pub front: Option<FrontSource>,
     /// #807: which string of the run the candidates are; `None` for `--expr`.
     pub expression_source: Option<crate::run_json::ExpressionSource>,
+    /// #1237: the compose provenance of the run (`--from-run`, `--front`); `None` for any other source.
+    pub composite: Option<crate::run_json::CompositeMarker>,
     /// #482: labels of windows that overlap the run's training or validation
     /// rows and were allowed anyway.
     pub in_sample_windows: Vec<String>,
@@ -120,12 +128,158 @@ pub struct ProtocolOptions {
     /// `split.fit_label`: the label report facts of the target (see
     /// [`crate::labels::fit_label_json`]).
     pub fit_label: Option<String>,
+    /// #1291: the rows that count as labelled.
+    pub labelled_rows: LabelledRows,
+    /// #1291: data without the fit label column is refused (the books of `--from-run` and
+    /// `--front` need it); otherwise the return alone labels a row.
+    pub fit_label_required: bool,
     /// The horizon comes from a target spec, not from `--horizon` alone; the
     /// report names it as the annualisation source.
     pub horizon_from_spec: bool,
     /// `stride_seconds` of the target spec: the period width is the larger of the
     /// horizon and this.
     pub stride_seconds: Option<f64>,
+    /// #1094: `--threshold-fit fitness`. Each window's cut is fitted on its
+    /// validation slice (training rows without one); `threshold_fixed` is the
+    /// reference cut and the fallback.
+    pub threshold_fit: Option<CutFit>,
+    /// #1180: the regime gate the run priced its book under (`--pnl-mask`),
+    /// carried like the band. Rows with the gate off drop out of the test book
+    /// and every on-run is its own book: it starts flat and pays its exit.
+    pub mask: Option<crate::regime_gate::GateSpec>,
+    /// #1175: a regime calendar that stratifies the pooled periods. A reporting input,
+    /// never read by a search.
+    pub regimes: Option<crate::regimes::Calendar>,
+    /// #1175: causal regime expressions; each splits the pooled periods into on and off.
+    pub regime_exprs: Vec<crate::regimes::ExprSpec>,
+    /// #1175: emit exposure, entries, gross and buy-and-hold per period with the strata.
+    pub period_series: bool,
+    /// #1199: the periods of the pooled series (`--period-grid`).
+    pub period_grid: PeriodGrid,
+    /// #1214: per candidate, the switch that defines its book (`--from-run` or
+    /// `--front` of a composed run); empty when no candidate is a switch.
+    pub switches: Vec<Option<SwitchCandidate>>,
+    /// #1203: what the book does on a row with a finite target and no finite
+    /// score (`--missing-score`).
+    pub missing_score: MissingScore,
+    /// #1176: `--emit-series`: the pooled block adds the cost, entry-stamp and
+    /// buy-and-hold net series and `entry_times` to the #1175 series.
+    pub emit_series: bool,
+    /// #1176: `--all-members`: every candidate of `--front` is also priced alone,
+    /// with its own carried threshold and band, into `members`. Reporting only.
+    pub all_members: bool,
+}
+
+/// #1214: a candidate whose book is a switch, and the run field it came from.
+#[derive(Clone, Debug)]
+pub struct SwitchCandidate {
+    pub switch: crate::regime_gate::Switch,
+    pub source: String,
+}
+
+/// #1199: which periods the pooled series of a report has. The grid never
+/// changes the book: positions, costs and exits are the same under both rules.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PeriodGrid {
+    /// A period where some row has a finite score and a finite target.
+    #[default]
+    Score,
+    /// A period where some test row of the window has a finite target before
+    /// the gate; a period where the book prices no row books net 0.
+    Target,
+}
+
+impl PeriodGrid {
+    pub fn parse(s: &str) -> Result<PeriodGrid, String> {
+        match s {
+            "score" => Ok(PeriodGrid::Score),
+            "target" => Ok(PeriodGrid::Target),
+            other => Err(format!("--period-grid needs score or target, got '{}'", other)),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PeriodGrid::Score => "score",
+            PeriodGrid::Target => "target",
+        }
+    }
+}
+
+/// #1199: the grid of the pooled series under `--period-grid target`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GridSummary {
+    pub rule: PeriodGrid,
+    /// Periods with no priced row (no finite score, or the gate off): net 0.
+    pub empty_periods: usize,
+    /// Priced rows of every period of the pooled series; 0 marks an empty period.
+    pub period_rows: Vec<usize>,
+}
+
+/// #1094: the rule of `--threshold-fit fitness`: the cut with the lowest block
+/// fitness among the cuts with at least `min_entry_times` distinct entry
+/// timestamps on the source rows of a window.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CutFit {
+    /// `--cut-min-entries`.
+    pub min_entry_times: u32,
+    /// `--cut-blocks`: time blocks of the fitness.
+    pub blocks: usize,
+    /// `--cut-lambda`: weight of the block regret sd.
+    pub lambda: f64,
+}
+
+impl Default for CutFit {
+    fn default() -> Self {
+        CutFit { min_entry_times: 30, blocks: 4, lambda: 1.0 }
+    }
+}
+
+/// #1094: one cut of a window's sweep, priced on the source rows.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CutPoint {
+    /// Source rows at or below the cut.
+    pub index: usize,
+    pub value: f64,
+    pub fitness: f64,
+    pub net: f64,
+    pub flips: u32,
+    pub exits: u32,
+    pub entry_times: u32,
+    /// Long rows over source rows.
+    pub exposure: f64,
+}
+
+/// #1094: the widest run of valid cuts around the fitted one whose fitness
+/// stays within `0.1 * (1 - best)` of the best.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CutPlateau {
+    pub lo: f64,
+    pub hi: f64,
+    pub rows_lo: usize,
+    pub rows_hi: usize,
+}
+
+/// #1094: the cut of one window under `--threshold-fit fitness`.
+#[derive(Clone, Debug)]
+pub struct CutReport {
+    /// `ValidationFitness` or `TrainFitness`; `Fixed` when the window fell back.
+    pub source: ThresholdSource,
+    /// The threshold of the window.
+    pub value: f64,
+    /// Source rows with a finite score and target.
+    pub rows: usize,
+    /// The cut the window uses, when a sweep ran.
+    pub cut: Option<CutPoint>,
+    pub reference_value: f64,
+    pub reference: Option<CutPoint>,
+    pub plateau: Option<CutPlateau>,
+    pub fit: CutFit,
+    /// `no_rows`, `book_error`, `no_valid_cut` or `floor`.
+    pub fallback: Option<&'static str>,
+    pub fallback_detail: Option<String>,
+    /// `(long-row share asked for, the cut)`, 32 rows.
+    pub profile: Vec<(f64, CutPoint)>,
 }
 
 /// #482: where a candidate list came from: a run's Pareto front.
@@ -135,6 +289,72 @@ pub struct FrontSource {
     pub run_sha256: String,
     /// Archive rank label of every candidate, in candidate order.
     pub labels: Vec<String>,
+    /// #1176: archive rank of every candidate, in candidate order.
+    pub ranks: Vec<usize>,
+}
+
+/// #1291: the rows that count as labelled. A labelled row is priced, enters
+/// the spacing and stride checks, the threshold and the constant control; the
+/// search's books hold the same rows.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LabelledRows {
+    /// A finite return: no target spec names a fit label apart from the return.
+    Return,
+    /// A finite return and a finite fit label in this column (the target spec's
+    /// label column): the rows `--fill drop` keeps in the search.
+    FitLabel(String),
+    /// A finite return of the book label in this column: the rows of a search
+    /// run with `--book-target` (`objective.book_target`).
+    BookTarget(String),
+}
+
+impl LabelledRows {
+    /// The rule of the search's books, for walk-forward and the ladder alike. `spec` is the
+    /// target spec entry of the fit label (`None`: no spec, so no fit label apart from the
+    /// return), priced on `return_column`. A run searched with `--book-target` prices every
+    /// finite return of its book label. The search prices every finite return of a top-tercile
+    /// book (#493: a row whose label alone is missing stays in the cross-section and earns its
+    /// return) and of a run whose `--fill` filled missing labels (`fills_labels`; drop and none
+    /// fill nothing). Otherwise a row needs a finite fit label, the spec's `column`.
+    pub fn of_search(spec: Option<&crate::target::TargetSpec>, return_column: &str, top_tercile: bool, fills_labels: bool, book_target: Option<String>) -> LabelledRows {
+        match (book_target, spec) {
+            (Some(b), _) => LabelledRows::BookTarget(b),
+            (None, Some(s)) if s.column != return_column && !top_tercile && !fills_labels => LabelledRows::FitLabel(s.column.clone()),
+            _ => LabelledRows::Return,
+        }
+    }
+
+    /// The fit label column a labelled row needs finite, if any.
+    pub fn fit_label(&self) -> Option<&str> {
+        match self {
+            LabelledRows::FitLabel(c) => Some(c),
+            _ => None,
+        }
+    }
+
+    pub fn json(&self) -> String {
+        match self {
+            LabelledRows::Return => "{\"rule\":\"return\"}".to_string(),
+            LabelledRows::FitLabel(c) => format!("{{\"rule\":\"fit_label\",\"column\":{}}}", jstr(c)),
+            LabelledRows::BookTarget(c) => format!("{{\"rule\":\"book_target\",\"column\":{}}}", jstr(c)),
+        }
+    }
+}
+
+/// #1291: the return of a row, NaN when its fit label is not finite.
+fn labelled(ret: f64, fit_label: Option<f64>) -> f64 {
+    if fit_label.map_or(true, f64::is_finite) {
+        ret
+    } else {
+        f64::NAN
+    }
+}
+
+/// #1238: the run file a `--from-run` report priced and the SHA-256 of its bytes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RunRef {
+    pub run: String,
+    pub run_sha256: String,
 }
 
 impl Default for ProtocolOptions {
@@ -152,9 +372,11 @@ impl Default for ProtocolOptions {
             pbo_blocks: 16,
             fdr_q: 0.10,
             batch_pnl: false,
+            flat_gaps: false,
             cost: None,
             front: None,
             expression_source: None,
+            composite: None,
             in_sample_windows: Vec::new(),
             final_read: false,
             locked_ranges: Vec::new(),
@@ -164,8 +386,20 @@ impl Default for ProtocolOptions {
             run_bands: None,
             quorum: None,
             fit_label: None,
+            labelled_rows: LabelledRows::Return,
+            fit_label_required: false,
             horizon_from_spec: false,
             stride_seconds: None,
+            threshold_fit: None,
+            mask: None,
+            regimes: None,
+            regime_exprs: Vec::new(),
+            period_series: false,
+            period_grid: PeriodGrid::Score,
+            switches: Vec::new(),
+            missing_score: MissingScore::Flat,
+            emit_series: false,
+            all_members: false,
         }
     }
 }
@@ -472,6 +706,14 @@ pub struct WindowResult {
     /// Latest stamp of any row used for training or validation. Its label ends
     /// at most `required_purge_seconds` later, which stays below `test_start`.
     pub train_last_time: Option<f64>,
+    /// #1094: the fitted cut under `--threshold-fit fitness`.
+    pub cut: Option<CutReport>,
+    /// #1236: under `--emit-series`, the distinct entry stamps of the window's pooled
+    /// book; the windows of a report sum to `pooled.entry_times`.
+    pub entry_times: Option<usize>,
+    /// #1214: the `gate` block of the window: the warm-up of the gate of the
+    /// selected candidate's book at the test start and, for a switch, its regime view.
+    pub gate: Option<String>,
 }
 
 /// #306: the band/cooldown book and its associative carry.
@@ -482,7 +724,8 @@ pub struct BandCheck {
     /// `carry2` for the 2-state band, `cooldown-K` for the K+1-state variant.
     pub carry: String,
     pub groups: usize,
-    /// Additive net from the composed carry (including every final exit).
+    /// Additive net from the composed carry (including every final exit), plus
+    /// the return of the held rows under `--missing-score hold` (#1203).
     pub net: f64,
     /// Scalar evaluator's sum of per-row net returns.
     pub scalar_net: f64,
@@ -592,12 +835,27 @@ pub struct Report {
     /// stamps, in the order of the pooled series.
     pub period_net: Vec<f64>,
     pub period_time: Vec<f64>,
+    /// #1199: `Some` under `--period-grid target`; `None` is the score grid.
+    pub period_grid: Option<GridSummary>,
+    /// #1175: the strata of the pooled periods; `None` without `--regimes`, `--regime-expr` or `--period-series`.
+    pub regimes: Option<crate::regimes::RegimeReport>,
+    /// #1214: the gate pass: the rule, the gate rows read, the barriers and the
+    /// gates of the books (the run's mask, the switches); `None` without one.
+    pub gate: Option<String>,
+    /// #1175: per-period exposure, entries, gross and buy-and-hold beside `period_net`.
+    pub period_extra: Option<PeriodExtra>,
+    /// #1176: print the `--emit-series` fields of `period_extra`.
+    pub emit_series: bool,
+    /// #1176: every front member priced alone (`--all-members`).
+    pub members: Option<Vec<Member>>,
     /// #487: cost source and return units of the book.
     pub cost: crate::target::CostDecl,
     pub cost_bps: f64,
     pub threshold_quantile: f64,
     /// The pre-registered fixed threshold, when one was supplied.
     pub threshold_fixed: Option<f64>,
+    /// #1094: `--threshold-fit fitness` and its rule.
+    pub threshold_fit: Option<CutFit>,
     /// #306: position policy and its band parameters.
     pub policy: Policy,
     /// #930: quorum and votes needed of the members (`candidates`) under `--policy vote`.
@@ -628,8 +886,12 @@ pub struct Report {
     pub selected_on: String,
     /// #482: the run whose Pareto front supplied the candidates.
     pub front: Option<FrontSource>,
+    /// #1238: the run of a `--from-run` report, written as `selection.run` and `run_sha256`.
+    pub from_run: Option<RunRef>,
     /// #807: `exact` or `rounded` for candidates read from a run.json.
     pub expression_source: Option<crate::run_json::ExpressionSource>,
+    /// #1237: the compose provenance of the run, written as `selection.composite`.
+    pub composite: Option<crate::run_json::CompositeMarker>,
     /// #308: whether the band protocol selected the candidate.
     pub band_select: bool,
     /// True when no test row influenced candidate or threshold selection.
@@ -638,6 +900,12 @@ pub struct Report {
     pub pool_reset_flat: bool,
     pub seam_cost: f64,
     pub seam_trades: usize,
+    /// #1203: the missing-score rule of the book, the pooled exits it paid at
+    /// the last priced row before a missing score, and the rows with a finite
+    /// score and no finite target inside a run that no earlier return covers.
+    pub missing_score: MissingScore,
+    pub missing_score_exits: usize,
+    pub unpriced_target_rows: usize,
     /// Fold sign test: computed only when folds are independent (no training
     /// interval overlaps another fold's test block). Expanding folds overlap by
     /// construction, so their sign test is reported as not applicable.
@@ -655,6 +923,8 @@ pub struct Report {
     pub batch_pnl: Option<crate::wf_batch::BatchSummary>,
     /// #284: run-scoped phase ledger (`io`, `pnl`, `host_other`, device-busy intervals). Not part of `json()`, which is the reproduction hash.
     pub ledger: crate::gpu_stats::RunLedger,
+    /// Columns and bytes the store scan read; `None` on the table path. Not part of `json()`.
+    pub scan: Option<ScanStats>,
     /// `entry_offset) + horizon + delay`.
     pub required_purge_seconds: f64,
     /// Smallest positive step between consecutive test rows of one group.
@@ -663,9 +933,24 @@ pub struct Report {
     pub min_purge_seconds: f64,
     /// `split.fit_label` of the printed report; the reproduction hash leaves it out.
     pub fit_label: Option<String>,
+    /// `split.labelled_rows` of the printed report; the reproduction hash leaves it out.
+    pub labelled_rows: LabelledRows,
     pub economics: crate::wf_protocol::Economics,
     pub inference: Option<crate::wf_protocol::Inference>,
     dropped_rows: usize,
+}
+
+/// #1176: one front member priced alone under `--all-members`: the report of
+/// `--expr <member>` with the member's carried threshold and band. Nothing in
+/// it feeds the selection of the parent report.
+#[derive(Clone, Debug)]
+pub struct Member {
+    pub archive_rank: usize,
+    pub label: String,
+    pub complexity: usize,
+    /// The expression has no input: the book takes one position on every row.
+    pub constant: bool,
+    pub report: Report,
 }
 
 /// A one-sided binomial sign test over fold expectancies.
@@ -758,18 +1043,35 @@ fn run_table_clocked(
     opts: &ProtocolOptions,
     clock: std::time::Instant,
 ) -> Result<Report, String> {
-    let layout = resolve_layout(spec, &table.names, &table.numeric)?;
-    let trees = parse_expressions(spec, &layout)?;
+    let layout = resolve_layout(spec, opts, &table.names, &table.numeric)?;
+    let plan = gate_plan(spec, opts, &table.names, &table.numeric)?;
+    let trees = parse_expressions(spec, opts, &layout, plan.as_ref())?;
     validate_windows(spec, opts)?;
 
     let times = data::time_keys(table, layout.time);
     let group_ids = layout.group.map(|g| table_group_ids(table, g));
     let t_pnl = std::time::Instant::now();
     let mut acc = Accum::new(spec, opts, trees.len())?;
+    let states = match &plan {
+        Some(p) => {
+            let mut pass = GatePass::new(p, &acc);
+            let mut row = Vec::new();
+            for r in 0..table.len() {
+                let g = group_ids.as_ref().map_or(0, |ids| ids[r]);
+                pass.step(0, times.value(r), g, |k| {
+                    row.clear();
+                    row.extend(p.gates[k].cols.iter().map(|&c| table.value(r, c)));
+                    expr::eval(&p.gates[k].spec.tree, &row)
+                })?;
+            }
+            Some(pass.finish(p, &mut acc))
+        }
+        None => None,
+    };
     if opts.final_read {
         acc.pass = Pass::TrainOnly;
     }
-    let mut features = Vec::with_capacity(layout.vars.len());
+    let mut features = Vec::with_capacity(layout.vars.len() + acc.n_states);
     for pass in 0..(if opts.final_read { 2 } else { 1 }) {
         if pass == 1 {
             acc.begin_test_pass(spec, &trees)?;
@@ -783,8 +1085,13 @@ fn run_table_clocked(
         for &c in &layout.vars {
             features.push(table.value(r, c));
         }
+        if let Some(s) = &states {
+            features.resize(layout.vars.len() + s.width(), f64::NAN);
+            s.write_row(&mut features[layout.vars.len()..], 0, r);
+        }
         let g = group_ids.as_ref().map_or(0, |ids| ids[r]);
-        acc.add(t, g, &features, ret_in(opts, table.value(r, layout.target)), &trees);
+        let y = labelled(ret_in(opts, table.value(r, layout.target)), layout.fit_label.map(|c| table.value(r, c)));
+        acc.add(t, g, &features, y, &trees);
     }
     }
     let mut report = acc.finish(
@@ -813,6 +1120,36 @@ pub fn run_store_with(path: &str, spec: &EvalSpec, opts: &ProtocolOptions) -> Re
     Ok(report)
 }
 
+/// What the store scan read (issue #1034): value columns of the projection and the bytes decoded.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScanStats {
+    pub store_columns: usize,
+    pub named_variables: usize,
+    pub projected_columns: usize,
+    pub groups_read: usize,
+    pub groups_skipped: usize,
+    pub value_bytes: u64,
+}
+
+impl ScanStats {
+    fn json(&self) -> String {
+        format!(
+            "{{\"source\":\"store\",\"store_columns\":{},\"named_variables\":{},\"projected_columns\":{},\"groups_read\":{},\"groups_skipped\":{},\"value_bytes\":{}}}",
+            self.store_columns, self.named_variables, self.projected_columns, self.groups_read, self.groups_skipped, self.value_bytes
+        )
+    }
+}
+
+/// Positions in `layout.vars` that `n` names. Block bodies are not walked: their inputs are argument positions.
+fn named_inputs(n: &Node, out: &mut Vec<usize>) {
+    if n.op == expr::Op::Input && !out.contains(&(n.val as usize)) {
+        out.push(n.val as usize);
+    }
+    for k in &n.kids {
+        named_inputs(k, out);
+    }
+}
+
 fn run_store_clocked(
     path: &str,
     spec: &EvalSpec,
@@ -822,33 +1159,130 @@ fn run_store_clocked(
     let fs = FileStore::open(path)?;
     let names = fs.header().names();
     let numeric = fs.header().numeric();
-    let mut layout = resolve_layout(spec, &names, &numeric)?;
+    let mut layout = resolve_layout(spec, opts, &names, &numeric)?;
     layout.time_i64 = fs.header().dtypes()[layout.time] == store::DType::I64;
-    let trees = parse_expressions(spec, &layout)?;
+    let plan = gate_plan(spec, opts, &names, &numeric)?;
+    let trees = parse_expressions(spec, opts, &layout, plan.as_ref())?;
     validate_windows(spec, opts)?;
 
     let mut acc = Accum::new(spec, opts, trees.len())?;
-    if opts.final_read {
-        acc.pass = Pass::TrainOnly;
-    }
     let header = fs.header();
     let t_pnl = std::time::Instant::now();
     let mut io_s = 0.0f64;
-    let mut buf = GroupBuf::new();
-    let mut scratch = Vec::new();
     let group_ids: Vec<u64> = match layout.group {
         Some(c) if !numeric[c] => header.levels(c).map_or_else(Vec::new, |l| l.iter().map(|s| label_group_id(s)).collect()),
         _ => Vec::new(),
     };
-    let mut features = Vec::with_capacity(layout.vars.len());
+    let mut named: Vec<usize> = Vec::new();
+    for tree in &trees {
+        named_inputs(tree, &mut named);
+    }
+    named.retain(|&p| p < layout.vars.len());
+    let time_f64 = layout.time_numeric && !layout.time_i64;
+    let group_f64 = layout.group.filter(|&g| numeric[g]);
+    let time_levels = header.levels(layout.time);
+    let time_of_code = |code: u32| -> f64 {
+        time_levels
+            .and_then(|l| l.get(code as usize))
+            .and_then(|s| data::parse_time(s))
+            .unwrap_or(f64::NAN)
+    };
+    // The time and group of row `r` of store group `group`, from the columns read for it.
+    let row_time = |r: usize, ints: &Option<Vec<i64>>, codes: &Option<Vec<u32>>, f64_time: Option<&[f64]>| -> f64 {
+        match (ints, codes) {
+            (Some(ints), _) => ints.get(r).copied().unwrap_or(i64::MIN) as f64,
+            (None, None) => f64_time.map_or(f64::NAN, |c| c[r]),
+            (None, Some(codes)) => time_of_code(codes.get(r).copied().unwrap_or(0)),
+        }
+    };
+    let row_group = |r: usize, codes: &Option<Vec<u32>>, f64_group: Option<&[f64]>| -> u64 {
+        match (layout.group, codes) {
+            (None, _) => 0,
+            (Some(_), Some(codes)) => {
+                let code = codes.get(r).copied().unwrap_or(0) as usize;
+                group_ids.get(code).copied().unwrap_or(label_group_id(""))
+            }
+            (Some(_), None) => group_key(f64_group.map_or(f64::NAN, |c| c[r])),
+        }
+    };
+    // #1214: the gate pass reads the time, the group and the gate columns of every row before the last window end.
+    let states = match &plan {
+        Some(p) => {
+            let t_io = std::time::Instant::now();
+            let mut needed: Vec<usize> = p.gates.iter().flat_map(|g| g.cols.iter().copied()).collect();
+            if time_f64 {
+                needed.push(layout.time);
+            }
+            needed.extend(group_f64);
+            needed.sort_unstable();
+            needed.dedup();
+            let projection = store::Projection::from_indices(&fs, &needed)?;
+            let at = |index: usize| -> usize { projection.columns().iter().position(|c| c.index == index).expect("projected column") };
+            let gate_at: Vec<Vec<usize>> = p.gates.iter().map(|g| g.cols.iter().map(|&c| at(c)).collect()).collect();
+            let mut pass = GatePass::new(p, &acc);
+            let mut pg = store::ProjectedGroup::new();
+            let mut row = Vec::new();
+            for group in 0..fs.n_groups() {
+                let len = header.group_len(group);
+                let ints = if layout.time_i64 { Some(fs.read_i64(group, layout.time)?) } else { None };
+                let codes = if layout.time_numeric || layout.time_i64 { None } else { Some(fs.read_codes(group, layout.time)?) };
+                fs.read_group_projected(group, &projection, &mut pg)?;
+                let group_codes = match layout.group {
+                    Some(c) if !numeric[c] => Some(fs.read_codes(group, c)?),
+                    _ => None,
+                };
+                let f64_time = time_f64.then(|| pg.col(at(layout.time)));
+                let f64_group = group_f64.map(|g| pg.col(at(g)));
+                for r in 0..len {
+                    let t = row_time(r, &ints, &codes, f64_time);
+                    let g = row_group(r, &group_codes, f64_group);
+                    pass.step(group, t, g, |k| {
+                        row.clear();
+                        row.extend(gate_at[k].iter().map(|&c| pg.col(c)[r]));
+                        expr::eval(&p.gates[k].spec.tree, &row)
+                    })?;
+                }
+            }
+            io_s += t_io.elapsed().as_secs_f64();
+            Some(pass.finish(p, &mut acc))
+        }
+        None => None,
+    };
+    if opts.final_read {
+        acc.pass = Pass::TrainOnly;
+    }
+    let mut needed: Vec<usize> = named.iter().map(|&p| layout.vars[p]).collect();
+    needed.push(layout.target);
+    needed.extend(layout.fit_label);
+    if time_f64 {
+        needed.push(layout.time);
+    }
+    needed.extend(group_f64);
+    let projection = store::Projection::from_indices(&fs, &needed)?;
+    let at = |index: usize| -> usize {
+        projection.columns().iter().position(|c| c.index == index).expect("projected column")
+    };
+    let var_at: Vec<(usize, usize)> = named.iter().map(|&p| (p, at(layout.vars[p]))).collect();
+    let target_at = at(layout.target);
+    let fit_label_at = layout.fit_label.map(at);
+    let time_at = time_f64.then(|| at(layout.time));
+    let group_at = group_f64.map(at);
+    let mut scan = ScanStats {
+        store_columns: header.n_cols,
+        named_variables: named.len(),
+        projected_columns: projection.len(),
+        ..ScanStats::default()
+    };
+    let mut pg = store::ProjectedGroup::new();
+    // Positions no candidate names stay 0.0: `expr::eval` reads a row only at `Input` nodes.
+    let mut features = vec![0.0f64; layout.vars.len() + acc.n_states];
     for pass in 0..(if opts.final_read { 2 } else { 1 }) {
         if pass == 1 {
             acc.begin_test_pass(spec, &trees)?;
         }
     for group in 0..fs.n_groups() {
         let t_io = std::time::Instant::now();
-        let view = fs.load_group_with(group, &mut buf, &mut scratch)?;
-        let len = view.len();
+        let len = header.group_len(group);
         let time_i64 = if layout.time_i64 {
             Some(fs.read_i64(group, layout.time)?)
         } else {
@@ -859,41 +1293,43 @@ fn run_store_clocked(
         } else {
             Some(fs.read_codes(group, layout.time)?)
         };
+        // An exact i64 or dictionary time is known before the value read; an f64 time is part of it.
+        let known_unwanted = match (&time_i64, &time_codes) {
+            (Some(ints), _) => !ints.iter().any(|&i| acc.wants(i as f64)),
+            (None, Some(codes)) => !codes.iter().any(|&c| acc.wants(time_of_code(c))),
+            (None, None) => false,
+        };
+        if known_unwanted {
+            io_s += t_io.elapsed().as_secs_f64();
+            scan.groups_skipped += 1;
+            continue;
+        }
+        let stats = fs.read_group_projected(group, &projection, &mut pg)?;
+        scan.groups_read += stats.groups;
+        scan.value_bytes += stats.value_bytes;
         let group_codes = match layout.group {
             Some(c) if !numeric[c] => Some(fs.read_codes(group, c)?),
             _ => None,
         };
         io_s += t_io.elapsed().as_secs_f64();
-        let time_levels = header.levels(layout.time);
+        let var_cols: Vec<(usize, &[f64])> = var_at.iter().map(|&(p, c)| (p, pg.col(c))).collect();
+        let target_col = pg.col(target_at);
+        let fit_label_col = fit_label_at.map(|c| pg.col(c));
+        let f64_time = time_at.map(|c| pg.col(c));
+        let f64_group = group_at.map(|c| pg.col(c));
         for r in 0..len {
-            let t = match (&time_i64, &time_codes) {
-                (Some(ints), _) => ints.get(r).copied().unwrap_or(i64::MIN) as f64,
-                (None, None) => view.col(layout.time)[r],
-                (None, Some(codes)) => {
-                    let code = codes.get(r).copied().unwrap_or(0) as usize;
-                    time_levels
-                        .and_then(|l| l.get(code))
-                        .and_then(|s| data::parse_time(s))
-                        .unwrap_or(f64::NAN)
-                }
-
-            };
+            let t = row_time(r, &time_i64, &time_codes, f64_time);
             if !acc.wants(t) {
                 continue;
             }
-            features.clear();
-            for &c in &layout.vars {
-                features.push(view.col(c)[r]);
+            for &(p, col) in &var_cols {
+                features[p] = col[r];
             }
-            let g = match (layout.group, &group_codes) {
-                (None, _) => 0,
-                (Some(_), Some(codes)) => {
-                    let code = codes.get(r).copied().unwrap_or(0) as usize;
-                    group_ids.get(code).copied().unwrap_or(label_group_id(""))
-                }
-                (Some(c), None) => group_key(view.col(c)[r]),
-            };
-            let y = ret_in(opts, view.col(layout.target)[r]);
+            if let Some(s) = &states {
+                s.write_row(&mut features[layout.vars.len()..], group, r);
+            }
+            let g = row_group(r, &group_codes, f64_group);
+            let y = labelled(ret_in(opts, target_col[r]), fit_label_col.map(|c| c[r]));
             acc.add(t, g, &features, y, &trees);
         }
     }
@@ -904,6 +1340,7 @@ fn run_store_clocked(
         fs.group_rows()
     );
     let mut report = acc.finish(clock, spec, opts, &layout, "store-stream", &bound, &trees)?;
+    report.scan = Some(scan);
     report.ledger.record_stage(crate::gpu_stats::Stage::Io, io_s);
     report.ledger.record_stage(crate::gpu_stats::Stage::Pnl, t_pnl.elapsed().as_secs_f64() - io_s);
     Ok(report)
@@ -924,9 +1361,181 @@ struct Layout {
     /// The store keeps the time column as `i64`; read it exactly rather than
     /// through the `f64` value block (which is absent).
     time_i64: bool,
+    /// #1291: the fit label column of [`LabelledRows::FitLabel`].
+    fit_label: Option<usize>,
 }
 
-fn resolve_layout(spec: &EvalSpec, names: &[String], numeric: &[bool]) -> Result<Layout, String> {
+/// #1214: one gate the windows read: its spec, the run field or flag it came
+/// from and the data columns of its inputs.
+#[derive(Clone, Debug)]
+struct PlanGate {
+    spec: crate::regime_gate::GateSpec,
+    source: String,
+    cols: Vec<usize>,
+}
+
+/// #1214: the gates of a walk-forward under `rcsr-gate-state/1` and the reader
+/// of each: the run's mask (#1180), the regime expressions (#1175) and the
+/// switch of each candidate. Equal gates share one entry. The state of gate `k`
+/// is feature `vars.len() + k` of every row.
+#[derive(Clone, Debug, Default)]
+struct GatePlan {
+    gates: Vec<PlanGate>,
+    mask: Option<usize>,
+    regimes: Vec<usize>,
+    switches: Vec<Option<usize>>,
+    /// The locked ranges this run does not open, each up to its lookback embargo.
+    barriers: Vec<crate::regime_gate::Barrier>,
+}
+
+fn gate_plan(spec: &EvalSpec, opts: &ProtocolOptions, names: &[String], numeric: &[bool]) -> Result<Option<GatePlan>, String> {
+    if opts.mask.is_none() && opts.regime_exprs.is_empty() && opts.switches.iter().all(Option::is_none) {
+        return Ok(None);
+    }
+    let mut plan = GatePlan {
+        barriers: opts
+            .locked_reach(spec)
+            .into_iter()
+            .map(|(s, _, _, reach)| crate::regime_gate::Barrier { start: s, end: reach, kind: crate::regime_gate::BarrierKind::Locked })
+            .collect(),
+        ..GatePlan::default()
+    };
+    let mut add = |gate: &crate::regime_gate::GateSpec, source: String, missing: &dyn Fn(&str) -> String, text: &dyn Fn(&str) -> String| -> Result<usize, String> {
+        if let Some(k) = plan.gates.iter().position(|g| g.spec.identity() == gate.identity()) {
+            return Ok(k);
+        }
+        let mut cols = Vec::with_capacity(gate.columns.len());
+        for name in &gate.columns {
+            let j = names.iter().position(|n| n == name).ok_or_else(|| missing(name))?;
+            if !numeric.get(j).copied().unwrap_or(false) {
+                return Err(text(name));
+            }
+            cols.push(j);
+        }
+        plan.gates.push(PlanGate { spec: gate.clone(), source, cols });
+        Ok(plan.gates.len() - 1)
+    };
+    let mask = match &opts.mask {
+        Some(g) => Some(add(
+            g,
+            "objective.spec.pnl_mask".to_string(),
+            &|n| format!("the run's regime mask reads column '{}', which is not in the data (pass --unmasked to price the raw formula)", n),
+            &|n| format!("the run's regime mask column '{}' must be numeric", n),
+        )?),
+        None => None,
+    };
+    let mut regimes = Vec::with_capacity(opts.regime_exprs.len());
+    for e in &opts.regime_exprs {
+        regimes.push(add(
+            &e.gate,
+            format!("--regime-expr {}", e.name),
+            &|n| format!("the regime expression {} reads column '{}', which is not in the data", e.name, n),
+            &|n| format!("the regime expression {} column '{}' must be numeric", e.name, n),
+        )?);
+    }
+    let mut switches = Vec::with_capacity(opts.switches.len());
+    for c in &opts.switches {
+        switches.push(match c {
+            Some(c) => Some(add(
+                &c.switch.gate,
+                c.source.clone(),
+                &|n| format!("the switch gate of {} reads column '{}', which is not in the data", c.source, n),
+                &|n| format!("the switch gate of {} column '{}' must be numeric", c.source, n),
+            )?),
+            None => None,
+        });
+    }
+    plan.mask = mask;
+    plan.regimes = regimes;
+    plan.switches = switches;
+    Ok(Some(plan))
+}
+
+/// #1214: the gate pass. One tape per gate reads every gate row of the data in
+/// file order up to the last window end and records the state of each row and
+/// the warm-up at each window's test start.
+struct GatePass {
+    tapes: Vec<crate::regime_gate::GateTape>,
+    /// `[gate][chunk][row]`: 1 on, 0 off, 3 off on a non-finite value, 2 not a readable gate row.
+    codes: Vec<Vec<Vec<u8>>>,
+    end: f64,
+}
+
+impl GatePass {
+    fn new(plan: &GatePlan, acc: &Accum) -> GatePass {
+        let starts: Vec<f64> = acc.windows.iter().map(|d| d.window.test_start).collect();
+        let end = acc.windows.iter().map(|d| d.window.test_end.max(d.window.train_end)).fold(f64::NEG_INFINITY, f64::max);
+        GatePass {
+            tapes: plan.gates.iter().map(|g| crate::regime_gate::GateTape::with_starts(&g.spec, plan.barriers.clone(), &starts)).collect(),
+            codes: vec![Vec::new(); plan.gates.len()],
+            end,
+        }
+    }
+
+    /// Row `r` of `chunk` (rows in file order); `value(k)` is the value of gate `k` on the row.
+    fn step(&mut self, chunk: usize, t: f64, group: u64, mut value: impl FnMut(usize) -> f64) -> Result<(), String> {
+        for (k, tape) in self.tapes.iter_mut().enumerate() {
+            let mut finite = true;
+            let state = if t < self.end {
+                tape.step_with(group, t, || {
+                    let v = value(k);
+                    finite = v.is_finite();
+                    v
+                })?
+            } else {
+                None
+            };
+            let codes = &mut self.codes[k];
+            if codes.len() <= chunk {
+                codes.resize(chunk + 1, Vec::new());
+            }
+            codes[chunk].push(match state {
+                Some(true) => 1,
+                Some(false) if finite => 0,
+                Some(false) => 3,
+                None => 2,
+            });
+        }
+        Ok(())
+    }
+
+    fn finish(self, plan: &GatePlan, acc: &mut Accum) -> GateStates {
+        acc.n_states = plan.gates.len();
+        for d in &mut acc.windows {
+            d.test_states = vec![Vec::new(); plan.gates.len()];
+        }
+        acc.gate_plan = Some(plan.clone());
+        acc.gate_warm = self.tapes.iter().map(|t| t.warm_ups()).collect();
+        acc.gate_rows_read = self.tapes.first().map_or(0, |t| t.rows_read());
+        GateStates { codes: self.codes }
+    }
+}
+
+/// #1214: the state of every gate on every row the gate pass read.
+struct GateStates {
+    codes: Vec<Vec<Vec<u8>>>,
+}
+
+impl GateStates {
+    fn width(&self) -> usize {
+        self.codes.len()
+    }
+
+    /// Writes the state of every gate on row `r` of `chunk`: 1 on, 0 off, -1 off on a non-finite
+    /// gate value, NaN for a row the pass did not read.
+    fn write_row(&self, out: &mut [f64], chunk: usize, r: usize) {
+        for (k, codes) in self.codes.iter().enumerate() {
+            out[k] = match codes.get(chunk).and_then(|c| c.get(r)) {
+                Some(1) => 1.0,
+                Some(0) => 0.0,
+                Some(3) => -1.0,
+                _ => f64::NAN,
+            };
+        }
+    }
+}
+
+fn resolve_layout(spec: &EvalSpec, opts: &ProtocolOptions, names: &[String], numeric: &[bool]) -> Result<Layout, String> {
     let find = |name: &str| -> Result<usize, String> {
         names
             .iter()
@@ -970,6 +1579,14 @@ fn resolve_layout(spec: &EvalSpec, names: &[String], numeric: &[bool]) -> Result
         }
     }
     let var_names = vars.iter().map(|&j| names[j].clone()).collect();
+    let fit_label = match opts.labelled_rows.fit_label() {
+        Some(name) => match names.iter().position(|n| n == name) {
+            Some(j) if numeric.get(j).copied().unwrap_or(false) => Some(j),
+            _ if opts.fit_label_required => return Err(format!("{} '{}' (the target spec's label column) is not a numeric column of the data: the run's books hold the rows whose fit label and return are finite", FIT_LABEL_REFUSAL, name)),
+            _ => None,
+        },
+        None => None,
+    };
     Ok(Layout {
         target,
         time,
@@ -978,14 +1595,18 @@ fn resolve_layout(spec: &EvalSpec, names: &[String], numeric: &[bool]) -> Result
         vars,
         var_names,
         time_i64: false,
+        fit_label,
     })
 }
 
-fn parse_expressions(spec: &EvalSpec, layout: &Layout) -> Result<Vec<Node>, String> {
-    let mut out = Vec::new();
-    for src in candidate_expressions(spec) {
-        let tree = expr::parse(&src, &layout.var_names)
-            .map_err(|e| format!("cannot parse expression '{}': {}", src, e))?;
+/// #1291: the start of the refusal of a data file without the fit label column (exit 2).
+pub const FIT_LABEL_REFUSAL: &str = "fit label column";
+
+/// The tree of every candidate. A switch candidate is `if(state, on, off)` over
+/// the state feature of its gate: its score on a row is the held branch's score.
+fn parse_expressions(spec: &EvalSpec, opts: &ProtocolOptions, layout: &Layout, plan: Option<&GatePlan>) -> Result<Vec<Node>, String> {
+    let parse = |src: &str| -> Result<Node, String> {
+        let tree = expr::parse(src, &layout.var_names).map_err(|e| format!("cannot parse expression '{}': {}", src, e))?;
         if has_dataset_op(&tree) {
             return Err(
                 "walk-forward expressions cannot use dataset aggregates or meta operators; \
@@ -993,7 +1614,18 @@ fn parse_expressions(spec: &EvalSpec, layout: &Layout) -> Result<Vec<Node>, Stri
                     .to_string(),
             );
         }
-        out.push(tree);
+        Ok(tree)
+    };
+    let mut out = Vec::new();
+    for (c, src) in candidate_expressions(spec).iter().enumerate() {
+        let gate = plan.and_then(|p| p.switches.get(c).copied().flatten());
+        match (opts.switches.get(c).and_then(Option::as_ref), gate) {
+            (Some(sw), Some(k)) => {
+                let state = expr::input(layout.vars.len() + k);
+                out.push(expr::node(expr::Op::If, vec![state, parse(&sw.switch.on)?, parse(&sw.switch.off)?]));
+            }
+            _ => out.push(parse(src)?),
+        }
     }
     Ok(out)
 }
@@ -1021,9 +1653,97 @@ pub fn top_tercile_refusal(spec: &EvalSpec, opts: &ProtocolOptions) -> Option<St
     })
 }
 
+/// #1094: the refusal message when `--threshold-fit fitness` meets a policy or
+/// flag whose book is not the plain CPU threshold book. The CLI reports it as a
+/// usage error.
+pub fn threshold_fit_conflict(policy: Policy, band_select: bool, device_pnl: bool, batch_pnl: bool) -> Option<String> {
+    if policy != Policy::Threshold {
+        return Some(format!(
+            "--threshold-fit fitness prices the plain threshold book; --policy {} is refused",
+            policy.as_str()
+        ));
+    }
+    let refused = [(band_select, "--select-band"), (device_pnl, "--device-pnl"), (batch_pnl, "--batch-pnl")];
+    refused.iter().find(|(set, _)| *set).map(|(_, flag)| {
+        format!("--threshold-fit fitness is not supported with {}: the fitted cut prices the CPU threshold book only", flag)
+    })
+}
+
+/// #1094: why `--threshold-fit fitness` cannot run with this spec, or `None`.
+pub fn threshold_fit_refusal(spec: &EvalSpec, opts: &ProtocolOptions) -> Option<String> {
+    let fit = opts.threshold_fit.as_ref()?;
+    if fit.min_entry_times == 0 {
+        return Some("--threshold-fit fitness: --cut-min-entries must be at least 1".to_string());
+    }
+    if fit.blocks == 0 || fit.blocks > crate::trading::FITNESS_MAX_BLOCKS {
+        return Some(format!(
+            "--threshold-fit fitness: --cut-blocks must be 1 to {}, got {}",
+            crate::trading::FITNESS_MAX_BLOCKS,
+            fit.blocks
+        ));
+    }
+    if !fit.lambda.is_finite() || fit.lambda < 0.0 {
+        return Some(format!("--threshold-fit fitness: --cut-lambda must be finite and >= 0, got {}", fit.lambda));
+    }
+    if let Some(msg) = threshold_fit_conflict(spec.policy, spec.band_select, spec.device_pnl, opts.batch_pnl) {
+        return Some(msg);
+    }
+    if spec.threshold_fixed.is_none() {
+        return Some("--threshold-fit fitness needs a reference cut: pass --threshold-fixed or --from-run".to_string());
+    }
+    None
+}
+
+/// #1176: the refusal of `--all-members` for these inputs, or `None`. The CLI
+/// reports it as a usage error before any data work.
+pub fn all_members_conflict(front: bool, band_select: bool, threshold_fit: bool, vote: bool, locked_read: bool) -> Option<String> {
+    if !front {
+        return Some("--all-members needs --front: it prices every member of a run's Pareto front".to_string());
+    }
+    if locked_read {
+        return Some("--all-members refuses --locked-test: a locked read reports the sealed candidate only".to_string());
+    }
+    let refused = [(band_select, "--select-band"), (threshold_fit, "--threshold-fit"), (vote, "--policy vote")];
+    refused.iter().find(|(set, _)| *set).map(|(_, flag)| {
+        format!("--all-members refuses {}: it prices every front member with its carried threshold and band and selects none", flag)
+    })
+}
+
+/// #1176: why `--all-members` cannot run with this spec, or `None`.
+pub fn all_members_refusal(spec: &EvalSpec, opts: &ProtocolOptions) -> Option<String> {
+    if !opts.all_members {
+        return None;
+    }
+    all_members_conflict(opts.front.is_some(), spec.band_select, opts.threshold_fit.is_some(), spec.policy == Policy::Vote, opts.final_read)
+}
+
 /// Votes needed for a long row: `ceil(quorum x K)`, at least 1.
 pub fn votes_required(quorum: f64, members: usize) -> usize {
     ((quorum * members as f64 - 1e-9).ceil().max(1.0) as usize).min(members.max(1))
+}
+
+/// #1211: stderr warning when `ceil(quorum x K)` rounds a product just above an
+/// integer up to the next vote count, or `None`.
+pub fn vote_quorum_warning(quorum: f64, members: usize) -> Option<String> {
+    let p = quorum * members as f64;
+    let whole = p.floor();
+    let frac = p - whole;
+    if members == 0 || whole < 1.0 || frac <= 1e-9 || frac > 0.05 + 1e-9 {
+        return None;
+    }
+    let need = votes_required(quorum, members);
+    let lower = (whole / members as f64 * 100.0).floor() / 100.0;
+    Some(format!(
+        "warning: --quorum {} over {} members requires {} votes: ceil({} x {}) = ceil({}); use --quorum {} for {} votes",
+        quorum,
+        members,
+        need,
+        quorum,
+        members,
+        format!("{:.4}", p).trim_end_matches('0').trim_end_matches('.'),
+        lower,
+        votes_required(lower, members)
+    ))
 }
 
 /// #930: the refusal message when `--policy vote` is combined with a flag or
@@ -1104,6 +1824,9 @@ fn validate_windows(spec: &EvalSpec, opts: &ProtocolOptions) -> Result<(), Strin
             return Err(format!("the run carries {} bands for {} candidates", bands.len(), n));
         }
     }
+    if let Some(msg) = all_members_refusal(spec, opts) {
+        return Err(msg);
+    }
     if spec.policy == Policy::TopTercile {
         if let Some(msg) = top_tercile_refusal(spec, opts) {
             return Err(msg);
@@ -1117,9 +1840,12 @@ fn validate_windows(spec: &EvalSpec, opts: &ProtocolOptions) -> Result<(), Strin
             return Err(msg);
         }
     }
+    if let Some(msg) = threshold_fit_refusal(spec, opts) {
+        return Err(msg);
+    }
     let table_validation = !opts.validation_starts.is_empty()
         && spec.windows.iter().all(|w| opts.validation_starts.iter().any(|(l, _)| *l == w.label));
-    if spec.candidates.len() > 1 && spec.policy != Policy::Vote && spec.validation_frac <= 0.0 && !table_validation {
+    if spec.candidates.len() > 1 && spec.policy != Policy::Vote && spec.validation_frac <= 0.0 && !table_validation && !opts.all_members {
         return Err(
             "multiple --expr candidates need a validation slice (--validation-frac > 0 or a windows \
              table with validation_start): select on a validation slice, never on the test block"
@@ -1230,7 +1956,7 @@ fn group_key(v: f64) -> u64 {
     if v.is_nan() {
         u64::MAX
     } else {
-        v.to_bits()
+        (v + 0.0).to_bits()
     }
 }
 
@@ -1246,6 +1972,10 @@ fn label_group_id(text: &str) -> u64 {
 }
 
 fn table_group_ids(table: &Table, col: usize) -> Vec<u64> {
+    // A numeric key is its value on both readers; the dictionary only keeps its source text.
+    if table.numeric[col] {
+        return table.col(col).iter().map(|&v| group_key(v)).collect();
+    }
     if let Some(dict) = table.dict(col) {
         let ids: Vec<u64> = dict.levels.iter().map(|l| label_group_id(l)).collect();
         let missing = label_group_id("");
@@ -1259,6 +1989,7 @@ fn table_group_ids(table: &Table, col: usize) -> Vec<u64> {
 // Accumulation
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct RowBase {
     time: f64,
     group: u64,
@@ -1275,6 +2006,8 @@ struct WindowData {
     validation_rows: Vec<RowBase>,
     validation_scores: Vec<Vec<f64>>,
     test_rows: Vec<RowBase>,
+    /// #1214: the state of every plan gate on every test row (1, 0, NaN), one vector per gate.
+    test_states: Vec<Vec<f64>>,
     test_scores: Vec<Vec<f64>>,
     /// Sum and count of the finite training-interval targets (#310 constant
     /// control).
@@ -1282,7 +2015,14 @@ struct WindowData {
     train_target_n: u64,
     /// Latest stamp of any row that entered training or validation.
     train_max_time: f64,
+    /// #1176: training rows outside the validation slice, scored or not.
+    train_seen: usize,
     dropped: usize,
+    /// #1094: the training rows and every candidate's score on them (NaN kept),
+    /// the source of a fitted cut in a window without a validation slice.
+    keep_train_rows: bool,
+    train_rows: Vec<RowBase>,
+    train_row_scores: Vec<Vec<f64>>,
 }
 
 /// Which rows an [`Accum`] scores. A final read scores in two passes: the
@@ -1312,6 +2052,13 @@ struct Accum {
     test_candidates: Vec<usize>,
     /// `--policy vote`: the final read scores every member on the test rows.
     vote: bool,
+    threshold_fit: Option<CutFit>,
+    /// #1214: the gate plan, the states' first feature index and count, the warm-up
+    /// of every gate at every window start and the gate rows the pass read.
+    gate_plan: Option<GatePlan>,
+    n_states: usize,
+    gate_warm: Vec<Vec<crate::regime_gate::WarmUp>>,
+    gate_rows_read: usize,
 }
 
 impl Accum {
@@ -1357,11 +2104,16 @@ impl Accum {
                 validation_rows: Vec::new(),
                 validation_scores: vec![Vec::new(); candidates],
                 test_rows: Vec::new(),
+                test_states: Vec::new(),
                 test_scores: vec![Vec::new(); candidates],
                 train_target_sum: 0.0,
                 train_target_n: 0,
                 train_max_time: f64::NEG_INFINITY,
+                train_seen: 0,
                 dropped: 0,
+                keep_train_rows: opts.threshold_fit.is_some() && validation_start.is_none(),
+                train_rows: Vec::new(),
+                train_row_scores: vec![Vec::new(); candidates],
             });
         }
         Ok(Accum {
@@ -1375,6 +2127,11 @@ impl Accum {
             forced: None,
             test_candidates: Vec::new(),
             vote: spec.policy == Policy::Vote,
+            threshold_fit: opts.threshold_fit,
+            gate_plan: None,
+            n_states: 0,
+            gate_warm: Vec::new(),
+            gate_rows_read: 0,
         })
     }
 
@@ -1399,26 +2156,27 @@ impl Accum {
 
     fn add(&mut self, t: f64, group: u64, features: &[f64], target: f64, trees: &[Node]) {
         debug_assert_eq!(trees.len(), self.candidates);
+        let states = &features[features.len() - self.n_states..];
         match self.pass {
             Pass::All | Pass::TrainOnly => {
                 for (s, tree) in self.scores.iter_mut().zip(trees) {
                     *s = expr::eval(tree, features);
                 }
-                push_scores(&mut self.windows, t, group, target, &self.scores, self.pass == Pass::All);
+                push_scores(&mut self.windows, t, group, (target, states), &self.scores, self.pass == Pass::All);
             }
             Pass::TestOnly => {
                 if self.vote {
                     for (s, tree) in self.scores.iter_mut().zip(trees) {
                         *s = expr::eval(tree, features);
                     }
-                    push_all_test(&mut self.windows, t, group, target, &self.scores);
+                    push_all_test(&mut self.windows, t, group, (target, states), &self.scores);
                     return;
                 }
                 for &c in &self.test_candidates {
                     self.scores[c] = expr::eval(&trees[c], features);
                 }
                 let forced = self.forced.as_deref().expect("the test pass follows the selection");
-                push_selected_test(&mut self.windows, forced, t, group, target, &self.scores);
+                push_selected_test(&mut self.windows, forced, t, group, (target, states), &self.scores);
             }
         }
     }
@@ -1437,7 +2195,7 @@ impl Accum {
                     d.window.label
                 ));
             }
-            chosen.push(select_candidate(d, spec, trees, has_validation)?.candidate);
+            chosen.push(select_candidate(d, spec, trees, has_validation, self.threshold_fit.as_ref())?.candidate);
         }
         if self.vote {
             self.test_candidates = (0..trees.len()).collect();
@@ -1454,6 +2212,107 @@ impl Accum {
         Ok(())
     }
 
+    /// #1176: the accumulation a scan of candidate `k` alone would have made:
+    /// the same rows, the scores of `k` and its own dropped-row count.
+    fn member(&self, k: usize) -> Accum {
+        let windows = self
+            .windows
+            .iter()
+            .map(|d| {
+                let test_bad = d.test_rows.iter().zip(&d.test_scores[k]).filter(|(r, s)| !r.target.is_finite() || !s.is_finite()).count();
+                WindowData {
+                    window: d.window.clone(),
+                    validation_start: d.validation_start,
+                    train_scores: vec![d.train_scores[k].clone()],
+                    train_score_max_time: vec![d.train_score_max_time[k]],
+                    validation_rows: d.validation_rows.clone(),
+                    validation_scores: vec![d.validation_scores[k].clone()],
+                    test_rows: d.test_rows.clone(),
+                    test_states: d.test_states.clone(),
+                    test_scores: vec![d.test_scores[k].clone()],
+                    train_target_sum: d.train_target_sum,
+                    train_target_n: d.train_target_n,
+                    train_max_time: d.train_max_time,
+                    train_seen: d.train_seen,
+                    dropped: d.train_seen - d.train_scores[k].len() + test_bad,
+                    keep_train_rows: d.keep_train_rows,
+                    train_rows: d.train_rows.clone(),
+                    train_row_scores: vec![d.train_row_scores[k].clone()],
+                }
+            })
+            .collect();
+        Accum {
+            locked: self.locked.clone(),
+            locked_purge: self.locked_purge,
+            locked_embargo: self.locked_embargo,
+            windows,
+            candidates: 1,
+            scores: vec![0.0],
+            pass: Pass::All,
+            forced: None,
+            test_candidates: Vec::new(),
+            vote: false,
+            threshold_fit: None,
+            gate_plan: self.gate_plan.as_ref().map(|p| GatePlan { switches: vec![p.switches.get(k).copied().flatten()], regimes: Vec::new(), ..p.clone() }),
+            n_states: self.n_states,
+            gate_warm: self.gate_warm.clone(),
+            gate_rows_read: self.gate_rows_read,
+        }
+    }
+
+    /// #1176: every front member priced alone, as `--expr <member>` with the
+    /// member's carried band. The members never enter the selection of the
+    /// parent report; they carry no bootstrap, null or batch section.
+    #[allow(clippy::too_many_arguments)]
+    fn price_members(
+        &self,
+        clock: std::time::Instant,
+        spec: &EvalSpec,
+        opts: &ProtocolOptions,
+        layout: &Layout,
+        source: &str,
+        memory_bound: &str,
+        trees: &[Node],
+    ) -> Result<Vec<Member>, String> {
+        let front = opts.front.as_ref().ok_or_else(|| "--all-members needs --front".to_string())?;
+        let expressions = candidate_expressions(spec);
+        let mut out = Vec::with_capacity(self.candidates);
+        for k in 0..self.candidates {
+            let one = EvalSpec {
+                expression: expressions[k].clone(),
+                candidates: Vec::new(),
+                band_select: false,
+                device_pnl: false,
+                ..spec.clone()
+            };
+            let one_opts = ProtocolOptions {
+                bootstrap_draws: 0,
+                null_draws: 0,
+                batch_pnl: false,
+                run_bands: opts.run_bands.as_ref().map(|b| vec![b[k].clone()]),
+                front: Some(FrontSource { labels: vec![front.labels[k].clone()], ranks: vec![front.ranks[k]], ..front.clone() }),
+                regimes: None,
+                regime_exprs: Vec::new(),
+                period_series: true,
+                emit_series: true,
+                all_members: false,
+                ..opts.clone()
+            };
+            let report = self
+                .member(k)
+                .finish(clock, &one, &one_opts, layout, source, memory_bound, &trees[k..=k])
+                .map_err(|e| format!("{}: {}", front.labels[k], e))?;
+            out.push(Member {
+                archive_rank: front.ranks[k],
+                label: front.labels[k].clone(),
+                complexity: expr::complexity(&trees[k]),
+                constant: crate::trading::is_constant(&trees[k]),
+                report,
+            });
+        }
+        Ok(out)
+    }
+
 
 
     fn finish(
@@ -1466,6 +2325,12 @@ impl Accum {
         memory_bound: &str,
         trees: &[Node],
     ) -> Result<Report, String> {
+        let member_reports = if opts.all_members {
+            Some(self.price_members(clock, spec, opts, layout, source, memory_bound, trees)?)
+        } else {
+            None
+        };
+        let emit_series = opts.emit_series || opts.all_members;
         let cost_side = spec.cost_bps / 10_000.0;
         let mut windows = Vec::with_capacity(self.windows.len());
         let mut pooled_returns: Vec<f64> = Vec::new();
@@ -1477,6 +2342,7 @@ impl Accum {
         let mut seam_trades = 0usize;
         let mut previous_end: Option<HashMap<u64, f64>> = None;
         let mut pooled_previous: HashMap<u64, f64> = HashMap::new();
+        let mut previous_test_end: Option<f64> = None;
         let expressions = candidate_expressions(spec);
         let want_inference = opts.bootstrap_draws > 0 || opts.null_draws > 0;
         let vote = spec.policy == Policy::Vote;
@@ -1498,10 +2364,36 @@ impl Accum {
         let mut const_all: Vec<f64> = Vec::new();
         let (mut bh_rows, mut bh_long, mut const_rows, mut const_long) = (0u64, 0u64, 0u64, 0u64);
         let mut cand_cols: Vec<Vec<f64>> = vec![Vec::new(); n_candidates];
+        let want_columns = opts.bootstrap_draws > 0 && !opts.final_read;
+        let (mut column_bh, mut column_const): (Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new());
         let mut books: Vec<crate::wf_protocol::NullBook> = Vec::new();
         let mut batch_in: Vec<crate::wf_batch::WindowScores> = Vec::new();
         let forced = self.forced.as_deref();
+        let plan = self.gate_plan.unwrap_or_default();
+        let gate_warm = self.gate_warm;
+        let gate_rows_read = self.gate_rows_read;
+        let target_grid = opts.period_grid == PeriodGrid::Target;
+        let mut period_rows: Vec<usize> = Vec::new();
+        let mut empty_periods = 0usize;
+        let mut unpriced_target_rows = 0usize;
+        let want_strata = opts.regimes.is_some() || !opts.regime_exprs.is_empty() || opts.period_series || emit_series;
+        let mut strata_in = StrataIn::new(opts.regime_exprs.len());
+        let mut entry_times = 0usize;
+        let validated = self.windows.iter().all(|d| d.validation_start.is_some());
         for (window_index, mut d) in self.windows.into_iter().enumerate() {
+            // #1199: the target grid, its period width and the rows that define it come from the rows before the gate.
+            let grid_source = target_grid.then(|| {
+                let rows: Vec<usize> = (0..d.test_rows.len()).filter(|&i| d.test_rows[i].target.is_finite()).collect();
+                (target_times(&d.test_rows), window_period(spec, opts, &d.test_rows), rows)
+            });
+            // #1214: every gate state comes from the gate pass (rcsr-gate-state/1).
+            let regime_values: Vec<Vec<f64>> = plan.regimes.iter().map(|&k| d.test_states[k].clone()).collect();
+            let regime_states: Vec<Vec<bool>> = regime_values.iter().map(|v| v.iter().map(|&s| s > 0.5).collect()).collect();
+            // #1203: the in-report candidate columns sit on the target grid of the rows before the gate.
+            let column_times = (want_columns && !target_grid).then(|| target_times(&d.test_rows));
+            if let Some(k) = plan.mask {
+                apply_mask(&mut d, k, window_index);
+            }
             {
                 let labelled = d.test_rows.iter().filter(|r| r.target.is_finite());
                 let book = crate::trading::TradingRows {
@@ -1531,8 +2423,9 @@ impl Accum {
                     d.window.label, d.window.test_start, d.window.test_end
                 ));
             }
-            let Selected { mut candidate, mut validation_error, mut threshold, band_selection, mut thresholds } =
-                select_candidate(&d, spec, trees, has_validation)?;
+            let Selected { mut candidate, mut validation_error, mut threshold, band_selection, mut thresholds, mut cuts } =
+                select_candidate(&d, spec, trees, has_validation, opts.threshold_fit.as_ref())?;
+            let cut = if vote { None } else { cuts[candidate].take() };
             let member_thresholds = if vote { thresholds.clone() } else { Vec::new() };
             if vote {
                 threshold = apply_vote(&mut d, &thresholds, need, spec.band_width);
@@ -1557,6 +2450,8 @@ impl Accum {
             }
             let source_name = if spec.policy == Policy::TopTercile {
                 ThresholdSource::None
+            } else if let Some(c) = &cut {
+                c.source
             } else if spec.threshold_fixed.is_some() {
                 ThresholdSource::Fixed
             } else if has_validation {
@@ -1564,7 +2459,10 @@ impl Accum {
             } else {
                 ThresholdSource::TrainType7
             };
-            let (ppy, inferred_dt, bucket, source) = window_period(spec, opts, &d.test_rows);
+            let (ppy, inferred_dt, bucket, source) = match &grid_source {
+                Some((_, period, _)) => *period,
+                None => window_period(spec, opts, &d.test_rows),
+            };
             period_source = Some(source);
             let mut fresh_previous: HashMap<u64, f64> = HashMap::new();
             let ev = evaluate_window(
@@ -1590,9 +2488,12 @@ impl Accum {
                     check_device: spec.device_pnl,
                 }),
                 opts.null_draws > 0,
+                opts.missing_score,
             );
             // Pooled path: carry each group's position across the seam unless
             // the caller asked for the historical flat reset.
+            let flat_here = spec.pool_reset_flat || (opts.flat_gaps && previous_test_end != Some(d.window.test_start));
+            previous_test_end = Some(d.window.test_end);
             let pev = if spec.pool_reset_flat {
                 evaluate_window(
                     &d.test_rows,
@@ -1609,8 +2510,12 @@ impl Accum {
                     false,
                     None,
                     false,
+                    opts.missing_score,
                 )
             } else {
+                if flat_here {
+                    pooled_previous.clear();
+                }
                 evaluate_window(
                     &d.test_rows,
                     &d.test_scores[candidate],
@@ -1626,10 +2531,11 @@ impl Accum {
                     false,
                     None,
                     false,
+                    opts.missing_score,
                 )
             };
-            if !spec.pool_reset_flat {
-                if let Some(prev_end) = &previous_end {
+            if !spec.pool_reset_flat && opts.mask.is_none() {
+                if let Some(prev_end) = previous_end.as_ref().filter(|_| !flat_here) {
                     for (group, &q_start) in &ev.first_positions {
                         let p_end = prev_end.get(group).copied().unwrap_or(0.0);
                         let delta = (q_start - p_end).abs();
@@ -1641,19 +2547,65 @@ impl Accum {
                 }
                 previous_end = Some(ev.end_positions.clone());
             }
+            unpriced_target_rows += unpriced_rows(&d.test_rows, &d.test_scores[candidate], spec.horizon, opts.missing_score);
+            let book_gate = plan.switches.get(candidate).copied().flatten().filter(|_| !vote);
+            let gate_json = book_gate.or(plan.mask).map(|k| {
+                let mut s = format!("{{\"source\":{},\"start\":{}", jstr(&plan.gates[k].source), gate_warm[k][window_index].json());
+                if book_gate.is_some() {
+                    s.push_str(&format!(",\"regime\":{}", switch_regime_json(&d, candidate, k, threshold, spec, opts, bucket, ppy)));
+                }
+                s.push('}');
+                s
+            });
             let train_rows = d.train_scores[candidate].len()
                 + d.validation_scores[candidate].len();
             dropped += d.dropped;
-            pooled_returns.extend_from_slice(&pev.returns);
-            pooled_gross.extend_from_slice(&pev.gross_returns);
+            let grid = match &grid_source {
+                Some((times, _, _)) => {
+                    Some(Grid::new(times, bucket, &pev.times).map_err(|e| format!("window '{}': {}", d.window.label, e))?)
+                }
+                None => None,
+            };
+            let column_grid = match &column_times {
+                Some(times) => Some(Grid::new(times, bucket, &ev.times).map_err(|e| format!("window '{}': {}", d.window.label, e))?),
+                None => None,
+            };
+            let on_grid = |v: &[f64]| -> Vec<f64> {
+                match &grid {
+                    Some(g) => g.pad(v),
+                    None => v.to_vec(),
+                }
+            };
+            if want_strata {
+                let valid: Vec<usize> = match &grid_source {
+                    Some((_, _, rows)) => rows.clone(),
+                    None => (0..d.test_rows.len())
+                        .filter(|&i| {
+                            let scored = opts.missing_score == MissingScore::Hold || d.test_scores[candidate].get(i).is_some_and(|s| s.is_finite());
+                            scored && d.test_rows[i].target.is_finite()
+                        })
+                        .collect(),
+                };
+                strata_in.add_window(&pev, bucket, opts, &d, &valid, (&regime_states, &regime_values), grid.as_ref());
+            }
+            pooled_returns.extend(on_grid(&pev.returns));
+            pooled_gross.extend(on_grid(&pev.gross_returns));
             pooled_stats.add_assign(&pev.stats);
+            entry_times += pev.entry_times;
             pooled_ppy.push(ppy);
-            pooled_times.extend_from_slice(&pev.times);
-            fresh_all.extend_from_slice(&ev.returns);
-            market_all.extend_from_slice(&ev.market);
+            match &grid {
+                Some(g) => {
+                    pooled_times.extend_from_slice(&g.times);
+                    period_rows.extend(g.pad_counts(&pev.counts));
+                    empty_periods += g.times.len() - g.slots.len();
+                }
+                None => pooled_times.extend_from_slice(&pev.times),
+            }
+            fresh_all.extend(on_grid(&ev.returns));
+            market_all.extend(on_grid(&ev.market));
             if let Some(c) = &ev.controls {
-                bh_all.extend_from_slice(&c.series[1]);
-                const_all.extend_from_slice(&c.series[2]);
+                bh_all.extend(on_grid(&c.series[1]));
+                const_all.extend(on_grid(&c.series[2]));
                 let bh = &c.get(crate::baselines::ControlKind::BuyAndHold).totals;
                 let cn = &c.get(crate::baselines::ControlKind::Constant).totals;
                 bh_rows += bh.rows;
@@ -1661,10 +2613,13 @@ impl Accum {
                 const_rows += cn.rows;
                 const_long += cn.long_rows;
             }
-            if opts.bootstrap_draws > 0 && !opts.final_read {
+            if let Some(cg) = grid.as_ref().or(column_grid.as_ref()).filter(|_| want_columns) {
+                // #1203: every candidate column, the selected one included, sits on the
+                // window's target grid with 0 where the candidate prices no row, and so
+                // do the SPA baselines of the columns.
                 for c in 0..n_candidates {
                     if c == candidate {
-                        cand_cols[c].extend_from_slice(&ev.returns);
+                        cand_cols[c].extend(cg.pad(&ev.returns));
                         continue;
                     }
                     let other = evaluate_window(
@@ -1682,18 +2637,21 @@ impl Accum {
                         false,
                         None,
                         false,
+                        opts.missing_score,
                     );
-                    for t in &ev.times {
-                        let v = match other.times.binary_search_by(|x| x.partial_cmp(t).unwrap()) {
-                            Ok(j) => other.returns[j],
-                            Err(_) => 0.0,
-                        };
-                        cand_cols[c].push(v);
-                    }
+                    let slots = cg.slots_of(&other.times).map_err(|e| format!("window '{}': {}", d.window.label, e))?;
+                    cand_cols[c].extend(pad_at(&slots, cg.times.len(), &other.returns));
+                }
+                if let Some(c) = &ev.controls {
+                    column_bh.extend(cg.pad(&c.series[1]));
+                    column_const.extend(cg.pad(&c.series[2]));
                 }
             }
             if let Some(b) = ev.book {
-                books.push(b);
+                books.push(match &grid {
+                    Some(g) => g.book(b),
+                    None => b,
+                });
             }
             if opts.batch_pnl {
                 batch_in.push(crate::wf_batch::WindowScores {
@@ -1720,6 +2678,8 @@ impl Accum {
                 window: d.window,
                 expression: if vote {
                     format!("vote {}/{}: {}", need, members, expressions.join(" ; "))
+                } else if plan.switches.get(candidate).copied().flatten().is_some() {
+                    expressions[candidate].clone()
                 } else {
                     expr::to_string(&trees[candidate], &layout.var_names)
                 },
@@ -1741,6 +2701,9 @@ impl Accum {
                 band: ev.band.map(|b| BandCheck { spec: Some(bands[candidate].clone()), ..b }),
                 hindsight_bound: ev.hindsight_bound,
                 band_selection,
+                cut,
+                entry_times: emit_series.then_some(pev.entry_times),
+                gate: gate_json,
             });
         }
 
@@ -1804,13 +2767,15 @@ impl Accum {
             constant_exposure: if const_rows == 0 { f64::NAN } else { const_long as f64 / const_rows as f64 },
         });
         let inference_report = if want_inference {
-            let zeros = vec![0.0; fresh_all.len()];
+            let candidates: Vec<Vec<f64>> = if want_columns { cand_cols } else { Vec::new() };
+            // #1203: SPA compares the candidate columns with a baseline on their grid.
+            let (bh, constant) = if candidates.is_empty() { (&bh_all, &const_all) } else { (&column_bh, &column_const) };
+            let zeros = vec![0.0; candidates.first().map_or(fresh_all.len(), Vec::len)];
             let baseline: &[f64] = match economics.best_baseline.as_str() {
-                "buy_and_hold" => &bh_all,
-                "constant_long_flat" => &const_all,
+                "buy_and_hold" => bh,
+                "constant_long_flat" => constant,
                 _ => &zeros,
             };
-            let candidates: Vec<Vec<f64>> = if opts.bootstrap_draws > 0 && !opts.final_read { cand_cols } else { Vec::new() };
             let mut inferred = crate::wf_protocol::infer(&crate::wf_protocol::InferenceInput {
                 draws: opts.bootstrap_draws,
                 null_draws: opts.null_draws,
@@ -1858,6 +2823,7 @@ impl Accum {
                 cost_side,
                 !spec.pool_reset_flat,
                 spec.control_seed,
+                opts.missing_score,
             )?)
         } else {
             None
@@ -1915,12 +2881,27 @@ impl Accum {
         };
         let selected_on = if vote {
             "none (all members vote; thresholds from validation or train rows)".to_string()
+        } else if expressions.len() > 1 && !validated {
+            "none (--all-members without a validation slice: the report book of every window is the first front member)".to_string()
         } else if expressions.len() > 1 {
             "validation".to_string()
         } else if spec.validation_frac > 0.0 {
             "validation (threshold only)".to_string()
         } else {
             "train (threshold only)".to_string()
+        };
+        let (regimes, period_extra) = if want_strata {
+            let r = (opts.regimes.is_some() || !opts.regime_exprs.is_empty()).then(|| strata_in.report(&pooled_returns, opts, pooled_ppy));
+            let mut extra = strata_in.extra;
+            if emit_series {
+                extra.cost = pooled_gross.iter().zip(&pooled_returns).map(|(g, n)| g - n).collect();
+                extra.entry_stamp = extra.entries.iter().map(|&e| if e > 0.0 { 1.0 } else { 0.0 }).collect();
+                extra.bh_net = bh_all.clone();
+                extra.entry_times = entry_times;
+            }
+            (r, Some(extra))
+        } else {
+            (None, None)
         };
         Ok(Report {
             expression: windows
@@ -1935,10 +2916,17 @@ impl Accum {
             pooled,
             period_net: pooled_returns,
             period_time: pooled_times,
+            period_grid: target_grid.then(|| GridSummary { rule: PeriodGrid::Target, empty_periods, period_rows }),
+            regimes,
+            gate: gate_report_json(&plan, gate_rows_read),
+            period_extra,
+            emit_series,
+            members: member_reports,
             cost: opts.cost_decl(spec.cost_bps),
             cost_bps: spec.cost_bps,
             threshold_quantile: spec.threshold_quantile,
             threshold_fixed: spec.threshold_fixed,
+            threshold_fit: opts.threshold_fit,
             policy: spec.policy,
             quorum: if vote { opts.quorum } else { None },
             votes_required: need,
@@ -1957,12 +2945,17 @@ impl Accum {
             candidates: expressions,
             selected_on,
             front: opts.front.clone(),
+            from_run: None,
             expression_source: opts.expression_source,
+            composite: opts.composite.clone(),
             band_select: spec.band_select,
             test_used_for_selection: false,
             pool_reset_flat: spec.pool_reset_flat,
             seam_cost,
             seam_trades,
+            missing_score: opts.missing_score,
+            missing_score_exits: pooled_stats.missing_score_exits,
+            unpriced_target_rows,
             sign_test,
             source: source.to_string(),
             memory_bound: memory_bound.to_string(),
@@ -1971,15 +2964,101 @@ impl Accum {
             device_pnl,
             batch_pnl,
             ledger,
+            scan: None,
             required_purge_seconds: required_purge,
             min_group_step,
             min_purge_seconds: min_gap,
             fit_label: opts.fit_label.clone(),
+            labelled_rows: if layout.fit_label.is_none() && opts.labelled_rows.fit_label().is_some() { LabelledRows::Return } else { opts.labelled_rows.clone() },
             economics,
             inference: inference_report,
             dropped_rows: dropped,
         })
     }
+}
+
+/// #1180: price the test rows of a window under the regime gate `k` of the
+/// plan. The state of a row is its `rcsr-gate-state/1` state from the gate pass
+/// (#1214), the same in every window and command. Every on-run of the labelled
+/// rows becomes its own group (a flat start and a paid exit, unique across
+/// windows, so no position carries over a seam) and the target of every off row
+/// becomes NaN, which drops the row from the book. #1278: the groups are the
+/// search's (`regime_gate::masked_groups` over the rows with a finite target),
+/// so an unlabelled row neither starts nor ends a run.
+fn apply_mask(d: &mut WindowData, k: usize, window_index: usize) {
+    let n = d.test_rows.len();
+    let on: Vec<bool> = d.test_states[k].iter().map(|&s| s > 0.5).collect();
+    let labelled: Vec<bool> = d.test_rows.iter().map(|r| r.target.is_finite()).collect();
+    let all_groups: Vec<u64> = d.test_rows.iter().map(|r| r.group).collect();
+    let ids = crate::regime_gate::masked_groups(&all_groups, &on, &labelled);
+    let base = (window_index as u64 + 1) << 40;
+    for i in 0..n {
+        d.test_rows[i].group = base + ids[i];
+        if !on[i] {
+            d.test_rows[i].target = f64::NAN;
+        }
+    }
+}
+
+/// #1214: the gate-state view of a switch book on a window's test rows: the
+/// object compose writes for its validation and test books (`regime_gate::regime`).
+#[allow(clippy::too_many_arguments)]
+fn switch_regime_json(d: &WindowData, candidate: usize, k: usize, threshold: f64, spec: &EvalSpec, opts: &ProtocolOptions, bucket: f64, ppy: f64) -> String {
+    let slice = crate::data::TradingSlice {
+        rows: crate::trading::TradingRows {
+            time: d.test_rows.iter().map(|r| r.time).collect(),
+            group: d.test_rows.iter().map(|r| r.group).collect(),
+            funding: Vec::new(),
+        },
+        ret: d.test_rows.iter().map(|r| r.target).collect(),
+    };
+    let tspec = crate::trading::TradingSpec {
+        cost_bps: spec.cost_bps,
+        threshold,
+        periods_per_year: Some(ppy),
+        period_seconds: (bucket > 0.0).then_some(bucket),
+        missing_score: opts.missing_score,
+        ..crate::trading::TradingSpec::default()
+    };
+    let pred = &d.test_scores[candidate];
+    let on: Vec<bool> = d.test_states[k].iter().map(|&s| s > 0.5).collect();
+    match crate::trading::evaluate(pred, &slice.ret, &slice.rows, &tspec).and_then(|book| crate::regime_gate::regime(pred, &on, &slice, &tspec, &book)) {
+        Ok(r) => crate::regime_gate::regime_json(&r),
+        Err(e) => format!("{{\"unusable\":{}}}", jstr(&e)),
+    }
+}
+
+/// #1214: the report's `gate` block: the gates of the books (the run's mask and
+/// the switches; the regime expressions are strata, reported under `regimes`),
+/// the state rule, the gate rows the pass read and the barriers. With one book
+/// gate its fields also stand at the top of the block.
+fn gate_report_json(plan: &GatePlan, rows_read: usize) -> Option<String> {
+    let mut book: Vec<usize> = plan.mask.into_iter().chain(plan.switches.iter().flatten().copied()).collect();
+    book.sort_unstable();
+    book.dedup();
+    if book.is_empty() {
+        return None;
+    }
+    let gate = |k: usize| {
+        let g = &plan.gates[k];
+        format!(
+            "\"source\":{},\"expr\":{},\"columns\":[{}],\"band\":{},\"dwell\":{}",
+            jstr(&g.source),
+            jstr(&g.spec.source),
+            g.spec.columns.iter().map(|c| jstr(c)).collect::<Vec<_>>().join(","),
+            jnum(g.spec.band),
+            g.spec.dwell
+        )
+    };
+    let single = if book.len() == 1 { format!("{},", gate(book[0])) } else { String::new() };
+    Some(format!(
+        "{{{}\"state_rule\":\"{}\",\"gate_rows_read\":{},\"barriers\":[{}],\"gates\":[{}]}}",
+        single,
+        crate::regime_gate::STATE_RULE,
+        rows_read,
+        plan.barriers.iter().map(|b| b.json()).collect::<Vec<_>>().join(","),
+        book.iter().map(|&k| format!("{{{}}}", gate(k))).collect::<Vec<_>>().join(",")
+    ))
 }
 
 /// #925: the band of candidate `c` in window `d`: `multiple` in score units, or
@@ -2001,7 +3080,7 @@ fn push_scores(
     windows: &mut [WindowData],
     t: f64,
     group: u64,
-    target: f64,
+    (target, states): (f64, &[f64]),
     scores: &[f64],
     with_test: bool,
 ) {
@@ -2026,6 +3105,13 @@ fn push_scores(
                     dst.push(if score.is_finite() { score } else { f64::NAN });
                 }
             } else {
+                d.train_seen += 1;
+                if d.keep_train_rows {
+                    d.train_rows.push(RowBase { time: t, group, target });
+                    for (dst, &score) in d.train_row_scores.iter_mut().zip(scores) {
+                        dst.push(score);
+                    }
+                }
                 for (c, (dst, &score)) in d.train_scores.iter_mut().zip(scores).enumerate() {
                     if score.is_finite() {
                         dst.push(score);
@@ -2044,6 +3130,9 @@ fn push_scores(
                 group,
                 target,
             });
+            for (dst, &s) in d.test_states.iter_mut().zip(states) {
+                dst.push(s);
+            }
             let bad = !target.is_finite() || scores.iter().any(|s| !s.is_finite());
             for (dst, &score) in d.test_scores.iter_mut().zip(scores) {
                 dst.push(score);
@@ -2056,10 +3145,13 @@ fn push_scores(
 }
 
 /// Final read of a vote book: a test row with the score of every member.
-fn push_all_test(windows: &mut [WindowData], t: f64, group: u64, target: f64, scores: &[f64]) {
+fn push_all_test(windows: &mut [WindowData], t: f64, group: u64, (target, states): (f64, &[f64]), scores: &[f64]) {
     for d in windows {
         if t >= d.window.test_start && t < d.window.test_end {
             d.test_rows.push(RowBase { time: t, group, target });
+            for (dst, &s) in d.test_states.iter_mut().zip(states) {
+                dst.push(s);
+            }
             for (dst, &score) in d.test_scores.iter_mut().zip(scores) {
                 dst.push(score);
             }
@@ -2078,12 +3170,15 @@ fn push_selected_test(
     chosen: &[usize],
     t: f64,
     group: u64,
-    target: f64,
+    (target, states): (f64, &[f64]),
     scores: &[f64],
 ) {
     for (d, &c) in windows.iter_mut().zip(chosen) {
         if t >= d.window.test_start && t < d.window.test_end {
             d.test_rows.push(RowBase { time: t, group, target });
+            for (dst, &s) in d.test_states.iter_mut().zip(states) {
+                dst.push(s);
+            }
             d.test_scores[c].push(scores[c]);
             if !target.is_finite() || !scores[c].is_finite() {
                 d.dropped += 1;
@@ -2232,6 +3327,8 @@ pub(crate) struct Stats {
     pub(crate) exits: usize,
     /// #309: rule exits (position falls), excluding the final exit.
     pub(crate) rule_exits: usize,
+    /// #1203: final exits of runs that a row without a score ends (`Flat`).
+    pub(crate) missing_score_exits: usize,
     /// #309: row-order sums of `p * r` and of the net row terms.
     pub(crate) gross_sum: f64,
     pub(crate) net_sum: f64,
@@ -2252,6 +3349,7 @@ impl Stats {
         self.entries += other.entries;
         self.exits += other.exits;
         self.rule_exits += other.rule_exits;
+        self.missing_score_exits += other.missing_score_exits;
         self.gross_sum += other.gross_sum;
         self.net_sum += other.net_sum;
     }
@@ -2265,6 +3363,11 @@ struct WindowEval {
     times: Vec<f64>,
     /// Equal-weight mean target per period: the always-long universe, no cost.
     market: Vec<f64>,
+    /// #1175: mean position and entry count of every period.
+    exposure: Vec<f64>,
+    entries: Vec<f64>,
+    /// #1176: distinct row timestamps with an entry.
+    entry_times: usize,
     book: Option<NullBook>,
     stats: Stats,
     first_positions: HashMap<u64, f64>,
@@ -2273,6 +3376,205 @@ struct WindowEval {
     band: Option<BandCheck>,
     hindsight_bound: Option<HindsightBound>,
     controls: Option<crate::baselines::ControlSet>,
+    /// Priced rows of every period of `returns`.
+    counts: Vec<usize>,
+}
+
+/// #1199: the periods of one window under `--period-grid target` and the grid
+/// period of every period the book priced.
+struct Grid {
+    cross: CrossSection,
+    times: Vec<f64>,
+    slots: Vec<usize>,
+}
+
+impl Grid {
+    /// `target_times`: the ascending stamps of the rows with a finite target
+    /// before the gate; `priced`: the period stamps of the book.
+    fn new(target_times: &[f64], bucket: f64, priced: &[f64]) -> Result<Grid, String> {
+        let mut cross = CrossSection::with_bucket(bucket);
+        for &t in target_times {
+            cross.add(t, 0.0, 0.0);
+        }
+        let times = cross.periods.iter().map(|p| p.time).collect();
+        let mut grid = Grid { cross, times, slots: Vec::new() };
+        grid.slots = grid.slots_of(priced)?;
+        Ok(grid)
+    }
+
+    /// The grid period of every stamp of `times` (ascending).
+    fn slots_of(&self, times: &[f64]) -> Result<Vec<usize>, String> {
+        let mut out = Vec::with_capacity(times.len());
+        let mut j = 0usize;
+        for &t in times {
+            let key = self.cross.key(t);
+            while j < self.times.len() && self.cross.key(self.times[j]) < key {
+                j += 1;
+            }
+            if j == self.times.len() || self.cross.key(self.times[j]) != key {
+                return Err(format!("the priced period at {} has no row with a finite target", jnum(t)));
+            }
+            out.push(j);
+        }
+        Ok(out)
+    }
+
+    fn pad(&self, v: &[f64]) -> Vec<f64> {
+        pad_at(&self.slots, self.times.len(), v)
+    }
+
+    fn pad_counts(&self, v: &[usize]) -> Vec<usize> {
+        let mut out = vec![0usize; self.times.len()];
+        for (k, &s) in self.slots.iter().enumerate() {
+            out[s] = v[k];
+        }
+        out
+    }
+
+    /// The null book on the grid: an empty period has no row and no cost.
+    fn book(&self, b: NullBook) -> NullBook {
+        let mut period_count = vec![0u32; self.times.len()];
+        let mut period_cost = vec![0.0f64; self.times.len()];
+        for (k, &s) in self.slots.iter().enumerate() {
+            period_count[s] = b.period_count[k];
+            period_cost[s] = b.period_cost[k];
+        }
+        NullBook { period: b.period.iter().map(|&p| self.slots[p as usize] as u32).collect(), period_count, period_cost, ..b }
+    }
+}
+
+fn pad_at(slots: &[usize], len: usize, v: &[f64]) -> Vec<f64> {
+    let mut out = vec![0.0f64; len];
+    for (k, &s) in slots.iter().enumerate() {
+        out[s] = v[k];
+    }
+    out
+}
+
+fn target_times(rows: &[RowBase]) -> Vec<f64> {
+    let mut t: Vec<f64> = rows.iter().filter(|r| r.target.is_finite()).map(|r| r.time).collect();
+    t.sort_by(f64::total_cmp);
+    t
+}
+
+/// #1203: rows with a finite score and no finite target that lie inside a run
+/// of the book (between two priced rows of one run) where the return of the
+/// run's previous priced row does not cover them (`t >= t_prev + horizon`;
+/// every such row when `horizon` is not positive).
+fn unpriced_rows(rows: &[RowBase], scores: &[f64], horizon: f64, missing: MissingScore) -> usize {
+    let mut idx: Vec<usize> = (0..rows.len()).collect();
+    idx.sort_by(|&a, &b| rows[a].group.cmp(&rows[b].group).then_with(|| rows[a].time.total_cmp(&rows[b].time)).then_with(|| a.cmp(&b)));
+    let (mut count, mut pending) = (0usize, 0usize);
+    let mut last: Option<(u64, f64)> = None;
+    for &i in &idx {
+        let (row, scored) = (&rows[i], scores[i].is_finite());
+        if last.is_some_and(|(g, _)| g != row.group) {
+            last = None;
+            pending = 0;
+        }
+        if row.target.is_finite() {
+            if scored || missing == MissingScore::Hold {
+                if last.is_some() {
+                    count += pending;
+                }
+                last = Some((row.group, row.time));
+            } else {
+                last = None;
+            }
+            pending = 0;
+        } else if let (true, Some((_, t0))) = (scored, last) {
+            if !(horizon > 0.0) || row.time >= t0 + horizon {
+                pending += 1;
+            }
+        }
+    }
+    count
+}
+
+/// #1175: the per-period series of the pooled book beside `period_net`.
+#[derive(Clone, Debug, Default)]
+pub struct PeriodExtra {
+    pub gross: Vec<f64>,
+    pub exposure: Vec<f64>,
+    pub entries: Vec<f64>,
+    /// Equal-weight mean target per period: buy-and-hold of the same rows, no cost.
+    pub bh: Vec<f64>,
+    /// Bucket start of every period: the instant a calendar row is tested against.
+    pub bucket_start: Vec<f64>,
+    /// #1176 (`--emit-series`): `gross - net` of every period, so the net at `m` times
+    /// the cost is `gross - m * cost`, the repricing of the cost ladder.
+    pub cost: Vec<f64>,
+    /// #1176: 1 for a period where at least one row enters a long run, else 0.
+    pub entry_stamp: Vec<f64>,
+    /// #1176: net of the buy-and-hold control on the same rows at the report cost.
+    pub bh_net: Vec<f64>,
+    /// #1176: distinct timestamps at which at least one row enters a long run.
+    pub entry_times: usize,
+}
+
+/// #1175: the pooled per-period series and the regime expression states, window by window.
+struct StrataIn {
+    extra: PeriodExtra,
+    states: Vec<Vec<bool>>,
+    counts: Vec<crate::regimes::RowCounts>,
+}
+
+impl StrataIn {
+    fn new(exprs: usize) -> Self {
+        StrataIn { extra: PeriodExtra::default(), states: vec![Vec::new(); exprs], counts: vec![Default::default(); exprs] }
+    }
+
+    /// `valid` are the rows behind the period states: the priced rows, or under the #1199 target grid
+    /// the rows with a finite target before the gate. On the grid every series has the grid's length
+    /// and an empty period has no gross, exposure, entry or buy-and-hold return.
+    #[allow(clippy::too_many_arguments)]
+    fn add_window(&mut self, pev: &WindowEval, bucket: f64, opts: &ProtocolOptions, d: &WindowData, valid: &[usize], (regime_states, regime_values): (&[Vec<bool>], &[Vec<f64>]), grid: Option<&Grid>) {
+        let key = |t: f64| if bucket > 0.0 { (t / bucket).floor() } else { t };
+        let pad = |v: &[f64]| -> Vec<f64> {
+            match grid {
+                Some(g) => g.pad(v),
+                None => v.to_vec(),
+            }
+        };
+        let times: &[f64] = grid.map_or(&pev.times, |g| &g.times);
+        self.extra.gross.extend(pad(&pev.gross_returns));
+        self.extra.exposure.extend(pad(&pev.exposure));
+        self.extra.entries.extend(pad(&pev.entries));
+        self.extra.bh.extend(pad(&pev.market));
+        self.extra.bucket_start.extend(times.iter().map(|&t| if bucket > 0.0 { key(t) * bucket } else { t }));
+        let period_keys: Vec<f64> = times.iter().map(|&t| key(t)).collect();
+        let row_keys: Vec<f64> = valid.iter().map(|&i| key(d.test_rows[i].time)).collect();
+        for k in 0..opts.regime_exprs.len() {
+            let on: Vec<bool> = valid.iter().map(|&i| regime_states[k][i]).collect();
+            let finite: Vec<bool> = valid.iter().map(|&i| regime_values[k][i] >= 0.0).collect();
+            let (st, c) = crate::regimes::period_states(&row_keys, &on, &finite, &period_keys);
+            self.states[k].extend(st);
+            self.counts[k].add(c);
+        }
+    }
+
+    fn report(&self, net: &[f64], opts: &ProtocolOptions, ppy: f64) -> crate::regimes::RegimeReport {
+        use crate::regimes::{expr_block, strata, RegimeReport, Series, StatOpts};
+        let o = StatOpts { periods_per_year: ppy, draws: opts.bootstrap_draws, block_len: opts.block_len, seed: opts.seed };
+        let s = Series {
+            net,
+            gross: Some(&self.extra.gross),
+            exposure: Some(&self.extra.exposure),
+            entries: Some(&self.extra.entries),
+            bh: Some(&self.extra.bh),
+        };
+        let mut r = RegimeReport::default();
+        if let Some(cal) = &opts.regimes {
+            let (names, assign) = cal.assign(&self.extra.bucket_start);
+            r.calendar_sha256 = Some(cal.sha256.clone());
+            r.calendar_rows = cal.rows.len();
+            r.calendar = strata(&names, "calendar", &assign, &s, &o);
+        }
+        for (k, e) in opts.regime_exprs.iter().enumerate() {
+            r.exprs.push(expr_block(e, &self.states[k], self.counts[k], &s, &o));
+        }
+        r
+    }
 }
 
 /// #310: what the control ladder needs beyond the test rows.
@@ -2401,7 +3703,7 @@ pub fn position_for(score: f64, threshold: f64) -> f64 {
 
 /// The scalar long-only evaluator on explicit rows: the reference that
 /// `trading::evaluate` must reproduce bit for bit under the plain threshold
-/// rule.
+/// rule and the same missing-score rule (#1203).
 pub fn reference_metrics(
     time: &[f64],
     group: &[u64],
@@ -2410,6 +3712,7 @@ pub fn reference_metrics(
     threshold: f64,
     cost_side: f64,
     periods_per_year: f64,
+    missing: MissingScore,
 ) -> Metrics {
     let rows: Vec<RowBase> = (0..time.len())
         .map(|i| RowBase {
@@ -2434,6 +3737,7 @@ pub fn reference_metrics(
         false,
         None,
         false,
+        missing,
     )
     .metrics
 }
@@ -2450,6 +3754,7 @@ pub fn reference_cell(
     threshold: f64,
     cost_side: f64,
     previous: &mut HashMap<u64, f64>,
+    missing: MissingScore,
 ) -> trading_gpu::PnlTotals {
     let rows: Vec<RowBase> = (0..time.len())
         .map(|i| RowBase {
@@ -2473,6 +3778,7 @@ pub fn reference_cell(
         false,
         None,
         false,
+        missing,
     );
     let s = &ev.stats;
     trading_gpu::PnlTotals {
@@ -2488,6 +3794,43 @@ pub fn reference_cell(
         turnover: s.total_abs_delta,
         net: s.net_sum,
     }
+}
+
+/// #1203: the book key of every row in book order. Run 0 of a group keeps the
+/// group id, so the carried seam applies to it; every later run gets a key
+/// that no group of the window, no other run and no carried book uses.
+fn run_keys(groups: &[u64], runs: &[u32], rows: &[RowBase], previous: &HashMap<u64, f64>) -> Vec<u64> {
+    if runs.iter().all(|&r| r == 0) {
+        return groups.to_vec();
+    }
+    let mix = |mut x: u64| {
+        x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        x ^ (x >> 31)
+    };
+    let mut used: std::collections::HashSet<u64> = rows.iter().map(|r| r.group).chain(previous.keys().copied()).collect();
+    let mut out = Vec::with_capacity(groups.len());
+    let mut last: Option<(u64, u32, u64)> = None;
+    for (&g, &r) in groups.iter().zip(runs) {
+        if r == 0 {
+            out.push(g);
+            continue;
+        }
+        let key = match last {
+            Some((lg, lr, key)) if lg == g && lr == r => key,
+            _ => {
+                let mut key = mix(g ^ mix(r as u64));
+                while !used.insert(key) {
+                    key = mix(key);
+                }
+                last = Some((g, r, key));
+                key
+            }
+        };
+        out.push(key);
+    }
+    out
 }
 
 /// `previous` carries each group's last position. Pass a fresh map for a
@@ -2507,20 +3850,40 @@ fn evaluate_window(
     device_pnl: bool,
     control_input: Option<ControlInput>,
     keep_book: bool,
+    missing: MissingScore,
 ) -> WindowEval {
     assert_eq!(rows.len(), scores.len());
-    // #305: one shared mask, score and target both finite. `position_for`
+    // #305: one shared mask over the rows with a finite target. `position_for`
     // alone would keep a finite score with a NaN target; that is the six-row
-    // difference documented in docs/walkforward.md.
+    // difference documented in docs/walkforward.md. #1203: a row with a finite
+    // target and no finite score follows `missing` (`trading::score_runs`).
+    let mut labelled: Vec<usize> = (0..rows.len()).filter(|&i| rows[i].target.is_finite()).collect();
+    labelled.sort_by(|&a, &b| {
+        rows[a]
+            .group
+            .cmp(&rows[b].group)
+            .then_with(|| rows[a].time.partial_cmp(&rows[b].time).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| a.cmp(&b))
+    });
+    let lab_groups: Vec<u64> = labelled.iter().map(|&i| rows[i].group).collect();
+    let lab_scored: Vec<bool> = labelled.iter().map(|&i| scores[i].is_finite()).collect();
+    let runs = crate::trading::score_runs(&lab_groups, &lab_scored, missing);
     let mut mask = ValidMask::new(rows.len());
-    for i in 0..rows.len() {
-        mask.set(i, scores[i].is_finite() && rows[i].target.is_finite());
+    let mut row_run = vec![0u32; rows.len()];
+    let mut row_ends = vec![false; rows.len()];
+    for (k, &i) in labelled.iter().enumerate() {
+        if let Some(run) = runs.run[k] {
+            mask.set(i, true);
+            row_run[i] = run;
+            row_ends[i] = runs.ends_at_missing[k];
+        }
     }
     let valid: Vec<usize> = mask.indices().collect();
     let n = valid.len();
     let mut positions = vec![0.0f64; n];
     let mut costs = vec![0.0f64; n];
     let mut net = vec![0.0f64; n];
+    let mut entered = vec![0.0f64; n];
     let mut stats = Stats {
         rows: n,
         ..Default::default()
@@ -2550,13 +3913,34 @@ fn evaluate_window(
         ord_returns.push(row.target);
         ord_groups.push(row.group);
     }
+    // #1203: the book of every row. Every scan, control, null and bound below
+    // reads these keys, so a run under `Flat` is its own book; `previous`,
+    // `first_positions` and `end_positions` stay keyed by group.
+    let ord_runs: Vec<u32> = order.iter().map(|&i| row_run[valid[i]]).collect();
+    let ord_keys = run_keys(&ord_groups, &ord_runs, rows, previous);
+    let ord_scored: Vec<bool> = ord_scores.iter().map(|s| s.is_finite()).collect();
+    let any_held = ord_scored.iter().any(|&s| !s);
+    // Under `Hold` the band and cooldown scans read the scored rows only, so
+    // their state carries across a held row.
+    let scan_rows: Vec<usize> = (0..n).filter(|&k| ord_scored[k]).collect();
+    let (scan_scores, scan_returns, scan_keys): (Vec<f64>, Vec<f64>, Vec<u64>) = if any_held {
+        (
+            scan_rows.iter().map(|&k| ord_scores[k]).collect(),
+            scan_rows.iter().map(|&k| ord_returns[k]).collect(),
+            scan_rows.iter().map(|&k| ord_keys[k]).collect(),
+        )
+    } else {
+        (Vec::new(), Vec::new(), Vec::new())
+    };
+    let (scan_scores, scan_returns, scan_keys): (&[f64], &[f64], &[u64]) =
+        if any_held { (&scan_scores, &scan_returns, &scan_keys) } else { (&ord_scores, &ord_returns, &ord_keys) };
 
     // #306: the band/cooldown book. `positions` are aligned with `order`;
     // `net` includes the final exit of every group. `dp` deliberately keeps
     // the threshold book: the DP is a bound, not a strategy.
     // One device launch over all rows: a chunk only partitions launches, and a
     // launch only runs the chains of the groups it touches.
-    let device_chunk = ord_returns.len().max(1);
+    let device_chunk = scan_returns.len().max(1);
     type BandBook = (Vec<f64>, f64, usize, String, String, Option<String>);
     let band_scan: Option<BandBook> = if policy == Policy::Band {
         let params = crate::trading_gpu::BandParams {
@@ -2570,9 +3954,9 @@ fn evaluate_window(
                 "cooldown scan",
                 || {
                     crate::trading_gpu::cooldown_scan_device(
-                        &ord_scores,
-                        &ord_returns,
-                        &ord_groups,
+                        scan_scores,
+                        scan_returns,
+                        scan_keys,
                         &params,
                         cost_side,
                         crate::trading_gpu::SCAN_THREADS,
@@ -2581,9 +3965,9 @@ fn evaluate_window(
                 },
                 || {
                     crate::trading_gpu::cooldown_scan(
-                        &ord_scores,
-                        &ord_returns,
-                        &ord_groups,
+                        scan_scores,
+                        scan_returns,
+                        scan_keys,
                         &params,
                         cost_side,
                         65_536,
@@ -2605,9 +3989,9 @@ fn evaluate_window(
                 "band scan",
                 || {
                     crate::trading_gpu::band_scan_device(
-                        &ord_scores,
-                        &ord_returns,
-                        &ord_groups,
+                        scan_scores,
+                        scan_returns,
+                        scan_keys,
                         &params,
                         cost_side,
                         crate::trading_gpu::SCAN_THREADS,
@@ -2616,9 +4000,9 @@ fn evaluate_window(
                 },
                 || {
                     crate::trading_gpu::band_scan(
-                        &ord_scores,
-                        &ord_returns,
-                        &ord_groups,
+                        scan_scores,
+                        scan_returns,
+                        scan_keys,
                         &params,
                         cost_side,
                         65_536,
@@ -2645,22 +4029,51 @@ fn evaluate_window(
         let times: Vec<f64> = rows.iter().map(|r| r.time).collect();
         crate::trading::top_tercile_positions(scores, &times)
     });
+    let mut ord_pos = vec![0.0f64; n];
+    match (&band_scan, &tercile) {
+        (Some((scanned, ..)), _) => {
+            for (j, &k) in scan_rows.iter().enumerate() {
+                ord_pos[k] = scanned[j];
+            }
+        }
+        (None, Some(top)) => {
+            for (k, &i) in order.iter().enumerate() {
+                ord_pos[k] = top[valid[i]];
+            }
+        }
+        // #305: strict `>` and a non-finite score is flat.
+        (None, None) => {
+            for k in 0..n {
+                ord_pos[k] = trading_gpu::long_position(ord_scores[k], threshold) as f64;
+            }
+        }
+    }
+    if any_held {
+        crate::trading::hold_positions(&ord_keys, &ord_scored, &mut ord_pos, |g| previous.get(g).copied().unwrap_or(0.0));
+    }
+    // #1203: a group whose first labelled row has no score has no seam
+    // position: no score decides that row. Under `Flat` the carried position
+    // closed at the earlier block's end; under `Hold` the row keeps it.
+    let mut leading_gap: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for k in 0..labelled.len() {
+        if !lab_scored[k] && (k == 0 || lab_groups[k] != lab_groups[k - 1]) {
+            leading_gap.insert(lab_groups[k]);
+        }
+    }
     for (k, &i) in order.iter().enumerate() {
         let row = &rows[valid[i]];
-        let pos = match (&band_scan, &tercile) {
-            (Some((positions, ..)), _) => positions[k],
-            (None, Some(top)) => top[valid[i]],
-            // #305: strict `>` and a non-finite score is flat.
-            (None, None) => trading_gpu::long_position(scores[valid[i]], threshold) as f64,
-        };
-        let prev = previous.get(&row.group).copied().unwrap_or(0.0);
+        let pos = ord_pos[k];
+        let key = ord_keys[k];
+        let prev = previous.get(&key).copied().unwrap_or(0.0);
         let delta = pos - prev;
         let cost = cost_side * delta.abs();
         positions[i] = pos;
         costs[i] = cost;
         net[i] = pos * row.target - cost;
-        previous.insert(row.group, pos);
-        first_positions.entry(row.group).or_insert(pos);
+        previous.insert(key, pos);
+        if !leading_gap.contains(&row.group) {
+            first_positions.entry(row.group).or_insert(pos);
+        }
 
         stats.total_abs_delta += delta.abs();
         stats.gross_sum += pos * row.target;
@@ -2673,6 +4086,7 @@ fn evaluate_window(
             stats.trades += 1;
         }
         if prev == 0.0 && pos > 0.0 {
+            entered[i] = 1.0;
             stats.entries += 1;
         }
         if pos > 0.0 {
@@ -2687,31 +4101,53 @@ fn evaluate_window(
             }
         }
     }
-    let end_positions = previous.clone();
 
-    // #145: charge the final exit. A flat strategy is free; a held position
-    // pays the same per-side cost as its entry.
-    let mut last_of_group: HashMap<u64, usize> = HashMap::new();
-    for (&g, _) in previous.iter() {
-        if let Some((i, _)) = order
-            .iter()
-            .filter(|&&i| rows[valid[i]].group == g)
-            .map(|&i| (i, rows[valid[i]].time))
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-        {
-            last_of_group.insert(g, i);
-        }
+    // #145: charge the final exit of every book (#1203: every run under
+    // `Flat`) at its last row. A flat strategy is free; a held position pays
+    // the same per-side cost as its entry.
+    let mut last_of_key: HashMap<u64, usize> = HashMap::new();
+    for (k, &key) in ord_keys.iter().enumerate() {
+        last_of_key.insert(key, k);
     }
-    for (g, i) in last_of_group {
-        let p = previous.get(&g).copied().unwrap_or(0.0);
+    for (key, k) in last_of_key {
+        let p = previous.get(&key).copied().unwrap_or(0.0);
         if p != 0.0 {
+            let i = order[k];
             let c = cost_side * p.abs();
             net[i] -= c;
             stats.total_cost += c;
             stats.net_sum -= c;
             stats.exits += 1;
+            if row_ends[valid[i]] {
+                stats.missing_score_exits += 1;
+            }
         }
     }
+    // #1203: under `Flat` a group leaves the window with the position of its
+    // last run, flat when a row without a score ends its labelled rows; the
+    // keys of the later runs close here.
+    if lab_scored.iter().any(|&s| !s) && missing == MissingScore::Flat {
+        let mut row_key = vec![0u64; rows.len()];
+        for (k, &i) in order.iter().enumerate() {
+            row_key[valid[i]] = ord_keys[k];
+        }
+        let mut ends: Vec<(u64, f64)> = Vec::new();
+        for k in 0..labelled.len() {
+            if k + 1 == labelled.len() || lab_groups[k + 1] != lab_groups[k] {
+                let end = if lab_scored[k] { previous.get(&row_key[labelled[k]]).copied().unwrap_or(0.0) } else { 0.0 };
+                ends.push((lab_groups[k], end));
+            }
+        }
+        for (k, &key) in ord_keys.iter().enumerate() {
+            if ord_runs[k] > 0 {
+                previous.remove(&key);
+            }
+        }
+        for (g, end) in ends {
+            previous.insert(g, end);
+        }
+    }
+    let end_positions = previous.clone();
 
     // #304: recompute the same long-only book through the fused canonical
     // reduction. Rows are already in `(group, time)` order, which is the
@@ -2719,6 +4155,14 @@ fn evaluate_window(
     // stays the reported authority; this block is a device/canonical check.
     let device = if device_pnl {
         let started = std::time::Instant::now();
+        // #1203: a held row repeats the score of the row before it in its book, so
+        // the threshold reduction holds the same position; a leading held row is flat.
+        let mut dev_scores = ord_scores.clone();
+        for k in 0..n {
+            if !ord_scored[k] {
+                dev_scores[k] = if k > 0 && ord_keys[k] == ord_keys[k - 1] { dev_scores[k - 1] } else { f64::NAN };
+            }
+        }
         let params = crate::trading_gpu::PnlParams {
             threshold,
             per_side_bps: cost_side * 10_000.0,
@@ -2727,9 +4171,9 @@ fn evaluate_window(
         };
         #[cfg(feature = "cuda")]
         let report = crate::trading_gpu::reduce_device(
-            &ord_scores,
+            &dev_scores,
             &ord_returns,
-            &ord_groups,
+            &ord_keys,
             &params,
             256,
             65_536,
@@ -2745,7 +4189,7 @@ fn evaluate_window(
         #[cfg(not(feature = "cuda"))]
         let backend = "cpu-canonical".to_string();
         let host_s = started.elapsed().as_secs_f64();
-        let canonical = crate::trading_gpu::reduce(&ord_scores, &ord_returns, &ord_groups, &params)
+        let canonical = crate::trading_gpu::reduce(&dev_scores, &ord_returns, &ord_keys, &params)
             .unwrap_or_else(|e| panic!("canonical P&L reduction failed: {}", e));
         let report = report.unwrap_or_else(|| canonical.clone());
         let bit_equal = report.strategy.identical(&canonical.strategy);
@@ -2773,13 +4217,15 @@ fn evaluate_window(
             net_delta: report.strategy.net - cpu_net,
             bit_equal,
             counts_equal,
-            f32_flip_rows: crate::trading_gpu::f32_flip_rows(&ord_scores, threshold),
+            f32_flip_rows: crate::trading_gpu::f32_flip_rows(&dev_scores, threshold),
         })
     } else {
         None
     };
 
     let scalar_net = net.iter().sum::<f64>();
+    // #1203: the scan prices the scored rows; the book adds the held rows' return.
+    let held_gross: f64 = (0..n).filter(|&k| !ord_scored[k]).map(|k| ord_pos[k] * ord_returns[k]).sum();
     let band = band_scan.map(
         |(_, band_net, groups, carry, backend, fallback_reason)| BandCheck {
             spec: None,
@@ -2787,7 +4233,7 @@ fn evaluate_window(
             min_hold,
             carry,
             groups,
-            net: band_net,
+            net: if any_held { band_net + held_gross } else { band_net },
             scalar_net,
             backend,
             fallback_reason,
@@ -2803,13 +4249,13 @@ fn evaluate_window(
             || {
                 crate::trading_gpu::dp_scan_device(
                     &ord_returns,
-                    &ord_groups,
+                    &ord_keys,
                     cost_side,
                     crate::trading_gpu::SCAN_THREADS,
                     device_chunk,
                 )
             },
-            || crate::trading_gpu::dp_scan(&ord_returns, &ord_groups, cost_side, 65_536),
+            || crate::trading_gpu::dp_scan(&ord_returns, &ord_keys, cost_side, 65_536),
         );
         let bound = scan.bound(cost_side);
         Some(HindsightBound {
@@ -2846,6 +4292,16 @@ fn evaluate_window(
         cross.add(row.time, net[i], positions[i] * row.target);
     }
     let (returns, gross_returns) = cross.series();
+    let mut book_cross = CrossSection::with_bucket(bucket);
+    for &i in &time_order {
+        book_cross.add(rows[valid[i]].time, positions[i], entered[i]);
+    }
+    let exposure: Vec<f64> = book_cross.periods.iter().map(|p| p.net_sum / p.count as f64).collect();
+    let entries: Vec<f64> = book_cross.periods.iter().map(|p| p.gross_sum).collect();
+    let mut entry_stamps: Vec<f64> = (0..n).filter(|&i| entered[i] > 0.0).map(|i| rows[valid[i]].time).collect();
+    entry_stamps.sort_by(f64::total_cmp);
+    entry_stamps.dedup();
+    let entry_times = entry_stamps.len();
 
     // #310: the control ladder on the same rows, the same cost and the same
     // equal-weight period aggregation. Every control starts flat, like the
@@ -2865,7 +4321,7 @@ fn evaluate_window(
         crate::baselines::evaluate_controls(
             &ord_positions,
             &ord_returns,
-            &ord_groups,
+            &ord_keys,
             cost_side,
             c.train_mean,
             c.seed,
@@ -2877,6 +4333,7 @@ fn evaluate_window(
     });
 
     let times: Vec<f64> = cross.periods.iter().map(|p| p.time).collect();
+    let counts: Vec<usize> = cross.periods.iter().map(|p| p.count).collect();
     let mut market_cross = CrossSection::with_bucket(bucket);
     for &i in &time_order {
         let row = &rows[valid[i]];
@@ -2901,7 +4358,7 @@ fn evaluate_window(
         Some(NullBook {
             positions: ord_positions.clone(),
             returns: ord_returns.clone(),
-            groups: ord_groups.clone(),
+            groups: ord_keys.clone(),
             period: group_order.iter().map(|&i| period_of[i]).collect(),
             period_count,
             period_cost: gross_returns.iter().zip(&returns).map(|(g, n)| g - n).collect(),
@@ -2917,7 +4374,11 @@ fn evaluate_window(
         returns,
         gross_returns,
         times,
+        counts,
         market,
+        exposure,
+        entries,
+        entry_times,
         book,
         stats,
         first_positions,
@@ -3101,7 +4562,7 @@ impl PeriodSource {
 /// The period width declared by the run: the target spec's horizon or, when
 /// wider, its label stride (#1053), else `--horizon`. One independent return
 /// per group spans exactly this width.
-fn declared_period(spec: &EvalSpec, opts: &ProtocolOptions) -> Option<(f64, PeriodSource)> {
+pub(crate) fn declared_period(spec: &EvalSpec, opts: &ProtocolOptions) -> Option<(f64, PeriodSource)> {
     if spec.horizon.is_finite() && spec.horizon >= 1.0 && spec.horizon <= SECONDS_PER_YEAR {
         let source = if opts.horizon_from_spec { PeriodSource::TargetSpec } else { PeriodSource::HorizonFlag };
         let width = match (source, opts.stride_seconds) {
@@ -3365,6 +4826,64 @@ impl Metrics {
     }
 }
 
+/// #1094: the `cut` object of a window.
+fn cut_json(c: &CutReport) -> String {
+    let num = |v: Option<f64>| v.map_or("null".to_string(), jnum);
+    let int = |v: Option<u64>| v.map_or("null".to_string(), |x| x.to_string());
+    let (p, r) = (c.cut.as_ref(), c.reference.as_ref());
+    let profile: Vec<String> = c
+        .profile
+        .iter()
+        .map(|(share, q)| {
+            format!(
+                "{{\"long_share\":{},\"index\":{},\"value\":{},\"fitness\":{},\"net\":{},\"entry_times\":{}}}",
+                jnum(*share),
+                q.index,
+                jnum(q.value),
+                jnum(q.fitness),
+                jnum(q.net),
+                q.entry_times
+            )
+        })
+        .collect();
+    format!(
+        "{{\"source\":{},\"value\":{},\"index\":{},\"rows\":{},\"fitness\":{},\"net\":{},\"flips\":{},\
+         \"exits\":{},\"entry_times\":{},\"exposure\":{},\"reference\":{{\"value\":{},\"index\":{},\
+         \"fitness\":{},\"net\":{},\"entry_times\":{},\"exposure\":{}}},\"plateau\":{},\
+         \"floor\":{{\"min_entry_times\":{}}},\"blocks\":{},\"lambda\":{},\"fallback\":{},\
+         \"fallback_detail\":{},\"profile\":[{}]}}",
+        jstr(c.source.as_str()),
+        jnum(c.value),
+        int(p.map(|q| q.index as u64)),
+        c.rows,
+        num(p.map(|q| q.fitness)),
+        num(p.map(|q| q.net)),
+        int(p.map(|q| q.flips as u64)),
+        int(p.map(|q| q.exits as u64)),
+        int(p.map(|q| q.entry_times as u64)),
+        num(p.map(|q| q.exposure)),
+        jnum(c.reference_value),
+        int(r.map(|q| q.index as u64)),
+        num(r.map(|q| q.fitness)),
+        num(r.map(|q| q.net)),
+        int(r.map(|q| q.entry_times as u64)),
+        num(r.map(|q| q.exposure)),
+        c.plateau.as_ref().map_or("null".to_string(), |q| format!(
+            "{{\"lo\":{},\"hi\":{},\"rows_lo\":{},\"rows_hi\":{}}}",
+            jnum(q.lo),
+            jnum(q.hi),
+            q.rows_lo,
+            q.rows_hi
+        )),
+        c.fit.min_entry_times,
+        c.fit.blocks,
+        jnum(c.fit.lambda),
+        c.fallback.map_or("null".to_string(), jstr),
+        c.fallback_detail.as_deref().map_or("null".to_string(), jstr),
+        profile.join(",")
+    )
+}
+
 impl WindowResult {
     fn json(&self) -> String {
         let mut s = format!(
@@ -3413,27 +4932,120 @@ impl WindowResult {
             s.pop();
             s.push_str(&format!(",\"member_thresholds\":[{}]}}", self.member_thresholds.iter().map(|t| jnum(*t)).collect::<Vec<_>>().join(",")));
         }
+        if let Some(c) = &self.cut {
+            s.pop();
+            s.push_str(&format!(",\"cut\":{}}}", cut_json(c)));
+        }
         if self.in_sample {
             s.pop();
             s.push_str(",\"in_sample\":true}");
+        }
+        if let Some(n) = self.entry_times {
+            s.pop();
+            s.push_str(&format!(",\"entry_times\":{}}}", n));
+        }
+        if let Some(g) = &self.gate {
+            s.pop();
+            s.push_str(&format!(",\"gate\":{}}}", g));
         }
         s
     }
 }
 
+impl Member {
+    /// #1176: one row of `members`: per-window metrics, pooled metrics with the
+    /// cost ladder, and the per-period series on the report's period grid.
+    fn json(&self) -> String {
+        let r = &self.report;
+        let series = |v: &[f64]| v.iter().map(|x| jnum(*x)).collect::<Vec<_>>().join(",");
+        let windows: Vec<String> = r
+            .windows
+            .iter()
+            .map(|w| {
+                format!(
+                    "{{\"label\":{},\"threshold\":{},\"threshold_source\":{},\"train_rows\":{},\"validation_rows\":{},\
+                     \"test_rows\":{},\"dropped_rows\":{},\"in_sample\":{},\"metrics\":{}}}",
+                    jstr(&w.window.label),
+                    jnum(w.threshold),
+                    jstr(&w.threshold_source),
+                    w.train_rows,
+                    w.validation_rows,
+                    w.test_rows,
+                    w.dropped_rows,
+                    w.in_sample,
+                    w.metrics.json()
+                )
+            })
+            .collect();
+        let empty = PeriodExtra::default();
+        let x = r.period_extra.as_ref().unwrap_or(&empty);
+        let e = &r.economics;
+        let mut pooled = r.pooled.json();
+        pooled.pop();
+        pooled.push_str(&format!(
+            ",\"net_mean\":{},\"entry_times\":{},\"seam_cost\":{},\"missing_score_exits\":{},\"unpriced_target_rows\":{},\
+             \"break_even_bps_per_side\":{},\"break_even_status\":{},\"cost_ladder\":{}}}",
+            jnum(r.pooled.mean_return),
+            x.entry_times,
+            jnum(r.seam_cost),
+            r.missing_score_exits,
+            r.unpriced_target_rows,
+            jnum(e.break_even_bps_per_side),
+            jstr(e.break_even_status),
+            e.ladder_json()
+        ));
+        let rows = r.period_grid.as_ref().map_or(String::new(), |g| {
+            format!(",\"period_rows\":[{}]", g.period_rows.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(","))
+        });
+        format!(
+            "{{\"archive_rank\":{},\"label\":{},\"complexity\":{},\"expression\":{},\"constant\":{},\"dropped_rows\":{},\
+             \"windows\":[{}],\"pooled\":{},\"series\":{{\"period_time\":[{}],\"period_net\":[{}],\"period_gross\":[{}],\
+             \"period_cost\":[{}],\"period_exposure\":[{}],\"period_entries\":[{}],\"period_entry_stamp\":[{}],\
+             \"period_bh\":[{}],\"period_bh_net\":[{}]{}}}}}",
+            self.archive_rank,
+            jstr(&self.label),
+            self.complexity,
+            jstr(r.candidates.first().map_or("", String::as_str)),
+            self.constant,
+            r.dropped_rows,
+            windows.join(","),
+            pooled,
+            series(&r.period_time),
+            series(&r.period_net),
+            series(&x.gross),
+            series(&x.cost),
+            series(&x.exposure),
+            series(&x.entries),
+            series(&x.entry_stamp),
+            series(&x.bh),
+            series(&x.bh_net),
+            rows
+        )
+    }
+}
+
 impl Report {
-    /// #482: `source`, `run`, `run_sha256` and the candidate labels, with a
-    /// leading comma. Empty when the candidates came from `--expr`.
+    /// #482: `source`, `run`, `run_sha256` and the candidate labels of a `--front`
+    /// report, `run` and `run_sha256` of a `--from-run` report (#1238), then the #1237
+    /// `composite` marker of a composed run, with a leading comma. Empty when the
+    /// candidates came from `--expr`.
     fn front_json(&self, paths: bool) -> String {
-        match &self.front {
-            Some(f) => format!(
-                ",\"source\":\"front\"{},\"run_sha256\":{},\"candidate_labels\":[{}]",
-                if paths { format!(",\"run\":{}", jstr(&f.run)) } else { String::new() },
+        let path = |run: &str| if paths { format!(",\"run\":{}", jstr(run)) } else { String::new() };
+        let mut s = match (&self.front, &self.from_run) {
+            (Some(f), _) => format!(
+                ",\"source\":\"{}\"{},\"run_sha256\":{},\"candidate_labels\":[{}]",
+                if self.members.is_some() { "front_all_members" } else { "front" },
+                path(&f.run),
                 jstr(&f.run_sha256),
                 f.labels.iter().map(|l| jstr(l)).collect::<Vec<_>>().join(",")
             ),
-            None => String::new(),
+            (None, Some(r)) => format!("{},\"run_sha256\":{}", path(&r.run), jstr(&r.run_sha256)),
+            (None, None) => String::new(),
+        };
+        if let Some(c) = &self.composite {
+            s.push_str(&format!(",\"composite\":{}", c.json()));
         }
+        s
     }
 
     /// Machine-readable JSON. The deterministic report, with the `--front` path.
@@ -3451,7 +5063,7 @@ impl Report {
         s.pop();
         s.push_str(&format!(
             ",\"split\":{{\"required_purge_seconds\":{},\"purge_seconds\":{},\"horizon_seconds\":{},\
-             \"embargo_seconds\":{},\"min_group_step_seconds\":{}{}}},\"economics\":{},\"inference\":{}}}",
+             \"embargo_seconds\":{},\"min_group_step_seconds\":{}{}{}}},\"economics\":{},\"inference\":{}}}",
             jnum(self.required_purge_seconds),
             jnum(self.min_purge_seconds),
             jnum(self.horizon),
@@ -3461,9 +5073,23 @@ impl Report {
                 (Some(f), true) => format!(",\"fit_label\":{}", f),
                 _ => String::new(),
             },
+            if paths { format!(",\"labelled_rows\":{}", self.labelled_rows.json()) } else { String::new() },
             self.economics.json(),
             self.inference.as_ref().map_or("null".to_string(), |i| i.json())
         ));
+        if let Some(r) = &self.regimes {
+            s.pop();
+            s.push_str(&format!(",\"regimes\":{}}}", r.json()));
+        }
+        if let Some(g) = &self.gate {
+            s.pop();
+            s.push_str(&format!(",\"gate\":{}}}", g));
+        }
+        if let Some(m) = &self.members {
+            s.pop();
+            let items: Vec<String> = m.iter().map(Member::json).collect();
+            s.push_str(&format!(",\"diagnostic\":true,\"members\":[{}]}}", items.join(",")));
+        }
         s
     }
 
@@ -3487,6 +5113,9 @@ impl Report {
         s.pop();
         if let Some(b) = &self.batch_pnl {
             s.push_str(&format!(",\"batch_timings\":{}", b.timings_json()));
+        }
+        if let Some(sc) = &self.scan {
+            s.push_str(&format!(",\"scan\":{}", sc.json()));
         }
         s.push_str(&format!(
             ",\"ledger\":{}}}",
@@ -3561,7 +5190,7 @@ impl Report {
              \"threshold\":{{\"quantile\":{},\"fixed\":{},\
              \"method\":\"exact order-preserving radix select + linear interpolation (numpy type 7) in f64\",\
              \"sources\":[\"train_type7\",\"validation_type7\",\"fixed\"],\
-             \"screening_only\":false,\"source\":{}}},\
+             \"screening_only\":false,\"source\":{}{}}},\
              \"annualization\":{{\"periods_per_year\":{},\"method\":{},\"source\":{},\"period_seconds\":{}}},\
              \"risk_model\":{{\"mode\":\"per-period\",\"periods_per_year\":{},\
              \"sharpe\":{{\"scale\":\"sqrt(periods_per_year)\",\"ddof\":1,\
@@ -3579,6 +5208,7 @@ impl Report {
              \"band_select\":{},\"test_used_for_selection\":{},\
              \"candidate_count\":{}{}{}}},\
              \"pooled_seam\":{{\"reset_flat\":{},\"seam_cost\":{},\"seam_trades\":{}}},\
+             \"book\":{{\"missing_score\":{},\"missing_score_exits\":{},\"unpriced_target_rows\":{}}},\
              \"sign_test\":{{\"positive\":{},\"total\":{},\"applicable\":{},\
              \"p_value\":{},\"method\":{}}},\
              \"lockbox\":{},\
@@ -3616,6 +5246,7 @@ impl Report {
                 .first()
                 .map(|w| w.threshold_source.as_str())
                 .unwrap_or("none")),
+            self.threshold_fit_json(),
             jnum(self.periods_per_year),
             jstr(&self.annualization),
             jstr(self.annualization_source),
@@ -3638,6 +5269,9 @@ impl Report {
             self.pool_reset_flat,
             jnum(self.seam_cost),
             self.seam_trades,
+            jstr(self.missing_score.name()),
+            self.missing_score_exits,
+            self.unpriced_target_rows,
             self.sign_test.positive,
             self.sign_test.total,
             self.sign_test.applicable,
@@ -3673,6 +5307,24 @@ impl Report {
         )
     }
 
+    /// #1094: the fields `--threshold-fit` adds to the `threshold` object, with
+    /// a leading comma; empty without the flag.
+    fn threshold_fit_json(&self) -> String {
+        match &self.threshold_fit {
+            Some(f) => format!(
+                ",\"fit\":\"fitness\",\"fit_method\":\"per window, the cut of lowest block fitness on the validation rows \
+                 (training rows without a validation slice) among cuts with at least cut_min_entries distinct entry \
+                 timestamps, one sort and one sweep in f64; the fixed threshold when no cut passes\",\
+                 \"fit_sources\":[\"train_fitness\",\"validation_fitness\",\"fixed\"],\
+                 \"cut_min_entries\":{},\"cut_blocks\":{},\"cut_lambda\":{}",
+                f.min_entry_times,
+                f.blocks,
+                jnum(f.lambda)
+            ),
+            None => String::new(),
+        }
+    }
+
     fn vote_json(&self) -> String {
         match self.quorum {
             Some(q) if self.policy == Policy::Vote => format!(
@@ -3690,11 +5342,41 @@ impl Report {
         let series = |v: &[f64]| v.iter().map(|x| jnum(*x)).collect::<Vec<_>>().join(",");
         let mut s = self.pooled.json();
         s.pop();
+        let grid = self.period_grid.as_ref().map_or(String::new(), |g| {
+            format!(
+                ",\"grid\":{{\"rule\":{},\"periods\":{},\"empty_periods\":{}}},\"period_rows\":[{}]",
+                jstr(g.rule.as_str()),
+                g.period_rows.len(),
+                g.empty_periods,
+                g.period_rows.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(",")
+            )
+        });
         s.push_str(&format!(
-            ",\"period_net\":[{}],\"period_time\":[{}]}}",
+            ",\"period_net\":[{}],\"period_time\":[{}]{}}}",
             series(&self.period_net),
-            series(&self.period_time)
+            series(&self.period_time),
+            grid
         ));
+        if let Some(x) = &self.period_extra {
+            s.pop();
+            s.push_str(&format!(
+                ",\"period_gross\":[{}],\"period_exposure\":[{}],\"period_entries\":[{}],\"period_bh\":[{}]}}",
+                series(&x.gross),
+                series(&x.exposure),
+                series(&x.entries),
+                series(&x.bh)
+            ));
+            if self.emit_series {
+                s.pop();
+                s.push_str(&format!(
+                    ",\"period_cost\":[{}],\"period_entry_stamp\":[{}],\"period_bh_net\":[{}],\"entry_times\":{}}}",
+                    series(&x.cost),
+                    series(&x.entry_stamp),
+                    series(&x.bh_net),
+                    x.entry_times
+                ));
+            }
+        }
         s
     }
 
@@ -3755,6 +5437,17 @@ impl Report {
         };
         let threshold_rule = if self.policy == Policy::TopTercile {
             "none: the policy ranks the scores of each timestamp (source `none`)".to_string()
+        } else if let (Some(f), Some(theta)) = (self.threshold_fit, self.threshold_fixed) {
+            format!(
+                "fitted per window on its validation rows (training rows without a validation slice): the cut of \
+                 lowest block fitness ({} blocks, lambda {}) among cuts with at least {} distinct entry timestamps, \
+                 frozen on the test block; the reference theta = {} where no cut passes (sources `train_fitness`, \
+                 `validation_fitness`, `fixed`)",
+                f.blocks,
+                f.lambda,
+                f.min_entry_times,
+                theta
+            )
         } else if let Some(theta) = self.threshold_fixed {
             format!(
                 "pre-registered fixed theta = {} (no data fitting; source `fixed`)",
@@ -3841,6 +5534,39 @@ impl Report {
                 w.metrics.trades
             ));
         }
+        if self.threshold_fit.is_some() {
+            s.push_str(
+                "\n## Fitted cut (source rows)\n\n\
+                 Fitness, net, entry timestamps and exposure are measured on the source rows, where the cut was chosen; \
+                 they are not out-of-sample results.\n\n\
+                 | window | source | cut | reference | rows | fitness | net | entry times | exposure | plateau | fallback |\n\
+                 |---|---|---:|---:|---:|---:|---:|---:|---:|---|---|\n",
+            );
+            for w in &self.windows {
+                if let Some(c) = &w.cut {
+                    let p = c.cut.as_ref();
+                    s.push_str(&format!(
+                        "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                        w.window.label,
+                        c.source.as_str(),
+                        md_num(c.value),
+                        md_num(c.reference_value),
+                        c.rows,
+                        md_num(p.map_or(f64::NAN, |q| q.fitness)),
+                        md_num(p.map_or(f64::NAN, |q| q.net)),
+                        p.map_or("n/a".to_string(), |q| q.entry_times.to_string()),
+                        md_num(p.map_or(f64::NAN, |q| q.exposure)),
+                        c.plateau.as_ref().map_or("n/a".to_string(), |q| format!(
+                            "{} to {} ({} rows)",
+                            md_num(q.lo),
+                            md_num(q.hi),
+                            q.rows_hi - q.rows_lo
+                        )),
+                        c.fallback.unwrap_or("none")
+                    ));
+                }
+            }
+        }
         s.push_str("\n## Controls (long-only, per window)\n\n");
         s.push_str(
             "Each control is priced on the window's valid test rows with the same cost, starts flat and pays its final exit. Beta is on the buy-and-hold period series. Cash Sharpe is n/a (zero variance).\n\n\
@@ -3917,6 +5643,14 @@ impl Report {
             self.seam_trades,
             md_num(p.total_abs_delta)
         ));
+        if let Some(g) = &self.period_grid {
+            s.push_str(&format!(
+                "\nPeriod grid: {} (every period with a finite target before the gate); {} of {} periods have no priced row and book net 0.\n",
+                g.rule.as_str(),
+                g.empty_periods,
+                g.period_rows.len()
+            ));
+        }
         if self.sign_test.applicable {
             s.push_str(&format!(
                 "\nFold sign test: {}/{} positive, one-sided p = {}. {}\n",
@@ -3937,6 +5671,10 @@ impl Report {
         if let Some(i) = &self.inference {
             s.push('\n');
             s.push_str(&i.markdown());
+        }
+        if let Some(r) = &self.regimes {
+            s.push('\n');
+            s.push_str(&r.markdown());
         }
         s
     }
@@ -4033,6 +5771,104 @@ struct Selected {
     threshold: f64,
     band_selection: Option<crate::selection::BandSelection>,
     thresholds: Vec<f64>,
+    /// #1094: the fitted cut of every candidate under `--threshold-fit`.
+    cuts: Vec<Option<CutReport>>,
+}
+
+/// #1094: long-row shares of the cut profile, ascending: `0.5 * 0.7^j` and
+/// `1 - 0.5 * 0.7^j` for `j = 0..15`.
+fn profile_shares() -> Vec<f64> {
+    let mut tail = Vec::with_capacity(16);
+    let mut p = 0.5f64;
+    for _ in 0..16 {
+        tail.push(p);
+        p *= 0.7;
+    }
+    let mut shares: Vec<f64> = tail.iter().rev().copied().collect();
+    shares.extend(tail.iter().map(|p| 1.0 - p));
+    shares
+}
+
+/// #1094: the cut of one candidate in one window from its source rows (the
+/// validation slice, else the training rows), with `reference` as the
+/// fallback. The test rows are not an input.
+fn fit_cut(rows: &[RowBase], scores: &[f64], reference: f64, fit: &CutFit, cost_bps: f64, source: ThresholdSource) -> CutReport {
+    let mut idx: Vec<usize> = (0..rows.len()).filter(|&i| scores[i].is_finite() && rows[i].target.is_finite()).collect();
+    idx.sort_by(|&a, &b| {
+        rows[a].group.cmp(&rows[b].group).then_with(|| rows[a].time.total_cmp(&rows[b].time)).then_with(|| a.cmp(&b))
+    });
+    let mut report = CutReport {
+        source: ThresholdSource::Fixed,
+        value: reference,
+        rows: idx.len(),
+        cut: None,
+        reference_value: reference,
+        reference: None,
+        plateau: None,
+        fit: *fit,
+        fallback: None,
+        fallback_detail: None,
+        profile: Vec::new(),
+    };
+    if idx.len() < 2 {
+        report.fallback = Some("no_rows");
+        return report;
+    }
+    let pred: Vec<f64> = idx.iter().map(|&i| scores[i]).collect();
+    let time: Vec<f64> = idx.iter().map(|&i| rows[i].time).collect();
+    let slice = data::TradingSlice {
+        rows: crate::trading::TradingRows {
+            time: time.clone(),
+            group: idx.iter().map(|&i| rows[i].group).collect(),
+            funding: Vec::new(),
+        },
+        ret: idx.iter().map(|&i| rows[i].target).collect(),
+    };
+    let book_spec = crate::trading::TradingSpec { cost_bps, min_trades: 1, threshold: reference, ..crate::trading::TradingSpec::default() };
+    let sweep = match crate::trading::FitnessBook::with_blocks(&slice, &book_spec, 0.0, fit.blocks, fit.lambda)
+        .and_then(|book| book.cut_sweep(&pred, &time))
+    {
+        Ok(s) => s,
+        Err(e) => {
+            report.fallback = Some("book_error");
+            report.fallback_detail = Some(e);
+            return report;
+        }
+    };
+    let n = sweep.rows();
+    let point = |t: usize| CutPoint {
+        index: t,
+        value: sweep.value(&pred, t),
+        fitness: sweep.fitness(t),
+        net: sweep.net(t),
+        flips: sweep.flips(t),
+        exits: sweep.exits(t),
+        entry_times: sweep.entry_times(t),
+        exposure: (n - t) as f64 / n as f64,
+    };
+    let reference_index = sweep.index_of(&pred, reference);
+    let reference_point = CutPoint { value: reference, ..point(reference_index) };
+    report.profile = profile_shares()
+        .into_iter()
+        .map(|p| (p, point(sweep.snap(n - (p * n as f64).round() as usize))))
+        .collect();
+    match sweep.best(&crate::trading::CutFloor { min_entry_times: fit.min_entry_times }, reference_index) {
+        Some(t) => {
+            let chosen = point(t);
+            let (lo, hi) = sweep.plateau(t);
+            report.plateau = Some(CutPlateau { lo: sweep.value(&pred, lo), hi: sweep.value(&pred, hi), rows_lo: lo, rows_hi: hi });
+            report.source = source;
+            report.value = chosen.value;
+            report.cut = Some(chosen);
+        }
+        None => {
+            let inner = (1..n).any(|t| sweep.is_valid(t) && sweep.fitness(t).is_finite());
+            report.fallback = Some(if inner { "floor" } else { "no_valid_cut" });
+            report.cut = Some(reference_point.clone());
+        }
+    }
+    report.reference = Some(reference_point);
+    report
 }
 
 /// The candidate of one window. Reads the training and validation rows only,
@@ -4043,9 +5879,11 @@ fn select_candidate(
     spec: &EvalSpec,
     trees: &[Node],
     has_validation: bool,
+    fit: Option<&CutFit>,
 ) -> Result<Selected, String> {
             let mut best: Option<(usize, f64, f64)> = None;
             let mut thresholds = vec![f64::NAN; d.train_scores.len()];
+            let mut cuts: Vec<Option<CutReport>> = vec![None; d.train_scores.len()];
             for (c, scores) in d.train_scores.iter().enumerate() {
                 let source_scores = if has_validation {
                     &d.validation_scores[c]
@@ -4067,6 +5905,15 @@ fn select_candidate(
                 };
                 let threshold = if spec.policy == Policy::TopTercile {
                     f64::NAN
+                } else if let (Some(fit), Some(theta)) = (fit, spec.threshold_fixed) {
+                    let report = if has_validation {
+                        fit_cut(&d.validation_rows, &d.validation_scores[c], theta, fit, spec.cost_bps, ThresholdSource::ValidationFitness)
+                    } else {
+                        fit_cut(&d.train_rows, &d.train_row_scores[c], theta, fit, spec.cost_bps, ThresholdSource::TrainFitness)
+                    };
+                    let value = report.value;
+                    cuts[c] = Some(report);
+                    value
                 } else if let Some(theta) = spec.threshold_fixed {
                     Threshold::fixed(theta)?.value()
                 } else if has_validation {
@@ -4129,7 +5976,7 @@ fn select_candidate(
                 let err = if has_validation { Some(err) } else { None };
                 (c, err, theta)
             };
-    Ok(Selected { candidate, validation_error, threshold, band_selection, thresholds })
+    Ok(Selected { candidate, validation_error, threshold, band_selection, thresholds, cuts })
 }
 
 #[cfg(test)]
@@ -4364,5 +6211,17 @@ mod close_ledger_tests {
         close_ledger_at(&mut ledger, 1.0);
         assert_eq!(ledger.wall_s(), 1.0);
         assert_eq!(ledger.closure_residual().value, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod group_key_tests {
+    use super::*;
+
+    #[test]
+    fn signed_zeros_and_nans_share_one_id_each() {
+        assert_eq!(group_key(-0.0), group_key(0.0));
+        assert_eq!(group_key(f64::NAN), u64::MAX);
+        assert_ne!(group_key(1.0), group_key(-1.0));
     }
 }

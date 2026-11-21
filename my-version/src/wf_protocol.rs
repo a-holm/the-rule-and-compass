@@ -22,7 +22,7 @@ pub struct NullBook {
     pub groups: Vec<u64>,
     /// Period index of each row.
     pub period: Vec<u32>,
-    /// Rows per period.
+    /// Rows per period; 0 for an empty period of `--period-grid target`, which books 0.
     pub period_count: Vec<u32>,
     /// Observed cost per period (`gross - net`), held fixed under the nulls.
     pub period_cost: Vec<f64>,
@@ -426,7 +426,7 @@ fn permuted_sources(periods: usize, block: usize, rng: &mut Mt) -> Vec<u32> {
 }
 
 /// Smallest offset of the shared shift and the number of offsets of a window of `periods`.
-fn shift_range(periods: usize, block: usize) -> (u64, u64) {
+pub(crate) fn shift_range(periods: usize, block: usize) -> (u64, u64) {
     let lo = block.min(periods / 4).max(1) as u64;
     let p = periods as u64;
     (lo, (p + 1).saturating_sub(2 * lo))
@@ -454,7 +454,7 @@ fn shifted_stats(
             bins[book.period[row] as usize] += v;
         }
         for k in 0..periods {
-            r_stat.push(bins[k] / book.period_count[k] as f64);
+            r_stat.push(if book.period_count[k] == 0 { 0.0 } else { bins[k] / book.period_count[k] as f64 });
         }
     }
     Ok((r_stat.mean(), r_stat.sharpe()))
@@ -494,7 +494,7 @@ fn run_nulls(i: &InferenceInput) -> Result<NullTests, String> {
                 }
             }
             for k in 0..periods {
-                p_stat.push(sum[k] / book.period_count[k] as f64 - book.period_cost[k]);
+                p_stat.push(if book.period_count[k] == 0 { 0.0 } else { sum[k] / book.period_count[k] as f64 - book.period_cost[k] });
             }
         }
         perm_mean.push(p_stat.mean());
@@ -611,7 +611,8 @@ fn null_row_json(r: &NullRow) -> String {
 }
 
 impl Economics {
-    pub fn json(&self) -> String {
+    /// The `cost_ladder` array.
+    pub fn ladder_json(&self) -> String {
         let ladder: Vec<String> = self
             .ladder
             .iter()
@@ -628,6 +629,10 @@ impl Economics {
                 )
             })
             .collect();
+        format!("[{}]", ladder.join(","))
+    }
+
+    pub fn json(&self) -> String {
         let bench: Vec<String> = self
             .benchmarks
             .iter()
@@ -662,7 +667,7 @@ impl Economics {
         format!(
             "{{\"book\":\"long_flat_vs_cash\",\"cost_bps_per_side\":{},\"periods_per_year\":{},\
              \"sortino\":{},\"calmar\":{},\"cvar_95\":{},\"cvar_99\":{},\
-             \"break_even_bps_per_side\":{},\"break_even_status\":{},\"cost_ladder\":[{}],\"daily\":{}{},\
+             \"break_even_bps_per_side\":{},\"break_even_status\":{},\"cost_ladder\":{},\"daily\":{}{},\
              \"benchmark_series\":\"every window started flat\",\"best_baseline\":{},\"benchmarks\":[{}]}}",
             jnum(self.cost_bps),
             jnum(self.periods_per_year),
@@ -672,7 +677,7 @@ impl Economics {
             jnum(self.cvar99),
             jnum(self.break_even_bps_per_side),
             jstr(self.break_even_status),
-            ladder.join(","),
+            self.ladder_json(),
             daily,
             unavailable,
             jstr(&self.best_baseline),

@@ -18,6 +18,7 @@
 //! so older checkpoints still load and default checkpoints keep their bytes.
 //! `tests/settings_table.rs` checks every row in every reader.
 
+use crate::qd::DescriptorKind;
 use crate::search::{Config, FitAccept, FrontScope, MigrationPolicy, MutationMix, RestartPolicy, Selection, VariationMode};
 use std::collections::BTreeMap;
 
@@ -38,10 +39,16 @@ pub enum Group {
     Fit,
     /// The variation engine selection, after the checkpoint options.
     Engine,
+    /// Structural de-duplication.
+    Dedup,
+    /// Pareto-front parent feedback.
+    FrontParents,
+    /// The quality-diversity settings, after the other `--qd` options.
+    Qd,
 }
 
 impl Group {
-    pub const ALL: [Group; 7] = [
+    pub const ALL: [Group; 10] = [
         Group::Stop,
         Group::Schedule,
         Group::Island,
@@ -49,6 +56,9 @@ impl Group {
         Group::Filter,
         Group::Fit,
         Group::Engine,
+        Group::Dedup,
+        Group::FrontParents,
+        Group::Qd,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -60,6 +70,9 @@ impl Group {
             Group::Filter => "filter",
             Group::Fit => "fit",
             Group::Engine => "engine",
+            Group::Dedup => "dedup",
+            Group::FrontParents => "front_parents",
+            Group::Qd => "qd",
         }
     }
 }
@@ -164,7 +177,7 @@ macro_rules! enum_value {
     )*};
 }
 
-enum_value!(Selection, RestartPolicy, MutationMix, FrontScope, MigrationPolicy, VariationMode, FitAccept);
+enum_value!(Selection, RestartPolicy, MutationMix, FrontScope, MigrationPolicy, VariationMode, FitAccept, DescriptorKind);
 
 /// How the command line sets a row.
 pub enum Cli<T> {
@@ -241,6 +254,8 @@ pub trait Setting: Sync {
     /// The checkpoint writer emits the key even at the default.
     fn always(&self) -> bool;
     fn takes_value(&self) -> bool;
+    /// The flag sets the value to `false`: a `--no-<name>` flag, whose schema default is `false`.
+    fn negative(&self) -> bool;
     /// Set the row from the command line; `value` is `None` for a flag.
     fn apply_cli(&self, cfg: &mut Config, value: Option<&str>) -> Result<(), String>;
     /// Copy the row's value from `from` into `to`.
@@ -286,6 +301,9 @@ impl<T: Value> Setting for Row<T> {
     }
     fn takes_value(&self) -> bool {
         matches!(self.cli, Cli::Value(_))
+    }
+    fn negative(&self) -> bool {
+        matches!(&self.cli, Cli::Flag(v) if v.show() == "false")
     }
     fn apply_cli(&self, cfg: &mut Config, value: Option<&str>) -> Result<(), String> {
         let v = match (&self.cli, value) {
@@ -490,6 +508,18 @@ fn island_policy(cfg: &Config) -> bool {
     cfg.restart_policy == RestartPolicy::Island
 }
 
+fn lexicase_selection(cfg: &Config) -> bool {
+    cfg.selection == Selection::Lexicase
+}
+
+fn lexicase_cases(text: &str) -> Result<usize, String> {
+    let max = crate::search::MAX_LEXICASE_CASES;
+    match text.parse::<usize>() {
+        Ok(k) if (2..=max).contains(&k) => Ok(k),
+        _ => Err(format!("--lexicase-cases needs an integer from 2 to {}, got '{}'", max, text)),
+    }
+}
+
 /// The table. Within a group, the order is the order of every reader.
 pub static TABLE: &[&dyn Setting] = &[
     &Row::<usize> {
@@ -565,8 +595,8 @@ pub static TABLE: &[&dyn Setting] = &[
         group: Group::Island,
         schema_type: "enum",
         schema_default: "lexicographic",
-        schema: "#465: survivor and parent selection inside an island: lexicographic (generational replacement, tournament on error then size) or afp (age-fitness Pareto: survivors of parents, offspring and random immigrants by non-dominated sorting on error, complexity and age with crowding distance; parents by Pareto rank and crowding). Saved search setting. afp runs on the node path; --variation postfix with afp exits 2, auto picks the node path",
-        help: "  --selection lexicographic|afp
+        schema: "#465: survivor and parent selection inside an island: lexicographic (generational replacement, tournament on error then size), afp (age-fitness Pareto: survivors of parents, offspring and random immigrants by non-dominated sorting on error, complexity and age with crowding distance; parents by Pareto rank and crowding) or lexicase (#1023: generational replacement with the elite; parents by semi-dynamic epsilon-lexicase on --lexicase-cases cases drawn per generation: row losses under the metric fitness, (group, time block) sub-book regrets under --fitness pnl; epsilon is the median absolute deviation of the island's errors on each case). Saved search setting. afp and lexicase run on the node path; --variation postfix with either exits 2, auto picks the node path. lexicase runs on the CPU: --gpu with it exits 2 and a CUDA build without --gpu notes the reason and stays on the CPU. Under the metric fitness lexicase needs a metric with a per-row loss (absolute, squared, log_squashed, aic, aicc, bic, log_loss, brier, hinge, hinge_ordinary, hinge_squared), one target and no --weight; any other exits 2",
+        help: "  --selection lexicographic|afp|lexicase
                              survivor and parent selection inside an island.
                              lexicographic (default) replaces the island with
                              its offspring and picks parents by error, then
@@ -574,9 +604,16 @@ pub static TABLE: &[&dyn Setting] = &[
                              offspring on (error, complexity, age), adds a few
                              random immigrants per generation and picks
                              parents by Pareto rank and crowding distance.
-                             Node path only; refuses --variation postfix",
+                             lexicase replaces the island like lexicographic
+                             and picks parents by epsilon-lexicase on cases
+                             drawn per generation (--lexicase-cases): row
+                             losses under the metric fitness, (group, time
+                             block) sub-book regrets under --fitness pnl.
+                             lexicase runs on the CPU and needs a per-row
+                             loss metric. Node path only; refuses --variation
+                             postfix",
         bench: Some(Bench {
-            usage: "  --selection <mode>        lexicographic (default) or afp (age-fitness Pareto)",
+            usage: "  --selection <mode>        lexicographic (default), afp (age-fitness Pareto) or lexicase",
             omit_unset: false,
         }),
         gui: false,
@@ -586,6 +623,30 @@ pub static TABLE: &[&dyn Setting] = &[
         write: Write::UnlessDefault,
         active: None,
         conflict: Conflict::Saved,
+    },
+    &Row::<usize> {
+        flag: "--lexicase-cases",
+        key: "lexicase_cases",
+        group: Group::Island,
+        schema_type: "int",
+        schema_default: "256",
+        schema: "#1023: cases one --selection lexicase generation selects on, 2 to 4096. Metric fitness: this many rows of the generation's sample (all rows when fewer), drawn from the seed and the generation. --fitness pnl: every (group, time block) sub-book with a positive hindsight bound is a case; when there are more, this many are drawn per generation. Read only under --selection lexicase. Saved search setting: a resume refuses a different value; a checkpoint without it loads 256",
+        help: "  --lexicase-cases <K>       cases one --selection lexicase generation selects
+                             on, default 256, 2 to 4096: rows under the metric
+                             fitness, sub-books under --fitness pnl, drawn per
+                             generation from the seed. Saved search setting
+                             (#1023)",
+        bench: Some(Bench {
+            usage: "  --lexicase-cases <K>      cases per generation under --selection lexicase",
+            omit_unset: true,
+        }),
+        gui: false,
+        get: |c| &c.lexicase_cases,
+        set: |c| &mut c.lexicase_cases,
+        cli: Cli::Value(lexicase_cases),
+        write: Write::UnlessDefault,
+        active: Some(lexicase_selection),
+        conflict: Conflict::SavedKey,
     },
     &Row::<RestartPolicy> {
         flag: "--restart-policy",
@@ -788,10 +849,10 @@ pub static TABLE: &[&dyn Setting] = &[
         group: Group::Variation,
         schema_type: "flag",
         schema_default: "false",
-        schema: "#471: each island learns edit weights from the last 10 generations: w_k = max(0.02, (s_k + 1) / (a_k + 2)), normalised, where a child counts as a success when its error is below its first parent's. Uses all seven edit kinds; the --mutation-mix weights stand until a generation has been observed. Learns only from CPU-scored generations (a deferred GPU batch or a screening subset keeps the base weights). The counts are saved in the checkpoint. Saved search setting. Exit 2 with --variation postfix",
+        schema: "#471: each island learns edit weights from the last 10 generations: w_k = max(0.02, (s_k + 1) / (a_k + 2)), normalised, where a child counts as a success when its error is below its first parent's. Uses all seven edit kinds; the --mutation-mix weights stand until a generation has been observed. Learns on both backends: the CPU path counts a child when it is scored, a device-scored generation is counted at the generation barrier by the same win rule (#1079). A screening subset (--fit-samples) keeps the base weights. The counts are saved in the checkpoint. Saved search setting. Exit 2 with --variation postfix",
         help: "  --adaptive-mix             per-island edit weights learned from the success
                              rate of the last 10 generations (uses all seven edit
-                             kinds; learns from CPU-scored generations only).
+                             kinds; learns on the CPU and the device).
                              Off by default; not with --variation postfix (#471)",
         bench: Some(Bench {
             usage: "  --adaptive-mix            per-island edit weights from success rates (#471)",
@@ -937,6 +998,64 @@ pub static TABLE: &[&dyn Setting] = &[
         get: |c| &c.fit_accept,
         set: |c| &mut c.fit_accept,
         cli: Cli::Value(FitAccept::parse),
+        write: Write::UnlessDefault,
+        active: None,
+        conflict: Conflict::SavedKey,
+    },
+    &Row::<bool> {
+        flag: "--no-dedup",
+        key: "dedup",
+        group: Group::Dedup,
+        schema_type: "flag",
+        schema_default: "false",
+        schema: "disable structural de-duplication",
+        help: "  --no-dedup                 disable structural de-duplication",
+        bench: None,
+        gui: true,
+        get: |c| &c.dedup,
+        set: |c| &mut c.dedup,
+        cli: Cli::Flag(false),
+        write: Write::Required,
+        active: None,
+        conflict: Conflict::Saved,
+    },
+    &Row::<bool> {
+        flag: "--no-front-parents",
+        key: "front_parents",
+        group: Group::FrontParents,
+        schema_type: "flag",
+        schema_default: "false",
+        schema: "draw every parent from the island tournament; disables the 15% Pareto-front feedback and restores the pre-#76 trajectory exactly",
+        help: "  --no-front-parents         draw every parent from the island tournament;
+                             turns off the 15% Pareto-front feedback (#76)",
+        bench: None,
+        gui: true,
+        get: |c| &c.front_parents,
+        set: |c| &mut c.front_parents,
+        cli: Cli::Flag(false),
+        write: Write::UnlessDefault,
+        active: None,
+        conflict: Conflict::Saved,
+    },
+    &Row::<DescriptorKind> {
+        flag: "--qd-descriptor",
+        key: "qd_descriptor",
+        group: Group::Qd,
+        schema_type: "enum",
+        schema_default: "moments",
+        schema: "#1084: moments | book. What the two QD descriptor axes measure. moments: variable usage x prediction skewness. book: the long/flat book of the search fitness, from the reduction that gives the regret: exposure x = long_rows / rows mapped by ln(x / 1e-4) / ln(1e4), and mean holding length h = long_rows / max(1, entries) rows, entries = (flips + exits) / 2 over every (group, block) run, mapped by ln(h) / ln(1e4); both clamped to [0, 1], a flat book at (0, 0). Needs --fitness pnl and a QD archive (--qd, --qd-cells or --qd-policy), else exit 2. Under book every cell counts as reachable. A device-scored member gets its book descriptor from one CPU evaluation, counted in qd.descriptor_fallbacks. --json qd.descriptor is book; the key is absent under moments. Saved search setting: written to the checkpoint only for book, a resume refuses a different value, a checkpoint without it loads as moments",
+        help: "  --qd-descriptor moments|book
+                             what the QD descriptor axes measure. moments
+                             (default): variable usage x prediction skewness.
+                             book: log exposure x log mean holding length of
+                             the long/flat book the fitness prices. book needs
+                             --fitness pnl and --qd, --qd-cells or
+                             --qd-policy. Saved search setting (#1084)",
+        bench: None,
+        gui: false,
+        get: |c| &c.qd_descriptor,
+        set: |c| &mut c.qd_descriptor,
+        cli: Cli::Value(DescriptorKind::parse),
         write: Write::UnlessDefault,
         active: None,
         conflict: Conflict::SavedKey,

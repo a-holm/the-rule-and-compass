@@ -717,7 +717,7 @@ mod device {
         let want_all = bg::WANT_MEAN | bg::WANT_BREADTH | bg::WANT_DISPERSION | bg::WANT_REL;
         for (seed, scale) in [(1u64, 0.02), (2, 0.5)] {
             let src = source(&c, seed, scale);
-            let st = gpu.group_stats(&src, want_all).expect("group stats");
+            let st = gpu.group_stats(&src, want_all, 20).expect("group stats");
             let [mkt, br, sd, rel] = oracle_stats(&c, &src);
             let mut finite = 0usize;
             for i in 0..src.len() {
@@ -729,7 +729,7 @@ mod device {
             }
             assert!(finite > 0 && finite < src.len(), "fixture must mix valid and thin timestamps");
             // A partial request returns only what was asked for.
-            let only = gpu.group_stats(&src, bg::WANT_MEAN).unwrap();
+            let only = gpu.group_stats(&src, bg::WANT_MEAN, 20).unwrap();
             assert_eq!(only.mean.len(), src.len());
             assert!(only.breadth.is_empty() && only.rel.is_empty());
         }
@@ -743,7 +743,7 @@ mod device {
         let c = cross_section(30, 520, 31);
         let mut gpu = market_ctx(&c);
         let r1 = source_nan(&c, 5, 0.01, 997);
-        let got = gpu.avg_corr(&r1).expect("avg_corr");
+        let got = gpu.avg_corr(&r1, 20).expect("avg_corr");
         let want = oracle_avg_corr(&c, &r1);
         let mut finite = 0usize;
         for i in 0..r1.len() {
@@ -756,7 +756,7 @@ mod device {
         let vol: Vec<f64> = source(&c, 8, 100.0).iter().map(|v| v.abs()).collect();
         let mut bench = bench_series(520, 77, 17);
         bench.planes[bg::PLANE_VOLUME].iter_mut().for_each(|v| *v += 5.0);
-        let share = gpu.volume_share(&vol, &bench).expect("volume share");
+        let share = gpu.volume_share(&vol, &bench, 20).expect("volume share");
         let mut expect = vec![f64::NAN; vol.len()];
         for group in groups(&c, &order(&c)) {
             let (mut total, mut count) = (0.0, 0usize);

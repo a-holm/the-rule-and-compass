@@ -16,7 +16,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 pub const SCHEMA_VERSION: u32 = 1;
-pub const FEATURE_REGISTRY_VERSION: u32 = 1;
+pub const FEATURE_REGISTRY_VERSION: u32 = 2;
 pub const DEFAULT_PANEL_VERSION: &str = "2";
 
 /// Compact 52-feature parity is owned by #269; this module registers and
@@ -228,6 +228,8 @@ pub struct ColumnSchema {
     pub dtype: DType,
     pub availability_start: Option<i64>,
     pub availability_end: Option<i64>,
+    /// Member floor the column was built with (#1274); `None` outside the cross-section columns.
+    pub min_members: Option<usize>,
     pub sha256: String,
 }
 
@@ -390,6 +392,7 @@ pub fn build_schema_excluding(store: &FileStore, exclude: Option<crate::lockbox:
             dtype: dtypes[c],
             availability_start: first[c],
             availability_end: last[c],
+            min_members: None,
             sha256: hasher.finalize(),
         });
     }
@@ -458,13 +461,13 @@ pub fn schema_json(
         s.push_str(&format!(
             "{{\"name\":{},\"family\":{},\"timeframe\":{},\"sources\":[{}],\"transform\":{},\
              \"causal_offset\":{},\"warmup_bars\":{},\"lookback_seconds\":{},\"dtype\":{},\"unit\":{},\
-             \"availability_start\":{},\"availability_end\":{},\"pit_rule\":{},\
+             \"availability_start\":{},\"availability_end\":{},\"pit_rule\":{},{}\
              \"semantic_cost\":{},\"status\":{},\"sha256\":{}}}{}\n",
             esc(&c.name),
             esc(&r.family),
             esc(&r.timeframe),
             sources.join(","),
-            esc(&r.transform),
+            esc(&crate::cross_floor::pit_text(&r.transform, c.min_members)),
             r.causal_offset,
             r.warmup,
             opt_i64(crate::enrich::lookback_seconds(&c.name, base_bar)),
@@ -472,7 +475,8 @@ pub fn schema_json(
             esc(&r.unit),
             opt_i64(c.availability_start),
             opt_i64(c.availability_end),
-            esc(&r.pit_rule),
+            esc(&crate::cross_floor::pit_text(&r.pit_rule, c.min_members)),
+            c.min_members.map(|k| format!("\"min_members\":{},", k)).unwrap_or_default(),
             r.semantic_cost,
             esc(if r.available { "available" } else { "unavailable" }),
             esc(&c.sha256),
@@ -550,8 +554,29 @@ pub fn write_schema_locked(
     retired: Option<&crate::retire::Retirement>,
     record: Option<&crate::lockrec::LockRecord>,
 ) -> Result<String, String> {
+    let names = FileStore::open(store_path)?.header().names();
+    let floors = crate::cross_floor::resolved_columns(store_path, &names);
+    write_schema_floors(store_path, panel_version, locked_test, also, embargo_floor, retired, record, &floors)
+}
+
+/// As [`write_schema_locked`], recording `floors` (column name to member floor, #1274) on the cross-section columns.
+pub fn write_schema_floors(
+    store_path: &str,
+    panel_version: &str,
+    locked_test: Option<&crate::lockbox::Lockbox>,
+    also: Option<&crate::lockbox::Lockbox>,
+    embargo_floor: Option<i64>,
+    retired: Option<&crate::retire::Retirement>,
+    record: Option<&crate::lockrec::LockRecord>,
+    floors: &BTreeMap<String, usize>,
+) -> Result<String, String> {
     let store = FileStore::open(store_path)?;
-    let (columns, bar, kept) = build_schema_excluding(&store, record.map(|r| r.range))?;
+    let (mut columns, bar, kept) = build_schema_excluding(&store, record.map(|r| r.range))?;
+    for c in &mut columns {
+        if crate::cross_floor::is_floored(&c.name) {
+            c.min_members = floors.get(&c.name).copied();
+        }
+    }
     let rows = if record.is_some() { kept } else { store.n_rows() };
     let mut text = schema_json(&columns, &bar, rows, panel_version, locked_test, also, embargo_floor, retired);
     if let Some(r) = record {
@@ -577,6 +602,26 @@ pub fn read_hashes(schema_file: &str) -> Result<BTreeMap<String, String>, String
         return Err(format!("{}: no column entries", schema_file));
     }
     Ok(out)
+}
+
+/// Version recorded in a schema sidecar header; a sidecar without the key
+/// reads as version 1. None when the file cannot be read.
+pub fn recorded_version(schema_file: &str) -> Option<u32> {
+    const KEY: &str = "\"feature_registry_version\":";
+    let text = std::fs::read_to_string(schema_file).ok()?;
+    let head = text.lines().next()?;
+    let Some(at) = head.find(KEY) else { return Some(1) };
+    head[at + KEY.len()..].split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
+}
+
+/// One stderr line when the sidecar was written by an older registry.
+pub fn registry_age_note(schema_file: &str) -> Option<String> {
+    let v = recorded_version(schema_file)?;
+    (v < FEATURE_REGISTRY_VERSION).then(|| {
+        format!(
+            "warning: {schema_file} was written with feature_registry_version {v}, this build has {FEATURE_REGISTRY_VERSION}; column hashes still verify, registry text (formula, floor) may differ; run `rcsr panel schema --data <store>` to rewrite it"
+        )
+    })
 }
 
 /// Re-hash the store and compare with its schema file. Returns the names whose
@@ -639,6 +684,9 @@ pub fn check_vars(store_path: &str, vars: &[String]) -> Result<(), String> {
     let schema_file = schema_path(store_path);
     if !Path::new(&schema_file).is_file() {
         return Ok(());
+    }
+    if let Some(note) = registry_age_note(&schema_file) {
+        eprintln!("{}", note);
     }
     let known = read_hashes(&schema_file)?;
     for v in vars {
@@ -766,6 +814,19 @@ pub fn select_view_excluding(
     view: usize,
     excluded: &[(String, String)],
 ) -> Result<View, ViewError> {
+    select_view_versioned(columns, size, seed, view, excluded, FEATURE_REGISTRY_VERSION)
+}
+
+/// `select_view_excluding` with the registry version that enters the view id.
+/// The drawn columns never depend on it.
+pub fn select_view_versioned(
+    columns: &[String],
+    size: usize,
+    seed: u64,
+    view: usize,
+    excluded: &[(String, String)],
+    registry_version: u32,
+) -> Result<View, ViewError> {
     check_view_size(size).map_err(ViewError::Invalid)?;
     let mut fams: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for c in columns {
@@ -838,7 +899,7 @@ pub fn select_view_excluding(
         })
         .collect();
     let families: Vec<(String, Vec<String>)> = picked.into_iter().collect();
-    let id_text = format!("{}|{}|{}|{}|{}", FEATURE_REGISTRY_VERSION, seed, view, size, cols.join(","));
+    let id_text = format!("{}|{}|{}|{}|{}", registry_version, seed, view, size, cols.join(","));
     let id = manifest::sha256_hex(id_text.as_bytes())[..12].to_string();
     Ok(View {
         id,
@@ -907,6 +968,11 @@ pub fn test_ids(e: &RegistryEntry) -> Vec<&'static str> {
             "tests/enrich.rs::flow_formulas_match_hand_built_bars",
             "tests/enrich.rs::flow_windows_are_gap_masked",
             "tests/enrich.rs::flow_windows_never_bridge_a_listing_boundary",
+        ],
+        "cross" if crate::enrich::CROSS_GATE_NAMES.contains(&e.name.as_str()) => vec![
+            "tests/enrich.rs::market_gate_columns_match_hand_built_series",
+            "tests/enrich.rs::market_gate_columns_are_causal_under_future_edits",
+            "tests/enrich.rs::market_gate_columns_respect_the_member_floor",
         ],
         "cross" => vec![
             "tests/enrich.rs::cross_family_is_exactly_the_registry_and_market_state_is_ex_self_pit",

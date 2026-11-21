@@ -18,6 +18,7 @@
 //! * Null p-values use `(1 + #{null >= observed}) / (B + 1)`.
 //! * The SPA test is Hansen (2005) with a joint circular block bootstrap, the
 //!   studentised statistic and the three recentering variants.
+//! * StepM is Romano and Wolf (2005) on the SPA resampler.
 //! * DSR is Bailey and Lopez de Prado (2014); PBO is the CSCV procedure of
 //!   Bailey, Borwein, Lopez de Prado and Zhu (2017).
 
@@ -35,6 +36,81 @@ pub fn normal_cdf(x: f64) -> f64 {
 }
 
 pub use crate::noise::normal_quantile;
+
+/// #1184: upper tail `P(T > t)` of Student's t with `df` degrees of freedom,
+/// from the regularised incomplete beta function (continued fraction, `f64`).
+/// A tail below the normal tail never occurs for `t > 0`.
+pub fn student_t_sf(t: f64, df: f64) -> f64 {
+    if t.is_nan() || !(df > 0.0) {
+        return f64::NAN;
+    }
+    if t == f64::INFINITY {
+        return 0.0;
+    }
+    if t == f64::NEG_INFINITY {
+        return 1.0;
+    }
+    if t < 0.0 {
+        return 1.0 - student_t_sf(-t, df);
+    }
+    // sf = I_x(df/2, 1/2) / 2 with x = df / (df + t^2); y = 1 - x without cancellation.
+    let (a, b) = (df / 2.0, 0.5);
+    let x = df / (df + t * t);
+    let y = t * t / (df + t * t);
+    let ln_front = crate::diagnostics::ln_gamma(a + b) - crate::diagnostics::ln_gamma(a) - crate::diagnostics::ln_gamma(b)
+        + a * x.ln()
+        + b * y.ln();
+    let i = if x < (a + 1.0) / (a + b + 2.0) {
+        ln_front.exp() * beta_cf(a, b, x) / a
+    } else {
+        1.0 - ln_front.exp() * beta_cf(b, a, y) / b
+    };
+    0.5 * i
+}
+
+/// Continued fraction of the incomplete beta function (modified Lentz).
+fn beta_cf(a: f64, b: f64, x: f64) -> f64 {
+    const TINY: f64 = 1e-300;
+    let (qab, qap, qam) = (a + b, a + 1.0, a - 1.0);
+    let mut c = 1.0;
+    let mut d = 1.0 - qab * x / qap;
+    if d.abs() < TINY {
+        d = TINY;
+    }
+    d = 1.0 / d;
+    let mut h = d;
+    for m in 1..=2000 {
+        let m = m as f64;
+        let m2 = 2.0 * m;
+        let aa = m * (b - m) * x / ((qam + m2) * (a + m2));
+        d = 1.0 + aa * d;
+        if d.abs() < TINY {
+            d = TINY;
+        }
+        c = 1.0 + aa / c;
+        if c.abs() < TINY {
+            c = TINY;
+        }
+        d = 1.0 / d;
+        h *= d * c;
+        let aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2));
+        d = 1.0 + aa * d;
+        if d.abs() < TINY {
+            d = TINY;
+        }
+        c = 1.0 + aa / c;
+        if c.abs() < TINY {
+            c = TINY;
+        }
+        d = 1.0 / d;
+        let del = d * c;
+        h *= del;
+        if (del - 1.0).abs() < 1e-16 {
+            break;
+        }
+    }
+    h
+}
 
 pub fn mean(x: &[f64]) -> f64 {
     if x.is_empty() {
@@ -94,6 +170,13 @@ pub fn sharpe_per_period(x: &[f64]) -> f64 {
     } else {
         f64::NAN
     }
+}
+
+/// #1237: the 1-based nearest-rank position `ceil(P n / 100)` of an integer percentile `P`
+/// in 1..=99 among `n` ascending values, as `(P n + 99) / 100` in integer arithmetic; 0 for
+/// `n = 0`. No interpolation: the percentile is the value at that position.
+pub fn nearest_rank(n: usize, percentile: u32) -> usize {
+    (percentile as usize * n + 99) / 100
 }
 
 /// Type-7 quantile of an ascending slice.
@@ -871,4 +954,114 @@ pub fn bh_fdr(p: &[f64], q: f64) -> Bh {
         adjusted,
         n_rejected: cutoff,
     }
+}
+
+// ---------------------------------------------------------------------------
+// StepM
+// ---------------------------------------------------------------------------
+
+/// Result of the Romano and Wolf (2005) StepM.
+#[derive(Clone, Debug)]
+pub struct StepM {
+    pub models: usize,
+    pub n: usize,
+    pub block_len: usize,
+    pub draws: usize,
+    pub seed: u32,
+    pub alpha: f64,
+    /// Studentised `sqrt(n) dbar_k / omega_k` of every model.
+    pub statistic: Vec<f64>,
+    /// One-sided bootstrap p of `mean d_k > 0`, `(1 + count) / (B + 1)`.
+    pub p_values: Vec<f64>,
+    pub rejected: Vec<bool>,
+    /// The critical value of every step.
+    pub critical: Vec<f64>,
+}
+
+/// StepM of Romano and Wolf (2005). `d[k][t]` is model `k`'s performance minus
+/// the benchmark's at period `t`; model `k` beats the benchmark when its mean
+/// is positive. One joint circular block bootstrap (the resampler of
+/// [`spa_test`]) gives the centred studentised draws. Each step rejects every
+/// model left whose statistic exceeds the `1 - alpha` quantile of the largest
+/// draw over the models left, until a step rejects none; the family-wise error
+/// rate is `alpha` asymptotically.
+pub fn stepm(d: &[Vec<f64>], block: usize, draws: usize, seed: u32, alpha: f64) -> Result<StepM, String> {
+    let k = d.len();
+    if k == 0 {
+        return Err("StepM needs at least one model".to_string());
+    }
+    if draws < 2 {
+        return Err("StepM needs at least 2 draws".to_string());
+    }
+    if !(alpha > 0.0 && alpha < 1.0) {
+        return Err("StepM needs alpha in (0, 1)".to_string());
+    }
+    let n = d.iter().map(|c| c.len()).min().unwrap_or(0);
+    if n < 3 {
+        return Err("StepM needs at least 3 periods".to_string());
+    }
+    let block = block.clamp(1, n);
+    let nf = n as f64;
+    let dbar: Vec<f64> = d.iter().map(|c| mean(&c[..n])).collect();
+    let mut prefix = vec![vec![0.0f64; 2 * n + 1]; k];
+    for (c, col) in d.iter().enumerate() {
+        for i in 0..2 * n {
+            prefix[c][i + 1] = prefix[c][i] + (col[i % n] - dbar[c]);
+        }
+    }
+    let mut rng = Mt::new(seed);
+    let mut star = vec![vec![0.0f64; k]; draws];
+    let mut starts: Vec<(usize, usize)> = Vec::new();
+    for row in star.iter_mut() {
+        starts.clear();
+        let mut remaining = n;
+        while remaining > 0 {
+            let len = block.min(remaining);
+            starts.push((rng.usize_below(n), len));
+            remaining -= len;
+        }
+        for c in 0..k {
+            let s: f64 = starts.iter().map(|&(s, len)| prefix[c][s + len] - prefix[c][s]).sum();
+            row[c] = s / nf;
+        }
+    }
+    let omega: Vec<f64> = (0..k)
+        .map(|c| {
+            let v: Vec<f64> = star.iter().map(|r| r[c]).collect();
+            nf.sqrt() * sample_sd(&v)
+        })
+        .collect();
+    let statistic: Vec<f64> = (0..k)
+        .map(|c| {
+            if omega[c] > 0.0 {
+                nf.sqrt() * dbar[c] / omega[c]
+            } else if dbar[c] > 0.0 {
+                f64::INFINITY
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let z = |row: &[f64], c: usize| if omega[c] > 0.0 { nf.sqrt() * row[c] / omega[c] } else { 0.0 };
+    let p_values: Vec<f64> = (0..k).map(|c| null_p_count(star.iter().filter(|r| z(r, c) >= statistic[c]).count(), draws)).collect();
+    let mut rejected = vec![false; k];
+    let mut critical = Vec::new();
+    loop {
+        let left: Vec<usize> = (0..k).filter(|&c| !rejected[c]).collect();
+        if left.is_empty() {
+            break;
+        }
+        let mut maxes: Vec<f64> = star.iter().map(|r| left.iter().map(|&c| z(r, c)).fold(f64::NEG_INFINITY, f64::max)).collect();
+        maxes.sort_by(|a, b| a.total_cmp(b));
+        let cv = quantile_sorted(&maxes, 1.0 - alpha);
+        critical.push(cv);
+        let new: Vec<usize> = left.into_iter().filter(|&c| statistic[c] > cv).collect();
+        if new.is_empty() {
+            break;
+        }
+        for c in new {
+            rejected[c] = true;
+        }
+    }
+    Ok(StepM { models: k, n, block_len: block, draws, seed, alpha, statistic, p_values, rejected, critical })
 }

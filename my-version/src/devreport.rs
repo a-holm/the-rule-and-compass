@@ -1098,6 +1098,7 @@ mod tests {
             isolated: 0,
             migrants: 0,
             migrants_skipped: 0,
+            lexicase_cases: None,
         }
         .json()
     }

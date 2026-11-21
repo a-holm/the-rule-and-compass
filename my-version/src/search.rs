@@ -81,6 +81,8 @@ pub enum Selection {
     Lexicographic,
     /// Age-fitness Pareto survivor selection over parents and offspring.
     Afp,
+    /// #1023: generational replacement with epsilon-lexicase parent selection.
+    Lexicase,
 }
 
 impl Selection {
@@ -88,6 +90,7 @@ impl Selection {
         match self {
             Selection::Lexicographic => "lexicographic",
             Selection::Afp => "afp",
+            Selection::Lexicase => "lexicase",
         }
     }
 
@@ -95,8 +98,9 @@ impl Selection {
         match s {
             "lexicographic" => Ok(Selection::Lexicographic),
             "afp" => Ok(Selection::Afp),
+            "lexicase" => Ok(Selection::Lexicase),
             other => Err(format!(
-                "selection must be 'lexicographic' or 'afp', got '{}'",
+                "selection must be 'lexicographic', 'afp' or 'lexicase', got '{}'",
                 other
             )),
         }
@@ -382,7 +386,8 @@ pub struct Config {
     pub fit_view: Option<std::sync::Arc<Sample>>,
     /// #255: hard bound on how many admitted candidates one generation may
     /// refit with the exact CPU fallback arm. The first `N` fallbacks in the
-    /// deterministic admission order are refit; any remainder keeps the finite
+    /// rotated prefix order (#1125: group, then island from a start island that
+    /// moves with the seed and the generation) are refit; any remainder keeps the finite
     /// constants the device produced and is reported in `fit_fallback_bounded`.
     /// `0` disables the bound. The default is high enough not to fire on the
     /// recorded cell, so normal runs are bit-identical to the serial loop.
@@ -426,6 +431,9 @@ pub struct Config {
     /// hashes descriptors to random cells. Only the first is the proposed
     /// method; the other two are equal-budget controls.
     pub qd_control: u8,
+    /// #1084: what the QD descriptor axes measure. `Book` reads the long/flat
+    /// fitness book and needs `--fitness pnl`; `Moments` is the original pair.
+    pub qd_descriptor: qd::DescriptorKind,
     /// Optional progress callback, invoked once per generation.
     pub progress: Option<ProgressFn>,
     /// #211: optional development-log callback, invoked once per generation
@@ -459,7 +467,9 @@ pub struct Config {
     pub gpu: bool,
     /// #604: an explicit `--gpu` (or `--dispatch device`). A device failure
     /// after the start-up probe ends the run with an error instead of
-    /// continuing on the CPU. Not a search setting.
+    /// continuing on the CPU. The two start-up refusals the CLI turns into
+    /// exit 2 (lexicase selection, refused by the search up front, and a masked
+    /// sd-unit book) end the run too. Not a search setting.
     pub gpu_required: bool,
     /// #26: print the one-line `# gpu: ...` note. The CLI clears this with
     /// `--quiet`, which promises an empty stderr for machine-readable output.
@@ -504,6 +514,10 @@ pub struct Config {
     pub variation: VariationMode,
     /// #465: survivor and parent selection inside an island.
     pub selection: Selection,
+    /// #1023: cases one `--selection lexicase` generation selects on (rows
+    /// under the metric fitness, sub-books under `--fitness pnl`). Saved search
+    /// setting, read only under lexicase.
+    pub lexicase_cases: usize,
     /// #1022: which stall rule restarts an island. Saved search setting.
     pub restart_policy: RestartPolicy,
     /// #1022: generations a restarted island takes no front parent and no
@@ -803,9 +817,11 @@ pub use prune::PruneReport;
 mod fit_route; // #1091: the fit route of both device fit schedules
 mod fit_accept; // #1117: the fit-accept decision counts
 pub use fit_accept::{FitAcceptCounts, FitAcceptReport, FitPath};
+mod lexicase; // #1023: epsilon-lexicase parent selection
+pub use lexicase::{limit_refusal as lexicase_limit_refusal, metric_refusal as lexicase_metric_refusal, DEFAULT_LEXICASE_CASES, MAX_LEXICASE_CASES};
 use fit_route::{accept_fit, unfitted_wins};
 #[cfg(feature = "cuda")]
-use fit_route::{DeviceArm, ExactFits, FitRoute, FitSettings, RouteCounts};
+use fit_route::{DeviceArm, ExactFits, FitRoute, FitSettings, Rotation, RouteCounts};
 /// #495: default relative band of the finalist refit (`inf`: refit every unique tree).
 pub const DEFAULT_REFIT_BAND: f64 = f64::INFINITY;
 
@@ -853,6 +869,7 @@ impl Default for Config {
             qd_cvt: false,
             qd_policy: false,
             qd_control: 0,
+            qd_descriptor: qd::DescriptorKind::Moments,
             progress: None,
             dev_log: None, // #211: off unless --dev-log is given
             front_observer: None, // #462
@@ -878,6 +895,7 @@ impl Default for Config {
             fit_release_waves: 0,
             variation: VariationMode::Auto,
             selection: Selection::Lexicographic,
+            lexicase_cases: DEFAULT_LEXICASE_CASES,
             restart_policy: RestartPolicy::Archive,
             restart_isolation: 25,
             explore_islands: 0,
@@ -936,7 +954,7 @@ impl Config {
         compare!(fit_admission, "fit_admission");
         settings::differences(Group::Engine, self, other, &mut diff);
         settings::differences(Group::Variation, self, other, &mut diff);
-        compare!(dedup, "dedup");
+        settings::differences(Group::Dedup, self, other, &mut diff);
         // #256: `time_budget` is a per-process limit, not search state; a resumed
         // run may set a new one.
         settings::differences(Group::Stop, self, other, &mut diff);
@@ -945,13 +963,14 @@ impl Config {
         compare!(fit_rows, "fit_rows"); // #116
         compare!(fit_fallback_max, "fit_fallback_max"); // #255
         compare!(refit_band, "refit_band"); // #495
-        compare!(front_parents, "front_parents"); // #76
+        settings::differences(Group::FrontParents, self, other, &mut diff);
         settings::differences(Group::Island, self, other, &mut diff);
         compare!(qd_bins, "qd_bins"); // #120
         compare!(qd_cell_cap, "qd_cell_cap"); // #120
         compare!(qd_cvt, "qd_cvt"); // #120
         compare!(qd_policy, "qd_policy"); // #120
         compare!(qd_control, "qd_control"); // #120
+        settings::differences(Group::Qd, self, other, &mut diff); // #1084
         // #25: units only change the trajectory when they are required; the
         // declaration itself is still part of the saved configuration.
         compare!(units, "units");
@@ -1019,12 +1038,21 @@ struct Ind {
     /// `+inf` (a CPU score, a CPU check of a device `+inf`, or a dimension
     /// rejection). `None` means unconfirmed. Any write of `error` clears it.
     inf_rows: Option<u64>,
+    /// #1079: under `--adaptive-mix` with a deferred score, the first parent's
+    /// error and the bit set of edit kinds that made this offspring. Consumed
+    /// by `learn_mix_at_barrier` in the generation that set it; never saved.
+    edit: Option<(f64, u8)>,
+    /// #1023: under `--selection lexicase --fitness pnl`, the regret of every
+    /// kept sub-book from the prediction vector that produced `error`. Any
+    /// write of `error` clears it; never saved.
+    cases: Option<std::sync::Arc<[f32]>>,
 }
 
 impl Ind {
     fn set_error(&mut self, error: f64) {
         self.error = error;
         self.inf_rows = None;
+        self.cases = None;
     }
 
     /// #500: mark a `+inf` error as confirmed on the CPU for rows `rows`.
@@ -1066,16 +1094,16 @@ impl Ind {
         // fallback. The folded path applies whenever scoring already produces
         // predictions, which is every metric except the squared reuse case.
         let want_descriptor = cfg.qd_bins > 0 && !train.sample.is_multi();
-        let (error, descriptor) = if cfg.accepts_dimensions(&tree) {
+        let (error, descriptor, cases) = if cfg.accepts_dimensions(&tree) {
             match fitted {
                 Some(fit) if can_reuse_sse(cfg, train, &fit, hash) => {
-                    let d = want_descriptor.then(|| qd::descriptor(&tree, train.sample));
-                    (fit.sse / train.sample.len() as f64, d)
+                    let d = want_descriptor.then(|| qd_descriptor_of(&tree, train, cfg)); // #1084
+                    (fit.sse / train.sample.len() as f64, d, None)
                 }
-                _ => fitness_error_and_descriptor(&tree, train, cfg, want_descriptor), // #27 #480
+                _ => fitness_scored(&tree, train, cfg, want_descriptor, lexicase::stores_cases(cfg)), // #27 #480 #1023
             }
         } else {
-            (f64::INFINITY, None)
+            (f64::INFINITY, None, None)
         };
         Ind {
             tree,
@@ -1084,6 +1112,8 @@ impl Ind {
             descriptor,
             age: 0,
             inf_rows: None,
+            edit: None,
+            cases,
         }
     }
 
@@ -1111,6 +1141,8 @@ impl Ind {
             descriptor: None,
             age: 0,
             inf_rows: None,
+            edit: None,
+            cases: None,
         }
     }
 
@@ -1123,13 +1155,14 @@ impl Ind {
     fn score_in_place(&mut self, train: &EvalSample, cfg: &Config) {
         // #25: re-evaluation must not resurrect a rejected candidate.
         let want_descriptor = cfg.qd_bins > 0 && !train.sample.is_multi();
-        let (error, descriptor) = if cfg.accepts_dimensions(&self.tree) {
-            fitness_error_and_descriptor(&self.tree, train, cfg, want_descriptor) // #27 #480
+        let (error, descriptor, cases) = if cfg.accepts_dimensions(&self.tree) {
+            fitness_scored(&self.tree, train, cfg, want_descriptor, lexicase::stores_cases(cfg)) // #27 #480 #1023
         } else {
-            (f64::INFINITY, None)
+            (f64::INFINITY, None, None)
         };
         self.set_error(error);
         self.descriptor = descriptor;
+        self.cases = cases;
     }
 
     /// #500: `reeval` for an individual with a non-finite error. A `+inf` error
@@ -1212,11 +1245,15 @@ impl Ind {
             tree: ind.tree,
             error: ind.error,
             complexity: ind.complexity,
-            // A checkpoint stores the tree and score, not the descriptor; the
-            // archive recomputes it on the resumed run like any other candidate.
+            // A checkpoint stores the tree and score, not the descriptor. A CPU
+            // resume re-scores the population, which recomputes it through the
+            // scoring pass; otherwise the QD archive (saved under --qd-policy,
+            // #1166) takes it from its descriptor cache or one evaluation.
             descriptor: None,
             age: ind.age,
             inf_rows: None,
+            edit: None,
+            cases: None,
         }
     }
 }
@@ -1699,7 +1736,7 @@ impl GpuSearch {
         let settings = FitSettings::of(cfg);
         let arm = DeviceArm::for_metric(cfg.metric, fit_train.len(), cfg.fit_iters);
         let single_class = fit_route::single_class(cfg.metric, fit_train);
-        let mut route = FitRoute::new(settings, self.tail_overlap);
+        let mut route = FitRoute::new(settings, self.tail_overlap).with_rotation(Rotation::of(cfg.seed, generation, islands.len()));
         let mut planned: Vec<(usize, usize, crate::fit::GpuFitPlan)> = Vec::new();
         for &(i, j) in admitted {
             route.fold(&mut islands[i][j].tree);
@@ -1753,7 +1790,7 @@ impl GpuSearch {
             }
         }
         route.submit_early(&mut self.pool_fits(&mut pending, fit_train, &settings));
-        // #255: the refit prefix in admission order, written back by slot.
+        // #255: the refit prefix in the route's key order, written back by slot.
         let done = route.finish(&mut self.pool_fits(&mut pending, fit_train, &settings));
         for s in done.settled {
             islands[s.island][s.slot].tree = s.tree;
@@ -1910,12 +1947,7 @@ impl GpuSearch {
                 pending
                     .iter()
                     .copied()
-                    .filter(|&(i, j)| {
-                        matches!(
-                            crate::fit::gpu_fit_plan_reason(&islands[i][j].tree),
-                            Err(crate::fit::GpuFitReject::NoConstants)
-                        )
-                    })
+                    .filter(|&(i, j)| crate::fit::has_no_fit_constants(&islands[i][j].tree))
                     .collect()
             } else {
                 pending.clone()
@@ -2195,7 +2227,7 @@ impl GpuSearch {
                 on_cpu.push((i, j));
                 continue;
             }
-            match crate::fit::gpu_fit_plan_reason(&islands[i][j].tree) {
+            match crate::fit::gpu_fit_plan_reason(&islands[i][j].tree, cfg.fit_thresholds) {
                 Ok(plan) => {
                     plans.push(plan);
                     slots.push((i, j));
@@ -2749,7 +2781,7 @@ fn count_improved(map: &mut BTreeMap<String, usize>, cause: FitFallbackCause) {
 /// A cap of `0` means unbounded. The split is a pure function of the admitted
 /// count and the configured cap, so the same seed and configuration always
 /// choose the same prefix; the caller keeps the first `refit` entries in the
-/// deterministic admission order.
+/// route's rotated key order (#1125).
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn fallback_batch_split(total: usize, cap: usize) -> (usize, usize) {
     if cap == 0 {
@@ -3496,6 +3528,26 @@ fn gpu_lost(
     Ok(())
 }
 
+/// #1245: a start-up refusal. `fails_required` marks the refusals that an
+/// explicit `--gpu` turns into exit 2 on the CLI; under `gpu_required` they end
+/// the run like a lost device. Every other refusal keeps the labelled CPU path.
+#[cfg(feature = "cuda")]
+fn gpu_refused(
+    cfg: &Config,
+    reason: &str,
+    fails_required: bool,
+    backend_reason: &mut Option<String>,
+) -> Result<(), String> {
+    if fails_required && cfg.gpu_required {
+        return Err(format!("{}{}", GPU_REQUIRED_PREFIX, reason));
+    }
+    if cfg.gpu_notes {
+        eprintln!("# gpu: off ({})", reason);
+    }
+    *backend_reason = Some(reason.to_string());
+    Ok(())
+}
+
 /// #1089: the `(island, slot)` pairs still pending (`error.is_nan()`), in
 /// island then slot order.
 #[cfg(feature = "cuda")]
@@ -3558,6 +3610,7 @@ fn finish_on_cpu(
     rescore_pending_cpu(islands, rows, cfg, pool);
     for (i, j, mut before) in unfitted {
         before.age = islands[i][j].age;
+        before.edit = islands[i][j].edit; // #1079
         let fitted = islands[i][j].clone();
         let moved = expr::structural_hash(&before.tree) != expr::structural_hash(&fitted.tree);
         let (ind, kept) = accept_fit(before, fitted);
@@ -3719,7 +3772,7 @@ fn score_pipeline_batch(
     // call is big enough to fill the GPU (`FIT_BATCH_MIN`).
     for (k, mut job) in jobs.into_iter().enumerate() {
         route.fold(&mut job.2);
-        match crate::fit::gpu_fit_plan_reason(&job.2) {
+        match crate::fit::gpu_fit_plan_reason(&job.2, route.settings().thresholds) {
             Err(crate::fit::GpuFitReject::NoConstants) => {}
             plan => pending.push(job, offered_hash[k], plan),
         }
@@ -3848,7 +3901,7 @@ fn finish_pipeline_loss(
 }
 
 /// #578: refit the first `--fit-fallback-max` fallbacks of the generation on
-/// the CPU in the synchronous order, hold the rest, then simplify and score
+/// the CPU in the route's key order, hold the rest, then simplify and score
 /// every fallback tree on the device, as `fit_pending` and its re-score do.
 /// #958: a fallback whose exact fit started early on the pool takes that
 /// result; one past the prefix drops it.
@@ -4001,6 +4054,12 @@ fn long_pnl_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
     let Some(book) = cfg.fitness.book() else {
         return Some("the long_pnl fitness book was not rebuilt");
     };
+    if book.is_masked() && book.band_units() == crate::trading::BandUnits::Sd {
+        return Some(crate::gpu::LONG_PNL_MASKED_SD);
+    }
+    if book.has_layer() {
+        return Some("--gate-search is priced on the CPU: the device book carries no gate layer");
+    }
     if train.is_multi() {
         return Some("multi-output objective");
     }
@@ -4308,6 +4367,7 @@ pub fn device_plan_for(cfg: &Config, train: &Sample) -> Option<crate::memory::De
         weights: !train.w.is_empty(),
         label_sign,
         pnl_book: long_pnl,
+        pnl_block_ids: cfg.fitness.book().is_some_and(|b| b.blocks() > crate::trading::FITNESS_MAX_BLOCKS),
     };
     let caps = crate::memory::DeviceCaps::from_env(cfg.gpu_memory);
     Some(crate::memory::device_plan(&workload, &info, &caps))
@@ -4511,20 +4571,60 @@ fn fitness_error_and_descriptor(
     cfg: &Config,
     want_descriptor: bool,
 ) -> (f64, Option<qd::Descriptor>) {
+    let (error, descriptor, _) = fitness_scored(tree, data, cfg, want_descriptor, false);
+    (error, descriptor)
+}
+
+/// #1023: [`fitness_error_and_descriptor`] and, when `want_cases` and the
+/// regret is finite, the sub-book regrets of the same prediction vector.
+#[allow(clippy::type_complexity)]
+fn fitness_scored(
+    tree: &Node,
+    data: &EvalSample,
+    cfg: &Config,
+    want_descriptor: bool,
+    want_cases: bool,
+) -> (f64, Option<qd::Descriptor>, Option<std::sync::Arc<[f32]>>) {
     let Some(book) = cfg.fitness.book() else {
-        return eval_error_and_descriptor(tree, data, cfg.metric, want_descriptor);
+        let (error, descriptor) = eval_error_and_descriptor(tree, data, cfg.metric, want_descriptor);
+        return (error, descriptor, None);
     };
     let s = data.sample;
     if s.is_empty() || s.len() != book.len() {
         debug_assert!(false, "fitness book has {} rows, the sample {}", book.len(), s.len());
-        return (f64::INFINITY, None);
+        return (f64::INFINITY, None, None);
     }
     let nvars = s.x.first().map(Vec::len).unwrap_or(0);
-    with_predictions(tree, data, |pred| {
-        let error = book.regret(pred);
-        let descriptor = want_descriptor.then(|| qd::descriptor_from_prediction(tree, pred, nvars));
-        (error, descriptor)
-    })
+    let run = || with_predictions(tree, data, |pred| {
+        let (error, descriptor) = if want_descriptor && cfg.qd_descriptor == qd::DescriptorKind::Book {
+            // #1084: the descriptor reads the reduction that gives the regret.
+            let (error, shape) = book.regret_and_shape(pred);
+            (error, Some(qd::book_descriptor(&shape)))
+        } else {
+            let error = book.regret(pred);
+            (error, want_descriptor.then(|| qd::descriptor_from_prediction(tree, pred, nvars)))
+        };
+        let cases = (want_cases && error.is_finite()).then(|| book.case_errors(pred).into());
+        (error, descriptor, cases)
+    });
+    if book.has_layer() {
+        crate::gate_search::with_candidate(tree, run)
+    } else {
+        run()
+    }
+}
+
+/// #1084: the configured QD descriptor of `tree` on `data` by one evaluation,
+/// for a tree that has none from its scoring pass (device-scored, a random
+/// probe, or unknown to the archive). The moments kind is [`qd::descriptor`];
+/// the book kind is the scoring path's own book reduction.
+fn qd_descriptor_of(tree: &Node, data: &EvalSample, cfg: &Config) -> qd::Descriptor {
+    match cfg.qd_descriptor {
+        qd::DescriptorKind::Moments => qd::descriptor(tree, data.sample),
+        qd::DescriptorKind::Book => fitness_error_and_descriptor(tree, data, cfg, true)
+            .1
+            .unwrap_or_else(|| qd::book_descriptor(&crate::trading::BookShape::default())),
+    }
 }
 
 /// #120: score a candidate and, when asked, accumulate its behaviour
@@ -4646,7 +4746,8 @@ fn score_tree_checked(tree: &Node, data: &EvalSample, cfg: &Config) -> f64 {
 /// The compiled program and the tile kernel are the ones [`PredBuf::fill`]
 /// uses, and every row value depends on its own row only, so a row range gives
 /// the bits of the full call. The book and the plain metric read the same
-/// buffer through the same functions. A non-finite prediction makes the book
+/// buffer through the same functions. A non-finite prediction (#1244: on a row
+/// inside the regime mask of a masked book) makes the book
 /// score `+inf` (`totals` sets `nonfinite`) and every plain unweighted metric
 /// too (`score_with_constants`). With `min_trades >= 1` and no row above the
 /// threshold the book counts no flip, so the score is `+inf` without it.
@@ -4664,7 +4765,7 @@ fn score_tree_checked_work(tree: &Node, data: &EvalSample, cfg: &Config) -> (f64
         && s.x.len() == s.len()
         && s.w.is_empty()
         && match book {
-            Some(b) => b.len() == s.len(),
+            Some(b) => b.len() == s.len() && !b.has_layer(),
             None => !cfg.metric.is_implicit(),
         };
     if !modelled {
@@ -4677,13 +4778,14 @@ fn score_tree_checked_work(tree: &Node, data: &EvalSample, cfg: &Config) -> (f64
         let PredBuf { pred, scratch } = &mut *buf;
         pred.clear();
         pred.resize(s.len(), 0.0);
+        let mask = mask_flags(cfg);
         let mut long = false;
         let mut start = 0;
         while start < s.len() {
             let end = (start + CHECK_CHUNK).min(s.len());
             crate::eval_soa::eval_rows_into(&program, cols, start, end, pred, scratch);
-            for &p in &pred[start..end] {
-                if !p.is_finite() {
+            for (k, &p) in pred[start..end].iter().enumerate() {
+                if !p.is_finite() && decides(mask, start + k) {
                     work.early = 1;
                     work.early_rows = end as u64;
                     return (f64::INFINITY, work);
@@ -4704,11 +4806,23 @@ fn score_tree_checked_work(tree: &Node, data: &EvalSample, cfg: &Config) -> (f64
     })
 }
 
+/// #1244: the flags of a regime-masked fitness book; `None` without a mask.
+fn mask_flags(cfg: &Config) -> Option<&[u8]> {
+    cfg.fitness.book().filter(|b| b.is_masked()).map(|b| b.flags())
+}
+
+/// #1244: whether the prediction of row `i` can decide the score: every row
+/// without a mask, the rows inside the regime mask with one.
+fn decides(mask: Option<&[u8]>, i: usize) -> bool {
+    mask.map_or(true, |f| f.get(i).map_or(true, |&b| b & crate::trading::FITNESS_MASK_OFF == 0))
+}
+
 /// #500/#589: whether a non-finite prediction in the first rows decides the
-/// score. `Some(true)`: the first rows hold one, which makes the full score
-/// `+inf` for the plain metrics and the P&L book. `Some(false)`: the prefix is
-/// finite and the full pass decides. `None`: the score does not follow that
-/// rule (implicit, weighted, multi-output), so the full pass always runs.
+/// score. `Some(true)`: the first rows hold one (#1244: on a row inside the
+/// regime mask of a masked book), which makes the full score `+inf` for the
+/// plain metrics and the P&L book. `Some(false)`: the prefix is finite and the
+/// full pass decides. `None`: the score does not follow that rule (implicit,
+/// weighted, multi-output), so the full pass always runs.
 fn nonfinite_prefix(tree: &Node, data: &EvalSample, cfg: &Config) -> Option<bool> {
     let s = data.sample;
     if s.is_empty()
@@ -4718,15 +4832,16 @@ fn nonfinite_prefix(tree: &Node, data: &EvalSample, cfg: &Config) -> Option<bool
     {
         return None;
     }
+    let mask = mask_flags(cfg);
     let rows = s.x.len().min(INF_PROBE_ROWS);
     if let Some(cols) = &data.cols {
         if let Some(program) = crate::eval_soa::compile(tree) {
             let mut pred = vec![0.0; rows];
             crate::eval_soa::eval_batch(&program, cols, rows, &mut pred);
-            return Some(pred.iter().any(|p| !p.is_finite()));
+            return Some(pred.iter().enumerate().any(|(i, p)| !p.is_finite() && decides(mask, i)));
         }
     }
-    Some(s.x.iter().take(rows).any(|row| !eval(tree, row).is_finite()))
+    Some(s.x.iter().take(rows).enumerate().any(|(i, row)| decides(mask, i) && !eval(tree, row).is_finite()))
 }
 
 /// #500: the prefix decides the score and the run keeps no descriptor
@@ -4881,17 +4996,16 @@ fn fit_constants_with_iters(
         }
         // #116 + #117: strategy and metric together.
         let sse = crate::fit::with_fit_irls(cfg.fit_irls, || {
-            crate::fit::with_fit_thresholds(cfg.fit_thresholds, || {
-                crate::fit::fit_weighted_strategy_metric(
-                    tree,
-                    &fit.x,
-                    &fit.y,
-                    &fit.w,
-                    iters,
-                    cfg.fit_strategy,
-                    cfg.metric,
-                )
-            })
+            crate::fit::fit_weighted_strategy_metric(
+                tree,
+                &fit.x,
+                &fit.y,
+                &fit.w,
+                iters,
+                cfg.fit_strategy,
+                cfg.metric,
+                cfg.fit_thresholds,
+            )
         });
         Some(FitResult {
             sse,
@@ -5576,12 +5690,7 @@ fn select_promoted(
             // #169: a candidate with no constants has nothing to fit. Keep its
             // screening score and do not spend an admission slot or bill a
             // meaningless CPU fallback for it.
-            .filter(|&(j, _, _)| {
-                !matches!(
-                    crate::fit::gpu_fit_plan_reason(&pop[j].tree),
-                    Err(crate::fit::GpuFitReject::NoConstants)
-                )
-            })
+            .filter(|&(j, _, _)| !crate::fit::has_no_fit_constants(&pop[j].tree))
             .collect();
         ranked.sort_by(|a, b| {
             crate::error_order::cmp_error(a.1, b.1)
@@ -5933,11 +6042,20 @@ fn full_data_archive(
         return full_data_archive_with(archive, islands, train, cfg, refit_gpu_fit, false, counts);
     }
     // #848: fixed-position trees stay off the front unless nothing else is left.
-    let (front, report) = full_data_archive_with(archive, islands, train, cfg, refit_gpu_fit, true, counts);
+    // #1124: each pass counts into its own tally; only the reported pass joins the run counts.
+    let first = FitAcceptCounts::default();
+    let (front, report) = full_data_archive_with(archive, islands, train, cfg, refit_gpu_fit, true, counts.map(|_| &first));
     if !front.items.is_empty() {
+        if let Some(c) = counts {
+            c.absorb(&first);
+        }
         return (front, report);
     }
-    let (front, mut report) = full_data_archive_with(archive, islands, train, cfg, refit_gpu_fit, false, counts);
+    let second = FitAcceptCounts::default();
+    let (front, mut report) = full_data_archive_with(archive, islands, train, cfg, refit_gpu_fit, false, counts.map(|_| &second));
+    if let Some(c) = counts {
+        c.absorb(&second);
+    }
     report.fixed_position_fallback = true;
     (front, report)
 }
@@ -6164,6 +6282,10 @@ struct Parents<'a> {
     /// `qd_control`.
     qd: Option<(Option<&'a QdArchive>, u8)>,
     source: ParentSource,
+    /// #1023: this generation's lexicase cases, set by the generation loop.
+    cases: Option<&'a lexicase::CaseSet>,
+    /// #1023: the island's lexicase pool, set by `evolve_island` from `cases`.
+    lexicase: Option<&'a lexicase::Pool>,
 }
 
 /// #120: one parent under the QD policy or the original #76 draw.
@@ -6188,6 +6310,13 @@ fn pick_parent_policy(island: &[Ind], parents: &Parents<'_>, rng: &mut Mt) -> No
         if let Some(tree) = parent {
             return tree.clone();
         }
+    }
+    if let Some(pool) = parents.lexicase {
+        // #1023: the front draw stays in front of the island selection.
+        return match front_parent(parents.front, rng, parents.source.front_p) {
+            Some(tree) => tree.clone(),
+            None => island[pool.select(island, rng)].tree.clone(),
+        };
     }
     pick_parent(island, parents.front, rng, parents.source.front_p).clone()
 }
@@ -6514,6 +6643,10 @@ fn evolve_island(
         }
     }
 
+    // #1023: the island's lexicase pool on this generation's cases.
+    let lex_pool = parents.cases.map(|set| lexicase::Pool::build(isl, set, cfg, train, workers));
+    let parents = Parents { lexicase: lex_pool.as_ref(), ..parents };
+
     let afp = cfg.selection == Selection::Afp;
     // #465: Pareto rank and crowding of the parents drive the tournament.
     let (par_rank, par_crowd) = if afp {
@@ -6548,15 +6681,17 @@ fn evolve_island(
     let mut attempts = 0usize;
     let max_attempts = pop * 50 + 50;
 
-    // #471: edit weights and the adaptive window. Learning needs the child's
-    // error now, which a deferred GPU batch or a screening subset does not give.
+    // #471: edit weights and the adaptive window. Inline learning needs the
+    // child's error now; a deferred GPU batch hands its edit records to
+    // `learn_mix_at_barrier` (#1079); a screening subset never learns.
     let base_opts = cfg.variation_opts();
     let mut opts = base_opts;
     if cfg.adaptive_mix {
         opts.mix = mix.weights(&base_opts.mix);
     }
-    let learn = cfg.adaptive_mix && !screened && !defer_gpu;
-    let parent_errors: std::collections::HashMap<u64, f64> = if learn {
+    let track = cfg.adaptive_mix && !screened;
+    let learn = track && !defer_gpu;
+    let parent_errors: std::collections::HashMap<u64, f64> = if track {
         isl.iter()
             .map(|i| (expr::structural_hash(&i.tree), i.error))
             .chain(parents.front.iter().map(|s| (expr::structural_hash(&s.tree), s.error)))
@@ -6584,7 +6719,7 @@ fn evolve_island(
             // parents; 5% still come from the global Pareto front. With the policy
             // off this is exactly the #76 draw.
             let (p1, mut age) = pick_parent_aged(isl, &parents, rng, afp, &par_rank, &par_crowd);
-            let parent_err = if learn {
+            let parent_err = if track {
                 parent_errors.get(&expr::structural_hash(&p1)).copied()
             } else {
                 None
@@ -6633,7 +6768,9 @@ fn evolve_island(
                 GenCounters::count(counters, |c| &c.post_fit_drops); // #463
                 continue;
             }
-            if let Some((parent, used)) = meta[k] {
+            if defer_gpu {
+                ind.edit = meta[k];
+            } else if let Some((parent, used)) = meta[k] {
                 let won = ind.error.is_finite() && (!parent.is_finite() || ind.error < parent);
                 for kind in expr::EditKind::ALL {
                     if used & (1 << kind.index()) != 0 {
@@ -6695,14 +6832,14 @@ fn evolve_island(
                     let mut best_score = if hc && !expr::row_dependent(&t) {
                         f64::INFINITY
                     } else {
-                        let d = qd::descriptor(&t, train.sample);
+                        let d = qd_descriptor_of(&t, train, cfg); // #1084
                         (d.usage - target.usage).powi(2) + (d.skew - target.skew).powi(2)
                     };
                     for _ in 0..3 {
                         let cand = random_tree_with(
                             rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs)
                         );
-                        let d = qd::descriptor(&cand, train.sample);
+                        let d = qd_descriptor_of(&cand, train, cfg); // #1084
                         let score = (d.usage - target.usage).powi(2) + (d.skew - target.skew).powi(2);
                         if score < best_score && !(hc && !expr::row_dependent(&cand)) {
                             t = cand;
@@ -6745,6 +6882,24 @@ fn evolve_island(
     }
 
     *isl = next;
+}
+
+/// #1079: learn the edit success counts of a device-scored generation.
+fn learn_mix_at_barrier(islands: &mut [Vec<Ind>], mixes: &mut [MixWindow]) {
+    for (pop, mix) in islands.iter_mut().zip(mixes.iter_mut()) {
+        let mut counts: MixCounts = [(0, 0); expr::EDIT_KINDS];
+        for ind in pop.iter_mut() {
+            let Some((parent, used)) = ind.edit.take() else { continue };
+            let won = ind.error.is_finite() && (!parent.is_finite() || ind.error < parent);
+            for kind in expr::EditKind::ALL {
+                if used & (1 << kind.index()) != 0 {
+                    counts[kind.index()].0 += 1;
+                    counts[kind.index()].1 += won as u64;
+                }
+            }
+        }
+        mix.push(counts);
+    }
 }
 
 /// A user-provided starting expression, after simplification, constant fitting
@@ -7215,6 +7370,7 @@ fn snapshot(
     test: &Sample,
     final_archive: Option<&Archive>,
     candidates_evaluated: u64,
+    qd: Option<&QdArchive>, // #1166
 ) -> Checkpoint {
     let (words, idx) = main_rng.state();
     Checkpoint {
@@ -7262,7 +7418,11 @@ fn snapshot(
             backend == Backend::Gpu,
         )),
         target_spec: None,
+        split_intervals: None,
         candidates_evaluated,
+        // #1166: trajectory state only under the policy; a passive archive is
+        // rebuilt on resume, so its checkpoint keeps its bytes.
+        qd: qd.filter(|_| cfg.qd_policy).map(QdArchive::state),
     }
 }
 
@@ -7274,6 +7434,17 @@ fn scoring_kind(gpu_used: bool) -> crate::backend::Kind {
         crate::backend::Kind::Gpu
     } else {
         crate::backend::Kind::Cpu
+    }
+}
+
+/// The `backend` identity field of a checkpoint, the one value every snapshot of a
+/// process writes. A device that only fits (`fit_only_device`) leaves the host
+/// scoring, so such a run is a `cpu` run unless it scored on the device (`gpu_used`).
+pub fn checkpoint_backend(defer_gpu: bool, fit_only_device: bool, gpu_used: bool) -> Backend {
+    if (defer_gpu && !fit_only_device) || gpu_used {
+        Backend::Gpu
+    } else {
+        Backend::Cpu
     }
 }
 
@@ -7451,6 +7622,9 @@ fn postfix_variation_for(cfg: &Config, train: &Sample) -> Result<Variation, Stri
     }
     if cfg.selection == Selection::Afp {
         return Err("--selection afp runs on the node path".to_string());
+    }
+    if cfg.selection == Selection::Lexicase {
+        return Err("--selection lexicase runs on the node path".to_string()); // #1023
     }
     if cfg.fit_iters != 0 {
         return Err("constant fitting is enabled".to_string());
@@ -7808,6 +7982,7 @@ fn dev_generation(
         isolated: 0,
         migrants: 0,
         migrants_skipped: 0,
+        lexicase_cases: None,
     }
 }
 
@@ -8137,6 +8312,8 @@ fn run_postfix_search(
                             descriptor: None,
                             age: 0,
                             inf_rows: None,
+                            edit: None,
+                            cases: None,
                         })
                         .collect()
                 })
@@ -8159,6 +8336,7 @@ fn run_postfix_search(
                 test,
                 None,
                 candidates,
+                None, // #1166: the flat path refuses a QD archive
             );
             emit(&mut on_checkpoint, &cp);
             io_stage_total += io_mark.elapsed().as_secs_f64();
@@ -8213,6 +8391,8 @@ fn run_postfix_search(
                         descriptor: None,
                         age: 0,
                         inf_rows: None,
+                        edit: None,
+                        cases: None,
                     })
                     .collect()
             })
@@ -8235,6 +8415,7 @@ fn run_postfix_search(
             test,
             None,
             candidates,
+            None, // #1166
         );
         Some(cp)
     } else {
@@ -8358,20 +8539,6 @@ fn run_search(
     resume: Option<Checkpoint>,
     save_every: usize,
     seeds: &[Node],
-    on_checkpoint: Option<CheckpointFn<'_>>,
-) -> Result<Outcome, String> {
-    crate::fit::with_fit_thresholds(cfg.fit_thresholds, || {
-        run_search_scoped(cfg, train, test, resume, save_every, seeds, on_checkpoint)
-    })
-}
-
-fn run_search_scoped(
-    cfg: &Config,
-    train: &Sample,
-    test: &Sample,
-    resume: Option<Checkpoint>,
-    save_every: usize,
-    seeds: &[Node],
     mut on_checkpoint: Option<CheckpointFn<'_>>,
 ) -> Result<Outcome, String> {
     if let Some(book) = cfg.fitness.book() {
@@ -8395,6 +8562,12 @@ fn run_search_scoped(
             "--front-scope island with --qd-policy: the QD archive is one parent pool shared by every island"
                 .to_string(),
         ); // #1070
+    }
+    if cfg.qd_bins > 0 && cfg.qd_descriptor == qd::DescriptorKind::Book && cfg.fitness.book().is_none() {
+        return Err("--qd-descriptor book needs --fitness pnl: the book descriptor reads the long/flat fitness book".to_string()); // #1084
+    }
+    if let Some(reason) = lexicase::refusal(cfg, train) {
+        return Err(reason); // #1023
     }
     #[cfg(feature = "cuda")]
     crate::gpu::note_search_start();
@@ -8471,6 +8644,14 @@ fn run_search_scoped(
     #[cfg(feature = "cuda")]
     let mut gpu: Option<GpuSearch> = if !cfg.gpu {
         None
+    } else if cfg.selection == Selection::Lexicase {
+        // #1023: the device returns no per-case errors; lexicase runs on the CPU.
+        let reason = "--selection lexicase reads per-case errors the device scorer does not return";
+        if cfg.gpu_notes {
+            eprintln!("# gpu: off ({})", reason);
+        }
+        backend_reason = Some(reason.to_string());
+        None
     } else {
         // #230: the evaluator still has no native rank scorer, but the exact
         // rank polish is a device *fit* objective. When that is the only thing
@@ -8516,10 +8697,7 @@ fn run_search_scoped(
         } else {
             match gpu_blocker(cfg, train) {
                 Some(reason) => {
-                    if cfg.gpu_notes {
-                        eprintln!("# gpu: off ({})", reason);
-                    }
-                    backend_reason = Some(reason.to_string());
+                    gpu_refused(cfg, reason, reason == crate::gpu::LONG_PNL_MASKED_SD, &mut backend_reason)?;
                     None
                 }
                 None => {
@@ -8786,6 +8964,7 @@ fn run_search_scoped(
     let mut best_prev: f64;
     let mut no_improve: usize;
     let mut candidates: u64;
+    let mut saved_qd: Option<qd::QdState> = None; // #1166
     // #85: did any generation fit on a screening subset? Only then may the
     // final archive be refit; a request at least as large as the sample, or
     // `--no-fit`, stays an exact no-op.
@@ -8837,8 +9016,14 @@ fn run_search_scoped(
             stagnant: saved_stagnant,
             candidates_evaluated: saved_candidates,
             main_rng,
+            qd: qd_state,
             ..
         } = cp;
+        // #1166: under the policy the archive chose this trajectory's parents;
+        // an empty one would continue a different search.
+        if cfg.qd_policy {
+            saved_qd = Some(qd_state.ok_or_else(|| crate::checkpoint::QD_ARCHIVE_MISSING.to_string())?);
+        }
         gens_done = generations;
         candidates = saved_candidates;
         converged_early = stopped_early;
@@ -9116,9 +9301,11 @@ fn run_search_scoped(
     // no population state, so it cannot affect the search trajectory.
     let mut progress_stats = ProgressStats::new(crate::progress_stats::DEFAULT_WINDOW);
     let mut stats_observed = false;
-    // #120: passive descriptor archive. It observes evaluated individuals and
-    // never feeds back into selection, so turning it on cannot change the
-    // trajectory or the Pareto front.
+    // #120: the descriptor archive. Under the passive `--qd` it observes
+    // evaluated individuals and never feeds back into selection, so turning it
+    // on cannot change the trajectory or the Pareto front, and a resume rebuilds
+    // it. Under `--qd-policy` it chooses parents, migration victims and restart
+    // aims, so a resume continues the saved archive (#1166).
     let mut qd_archive = if cfg.qd_bins > 0 {
         let archive = if cfg.qd_control == 2 {
             QdArchive::new_random(cfg.qd_bins, cfg.qd_cell_cap)
@@ -9127,7 +9314,11 @@ fn run_search_scoped(
         } else {
             QdArchive::new(cfg.qd_bins, cfg.qd_cell_cap)
         };
-        Some(archive.with_nvars(nvars))
+        let mut archive = archive.with_nvars(nvars).with_kind(cfg.qd_descriptor); // #1084
+        if let Some(state) = saved_qd.take() {
+            archive.restore(state).map_err(|e| format!("cannot resume: {e}"))?; // #1166
+        }
+        Some(archive)
     } else {
         None
     };
@@ -9236,6 +9427,8 @@ fn run_search_scoped(
             // scored `eval_data`. It describes `gen_train` only when those are
             // the same rows: no per-generation subset and no screening subset.
             let cached_descriptors_valid = gen_sample.is_none() && !screened;
+            // #1023: the generation's lexicase cases, from the seed and `gen` alone.
+            let lex_cases = (cfg.selection == Selection::Lexicase).then(|| lexicase::CaseSet::for_generation(cfg, gen_train, gen));
 
             // #86: with predictor subsampling active (and no screening), refit
             // the carried-over population on this generation's fit rows, then
@@ -9322,11 +9515,13 @@ fn run_search_scoped(
             #[cfg(feature = "cuda")]
             let mut pipeline_scored = false;
             #[cfg(feature = "cuda")]
-            let mut pipeline_route = FitRoute::new(FitSettings::of(cfg), gpu.as_ref().is_some_and(|g| g.tail_overlap));
+            let mut pipeline_route = FitRoute::new(FitSettings::of(cfg), gpu.as_ref().is_some_and(|g| g.tail_overlap))
+                .with_rotation(Rotation::of(cfg.seed, gen, islands.len()));
             #[cfg(feature = "cuda")]
             let mut pipeline_tail = PipelineTail { rows: gen_train, pending: PendingTail::default() };
             #[cfg(feature = "cuda")]
             let mut fit_queue = PipelineFitQueue::default();
+            let deferred = defer_gpu && !screened; // #1079: `score_generation` may clear `defer_gpu`
             std::thread::scope(|s| {
                 // The queue lives in the scope: producers take a clone of the
                 // sender, and `drain` consumes the original so it can end.
@@ -9354,7 +9549,7 @@ fn run_search_scoped(
                     .map(|(i, (((isl, r), mix), sender))| {
                         // #10: carry the block registry into the island thread.
                         let blocks = blocks.clone();
-                        let parents = Parents { front: policy.front(i, front), qd: qd_parents, source: policy.parent_source(i) }; // #76 #120 #1081 #1070
+                        let parents = Parents { front: policy.front(i, front), qd: qd_parents, source: policy.parent_source(i), cases: lex_cases.as_ref(), lexicase: None }; // #76 #120 #1081 #1070 #1023
                         s.spawn(move || {
                             expr::set_blocks(blocks);
                             #[cfg(feature = "cuda")]
@@ -9503,6 +9698,9 @@ fn run_search_scoped(
                     defer_gpu =
                         score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_data, cfg, &mut backend_reason, gen, &mut dispatcher, rows_version, fit_counts)?;
                 }
+            }
+            if cfg.adaptive_mix && deferred {
+                learn_mix_at_barrier(&mut islands, &mut mixes); // #1079
             }
             let dev_eval = dev_lap(&mut dev_mark); // #211: evaluator batch
             let stage_eval = stage_lap(&mut stage_mark); // #284
@@ -9666,7 +9864,7 @@ fn run_search_scoped(
                     }
                     dev_island_best.push(best);
                 }
-                let rec = dev_generation(
+                let mut rec = dev_generation(
                     gens_done,
                     cfg,
                     dev_errors,
@@ -9691,6 +9889,7 @@ fn run_search_scoped(
                         }
                     }),
                 );
+                rec.lexicase_cases = lex_cases.as_ref().map(|c| c.len()); // #1023
                 dev_rec = Some(rec);
             }
 
@@ -9768,7 +9967,7 @@ fn run_search_scoped(
                 for s in &archive.items {
                     items.push((s.tree.clone(), s.error, s.cost, None));
                 }
-                qd.record_with_descriptors(items, gen_train);
+                qd.record_with_descriptors_by(items, gen_train, |t| qd_descriptor_of(t, gen_data, cfg)); // #1084
             }
 
             // A checkpoint is taken only at a generation boundary: all of the
@@ -9776,11 +9975,7 @@ fn run_search_scoped(
             if checkpoint_due(save_every, gens_done, last_save.elapsed().as_secs_f64(), save_interval_s) {
                 last_save = std::time::Instant::now();
                 let io_mark = std::time::Instant::now();
-                let backend = if defer_gpu || gpu_used {
-                    Backend::Gpu
-                } else {
-                    Backend::Cpu
-                };
+                let backend = checkpoint_backend(defer_gpu, fit_only_device, gpu_used);
                 let cp = snapshot(
                     cfg,
                     backend,
@@ -9799,6 +9994,7 @@ fn run_search_scoped(
                     test,
                     None,
                     candidates,
+                    qd_archive.as_ref(), // #1166
                 );
                 emit(&mut on_checkpoint, &cp);
                 io_stage_total += io_mark.elapsed().as_secs_f64();
@@ -9832,32 +10028,17 @@ fn run_search_scoped(
         );
     }
 
-    // #120: promoted cell elites are rebuilt exactly on every training row in
-    // f64 before they are reported. Screening and row subsets may guide the
-    // search, but the QD report is never a subset estimate.
     // #855: an interim chunk saves the search state and skips the report.
     let interim = cfg.interim_chunk && stop_reason == "time_budget" && on_checkpoint.is_some();
-    if cfg.qd_policy && !interim {
-        if let Some(qd) = qd_archive.as_mut() {
-            qd.refit_all(|tree| {
-                let sol = refit_survivor(tree, &train_data, cfg, Some(&run_fit));
-                (sol.error, sol.cost)
-            });
-        }
-    }
 
     // Capture the exit state before the final full-data archive rebuild: the
     // saved search archive is the one at the last completed generation. It is
     // emitted after the rebuild (#256) so it also carries the archive the run
-    // reports.
+    // reports. #1166: the QD archive is captured before its refit below too.
     let mut io_final_s = 0.0f64;
     let io_mark = std::time::Instant::now();
     let pending_cp: Option<Checkpoint> = if on_checkpoint.is_some() {
-        let backend = if (defer_gpu && !fit_only_device) || gpu_used {
-            Backend::Gpu
-        } else {
-            Backend::Cpu
-        };
+        let backend = checkpoint_backend(defer_gpu, fit_only_device, gpu_used);
         let cp = snapshot(
             cfg,
             backend,
@@ -9876,12 +10057,25 @@ fn run_search_scoped(
             test,
             None,
             candidates,
+            qd_archive.as_ref(), // #1166
         );
         Some(cp)
     } else {
         None
     };
     io_final_s += io_mark.elapsed().as_secs_f64();
+
+    // #120: promoted cell elites are rebuilt exactly on every training row in
+    // f64 before they are reported. Screening and row subsets may guide the
+    // search, but the QD report is never a subset estimate.
+    if cfg.qd_policy && !interim {
+        if let Some(qd) = qd_archive.as_mut() {
+            qd.refit_all(|tree| {
+                let sol = refit_survivor(tree, &train_data, cfg, Some(&run_fit));
+                (sol.error, sol.cost)
+            });
+        }
+    }
 
     // #169: with the GPU-fit arm every finalist is also refit by the exact CPU
     // f64 LM before it is scored on all training rows.
@@ -10104,16 +10298,32 @@ mod gpu_dead_start_tests;
 mod tests {
     use super::*;
 
-    /// #1060: a fit-only device run defers the fit to the device (the periodic
-    /// checkpoint identity says `gpu`) but scores every candidate on the host
-    /// (`gpu_used` stays false), so the cost sidecar must say `cpu`, as the exit
-    /// write does.
+    /// #1127: the exit rule of the checkpoint identity, a fit-only device run
+    /// scores on the host, so both snapshot sites of its process say `cpu`.
+    #[test]
+    fn checkpoint_backend_of_a_fit_only_device_run_is_cpu() {
+        let (defer_gpu, fit_only_device, gpu_used) = (true, true, false);
+        assert_eq!(checkpoint_backend(defer_gpu, fit_only_device, gpu_used), Backend::Cpu);
+        assert_eq!(checkpoint_backend(true, true, true), Backend::Gpu);
+    }
+
+    /// #1127: no run that is not fit-only changes a checkpoint byte, for every
+    /// state either site can see.
+    #[test]
+    fn checkpoint_backend_is_unchanged_for_runs_that_are_not_fit_only() {
+        for defer_gpu in [false, true] {
+            for gpu_used in [false, true] {
+                let old = if defer_gpu || gpu_used { Backend::Gpu } else { Backend::Cpu };
+                assert_eq!(checkpoint_backend(defer_gpu, false, gpu_used), old);
+            }
+        }
+    }
+
+    /// #1060: a fit-only device run defers the fit to the device but scores every
+    /// candidate on the host (`gpu_used` stays false), so the cost sidecar says `cpu`.
     #[test]
     fn the_sidecar_backend_of_a_fit_only_device_run_is_cpu() {
-        let (defer_gpu, fit_only_device, gpu_used) = (true, true, false);
-        let periodic_identity = if defer_gpu || gpu_used { Backend::Gpu } else { Backend::Cpu };
-        assert_eq!(periodic_identity, Backend::Gpu);
-        assert!(fit_only_device);
+        let gpu_used = false;
         assert_eq!(scoring_kind(gpu_used), crate::backend::Kind::Cpu);
         assert_eq!(scoring_kind(true), crate::backend::Kind::Gpu);
     }
@@ -10127,7 +10337,7 @@ mod tests {
                     Op::Add,
                     vec![node(Op::Mul, vec![constant(1.0), input(0)]), constant(0.5)],
                 );
-                (0, k, crate::fit::gpu_fit_plan_reason(&tree).expect("an eligible plan"))
+                (0, k, crate::fit::gpu_fit_plan_reason(&tree, false).expect("an eligible plan"))
             })
             .collect()
     }
@@ -10357,6 +10567,8 @@ mod tests {
             descriptor: None,
             age: 0,
             inf_rows: None,
+            edit: None,
+            cases: None,
         }
     }
 
@@ -10666,6 +10878,8 @@ mod tests {
             descriptor: None,
             age: 0,
             inf_rows: None,
+            edit: None,
+            cases: None,
         };
         refresh_after_fit(&mut ind, &cfg);
         let want = expr::simplify(&tree);
@@ -11202,13 +11416,13 @@ mod tests {
         assert_eq!(crate::fit::GPU_FIT_MAX_CONSTANTS, 20);
         for p in 17..=20usize {
             assert!(
-                crate::fit::gpu_fit_plan_reason(&many_constants(p)).is_ok(),
+                crate::fit::gpu_fit_plan_reason(&many_constants(p), false).is_ok(),
                 "p={} must be fitted on the device, not silently fallen back",
                 p
             );
         }
         for p in 21..=22usize {
-            let reason = match crate::fit::gpu_fit_plan_reason(&many_constants(p)) {
+            let reason = match crate::fit::gpu_fit_plan_reason(&many_constants(p), false) {
                 Err(reason) => reason,
                 Ok(_) => panic!("p={} has no kernel instantiation", p),
             };
@@ -11305,7 +11519,7 @@ mod tests {
     // #76: two distinguishable front members.
     /// No front, no QD archive: every parent comes from the island tournament.
     fn no_parents() -> Parents<'static> {
-        Parents { front: &[], qd: None, source: ParentSource { front_p: 0.0, shared: true } }
+        Parents { front: &[], qd: None, source: ParentSource { front_p: 0.0, shared: true }, cases: None, lexicase: None }
     }
 
     fn two_member_front() -> Vec<Sol> {
@@ -11339,6 +11553,8 @@ mod tests {
             descriptor: None,
             age: 0,
             inf_rows: None,
+            edit: None,
+            cases: None,
         }];
 
         let mut rng = Mt::new(11);
@@ -11408,7 +11624,7 @@ mod tests {
                 &aggs,
                 false,
                 false,
-                Parents { front, qd: None, source: ParentSource { front_p: 0.0, shared: true } },
+                Parents { front, qd: None, source: ParentSource { front_p: 0.0, shared: true }, cases: None, lexicase: None },
                 None,  // #119: synchronous test path
                 None,  // #211: no development log in this test
                 1,     // #463
@@ -11610,6 +11826,8 @@ mod tests {
             descriptor: None,
             age: 0,
             inf_rows: None,
+            edit: None,
+            cases: None,
         };
 
         ind.refit_and_reeval(&first_data, &first, &cfg, None);
@@ -13064,8 +13282,62 @@ mod tests {
         );
     }
 
+    /// #1084: under `--fitness pnl` the book descriptor comes from the same
+    /// reduction as the regret, the regret bits do not move, and the evaluating
+    /// fallback (the path of a device-scored member) gives the same point.
+    #[test]
+    fn qd_book_descriptor_is_folded_into_the_pnl_scoring_pass() {
+        let s = sample();
+        let book = pnl_book(&s);
+        let trees = [
+            node(Op::Add, vec![input(0), constant(0.25)]),
+            node(Op::Sin, vec![node(Op::Mul, vec![constant(9.0), input(0)])]),
+            node(Op::Sub, vec![input(1), constant(1.2)]),
+        ];
+        let off = Config { fitness: Fitness::LongPnl(book.clone()), fit_iters: 0, threads: 1, ..Config::default() };
+        let moments = Config { qd_bins: 16, ..off.clone() };
+        let on = Config { qd_descriptor: crate::qd::DescriptorKind::Book, ..moments.clone() };
+        let data = EvalSample::new(&s, &off);
+        let mut points = Vec::new();
+        for t in &trees {
+            let plain = Ind::evaluated(t.clone(), &data, &off);
+            let ind = Ind::evaluated(t.clone(), &data, &on);
+            assert_eq!(plain.error.to_bits(), ind.error.to_bits(), "the book descriptor changed the regret");
+            let pred: Vec<f64> = s.x.iter().map(|row| expr::eval(t, row)).collect();
+            let (regret, shape) = book.regret_and_shape(&pred);
+            assert_eq!(regret.to_bits(), ind.error.to_bits());
+            let got = ind.descriptor.expect("the pnl scoring pass attaches the book descriptor");
+            assert_eq!(got, crate::qd::book_descriptor(&shape));
+            assert_eq!(qd_descriptor_of(t, &data, &on), got, "the fallback differs from the scoring pass");
+            let m = Ind::evaluated(t.clone(), &data, &moments).descriptor.expect("moments descriptor");
+            assert_eq!(m, crate::qd::descriptor_from_prediction(t, &pred, 2), "the moments kind changed");
+            assert_eq!(qd_descriptor_of(t, &data, &moments), crate::qd::descriptor(t, &s));
+            points.push(got);
+        }
+        assert!(points.iter().all(|d| d.usage > 0.0), "{points:?}");
+        assert!(points[0] != points[1] && points[1] != points[2], "{points:?}");
+    }
+
+    /// #1084: the book descriptor without a fitness book is refused, not run
+    /// with the moments pair.
+    #[test]
+    fn the_book_descriptor_needs_the_fitness_book() {
+        let s = sample();
+        let cfg = Config {
+            qd_bins: 8,
+            qd_descriptor: crate::qd::DescriptorKind::Book,
+            generations: 1,
+            threads: 1,
+            ..Config::default()
+        };
+        let err = run_seeded_checked(&cfg, &s, &s, &[]).err().expect("refused");
+        assert!(err.contains("--qd-descriptor book needs --fitness pnl"), "{err}");
+        let passive_off = Config { qd_bins: 0, ..cfg };
+        assert!(run_seeded_checked(&passive_off, &s, &s, &[]).is_ok(), "no archive, nothing to describe");
+    }
+
     fn aged_ind(tree: Node, error: f64, complexity: f64, age: u32) -> Ind {
-        Ind { tree, error, complexity, descriptor: None, age, inf_rows: None }
+        Ind { tree, error, complexity, descriptor: None, age, inf_rows: None, edit: None, cases: None }
     }
 
     /// #465: the lowest-error individual always survives, whatever its age or
@@ -13589,6 +13861,58 @@ mod tests {
         assert_eq!(long_pnl_blocker(&slope_cpu_fit, &train), None);
     }
 
+    /// #1244: the device scores a regime-masked book, so the mask adds no blocker to
+    /// any configuration; only a masked sd-unit band names its own reason.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn masked_book_adds_no_long_pnl_blocker() {
+        use crate::trading::{BandSpec, BandUnits, BookMask, FitnessBook, TradingRows, TradingSpec};
+        let (train, view, plain) = label_free_book_rows(400);
+        let n = train.len();
+        // The plain book has no cash and no funding, so its excess is the return.
+        let slice = crate::data::TradingSlice {
+            rows: TradingRows { time: (0..n).map(|i| 3600.0 * i as f64).collect(), group: vec![0; n], funding: Vec::new() },
+            ret: plain.excess().to_vec(),
+        };
+        let on: Vec<bool> = (0..n).map(|i| (i / 25) % 2 == 0).collect();
+        let build = |spec: &TradingSpec, masked: bool| {
+            let mask = masked.then_some(BookMask { on: &on, identity: "unit" });
+            std::sync::Arc::new(FitnessBook::with_segments(&slice, spec, 3600.0, 1, 1.0, &[], mask).expect("a profitable book"))
+        };
+        let spec = TradingSpec { cost_bps: 2.0, ..Default::default() };
+        assert_eq!(build(&spec, false).hash(), plain.hash(), "the rebuild is the plain book");
+        let masked = build(&spec, true);
+        assert!(masked.is_masked());
+        let base = label_free_config(&view, &plain);
+        let configs = [
+            base.clone(),
+            Config { metric: Metric::Slope, ..base.clone() },
+            Config { metric: Metric::Slope, fit_strategy: crate::fit::FitStrategy::Exact, ..base.clone() },
+            Config { fit_view: None, ..base.clone() },
+            Config { fit_view: None, metric: Metric::Median, ..base.clone() },
+            Config { fit_view: None, fit_rows: 100, fit_strategy: crate::fit::FitStrategy::Exact, ..base.clone() },
+            Config { fit_view: None, fit_rows: 100, ..base.clone() },
+            Config { fit_view: None, predictor_samples: Some(40), ..base.clone() },
+            Config { gpu: false, dispatch: crate::dispatch::DispatchMode::Auto, ..base.clone() },
+        ];
+        for (k, cfg) in configs.iter().enumerate() {
+            let with = |b: &std::sync::Arc<FitnessBook>| Config { fitness: Fitness::LongPnl(b.clone()), ..cfg.clone() };
+            for rows in [&train, &view] {
+                assert_eq!(long_pnl_blocker(&with(&masked), rows), long_pnl_blocker(&with(&plain), rows), "config {k}, {} rows", rows.len());
+                assert_eq!(gpu_blocker(&with(&masked), rows), gpu_blocker(&with(&plain), rows), "config {k}, {} rows", rows.len());
+            }
+        }
+        let band = |units: BandUnits, hold: usize| TradingSpec {
+            band: BandSpec { units, resolved: if units == BandUnits::Score { 0.3 } else { 0.0 }, ..BandSpec::score(0.3) },
+            min_holding: hold,
+            ..spec.clone()
+        };
+        let with = |b: std::sync::Arc<FitnessBook>| Config { fitness: Fitness::LongPnl(b), ..base.clone() };
+        assert_eq!(long_pnl_blocker(&with(build(&band(BandUnits::Score, 12), true)), &train), None);
+        assert_eq!(long_pnl_blocker(&with(build(&band(BandUnits::Sd, 12), false)), &train), None);
+        assert_eq!(long_pnl_blocker(&with(build(&band(BandUnits::Sd, 12), true)), &train), Some(crate::gpu::LONG_PNL_MASKED_SD));
+    }
+
     /// #971: with a fit view the device fits the CPU fit rows: the whole view, or the
     /// `--fit-rows` draw from it, and the constants equal the CPU fit on those rows.
     #[cfg(feature = "cuda")]
@@ -13945,6 +14269,45 @@ mod tests {
         let (got, work) = score_tree_checked_work(&tree, &view, &cfg);
         assert_eq!(got.to_bits(), f64::INFINITY.to_bits());
         assert_eq!(work, CheckWork::default());
+    }
+
+    /// #1244: under a regime mask a non-finite prediction outside the mask
+    /// decides nothing: the prefix probe and the checked pass read the rows
+    /// inside the mask only, and give the bits of `score_tree`.
+    #[test]
+    fn masked_nonfinite_checks_read_the_rows_inside_the_mask() {
+        let (s, plain) = checked_fixture(1, 1, true);
+        let n = s.len();
+        let on: Vec<bool> = (0..n).map(|i| !(i < 10 || (19_990..20_010).contains(&i) || i == n - 1)).collect();
+        let slice = crate::data::TradingSlice {
+            rows: crate::trading::TradingRows { time: (0..n).map(|i| 900.0 * i as f64).collect(), group: vec![0; n], funding: Vec::new() },
+            ret: s.y.clone(),
+        };
+        let spec = crate::trading::TradingSpec { cost_bps: 1.0, min_trades: 1, ..Default::default() };
+        let mask = crate::trading::BookMask { on: &on, identity: "unit" };
+        let book = crate::trading::FitnessBook::with_segments(&slice, &spec, 900.0, 1, 1.0, &[], Some(mask)).unwrap();
+        let cfg = Config { fitness: Fitness::LongPnl(std::sync::Arc::new(book)), ..plain };
+        let view = EvalSample::new(&s, &cfg);
+        let un = |op: Op, a: Node| node(op, vec![a]);
+        // Non-finite at rows 0, 20,000 and the last row, each outside the mask.
+        for tree in [input(2), input(3), input(4)] {
+            let exact = score_tree(&tree, &view, &cfg);
+            assert!(exact.is_finite(), "{tree:?}: {exact}");
+            assert_eq!(nonfinite_prefix(&tree, &view, &cfg), Some(false), "{tree:?}");
+            assert!(!prefix_is_non_finite(&tree, &view, &cfg), "{tree:?}");
+            let (got, work) = score_tree_checked_work(&tree, &view, &cfg);
+            assert_eq!(got.to_bits(), exact.to_bits(), "{tree:?}");
+            assert_eq!(work, CheckWork::default(), "{tree:?}");
+        }
+        // Non-finite inside the mask: in the prefix, and at row 25,000.
+        let ln = un(Op::Ln, input(0));
+        assert_eq!(nonfinite_prefix(&ln, &view, &cfg), Some(true));
+        assert_eq!(score_tree(&ln, &view, &cfg), f64::INFINITY);
+        let late = un(Op::Exp, un(Op::Exp, input(5)));
+        assert_eq!(nonfinite_prefix(&late, &view, &cfg), Some(false));
+        assert_eq!(score_tree(&late, &view, &cfg), f64::INFINITY);
+        let (got, work) = score_tree_checked_work(&late, &view, &cfg);
+        assert_eq!((got, work.early), (f64::INFINITY, 1));
     }
 
     /// A run clock for the device searches built in tests (a clock read inside a
@@ -14614,5 +14977,152 @@ mod tests {
         assert_eq!(gated.seeds[0].error.to_bits(), start.error.to_bits());
         assert_eq!(expr::structural_hash(&gated.seeds[0].tree), expr::structural_hash(&start.tree));
         assert!(plain.seeds[0].error > gated.seeds[0].error, "{} vs {}", plain.seeds[0].error, gated.seeds[0].error);
+    }
+
+    /// #1124: under the #848 fallback the finalist refit runs in two passes;
+    /// only the pass whose front is reported is counted.
+    #[test]
+    fn fit_accept_finalist_counts_the_reported_pass() {
+        use crate::expr::constant;
+        let s = threshold_panel();
+        let cfg = Config { reject_fixed_position: true, ..accept_config(&s, FitAccept::Fitness) };
+        let view = EvalSample::new(&s, &cfg);
+        let mut archive = Archive::new(10);
+        let tree = constant(5.0);
+        archive.items.push(Sol {
+            complexity: expr::complexity(&tree),
+            cost: cfg.complexity_model.complexity(&tree),
+            error: 0.0,
+            tree,
+        });
+        let counts = FitAcceptCounts::default();
+        let (front, report) = full_data_archive(&archive, &[], &view, &cfg, true, Some(&counts));
+        assert!(report.fixed_position_fallback, "the fixture reaches the fallback");
+        assert!(!front.items.is_empty());
+        let (kept, refused) = counts.snapshot().path("finalist").unwrap();
+        assert_eq!(kept + refused, 1, "one finalist, one decision");
+        assert!(((kept + refused) as usize) <= report.refits);
+    }
+
+    /// #1079: an island of scored offspring with edit records.
+    fn edit_island(rows: &[(Option<(f64, u8)>, f64)], cfg: &Config) -> Vec<Ind> {
+        rows.iter()
+            .map(|&(edit, error)| {
+                let mut ind = Ind::pending(input(0), cfg);
+                ind.set_error(error);
+                ind.edit = edit;
+                ind
+            })
+            .collect()
+    }
+
+    #[test]
+    fn barrier_learning_counts_like_the_inline_rule() {
+        let cfg = Config::default();
+        let inf = f64::INFINITY;
+        let mut islands = vec![edit_island(
+            &[
+                (Some((1.0, 0b0000011)), 0.5),
+                (Some((1.0, 0b0000110)), 2.0),
+                (Some((inf, 0b0001100)), 3.0),
+                (Some((1.0, 0b0011000)), inf),
+                (Some((inf, 0b0110000)), inf),
+                (None, 0.1),
+            ],
+            &cfg,
+        )];
+        let mut mixes = vec![MixWindow::new()];
+        learn_mix_at_barrier(&mut islands, &mut mixes);
+        let mut want: MixCounts = [(0, 0); expr::EDIT_KINDS];
+        want[0] = (1, 1);
+        want[1] = (2, 1);
+        want[2] = (2, 1);
+        want[3] = (2, 1);
+        want[4] = (2, 0);
+        want[5] = (1, 0);
+        let mut expected = MixWindow::new();
+        expected.push(want);
+        assert_eq!(mixes[0], expected);
+        assert!(islands[0].iter().all(|i| i.edit.is_none()));
+    }
+
+    /// #1079: `fit_iters = 0`, no QD policy: the barrier rule and the inline
+    /// rule see the same offspring, so they learn the same window.
+    fn adaptive_config() -> Config {
+        let mut cfg = Config::default();
+        cfg.pop = 40;
+        cfg.fit_iters = 0;
+        cfg.adaptive_mix = true;
+        cfg
+    }
+
+    fn adaptive_island(data: &EvalSample, cfg: &Config) -> Vec<Ind> {
+        (0..cfg.pop)
+            .map(|i| Ind::evaluated(node(Op::Add, vec![input(0), constant(i as f64)]), data, cfg))
+            .collect()
+    }
+
+    #[test]
+    fn barrier_and_inline_learning_agree() {
+        let s = sample();
+        let aggs = AggTable::from_sample(&s);
+        let cfg = adaptive_config();
+        assert!(!cfg.qd_policy);
+        let data = EvalSample::new(&s, &cfg);
+        let mut inline = adaptive_island(&data, &cfg);
+        let mut barrier = adaptive_island(&data, &cfg);
+        let (mut inline_rng, mut barrier_rng) = (Mt::new(23), Mt::new(23));
+        let (mut inline_mix, mut barrier_mix) = (MixWindow::new(), MixWindow::new());
+        for _ in 0..3 {
+            evolve_island(
+                &mut inline, &mut inline_rng, &cfg, &data, &s, 1, &aggs, false, false, no_parents(), None, None, 1,
+                &mut inline_mix, None,
+            );
+            evolve_island(
+                &mut barrier, &mut barrier_rng, &cfg, &data, &s, 1, &aggs, false, true, no_parents(), None, None, 1,
+                &mut barrier_mix, None,
+            );
+            for ind in barrier.iter_mut().filter(|i| i.error.is_nan()) {
+                ind.score_in_place(&data, &cfg);
+            }
+            let mut islands = vec![std::mem::take(&mut barrier)];
+            learn_mix_at_barrier(&mut islands, std::slice::from_mut(&mut barrier_mix));
+            barrier = islands.pop().unwrap();
+            assert_eq!(inline_mix, barrier_mix);
+            let key = |p: &[Ind]| -> Vec<(u64, u64)> {
+                p.iter().map(|i| (expr::structural_hash(&i.tree), i.error.to_bits())).collect()
+            };
+            assert_eq!(key(&inline), key(&barrier));
+        }
+        assert_eq!(inline_mix.len(), 3);
+        assert!(inline_mix.encode().iter().any(|&n| n > 0));
+    }
+
+    #[test]
+    fn no_edit_record_survives_a_generation() {
+        let s = sample();
+        let aggs = AggTable::from_sample(&s);
+        let cfg = adaptive_config();
+        let data = EvalSample::new(&s, &cfg);
+        let mut isl = adaptive_island(&data, &cfg);
+        let mut rng = Mt::new(5);
+        let mut mix = MixWindow::new();
+        for _ in 0..3 {
+            evolve_island(
+                &mut isl, &mut rng, &cfg, &data, &s, 1, &aggs, false, true, no_parents(), None, None, 1,
+                &mut mix, None,
+            );
+            assert!(isl.iter().any(|i| i.edit.is_some()), "offspring carry their edit record");
+            for ind in isl.iter_mut().filter(|i| i.error.is_nan()) {
+                ind.score_in_place(&data, &cfg);
+            }
+            let mut islands = vec![std::mem::take(&mut isl)];
+            learn_mix_at_barrier(&mut islands, std::slice::from_mut(&mut mix));
+            isl = islands.pop().unwrap();
+            assert!(isl.iter().all(|i| i.edit.is_none()));
+        }
+        assert_eq!(mix.len(), 3);
+        let attempts: u64 = mix.encode().chunks(2).map(|c| c[0]).sum();
+        assert!(attempts > 0);
     }
 }

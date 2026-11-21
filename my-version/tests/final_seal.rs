@@ -1186,3 +1186,501 @@ fn verify_read_accepts_another_spelling_of_the_front_path() {
     let (code, _, err) = go(&spelled, &["--verify-read", "--expect-report-sha256", &sha]);
     assert_eq!(code, 0, "{}", err);
 }
+
+/// #1094: the cut rule of `--threshold-fit fitness` is part of the sealed
+/// candidate and of the read binding: the fixed arm, another floor or another
+/// lambda is another candidate, and a verify with another rule scores nothing.
+#[test]
+fn threshold_fit_binds_the_sealed_read() {
+    let fit = ["--threshold-fixed", "0", "--threshold-fit", "fitness", "--cut-min-entries", "2", "--cut-blocks", "1"];
+    let (_s, data, l, sealed) = sealed_book("fit-binds", 400, &["x"], &fit);
+    let floor3 = ["--threshold-fixed", "0", "--threshold-fit", "fitness", "--cut-min-entries", "3", "--cut-blocks", "1"];
+    let lambda2 = ["--threshold-fixed", "0", "--threshold-fit", "fitness", "--cut-min-entries", "2", "--cut-blocks", "1", "--cut-lambda", "2"];
+    let fixed = ["--threshold-fixed", "0"];
+    let others: [&[&str]; 3] = [&fixed, &floor3, &lambda2];
+    for other in others {
+        let (code, out, err) = read(&data, &l, &sealed, &["x"], other);
+        assert_eq!(code, 3, "{:?}: {}{}", other, out, err);
+        assert!(err.contains("is not in the sealed list"), "{:?}: {}", other, err);
+        assert!(!Path::new(&marker_of(&data)).exists());
+    }
+    let (code, out, err) = read(&data, &l, &sealed, &["x"], &fit);
+    assert_eq!(code, 0, "{}", err);
+    assert!(out.contains("\"fit\":\"fitness\""), "{}", out);
+    let sha = recorded_read_sha(&l);
+    let (ledger_before, marker_before) = (std::fs::read(&l).unwrap(), std::fs::read(marker_of(&data)).unwrap());
+    for other in others {
+        let mut a = other.to_vec();
+        a.extend_from_slice(&["--verify-read", "--expect-report-sha256", sha.as_str()]);
+        let (code, out, err) = read(&data, &l, &sealed, &["x"], &a);
+        assert_eq!(code, 3, "{:?}: {}{}", other, out, err);
+        assert!(!err.contains("report sha256") && !out.contains("report_sha256"), "{:?}: {}{}", other, out, err);
+        assert_eq!(std::fs::read(&l).unwrap(), ledger_before);
+        assert_eq!(std::fs::read(marker_of(&data)).unwrap(), marker_before);
+    }
+    let mut verify = fit.to_vec();
+    verify.extend_from_slice(&["--verify-read", "--expect-report-sha256", sha.as_str()]);
+    let (code, _, err) = read(&data, &l, &sealed, &["x"], &verify);
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(test_reads(&l), 1);
+}
+
+/// #1214: a store with a gate column `h` (alternate 13-hour blocks) and the
+/// declared locked test at hours 300..400.
+fn switch_store(dir: &Path, name: &str) -> String {
+    let path = dir.join(name);
+    let mut csv = String::from("ts,x,h,y\n");
+    for i in 0..400i64 {
+        let x = ((i * 37) % 17) as f64 - 8.0;
+        let h = if (i / 13) % 2 == 0 { 0.5 } else { -0.5 } + 0.01 * ((i * 7) % 5) as f64;
+        let y = 0.0003 * x + (((i * 13) % 7) as f64 - 3.0) * 0.0004;
+        csv.push_str(&format!("{},{},{},{}\n", T0 + i * H, x, h, y));
+    }
+    std::fs::write(&path, csv).unwrap();
+    let d = s(&path);
+    lockbox::write_sidecar(&d, &Lockbox { start: T0 + 300 * H, end: T0 + 400 * H }, "test").unwrap();
+    d
+}
+
+/// A composed-style run.json whose finalist is the switch of gate `h` (band,
+/// dwell) holding `on` where the state is on and `off` elsewhere.
+fn switch_run(dir: &Path, name: &str, band: f64, dwell: usize, on: &str, off: &str) -> String {
+    let spec = "{\"column\":\"y\",\"name\":\"y\",\"kind\":\"forward_return\",\"deprecated\":false,\"return_column\":null,\"return_units\":\"simple\",\
+         \"horizon_seconds\":3600,\"entry_offset_seconds\":0,\"delay_seconds\":0,\"entry_price\":\"open\",\"exit_price\":\"close\",\"offset\":0.0,\
+         \"scale\":{\"kind\":\"constant\",\"value\":1.0},\"clip\":null,\"units\":\"return\",\"cost_bps\":null,\"cost_in_label\":false,\"construction_columns\":[],\"note\":null}";
+    let display = format!("if(greater(h, 0), {on}, {off})");
+    let sw = format!(
+        "{{\"gate\":{{\"schema\":\"rcsr-gate/1\",\"expr\":\"h\",\"columns\":[\"h\"],\"band\":{band},\"dwell\":{dwell},\"state_rule\":\"rcsr-gate-state/1\"}},\"on\":\"{on}\",\"off\":\"{off}\"}}"
+    );
+    let body = format!(
+        "{{\"tool\":\"rcsr\",\"target\":\"y\",\"variables\":[\"x\"],\"split\":{{\"mode\":\"temporal\",\"train_time\":[{},{}],\"required_purge_seconds\":3600}},\
+         \"target_spec\":{spec},\"search\":{{\"candidates_evaluated\":3}},\
+         \"objective\":{{\"spec\":{{\"threshold\":0.0,\"per_side_bps\":5.0,\"max_position\":1.0,\"cash_return\":0.0,\"min_holding\":1}},\"cost\":{{\"source\":\"flag\"}},\
+         \"finalist\":{{\"expression\":\"{display}\",\"expression_exact\":\"{display}\",\"switch\":{sw}}}}},\
+         \"pareto\":[{{\"archive_rank\":1,\"composite_id\":0,\"type\":\"C1\",\"expression\":\"{display}\",\"expression_exact\":\"{display}\",\"complexity\":5,\"pruned\":false,\"switch\":{sw}}}]}}",
+        T0,
+        T0 + 100 * H
+    );
+    let path = dir.join(name);
+    std::fs::write(&path, body).unwrap();
+    s(&path)
+}
+
+fn switch_wf(data: &str, ledger: &str, run: &str, extra: &[&str]) -> (i32, String, String) {
+    let mut a = vec![
+        "walkforward", "--data", data, "--target", "y", "--time", "ts", "--cost-bps", "5", "--json", "--ledger", ledger,
+        "--from-run", run,
+    ];
+    a.extend_from_slice(extra);
+    rcsr(&a)
+}
+
+fn candidate_of(out: &str) -> String {
+    out.split("\"candidate_id\":\"").nth(1).expect("candidate_id").split('"').next().unwrap().to_string()
+}
+
+#[test]
+fn locked_read_prices_a_stateful_composite_once() {
+    let (_scratch, dir) = scratch("switch-read");
+    let data = switch_store(&dir, "d.csv");
+    let run = switch_run(&dir, "switch.json", 0.02, 3, "x", "-1.0");
+    let (l, sealed) = (s(&dir.join("ledger.jsonl")), s(&dir.join("sealed.json")));
+    let dev = window("dev", 0, 150, 160, 250);
+    let (code, out, err) = switch_wf(&data, &l, &run, &["--window", &dev]);
+    assert_eq!(code, 0, "{}", err);
+    assert!(out.contains("\"source\":\"objective.finalist.switch\""), "{}", out);
+    let (code, _, err) = rcsr(&["protocol", "seal", "--final", "--ledger", &l, "--out", &sealed]);
+    assert_eq!(code, 0, "{}", err);
+    let locked = window("locked", 0, 250, 300, 400);
+    let read = |extra: &[&str]| {
+        let mut a = vec!["--locked-test", "--sealed", sealed.as_str(), "--window", locked.as_str()];
+        a.extend_from_slice(extra);
+        switch_wf(&data, &l, &run, &a)
+    };
+    let (code, out, err) = read(&[]);
+    assert_eq!(code, 0, "{}", err);
+    let j = rcsr::devlog::Json::parse(out.trim()).expect("json report");
+    let w = match j.get("windows") {
+        Some(rcsr::devlog::Json::Arr(a)) => a[0].clone(),
+        _ => panic!("windows"),
+    };
+    let start = w.get("gate").and_then(|g| g.get("start")).expect("windows[0].gate.start");
+    let last = start.get("warmup_last_time").and_then(|v| v.as_f64()).unwrap();
+    assert!(last < (T0 + 300 * H) as f64, "the warm-up ends before the locked start: {last}");
+    assert_eq!(last, (T0 + 299 * H) as f64, "the purge rows before the locked start are read for the gate");
+    assert!(w.get("gate").and_then(|g| g.get("regime")).is_some(), "the locked read prices the switch");
+    assert_eq!(test_reads(&l), 1);
+    let (code, _, err) = read(&[]);
+    assert_eq!(code, 3, "a second read is refused: {}", err);
+    assert_eq!(test_reads(&l), 1);
+    let sha = recorded_read_sha(&l);
+    let (code, _, err) = read(&["--verify-read", "--expect-report-sha256", &sha]);
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(test_reads(&l), 1, "verify appends no read");
+}
+
+#[test]
+fn procedure_spec_binds_the_gate() {
+    let (_scratch, dir) = scratch("switch-binding");
+    let data = switch_store(&dir, "d.csv");
+    let l = s(&dir.join("ledger.jsonl"));
+    let dev = window("dev", 0, 150, 160, 250);
+    let mut ids = Vec::new();
+    for (name, band, dwell, on, off) in [("base.json", 0.02, 3, "x", "-1.0"), ("dwell.json", 0.02, 6, "x", "-1.0"), ("band.json", 0.03, 3, "x", "-1.0"), ("swap.json", 0.02, 3, "-1.0", "x")] {
+        let run = switch_run(&dir, name, band, dwell, on, off);
+        let (code, out, err) = switch_wf(&data, &l, &run, &["--window", &dev]);
+        assert_eq!(code, 0, "{name}: {}", err);
+        ids.push(candidate_of(&out));
+    }
+    let mut distinct = ids.clone();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(distinct.len(), 4, "{ids:?}");
+}
+
+fn masked_run(dir: &Path) -> String {
+    let h = H;
+    let run = format!(
+        r#"{{"tool":"rcsr","variables":["x"],
+        "target_spec":{{"column":"y","name":"y","kind":"forward_return","deprecated":false,
+            "return_column":"y","return_units":"log","horizon_seconds":{h},"entry_offset_seconds":0,
+            "delay_seconds":0,"entry_price":"next open","exit_price":"close","offset":0.0,
+            "scale":{{"kind":"constant","value":1.0}},"clip":null,"units":"log_return","cost_bps":null,
+            "cost_in_label":false,"construction_columns":[],"note":null}},
+        "split":{{"train_time":[{a},{b}],"required_purge_seconds":0,"purge_seconds":0}},
+        "search":{{"candidates_evaluated":10}},
+        "objective":{{"spec":{{"threshold":0,"per_side_bps":5,"max_position":1,"cash_return":0,
+            "pnl_mask":{{"expr":"x","band":0.0,"dwell":1}}}},"finalist":{{"expression":"x","expression_exact":"x"}}}},
+        "pareto":[{{"expression":"x"}}]}}"#,
+        a = T0,
+        b = T0 + 100 * H
+    );
+    let path = dir.join("masked.run.json");
+    std::fs::write(&path, run).unwrap();
+    s(&path)
+}
+
+fn run_wf(data: &str, ledger: &str, run: &str, window: &str, extra: &[&str]) -> (i32, String, String) {
+    let mut a = vec![
+        "walkforward", "--data", data, "--time", "ts", "--from-run", run, "--json",
+        "--ledger", ledger, "--window", window,
+    ];
+    a.extend_from_slice(extra);
+    rcsr(&a)
+}
+
+fn event_field(ledger: &str, event: &str, key: &str) -> Vec<String> {
+    let pat = format!("\"{}\":\"", key);
+    std::fs::read_to_string(ledger)
+        .unwrap()
+        .lines()
+        .filter(|l| l.contains(&format!("\"event\":\"{}\"", event)))
+        .map(|l| l.split(&pat).nth(1).unwrap().split('"').next().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn masked_and_unmasked_runs_get_different_candidate_ids() {
+    let (_scratch, dir) = scratch("maskid");
+    let data = store(&dir, "d.csv");
+    let run = masked_run(&dir);
+    let dev_window = window("dev", 0, 150, 160, 250);
+    let locked = window("locked", 0, 250, 300, 400);
+
+    let l = s(&dir.join("both.jsonl"));
+    let (code, _, err) = run_wf(&data, &l, &run, &dev_window, &[]);
+    assert_eq!(code, 0, "{}", err);
+    let (code, _, err) = run_wf(&data, &l, &run, &dev_window, &["--unmasked"]);
+    assert_eq!(code, 0, "{}", err);
+    let ids = event_field(&l, "candidate", "id");
+    let specs = event_field(&l, "candidate", "spec_sha256");
+    assert_eq!((ids.len(), specs.len()), (2, 2), "{:?}", ids);
+    assert_ne!(ids[0], ids[1]);
+    assert_ne!(specs[0], specs[1]);
+
+    let (l2, sealed) = (s(&dir.join("masked.jsonl")), s(&dir.join("sealed.json")));
+    let (code, _, err) = run_wf(&data, &l2, &run, &dev_window, &[]);
+    assert_eq!(code, 0, "{}", err);
+    let (code, _, err) = rcsr(&["protocol", "seal", "--final", "--ledger", &l2, "--out", &sealed]);
+    assert_eq!(code, 0, "{}", err);
+    let (code, _, err) = run_wf(&data, &l2, &run, &locked, &["--unmasked", "--locked-test", "--sealed", &sealed]);
+    assert_eq!(code, 3, "{}", err);
+    assert!(err.contains("is not in the sealed list"), "{}", err);
+}
+
+#[path = "common/masked_run.rs"]
+mod masked_run;
+
+/// #1216: a masked `--sr-run` is refused before the ledger or the read marker is touched.
+#[test]
+fn ladder_masked_run_refusal_precedes_the_ledger() {
+    let (_scratch, dir, d, w, out, l, sealed) = ladder_fixture("ladder-masked");
+    let run = s(&dir.join("masked.run.json"));
+    std::fs::write(&run, masked_run::run_json(true, T0 as f64, (T0 + 300 * H) as f64)).unwrap();
+    let marker = format!("{d}.locked_reads.jsonl");
+    let before = (std::fs::read(&l).unwrap(), std::fs::read(&marker).ok());
+    let (code, _, err) = rcsr(&[
+        "ladder", "--data", &d, "--target", "y", "--time", "ts", "--group", "sym", "--features", "f1,f2",
+        "--windows", &w, "--scheme", "locked", "--purge-seconds", "7200", "--gbm-trees", "10", "--draws", "50",
+        "--max-fit-rows", "600", "--out", &out, "--locked-test", "--ledger", &l, "--sealed", &sealed, "--sr-run", &run,
+    ]);
+    assert_eq!(code, 2, "{}", err);
+    assert!(err.contains("pnl_mask"), "{}", err);
+    assert_eq!((std::fs::read(&l).unwrap(), std::fs::read(&marker).ok()), before, "the ledger and the marker stay as they were");
+    assert!(!Path::new(&out).exists(), "a refused read writes no report");
+    assert!(!std::fs::read_to_string(&l).unwrap().contains("baseline_read"));
+}
+
+/// A target spec for column `y` (horizon 1800 s, rows 3600 s apart) with the given return units and stride.
+fn units_spec(dir: &Path, name: &str, units: &str, stride: f64) -> String {
+    let text = format!(
+        "{{\"schema\":\"rcsr-target-spec/1\",\"targets\":[{{\"column\":\"y\",\"name\":\"y\",\
+         \"kind\":\"forward_return\",\"deprecated\":false,\"return_column\":\"y\",\"return_units\":\"{units}\",\
+         \"horizon_seconds\":1800,\"stride_seconds\":{stride},\"entry_offset_seconds\":0,\"delay_seconds\":0,\
+         \"entry_price\":\"open\",\"exit_price\":\"close\",\"offset\":0.0,\
+         \"scale\":{{\"kind\":\"constant\",\"value\":1.0}},\"clip\":null,\"units\":\"log_return\",\
+         \"cost_bps\":5,\"cost_in_label\":false,\"construction_columns\":[],\"note\":null}}]}}"
+    );
+    let path = dir.join(name);
+    std::fs::write(&path, text).unwrap();
+    s(&path)
+}
+
+fn spec_wf(data: &str, ledger: &str, spec: &str, window: &str, extra: &[&str]) -> (i32, String, String) {
+    let mut a = vec![
+        "walkforward", "--data", data, "--target", "y", "--target-spec", spec, "--time", "ts", "--expr", "x", "--json",
+        "--ledger", ledger, "--window", window,
+    ];
+    a.extend_from_slice(extra);
+    rcsr(&a)
+}
+
+/// Seals a development run under `base`, then reads it under `other` (refused) and under `base` (the control).
+fn spec_change_is_refused(name: &str, base: (&str, f64), other: (&str, f64)) {
+    let (_scratch, dir) = scratch(name);
+    let data = store(&dir, "d.csv");
+    let (a, b) = (units_spec(&dir, "a.json", base.0, base.1), units_spec(&dir, "b.json", other.0, other.1));
+    let (dev_window, locked) = (window("dev", 0, 150, 160, 250), window("locked", 0, 250, 300, 400));
+
+    let both = s(&dir.join("both.jsonl"));
+    for spec in [&a, &b] {
+        let (code, _, err) = spec_wf(&data, &both, spec, &dev_window, &[]);
+        assert_eq!(code, 0, "{}", err);
+    }
+    let ids = event_field(&both, "candidate", "id");
+    let specs = event_field(&both, "candidate", "spec_sha256");
+    assert_eq!((ids.len(), specs.len()), (2, 2), "{:?}", ids);
+    assert_ne!(ids[0], ids[1]);
+    assert_ne!(specs[0], specs[1]);
+
+    let (l, sealed) = (s(&dir.join("sealed.jsonl")), s(&dir.join("sealed.json")));
+    let (code, _, err) = spec_wf(&data, &l, &a, &dev_window, &[]);
+    assert_eq!(code, 0, "{}", err);
+    let (code, _, err) = rcsr(&["protocol", "seal", "--final", "--ledger", &l, "--out", &sealed]);
+    assert_eq!(code, 0, "{}", err);
+    let locked_flags = ["--locked-test", "--sealed", sealed.as_str()];
+    let (code, _, err) = spec_wf(&data, &l, &b, &locked, &locked_flags);
+    assert_eq!(code, 3, "{}", err);
+    assert!(err.contains("is not in the sealed list"), "{}", err);
+    assert_eq!(test_reads(&l), 0);
+    let (code, _, err) = spec_wf(&data, &l, &a, &locked, &locked_flags);
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(test_reads(&l), 1);
+}
+
+#[test]
+fn locked_read_under_another_stride_is_refused() {
+    spec_change_is_refused("stride-id", ("simple", 3600.0), ("simple", 2700.0));
+}
+
+#[test]
+fn locked_read_under_other_return_units_is_refused() {
+    spec_change_is_refused("units-id", ("simple", 3600.0), ("log", 3600.0));
+}
+
+#[test]
+fn schema_names_the_units_and_width_lines_of_the_procedure() {
+    let (code, out, err) = rcsr(&["schema"]);
+    assert_eq!(code, 0, "{}", err);
+    assert!(out.contains("return_units=log") && out.contains("period_width=<seconds>"));
+}
+
+/// A run.json of a search with --objective: finalist `x`, threshold 0, 10 bp per side, the
+/// one-hour forward return `y`, trained on hours 0..100.
+fn plain_run(dir: &Path, name: &str) -> String {
+    let spec = "{\"column\":\"y\",\"name\":\"y\",\"kind\":\"forward_return\",\"deprecated\":false,\"return_column\":null,\"return_units\":\"simple\",\
+         \"horizon_seconds\":3600,\"entry_offset_seconds\":0,\"delay_seconds\":0,\"entry_price\":\"open\",\"exit_price\":\"close\",\"offset\":0.0,\
+         \"scale\":{\"kind\":\"constant\",\"value\":1.0},\"clip\":null,\"units\":\"return\",\"cost_bps\":null,\"cost_in_label\":false,\"construction_columns\":[],\"note\":null}";
+    let body = format!(
+        "{{\"tool\":\"rcsr\",\"target\":\"y\",\"variables\":[\"x\"],\"split\":{{\"mode\":\"temporal\",\"train_time\":[{},{}],\"required_purge_seconds\":3600}},\
+         \"target_spec\":{spec},\"search\":{{\"candidates_evaluated\":3}},\
+         \"objective\":{{\"spec\":{{\"threshold\":0.0,\"per_side_bps\":10.0,\"max_position\":1.0,\"cash_return\":0.0,\"min_holding\":1}},\"cost\":{{\"source\":\"flag\"}},\
+         \"finalist\":{{\"expression\":\"x\",\"expression_exact\":\"x\"}}}},\
+         \"pareto\":[{{\"archive_rank\":1,\"expression\":\"x\",\"expression_exact\":\"x\",\"complexity\":1}}]}}\n",
+        T0,
+        T0 + 100 * H
+    );
+    let path = dir.join(name);
+    std::fs::write(&path, body).unwrap();
+    s(&path)
+}
+
+/// Path `k` of a CPCV(3, 2) assembly over six daily periods from 2020-01-01 at 10 bp and 8760
+/// periods a year (the grid of the hourly read; fixture F of tests/trials_table.rs): the
+/// population of a frozen pick.
+fn cpcv_path(dir: &Path, k: usize) -> String {
+    const F0: i64 = 1_577_836_800;
+    const DAY: i64 = 86_400;
+    let (s1, s2, s3) = ("1".repeat(64), "2".repeat(64), "3".repeat(64));
+    let (net, segments): ([f64; 6], [(&str, &str); 3]) = if k == 1 {
+        ([0.01, -0.02, 0.03, 0.00, -0.01, 0.02], [("s1", &s1), ("s1", &s1), ("s2", &s2)])
+    } else {
+        ([0.02, 0.01, -0.03, 0.01, 0.00, -0.02], [("s2", &s2), ("s3", &s3), ("s3", &s3)])
+    };
+    let segs: Vec<String> = (0..3)
+        .map(|g| {
+            let (split, sha) = segments[g];
+            let (a, b) = (F0 + 2 * DAY * g as i64, F0 + 2 * DAY * (g as i64 + 1));
+            format!(
+                "{{\"group\":\"G{}\",\"start\":{a},\"end\":{b},\"split\":\"{split}\",\"report\":\"wf_{split}.json\",\"report_sha256\":\"{sha}\",\
+                 \"expression\":[\"x\"],\"periods\":2,\"net\":{}}}",
+                g + 1,
+                net[2 * g] + net[2 * g + 1]
+            )
+        })
+        .collect();
+    let list = |v: &[f64]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",");
+    let time: Vec<f64> = (0..6).map(|d| (F0 + DAY * d) as f64).collect();
+    let (scheme, splits) = ("a".repeat(64), "b".repeat(64));
+    let text = format!(
+        "{{\"tool\":\"rcsr\",\"mode\":\"cpcv_path\",\"schema\":\"rcsr-cpcv-path/1\",\"window_definition\":\"{scheme}\",\
+         \"purge\":{{\"horizon_seconds\":86400,\"embargo_seconds\":0}},\"cost_model\":{{\"per_side_bps\":10,\"round_trip_bps\":20}},\
+         \"cost\":{{\"per_side_bps\":10,\"source\":\"flag\"}},\
+         \"annualization\":{{\"periods_per_year\":8760,\"method\":\"explicit\",\"source\":\"explicit\",\"period_seconds\":86400}},\
+         \"threshold\":{{\"quantile\":0.5,\"fixed\":0}},\"policy\":{{\"name\":\"threshold\",\"band_width\":0,\"min_hold\":1}},\
+         \"book\":{{\"missing_score\":\"flat\"}},\"pooled_seam\":{{\"reset_flat\":true,\"seam_cost\":0,\"seam_trades\":0}},\
+         \"cpcv\":{{\"scheme_sha256\":\"{scheme}\",\"splits_sha256\":\"{splits}\",\"groups\":3,\"test_groups\":2,\"splits\":3,\"paths\":2,\
+         \"path\":{k},\"seam_rule\":\"flat\",\"segments\":[{}]}},\
+         \"pooled\":{{\"periods\":6,\"periods_per_year\":8760,\"period_net\":[{}],\"period_time\":[{}]}}}}\n",
+        segs.join(","),
+        list(&net),
+        list(&time)
+    );
+    let path = dir.join(format!("path_{k}.json"));
+    std::fs::write(&path, text).unwrap();
+    s(&path)
+}
+
+/// #1238: the sealed-read path end to end on a 3-symbol fixture store with a declared
+/// fixture lock (hours 300..400): a development walk-forward registers the candidate, the
+/// candidate table freezes its thresholds, `protocol freeze` records the table and the two
+/// calendars, the final seal, the locked read with the series and the bootstrap, the
+/// after-read lock calendar, then the verdict.
+#[test]
+fn sealed_read_verdict_end_to_end() {
+    let (_scratch, dir) = scratch("verdict-e2e");
+    let p = |name: &str| s(&dir.join(name));
+    let data = p("panel.csv");
+    let mut csv = String::from("ts,s,x,close,y\n");
+    for i in 0..400i64 {
+        for (k, sym) in ["A", "B", "C"].iter().enumerate() {
+            let k = k as i64;
+            let x = ((i * 37 + k * 11) % 17) as f64 - 8.0;
+            let y = 0.0003 * x + (((i * 13 + k * 5) % 7) as f64 - 3.0) * 0.0004;
+            let close = 100.0 + 0.05 * i as f64 + (((i + 7 * k) % 24) as f64 - 12.0) * 0.1;
+            csv.push_str(&format!("{},{},{},{},{}\n", T0 + i * H, sym, x, close, y));
+        }
+    }
+    std::fs::write(&data, csv).unwrap();
+    lockbox::write_sidecar(&data, &Lockbox { start: T0 + 300 * H, end: T0 + 400 * H }, "test").unwrap();
+    let run = plain_run(&dir, "final.run.json");
+    let l = p("ledger.jsonl");
+    let wf = |extra: &[&str]| {
+        let mut a = vec![
+            "walkforward", "--data", data.as_str(), "--target", "y", "--time", "ts", "--group-by", "s", "--from-run", run.as_str(),
+            "--emit-series", "--json", "--ledger", l.as_str(),
+        ];
+        a.extend_from_slice(extra);
+        rcsr(&a)
+    };
+    let register = p("register.json");
+    let dev = window("dev", 0, 150, 160, 250);
+    let (code, _, err) = wf(&["--window", &dev, "--out", &register]);
+    assert_eq!(code, 0, "{}", err);
+
+    let paths = [cpcv_path(&dir, 1), cpcv_path(&dir, 2)];
+    let rule = p("rule.json");
+    std::fs::write(
+        &rule,
+        "{\"schema\":\"rcsr-trials-rule/1\",\"pick\":1,\"freeze\":{\"cpcv\":[3,2],\"cost_bps\":10,\"s4\":{\"window_days\":3,\"percentile\":10},\
+         \"p1\":{\"window_days\":2,\"percentile\":10},\"drawdown_cap\":{\"window_days\":3,\"percentile\":90,\"floor\":0.2}}}",
+    )
+    .unwrap();
+    let map = p("map.json");
+    std::fs::write(
+        &map,
+        format!(
+            "{{\"schema\":\"rcsr-trials-freeze-map/1\",\"rows\":[{{\"row\":\"{register}\",\"configuration\":\"F\",\"paths\":[\"{}\",\"{}\"],\"run\":\"{run}\"}}]}}",
+            paths[0], paths[1]
+        ),
+    )
+    .unwrap();
+    let table = p("table.json");
+    let (code, _, err) = rcsr(&["trials", "--wf", &register, "--table", "--rule", &rule, "--freeze-map", &map, "--draws", "20", "--out", &table]);
+    assert_eq!(code, 0, "{}", err);
+
+    let (sub, years) = (p("subwindows.csv"), p("years.csv"));
+    let at = |h: i64| T0 + h * H;
+    std::fs::write(&sub, format!("label,start,end\nprior_look,{},{}\npristine,{},{}\n", at(300), at(350), at(350), at(400))).unwrap();
+    std::fs::write(&years, format!("label,start,end\ny1,{},{}\ny2,{},{}\ny3,{},{}\n", at(300), at(334), at(334), at(367), at(367), at(400))).unwrap();
+    for (role, file) in [("thresholds", &table), ("subwindows", &sub), ("years", &years)] {
+        let (code, _, err) = rcsr(&["protocol", "freeze", "--ledger", &l, "--role", role, "--file", file]);
+        assert_eq!(code, 0, "{}: {}", role, err);
+    }
+    let sealed = p("sealed.json");
+    let (code, _, err) = rcsr(&["protocol", "seal", "--final", "--max-reads", "1", "--ledger", &l, "--out", &sealed]);
+    assert_eq!(code, 0, "{}", err);
+    let read_out = p("read.json");
+    let locked = window("locked", 0, 250, 300, 400);
+    let (code, _, err) = wf(&["--locked-test", "--sealed", &sealed, "--window", &locked, "--bootstrap", "200", "--out", &read_out]);
+    assert_eq!(code, 0, "{}", err);
+    let calendar = p("regimes_lock.csv");
+    let (code, _, err) = rcsr(&[
+        "protocol", "regimes", "--data", &data, "--time-col", "ts", "--price-col", "close", "--symbol-col", "s", "--index", "equal-weight", "--after-read",
+        "--ledger", &l, "--sealed", &sealed, "--expect-reads", "1", "--out", &calendar,
+    ]);
+    assert_eq!(code, 0, "{}", err);
+    let out = p("verdict.json");
+    let (code, stdout, err) = rcsr(&[
+        "protocol", "verdict", "--ledger", &l, "--sealed", &sealed, "--thresholds", &table, "--read", &read_out, "--subwindows", &sub, "--pristine-label",
+        "pristine", "--years", &years, "--regimes", &calendar, "--out", &out,
+    ]);
+    assert_eq!(code, 0, "{}{}", stdout, err);
+
+    use rcsr::devlog::Json;
+    let parse = |path: &str| Json::parse(std::fs::read_to_string(path).unwrap().trim()).unwrap();
+    let get = |j: &Json, path: &[&str]| -> Json { path.iter().fold(j.clone(), |cur, k| cur.get(k).unwrap_or_else(|| panic!("{} missing", k)).clone()) };
+    let (v, read, reg) = (parse(&out), parse(&read_out), parse(&register));
+    let c = match v.get("candidates") {
+        Some(Json::Arr(a)) => a[0].clone(),
+        other => panic!("candidates: {:?}", other),
+    };
+    let verdict = get(&c, &["verdict"]);
+    assert!(matches!(verdict.as_str(), Some("good" | "promising" | "not_confirmed" | "falsified")), "{:?}", verdict);
+    let run_sha = rcsr::manifest::sha256_hex(&std::fs::read(&run).unwrap());
+    assert_eq!(get(&read, &["selection", "run_sha256"]).as_str(), Some(run_sha.as_str()));
+    assert_eq!(get(&c, &["run_sha256"]).as_str(), Some(run_sha.as_str()));
+    let id = get(&read, &["protocol", "candidate_id"]);
+    assert_eq!(get(&reg, &["protocol", "candidate_id"]), id, "the register and the read share one candidate id");
+    assert_eq!(get(&c, &["candidate_id"]), id);
+    let p_read = get(&read, &["inference", "bootstrap", "p_mean_positive"]).as_f64().unwrap();
+    assert_eq!(get(&c, &["gates", "S5", "p"]).as_f64(), Some(p_read));
+    let full = match c.get("parts") {
+        Some(Json::Arr(a)) => a[0].clone(),
+        other => panic!("parts: {:?}", other),
+    };
+    assert_eq!(get(&full, &["bootstrap_p"]).as_f64(), Some(p_read), "the full part repeats the read's bootstrap");
+    let dd = get(&c, &["gates", "S3", "max_drawdown"]).as_f64().unwrap();
+    let pooled_dd = get(&read, &["pooled", "max_drawdown"]).as_f64().unwrap();
+    assert!((dd - pooled_dd).abs() <= 1e-12, "S3 {} vs pooled.max_drawdown {}", dd, pooled_dd);
+}

@@ -212,18 +212,22 @@ struct RcCtx {
     int carry_cap;
     int carry_warm;
     /* #481: the long/flat fitness book of the resident rows, one allocation:
-       `n` f64 excess returns followed by `n` seam-flag bytes. Null until
+       `n` f64 excess returns followed by `n` seam-flag bytes and, with more
+       than RC_PNL_MAX_BLOCKS blocks, `n` block id bytes (#1178). Null until
        `rc_set_pnl_book`. `d_pnl_totals` is set only by the test-only totals
        entry point. */
     unsigned char *d_pnl_book;
     double pnl_side;
     double pnl_threshold;
     /* #484: bound per time block (one entry, the whole-book bound, when
-       unblocked), the weight of the block spread and the block count (at most 8,
-       RC_PNL_MAX_BLOCKS). */
-    double pnl_bound[8];
+       unblocked), the weight of the block spread and the block count (at most
+       64, RC_PNL_WIDE_BLOCKS). #1178: the block statistic (RC_PNL_STAT_*) and
+       the worst-block count of RC_PNL_STAT_CVAR. */
+    double pnl_bound[64];
     double pnl_lambda;
     int pnl_blocks;
+    int pnl_stat;
+    int pnl_cvar_m;
     unsigned long long pnl_min_trades;
     void *d_pnl_totals;
     /* #925: the band `--band B` (score units, or the multiple of the training
@@ -900,10 +904,22 @@ __device__ __forceinline__ float rc_exec_row(const unsigned int *__restrict__ co
    tree. The block is exactly RC_PNL_WARPS warps whatever the row count. */
 #define RC_PNL_SEGMENT_ROWS 8192
 #define RC_PNL_WARPS 8
-/* #484: most time blocks, and the shift of the block id in the flags byte; keep
+/* #484: most time blocks whose id sits in the flags byte, and its shift; keep
    in step with `trading::FITNESS_MAX_BLOCKS` and `FITNESS_BLOCK_SHIFT`. */
 #define RC_PNL_MAX_BLOCKS 8
 #define RC_PNL_BLOCK_SHIFT 2
+/* #1244: bit 5 of a flags byte marks a row outside the regime mask
+   (`trading::FITNESS_MASK_OFF`). The scorers never interpret such a row and
+   never hold it long, so a non-finite score there decides nothing. */
+#define RC_PNL_MASK_OFF 32
+/* #1178: most time blocks of a book (`trading::FITNESS_BOOK_MAX_BLOCKS`); a
+   book with more than RC_PNL_MAX_BLOCKS reads its block ids from a byte array
+   and scores in the RC_PNL_WIDE_BLOCKS instantiation. */
+#define RC_PNL_WIDE_BLOCKS 64
+/* #1178: the statistic of the block regrets (`trading::BlockStat::code`). */
+#define RC_PNL_STAT_MEAN_SD 0
+#define RC_PNL_STAT_MEAN_SEMI 1
+#define RC_PNL_STAT_CVAR 2
 
 /* #222: the L1 majoriser floor, the same `1e-6` the CPU `irls_fit` uses. It is
    deliberately not smaller: at |r| = 0 the exact weight is infinite, and a
@@ -1607,8 +1623,16 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_kernel(
  * 2 to 4 and the seam bits mark every (group, block) run. Each block keeps its
  * own lane sum, warp sum and integer counts (the ballots restricted to the
  * rows of the block), the same trees per block, and thread 0 finishes with
- * `mean + lambda * sd` of the block regrets in the CPU's order. NB == 1 is the
- * unblocked kernel. */
+ * the statistic of the block regrets in the CPU's order (`rc_pnl_stat`).
+ * NB == 1 is the unblocked kernel.
+ *
+ * #1178: a book of 9 to 64 blocks reads its block ids from the byte array
+ * `bids` and scores in the NB == RC_PNL_WIDE_BLOCKS instantiation with the
+ * runtime block count `blk.nb`; a warp step that spans several blocks takes
+ * the counts of each block present with one ballot per block.
+ *
+ * #1244: a row with RC_PNL_MASK_OFF is flat and finite without an interpreter
+ * call (`FitnessBook::force_flat`), and so is the carry from it. */
 typedef struct RcPnlTotals {
     double gross;
     unsigned long long flips;
@@ -1616,17 +1640,20 @@ typedef struct RcPnlTotals {
     unsigned long long longs;
     int nonfinite;
     int pad;
-    double block_gross[RC_PNL_MAX_BLOCKS];
-    unsigned long long block_flips[RC_PNL_MAX_BLOCKS];
-    unsigned long long block_exits[RC_PNL_MAX_BLOCKS];
+    double block_gross[RC_PNL_WIDE_BLOCKS];
+    unsigned long long block_flips[RC_PNL_WIDE_BLOCKS];
+    unsigned long long block_exits[RC_PNL_WIDE_BLOCKS];
 } RcPnlTotals;
 
-/* The per-block bounds, the weight of the spread and the block count, passed
-   by value. */
+/* The per-block bounds, the weight of the spread, the block count, the
+   statistic (RC_PNL_STAT_*) and the worst-block count of RC_PNL_STAT_CVAR,
+   passed by value. */
 typedef struct RcPnlBlocks {
-    double bound[RC_PNL_MAX_BLOCKS];
+    double bound[RC_PNL_WIDE_BLOCKS];
     double lambda;
     int nb;
+    int stat;
+    int cvar_m;
     int pad;
 } RcPnlBlocks;
 
@@ -1635,13 +1662,58 @@ struct RcArgCheck<RcPnlBlocks> {
     static bool ok(const RcPnlBlocks &) { return true; }
 };
 
-static_assert(RC_PNL_MAX_BLOCKS == 8, "RcCtx::pnl_bound holds 8 block bounds");
+static_assert(RC_PNL_MAX_BLOCKS == 8, "the flags byte holds 8 block ids");
+static_assert(RC_PNL_WIDE_BLOCKS == 64, "RcCtx::pnl_bound holds 64 block bounds and a cvar choice fits 64 bits");
 static_assert(RC_MAX_THREADS == 32 * RC_PNL_WARPS, "the long/flat block is RC_PNL_WARPS warps");
 static_assert(RC_PNL_SEGMENT_ROWS % 32 == 0, "a segment is whole warp steps");
 
 __device__ __forceinline__ int rc_pnl_long(float pred, double threshold)
 {
     return isfinite(pred) && (double)pred > threshold;
+}
+
+/* #1178: the statistic of the finite block regrets `reg[0..nb)`, the operations
+   of `trading::block_stat` in the same order: `mean + lambda * sd` (sample sd;
+   one block is the regret), `mean + lambda * sqrt(mean(max(reg - 1, 0)^2))`,
+   or the mean of the `cvar_m` largest regrets (ties to the lower block),
+   summed in block order. */
+__device__ __forceinline__ double rc_pnl_stat(const double *reg, int nb, const RcPnlBlocks &blk)
+{
+    if (blk.stat == RC_PNL_STAT_CVAR) {
+        unsigned long long chosen = 0ull;
+        for (int j = 0; j < blk.cvar_m; ++j) {
+            int best = -1;
+            for (int b = 0; b < nb; ++b) {
+                if ((chosen >> b) & 1ull) continue;
+                if (best < 0 || reg[b] > reg[best]) best = b;
+            }
+            chosen |= 1ull << best;
+        }
+        double sum = 0.0;
+        for (int b = 0; b < nb; ++b) {
+            if ((chosen >> b) & 1ull) sum = __dadd_rn(sum, reg[b]);
+        }
+        return __ddiv_rn(sum, (double)blk.cvar_m);
+    }
+    double sum = 0.0;
+    for (int b = 0; b < nb; ++b) sum = __dadd_rn(sum, reg[b]);
+    const double mean = __ddiv_rn(sum, (double)nb);
+    if (blk.stat == RC_PNL_STAT_MEAN_SEMI) {
+        double ss = 0.0;
+        for (int b = 0; b < nb; ++b) {
+            const double d = reg[b] > 1.0 ? __dsub_rn(reg[b], 1.0) : 0.0;
+            ss = __dadd_rn(ss, __dmul_rn(d, d));
+        }
+        return __dadd_rn(mean, __dmul_rn(blk.lambda, __dsqrt_rn(__ddiv_rn(ss, (double)nb))));
+    }
+    if (nb == 1) return reg[0];
+    double ss = 0.0;
+    for (int b = 0; b < nb; ++b) {
+        const double d = __dsub_rn(reg[b], mean);
+        ss = __dadd_rn(ss, __dmul_rn(d, d));
+    }
+    const double sd = __dsqrt_rn(__ddiv_rn(ss, (double)(nb - 1)));
+    return __dadd_rn(mean, __dmul_rn(blk.lambda, sd));
 }
 
 /* Thread 0: fold the warp sums and counts of every block, score the
@@ -1662,11 +1734,12 @@ __device__ __forceinline__ void rc_pnl_finish(
     int *__restrict__ status,
     RcPnlTotals *__restrict__ totals)
 {
+    const int nb = NB > RC_PNL_MAX_BLOCKS ? blk.nb : NB;
     double bg[NB];
     unsigned long long bf[NB], be[NB];
     unsigned long long tf = 0, te = 0, tl = 0;
     int tb = 0;
-    for (int b = 0; b < NB; ++b) {
+    for (int b = 0; b < nb; ++b) {
         double g[RC_PNL_WARPS];
         bf[b] = 0;
         be[b] = 0;
@@ -1693,26 +1766,13 @@ __device__ __forceinline__ void rc_pnl_finish(
     } else if (tf >= min_trades) {
         double reg[NB];
         int finite = 1;
-        for (int b = 0; b < NB; ++b) {
+        for (int b = 0; b < nb; ++b) {
             const double net = __dsub_rn(bg[b], __dmul_rn(side, (double)(bf[b] + be[b])));
             reg[b] = __ddiv_rn(__dsub_rn(blk.bound[b], net), blk.bound[b]);
             finite &= isfinite(reg[b]);
         }
         if (finite) {
-            if (NB == 1) {
-                r = reg[0];
-            } else {
-                double sum = 0.0;
-                for (int b = 0; b < NB; ++b) sum = __dadd_rn(sum, reg[b]);
-                const double mean = __ddiv_rn(sum, (double)NB);
-                double ss = 0.0;
-                for (int b = 0; b < NB; ++b) {
-                    const double d = __dsub_rn(reg[b], mean);
-                    ss = __dadd_rn(ss, __dmul_rn(d, d));
-                }
-                const double sd = __dsqrt_rn(__ddiv_rn(ss, (double)(NB - 1)));
-                r = __dadd_rn(mean, __dmul_rn(blk.lambda, sd));
-            }
+            r = rc_pnl_stat(reg, nb, blk);
             if (!isfinite(r)) r = INFINITY;
         }
     }
@@ -1720,17 +1780,22 @@ __device__ __forceinline__ void rc_pnl_finish(
     status[p] = st;
     if (totals) {
         double gross = 0.0;
-        for (int b = 0; b < NB; ++b) gross = __dadd_rn(gross, bg[b]);
+        for (int b = 0; b < nb; ++b) gross = __dadd_rn(gross, bg[b]);
         totals[p].gross = gross;
         totals[p].flips = tf;
         totals[p].exits = te;
         totals[p].longs = tl;
         totals[p].nonfinite = tb;
         totals[p].pad = 0;
-        for (int b = 0; b < RC_PNL_MAX_BLOCKS; ++b) {
-            totals[p].block_gross[b] = b < NB ? bg[b] : 0.0;
-            totals[p].block_flips[b] = b < NB ? bf[b] : 0;
-            totals[p].block_exits[b] = b < NB ? be[b] : 0;
+        for (int b = 0; b < nb; ++b) {
+            totals[p].block_gross[b] = bg[b];
+            totals[p].block_flips[b] = bf[b];
+            totals[p].block_exits[b] = be[b];
+        }
+        for (int b = nb; b < RC_PNL_WIDE_BLOCKS; ++b) {
+            totals[p].block_gross[b] = 0.0;
+            totals[p].block_flips[b] = 0;
+            totals[p].block_exits[b] = 0;
         }
     }
 }
@@ -1745,6 +1810,7 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) pnl_score_kernel(
     int pooled,
     const double *__restrict__ excess,
     const unsigned char *__restrict__ flags,
+    const unsigned char *__restrict__ bids,
     double side,
     double threshold,
     RcPnlBlocks blk,
@@ -1759,6 +1825,7 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) pnl_score_kernel(
         : prog + off[p];
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
+    const unsigned int top = (unsigned int)((NB > RC_PNL_MAX_BLOCKS ? blk.nb : NB) - 1);
     __shared__ double sh_gross[NB][RC_PNL_WARPS];
     __shared__ unsigned int sh_flips[NB][RC_PNL_WARPS];
     __shared__ unsigned int sh_exits[NB][RC_PNL_WARPS];
@@ -1791,13 +1858,16 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) pnl_score_kernel(
             ? seg_start + RC_PNL_SEGMENT_ROWS
             : rows;
         unsigned int carry = 0u;
-        if (seg_start > 0) {
+        if (seg_start > 0 && !(flags[seg_start - 1] & RC_PNL_MASK_OFF)) {
             const float q = rc_exec_row(code, cols, n, (int)(seg_start - 1));
             carry = rc_pnl_long(q, threshold) ? 1u : 0u;
         }
         int bcur = 0;
         if (NB > 1) {
-            bcur = (int)min((flags[seg_start] >> RC_PNL_BLOCK_SHIFT) & (RC_PNL_MAX_BLOCKS - 1), (unsigned int)(NB - 1));
+            const unsigned int b0 = NB > RC_PNL_MAX_BLOCKS
+                ? (unsigned int)bids[seg_start]
+                : (flags[seg_start] >> RC_PNL_BLOCK_SHIFT) & (RC_PNL_MAX_BLOCKS - 1);
+            bcur = (int)min(b0, top);
         }
         double acc = 0.0;
         unsigned int cfc = 0, cec = 0;
@@ -1805,14 +1875,16 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) pnl_score_kernel(
             const long long row = base + lane;
             const int in = row < seg_end;
             float pred = 0.0f;
-            unsigned int f = 0u;
+            unsigned int f = 0u, wb = 0u;
             if (in) {
-                pred = rc_exec_row(code, cols, n, (int)row);
                 f = flags[row];
+                if (!(f & RC_PNL_MASK_OFF)) pred = rc_exec_row(code, cols, n, (int)row);
+                if (NB > RC_PNL_MAX_BLOCKS) wb = bids[row];
             }
+            const int live = in && !(f & RC_PNL_MASK_OFF);
             const int fin = isfinite(pred);
-            const int pos = in && fin && (double)pred > threshold;
-            bad |= in && !fin;
+            const int pos = live && fin && (double)pred > threshold;
+            bad |= live && !fin;
             const unsigned int m = __ballot_sync(0xffffffffu, pos);
             const unsigned int fst = __ballot_sync(0xffffffffu, (f & 1u) != 0u);
             const unsigned int lst = __ballot_sync(0xffffffffu, (f & 2u) != 0u);
@@ -1828,8 +1900,9 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) pnl_score_kernel(
                 if (pos) acc += excess[row];
                 continue;
             }
-            const unsigned int bid =
-                min((f >> RC_PNL_BLOCK_SHIFT) & (RC_PNL_MAX_BLOCKS - 1), (unsigned int)(NB - 1));
+            const unsigned int bid = NB > RC_PNL_MAX_BLOCKS
+                ? min(wb, top)
+                : min((f >> RC_PNL_BLOCK_SHIFT) & (RC_PNL_MAX_BLOCKS - 1), top);
             if (__all_sync(0xffffffffu, !in || (int)bid == bcur)) {
                 cfc += __popc(fl);
                 cec += __popc(ex);
@@ -1842,12 +1915,23 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) pnl_score_kernel(
             cfc = 0;
             cec = 0;
             if (pos) sg[bid] += excess[row];
+            if constexpr (NB > RC_PNL_MAX_BLOCKS) {
+                unsigned int todo = val;
+                while (todo) {
+                    const unsigned int k0 = __shfl_sync(0xffffffffu, bid, __ffs(todo) - 1);
+                    const unsigned int bm = __ballot_sync(0xffffffffu, in && bid == k0);
+                    sf[k0] += __popc(fl & bm);
+                    se[k0] += __popc(ex & bm);
+                    todo &= ~bm;
+                }
+            } else {
 #pragma unroll
-            for (int b = 0; b < NB; ++b) {
-                const unsigned int bm = __ballot_sync(0xffffffffu, in && bid == (unsigned int)b);
-                if (bm) {
-                    sf[b] += __popc(fl & bm);
-                    se[b] += __popc(ex & bm);
+                for (int b = 0; b < NB; ++b) {
+                    const unsigned int bm = __ballot_sync(0xffffffffu, in && bid == (unsigned int)b);
+                    if (bm) {
+                        sf[b] += __popc(fl & bm);
+                        se[b] += __popc(ex & bm);
+                    }
                 }
             }
             bcur = __shfl_sync(0xffffffffu, (int)bid, 31 - __clz(val));
@@ -1889,7 +1973,9 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) pnl_score_kernel(
  * row included, saturating at K). A row enters when its prediction is finite
  * and `(double)pred > threshold + b`, keeps a long position while finite and
  * `> threshold - b` or while `h < K`, and the first row of every run (group
- * or time block) starts flat: `BandParams::next` row for row.
+ * or time block) starts flat: `BandParams::next` row for row. #1244: a row
+ * with RC_PNL_MASK_OFF is not interpreted and neither enters nor stays, the
+ * step of `BandParams::next` on the score `f64::MIN`.
  *
  * The block walks the segments in rounds of RC_PNL_WARPS: in round `r` warp
  * `w` takes segment `r * RC_PNL_WARPS + w`, the same segments in the same
@@ -1996,6 +2082,7 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) pnl_band_kernel(
     int first,
     const double *__restrict__ excess,
     const unsigned char *__restrict__ flags,
+    const unsigned char *__restrict__ bids,
     double side,
     double threshold,
     RcPnlBlocks blk,
@@ -2014,6 +2101,7 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) pnl_band_kernel(
         : prog + off[p];
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
+    const unsigned int top = (unsigned int)((NB > RC_PNL_MAX_BLOCKS ? blk.nb : NB) - 1);
     __shared__ unsigned char sh_tab[2][RC_PNL_WARPS][RC_PNL_MAX_HOLD + 1];
     __shared__ double sh_gross[NB][RC_PNL_WARPS];
     __shared__ unsigned int sh_flips[NB][RC_PNL_WARPS];
@@ -2066,13 +2154,14 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) pnl_band_kernel(
                 float pred = 0.0f;
                 unsigned int f = 0u;
                 if (in) {
-                    pred = rc_exec_row(code, cols, n, (int)row);
                     f = flags[row];
+                    if (!(f & RC_PNL_MASK_OFF)) pred = rc_exec_row(code, cols, n, (int)row);
                 }
+                const int live = in && !(f & RC_PNL_MASK_OFF);
                 const int fin = isfinite(pred);
-                bad |= in && !fin;
-                const unsigned int ent = __ballot_sync(0xffffffffu, in && fin && (double)pred > hi);
-                const unsigned int stay = __ballot_sync(0xffffffffu, in && fin && (double)pred > lo);
+                bad |= live && !fin;
+                const unsigned int ent = __ballot_sync(0xffffffffu, live && fin && (double)pred > hi);
+                const unsigned int stay = __ballot_sync(0xffffffffu, live && fin && (double)pred > lo);
                 const unsigned int fst = __ballot_sync(0xffffffffu, (f & 1u) != 0u);
                 const int nv = (int)min((long long)32, seg_end - base);
                 if (lane == (step & 31)) {
@@ -2128,7 +2217,10 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) pnl_band_kernel(
             unsigned int carry = start > 0 ? 1u : 0u;
             int bcur = 0;
             if (NB > 1) {
-                bcur = (int)min((flags[seg_start] >> RC_PNL_BLOCK_SHIFT) & (RC_PNL_MAX_BLOCKS - 1), (unsigned int)(NB - 1));
+                const unsigned int b0 = NB > RC_PNL_MAX_BLOCKS
+                    ? (unsigned int)bids[seg_start]
+                    : (flags[seg_start] >> RC_PNL_BLOCK_SHIFT) & (RC_PNL_MAX_BLOCKS - 1);
+                bcur = (int)min(b0, top);
             }
             double acc = 0.0;
             unsigned int cfc = 0, cec = 0;
@@ -2147,6 +2239,7 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) pnl_band_kernel(
                 const long long row = base + lane;
                 const int in = row < seg_end;
                 const unsigned int f = in ? (unsigned int)flags[row] : 0u;
+                const unsigned int wb = (NB > RC_PNL_MAX_BLOCKS && in) ? (unsigned int)bids[row] : 0u;
                 const unsigned int fst = __ballot_sync(0xffffffffu, (f & 1u) != 0u);
                 const unsigned int lst = __ballot_sync(0xffffffffu, (f & 2u) != 0u);
                 const unsigned int val = __ballot_sync(0xffffffffu, in);
@@ -2171,8 +2264,9 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) pnl_band_kernel(
                     if (pos) acc += excess[row];
                     continue;
                 }
-                const unsigned int bid =
-                    min((f >> RC_PNL_BLOCK_SHIFT) & (RC_PNL_MAX_BLOCKS - 1), (unsigned int)(NB - 1));
+                const unsigned int bid = NB > RC_PNL_MAX_BLOCKS
+                    ? min(wb, top)
+                    : min((f >> RC_PNL_BLOCK_SHIFT) & (RC_PNL_MAX_BLOCKS - 1), top);
                 if (__all_sync(0xffffffffu, !in || (int)bid == bcur)) {
                     cfc += __popc(fl);
                     cec += __popc(ex);
@@ -2185,12 +2279,23 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) pnl_band_kernel(
                 cfc = 0;
                 cec = 0;
                 if (pos) sg[bid] += excess[row];
+                if constexpr (NB > RC_PNL_MAX_BLOCKS) {
+                    unsigned int todo = val;
+                    while (todo) {
+                        const unsigned int k0 = __shfl_sync(0xffffffffu, bid, __ffs(todo) - 1);
+                        const unsigned int bm = __ballot_sync(0xffffffffu, in && bid == k0);
+                        sf[k0] += __popc(fl & bm);
+                        se[k0] += __popc(ex & bm);
+                        todo &= ~bm;
+                    }
+                } else {
 #pragma unroll
-                for (int k = 0; k < NB; ++k) {
-                    const unsigned int bm = __ballot_sync(0xffffffffu, in && bid == (unsigned int)k);
-                    if (bm) {
-                        sf[k] += __popc(fl & bm);
-                        se[k] += __popc(ex & bm);
+                    for (int k = 0; k < NB; ++k) {
+                        const unsigned int bm = __ballot_sync(0xffffffffu, in && bid == (unsigned int)k);
+                        if (bm) {
+                            sf[k] += __popc(fl & bm);
+                            se[k] += __popc(ex & bm);
+                        }
                     }
                 }
                 bcur = __shfl_sync(0xffffffffu, (int)bid, 31 - __clz(val));
@@ -2364,16 +2469,22 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) pnl_sd_kernel(
 }
 
 /* #484: one instantiation per block count so the per-block accumulators stay
-   in registers. */
+   in registers. #1178: 9 to 64 blocks share the RC_PNL_WIDE_BLOCKS instantiation,
+   which reads the block ids after the flags. */
 static void rc_pnl_launch(RcCtx *c, const unsigned int *prog, const unsigned int *off,
                           int width, int pooled, int nprog)
 {
     RcPnlBlocks blk = {};
-    for (int b = 0; b < RC_PNL_MAX_BLOCKS; ++b) blk.bound[b] = c->pnl_bound[b];
+    for (int b = 0; b < RC_PNL_WIDE_BLOCKS; ++b) blk.bound[b] = c->pnl_bound[b];
     blk.lambda = c->pnl_lambda;
     blk.nb = c->pnl_blocks;
+    blk.stat = c->pnl_stat;
+    blk.cvar_m = c->pnl_cvar_m;
     const double *excess = (const double *)c->d_pnl_book;
     const unsigned char *flags = c->d_pnl_book + sizeof(double) * (size_t)c->n;
+    const int wide = c->pnl_blocks > RC_PNL_MAX_BLOCKS;
+    const unsigned char *bids = wide ? flags + (size_t)c->n : 0;
+    const int key = wide ? RC_PNL_WIDE_BLOCKS : c->pnl_blocks;
     RcPnlTotals *totals = (RcPnlTotals *)c->d_pnl_totals;
     c->pnl_sd_timed = 0;
     if (c->pnl_band != 0.0 || c->pnl_hold != 1) {
@@ -2391,17 +2502,17 @@ static void rc_pnl_launch(RcCtx *c, const unsigned int *prog, const unsigned int
     case K:                                                                                        \
         if (c->pnl_hold == 1) {                                                                    \
             rc_launch("pnl_band_kernel<K, 1>", pnl_band_kernel<K, 1>, count, RC_MAX_THREADS, 0, 0, \
-                c->d_cols, c->n, prog, off, width, pooled, first, excess, flags, c->pnl_side,      \
+                c->d_cols, c->n, prog, off, width, pooled, first, excess, flags, bids, c->pnl_side,\
                 c->pnl_threshold, blk, c->pnl_min_trades, c->pnl_band, sd, c->pnl_hold, ballots,   \
                 c->d_score_out, c->d_score_status, totals);                                        \
         } else {                                                                                   \
             rc_launch("pnl_band_kernel<K, 0>", pnl_band_kernel<K, 0>, count, RC_MAX_THREADS, 0, 0, \
-                c->d_cols, c->n, prog, off, width, pooled, first, excess, flags, c->pnl_side,      \
+                c->d_cols, c->n, prog, off, width, pooled, first, excess, flags, bids, c->pnl_side,\
                 c->pnl_threshold, blk, c->pnl_min_trades, c->pnl_band, sd, c->pnl_hold, ballots,   \
                 c->d_score_out, c->d_score_status, totals);                                        \
         }                                                                                          \
         break;
-            switch (c->pnl_blocks) {
+            switch (key) {
                 RC_PNL_BAND_CASE(1)
                 RC_PNL_BAND_CASE(2)
                 RC_PNL_BAND_CASE(3)
@@ -2410,6 +2521,7 @@ static void rc_pnl_launch(RcCtx *c, const unsigned int *prog, const unsigned int
                 RC_PNL_BAND_CASE(6)
                 RC_PNL_BAND_CASE(7)
                 RC_PNL_BAND_CASE(8)
+                RC_PNL_BAND_CASE(RC_PNL_WIDE_BLOCKS)
                 default:
                     break;
             }
@@ -2420,11 +2532,11 @@ static void rc_pnl_launch(RcCtx *c, const unsigned int *prog, const unsigned int
 #define RC_PNL_CASE(K)                                                                   \
     case K:                                                                              \
         rc_launch("pnl_score_kernel<K>", pnl_score_kernel<K>, nprog, RC_MAX_THREADS, 0, 0, \
-            c->d_cols, c->n, prog, off, width, pooled, excess, flags, c->pnl_side,       \
+            c->d_cols, c->n, prog, off, width, pooled, excess, flags, bids, c->pnl_side, \
             c->pnl_threshold, blk, c->pnl_min_trades, c->d_score_out, c->d_score_status, \
             totals);                                                                     \
         break;
-    switch (c->pnl_blocks) {
+    switch (key) {
         RC_PNL_CASE(1)
         RC_PNL_CASE(2)
         RC_PNL_CASE(3)
@@ -2433,6 +2545,7 @@ static void rc_pnl_launch(RcCtx *c, const unsigned int *prog, const unsigned int
         RC_PNL_CASE(6)
         RC_PNL_CASE(7)
         RC_PNL_CASE(8)
+        RC_PNL_CASE(RC_PNL_WIDE_BLOCKS)
         default:
             break;
     }
@@ -6763,17 +6876,22 @@ static int rc_pnl_book_fail(const char *why)
 
 /* #481, #484: upload the long/flat fitness book of the resident rows: the
    excess returns, the seam flags (value 1 first row of a run, value 2 last row,
-   bits 2 to 4 the time block id), the cost per side,
-   the threshold, the hindsight bound of each of `nblocks` time blocks (1 to 8;
-   one entry, the whole-book bound, when unblocked), the weight `lambda` of the
-   block spread and the trade floor. One allocation of 9 bytes per row, tag
-   "pnl_book", kept until rc_destroy or the next call. Returns 0, or -1 when
-   refused: a tiled context, a row count other than the resident one, a bad
-   block count, a non-positive bound or a refused allocation (the previous book
-   is released either way). */
+   bits 2 to 4 the time block id up to RC_PNL_MAX_BLOCKS blocks), the cost per
+   side, the threshold, the hindsight bound of each of `nblocks` time blocks (1
+   to 64; one entry, the whole-book bound, when unblocked), the weight `lambda`
+   of the block spread and the trade floor. #1178: with more than
+   RC_PNL_MAX_BLOCKS blocks `block_ids` holds the block of every row (each below
+   `nblocks`; null otherwise); `stat` is the block statistic (RC_PNL_STAT_*) and
+   `cvar_m` its worst-block count under RC_PNL_STAT_CVAR (1 to `nblocks`). One
+   allocation of 9 bytes per row (10 with block ids), tag "pnl_book", kept until
+   rc_destroy or the next call. Returns 0, or -1 when refused: a tiled context,
+   a row count other than the resident one, a bad block count, block ids or
+   statistic, a non-positive bound or a refused allocation (the previous book is
+   released either way). */
 int rc_set_pnl_book(void *ctx, const double *excess, const unsigned char *flags,
-                    int n, double side, double threshold, const double *bounds,
-                    int nblocks, double lambda, unsigned long long min_trades)
+                    const unsigned char *block_ids, int n, double side, double threshold,
+                    const double *bounds, int nblocks, double lambda, int stat, int cvar_m,
+                    unsigned long long min_trades)
 {
     RcCtx *c = (RcCtx *)ctx;
     rc_alloc_fail_clear();
@@ -6786,7 +6904,21 @@ int rc_set_pnl_book(void *ctx, const double *excess, const unsigned char *flags,
     if (c->tiled) return rc_pnl_book_fail("the context is tiled");
     if (n <= 0 || n != c->n) return rc_pnl_book_fail("the row count differs from the resident rows");
     if (!excess || !flags || !bounds) return rc_pnl_book_fail("a book array is null");
-    if (nblocks < 1 || nblocks > RC_PNL_MAX_BLOCKS) return rc_pnl_book_fail("the block count is outside 1 to 8");
+    if (nblocks < 1 || nblocks > RC_PNL_WIDE_BLOCKS) return rc_pnl_book_fail("the block count is outside 1 to 64");
+    const int wide = nblocks > RC_PNL_MAX_BLOCKS;
+    if (wide && !block_ids) return rc_pnl_book_fail("more than 8 blocks need a block id per row");
+    if (!wide && block_ids) return rc_pnl_book_fail("block ids are read with more than 8 blocks only");
+    if (wide) {
+        for (int i = 0; i < n; ++i) {
+            if ((int)block_ids[i] >= nblocks) return rc_pnl_book_fail("a block id is not below the block count");
+        }
+    }
+    if (stat != RC_PNL_STAT_MEAN_SD && stat != RC_PNL_STAT_MEAN_SEMI && stat != RC_PNL_STAT_CVAR) {
+        return rc_pnl_book_fail("the block statistic is unknown");
+    }
+    if (stat == RC_PNL_STAT_CVAR && (cvar_m < 1 || cvar_m > nblocks)) {
+        return rc_pnl_book_fail("the cvar block count is outside 1 to the block count");
+    }
     if (!(lambda >= 0.0) || !isfinite(lambda)) {
         return rc_pnl_book_fail("the block spread weight is negative or not finite");
     }
@@ -6794,12 +6926,13 @@ int rc_set_pnl_book(void *ctx, const double *excess, const unsigned char *flags,
         if (!(bounds[b] > 0.0)) return rc_pnl_book_fail("a block hindsight bound is not positive");
     }
     const size_t eb = sizeof(double) * (size_t)n;
-    const size_t bytes = eb + (size_t)n;
+    const size_t bytes = eb + (size_t)n * (wide ? 2 : 1);
     void *p = 0;
     if (rc_dev_alloc(c, "pnl_book", &p, bytes) != 0) return -1;
     unsigned char *book = (unsigned char *)p;
     rc_upload(book, excess, eb);
     rc_upload(book + eb, flags, (size_t)n);
+    if (wide) rc_upload(book + eb + (size_t)n, block_ids, (size_t)n);
     if (cudaGetLastError() != cudaSuccess) {
         rc_dev_free(c, book);
         return rc_pnl_book_fail("a CUDA error was pending after the book upload");
@@ -6807,9 +6940,11 @@ int rc_set_pnl_book(void *ctx, const double *excess, const unsigned char *flags,
     c->d_pnl_book = book;
     c->pnl_side = side;
     c->pnl_threshold = threshold;
-    for (int b = 0; b < RC_PNL_MAX_BLOCKS; ++b) c->pnl_bound[b] = b < nblocks ? bounds[b] : 0.0;
+    for (int b = 0; b < RC_PNL_WIDE_BLOCKS; ++b) c->pnl_bound[b] = b < nblocks ? bounds[b] : 0.0;
     c->pnl_blocks = nblocks;
     c->pnl_lambda = lambda;
+    c->pnl_stat = stat;
+    c->pnl_cvar_m = stat == RC_PNL_STAT_CVAR ? cvar_m : 0;
     c->pnl_min_trades = min_trades;
     c->pnl_band = 0.0;
     c->pnl_sd_units = 0;

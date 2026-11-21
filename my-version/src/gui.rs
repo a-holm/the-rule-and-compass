@@ -818,8 +818,13 @@ const UNSUPPORTED: &[(&str, &str)] = &[
     ("--resume", "checkpoints depend on a process lifecycle the stream does not have"),
     ("--select-rule", "post-loop selection is a CLI option"),
     ("--select-blocks", "post-loop selection is a CLI option"),
+    ("--split-table", "interval-list splits read a splits table the server does not open"),
+    ("--split-id", "interval-list splits read a splits table the server does not open"),
+    ("--embargo", "interval-list splits read a splits table the server does not open"),
     ("--select-se", "post-loop selection is a CLI option"),
     ("--select-block-len", "post-loop selection is a CLI option"),
+    ("--select-delta", "post-loop selection is a CLI option"),
+    ("--select-min-entries", "post-loop selection is a CLI option"),
     ("--select-require-edge", "post-loop selection is a CLI option"),
     ("--reselect", "checkpoints depend on a process lifecycle the stream does not have"),
     ("--reselect-run", "re-selection reads files the server does not open"),
@@ -950,8 +955,6 @@ fn parse_args(args: &[String]) -> Result<(RawOptions, search::Config), String> {
                     .ok_or_else(|| format!("unknown --fit-strategy '{}'", v))?;
             }
             "--no-fit" => cfg.fit_iters = 0,
-            "--no-dedup" => cfg.dedup = false,
-            "--no-front-parents" => cfg.front_parents = false,
             // #1083: settings from the search setting table that the browser implements.
             flag if crate::settings::find(flag).is_some_and(|r| r.gui()) => {
                 let row = crate::settings::find(flag).expect("matched by the guard");
@@ -1363,6 +1366,7 @@ impl RunPlan {
             scale_column: None,
             trading: None,
             canonical_train_order: false,
+            intervals: None,
         };
         let cv_dtypes = dtypes.clone();
         let prep = data::PrepSpec {

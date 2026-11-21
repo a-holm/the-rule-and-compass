@@ -1700,6 +1700,9 @@ pub fn run(args: &[String]) -> ! {
     if cmd == "rank" {
         crate::panel_rank::cli(&args[1..]);
     }
+    if cmd == "permute-labels" {
+        crate::permute_labels::cli(&args[1..]);
+    }
     let mut data = None;
     let mut membership_path = None;
     let mut out = None;
@@ -2245,6 +2248,13 @@ HOURLY V2 PANEL (#259):
   rcsr panel spread --data panel.rcsb --feature clv1 --label lbl_h1_fwd --range FROM..TO [--buckets 5] [--bucketing pooled|cross-section]
                     [--demean cross-section|none] [--min-members 20] [--block N] [--draws 2000] [--seed 1] [--lockbox S,E|none]
                   market-neutral bucket spread of a feature in bp with a block-bootstrap interval; refuses a range that reaches the locked test (#261)
+  rcsr panel permute-labels --data panel.rcsb --target-spec panel.targets.json --label h24a --block 30 --seed 1 --out null.rcsb
+                  [--columns a,b] [--time ts] [--group-by symbol] [--lockbox S,E|none] [--lock-record R]
+                  the search-capacity null store: the label family moves per symbol by one seeded circular-block order
+                  over the rows with a finite y (gap rows with a NaN y and a finite return in their own pool); features,
+                  time, symbol, t1 and weight keep their bytes; the manifest
+                  marks it null and rcsr trials --table reads its reports only with --null-wf (#1272;
+                  rcsr panel permute-labels --help)
   --input <dir>           archive directory (SYMBOL/SYMBOL-15m-YYYY-MM.zip); no network
   --jobs <n>              parallel symbols for snapshot and base (default 1)
   --gpu <auto|on|off>     base: run the 15m to 1h fold on the CUDA device (auto: from 1M decoded rows;
