@@ -133,6 +133,8 @@ pub struct ProtocolOptions {
     /// #1291: data without the fit label column is refused (the books of `--from-run` and
     /// `--front` need it); otherwise the return alone labels a row.
     pub fit_label_required: bool,
+    /// #1212: the book is priced on another label than the fit label.
+    pub book_label: Option<BookLabel>,
     /// The horizon comes from a target spec, not from `--horizon` alone; the
     /// report names it as the annualisation source.
     pub horizon_from_spec: bool,
@@ -341,6 +343,67 @@ impl LabelledRows {
     }
 }
 
+/// #1212: a book priced on another label than the one the formula was fitted on
+/// (`--book-target`, or the run's `objective.book_target_spec`). The book label's
+/// return column, horizon, stride and cost price the book on its rows
+/// ([`LabelledRows::BookTarget`]); the fit label keeps its purge.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BookLabel {
+    pub book: crate::target::TargetSpec,
+    pub fit: crate::target::TargetSpec,
+    pub source: BookSource,
+}
+
+/// #1212: where the book label came from (`book.source`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BookSource {
+    /// `--book-target`.
+    Flag,
+    /// `objective.book_target_spec` of the `--from-run` or `--front` run.
+    Run,
+}
+
+impl BookLabel {
+    /// The pair, `None` when `book` is the fit label itself; refused as the search refuses `--book-target`.
+    pub fn pair(fit: &crate::target::TargetSpec, book: &crate::target::TargetSpec, source: BookSource) -> Result<Option<BookLabel>, String> {
+        if book.column == fit.column {
+            return Ok(None);
+        }
+        match crate::target::book_pair_refusal(fit, book) {
+            Some(e) => Err(e),
+            None => Ok(Some(BookLabel { book: book.clone(), fit: fit.clone(), source })),
+        }
+    }
+
+    /// The fit label's `entry_offset + horizon + delay`, the purge floor of every window.
+    pub fn fit_purge_seconds(&self) -> f64 {
+        self.fit.required_purge_seconds()
+    }
+
+    /// The members the label adds to the report's `book` object, with a leading comma.
+    fn json(&self) -> String {
+        format!(
+            ",\"target\":{{\"column\":{},\"name\":{},\"return_column\":{},\"horizon_seconds\":{},\"stride_seconds\":{}}},\
+             \"fit_target\":{{\"column\":{},\"horizon_seconds\":{},\"required_purge_seconds\":{}}},\"source\":{}",
+            jstr(&self.book.column),
+            jstr(&self.book.name),
+            self.book.return_column.as_deref().map_or("null".to_string(), jstr),
+            jnum(self.book.horizon_seconds),
+            self.book.stride_seconds.map_or("null".to_string(), jnum),
+            jstr(&self.fit.column),
+            jnum(self.fit.horizon_seconds),
+            jnum(self.fit_purge_seconds()),
+            jstr(match self.source {
+                BookSource::Flag => "flag",
+                BookSource::Run => "run",
+            })
+        )
+    }
+}
+
+/// #1212: the start of the refusal of a data file without the book label's return column (exit 2).
+pub const BOOK_LABEL_REFUSAL: &str = "book label return column";
+
 /// #1291: the return of a row, NaN when its fit label is not finite.
 fn labelled(ret: f64, fit_label: Option<f64>) -> f64 {
     if fit_label.map_or(true, f64::is_finite) {
@@ -388,6 +451,7 @@ impl Default for ProtocolOptions {
             fit_label: None,
             labelled_rows: LabelledRows::Return,
             fit_label_required: false,
+            book_label: None,
             horizon_from_spec: false,
             stride_seconds: None,
             threshold_fit: None,
@@ -423,8 +487,10 @@ impl ProtocolOptions {
 impl ProtocolOptions {
     /// `entry_offset + horizon + delay`: the minimum distance from a training
     /// row to a test row so that no training label reaches the test decision.
+    /// With a book label (#1212) the fit label's requirement is the floor.
     pub fn required_purge_seconds(&self, horizon: f64) -> f64 {
-        self.entry_offset + horizon + self.delay
+        let own = self.entry_offset + horizon + self.delay;
+        self.book_label.as_ref().map_or(own, |b| own.max(b.fit_purge_seconds()))
     }
 
     /// Whole seconds of purge in front of a sealed range: the label purge, or
@@ -935,6 +1001,8 @@ pub struct Report {
     pub fit_label: Option<String>,
     /// `split.labelled_rows` of the printed report; the reproduction hash leaves it out.
     pub labelled_rows: LabelledRows,
+    /// #1212: the `book` members of a book priced on another label than the fit label.
+    pub book_label: Option<String>,
     pub economics: crate::wf_protocol::Economics,
     pub inference: Option<crate::wf_protocol::Inference>,
     dropped_rows: usize,
@@ -1542,7 +1610,15 @@ fn resolve_layout(spec: &EvalSpec, opts: &ProtocolOptions, names: &[String], num
             .position(|n| n == name)
             .ok_or_else(|| format!("column '{}' not found; available: {:?}", name, names))
     };
-    let target = find(&spec.target)?;
+    let target = match (find(&spec.target), &opts.book_label) {
+        (Err(_), Some(b)) => {
+            return Err(format!(
+                "{} '{}' of the book label '{}' is not a column of the data: the book is priced on it",
+                BOOK_LABEL_REFUSAL, spec.target, b.book.column
+            ))
+        }
+        (found, _) => found?,
+    };
     if !numeric.get(target).copied().unwrap_or(false) {
         return Err(format!("target '{}' must be numeric", spec.target));
     }
@@ -1930,6 +2006,18 @@ fn validate_windows(spec: &EvalSpec, opts: &ProtocolOptions) -> Result<(), Strin
             }
         }
         let gap = w.test_start - w.train_end;
+        if let Some(b) = opts.book_label.as_ref().filter(|b| gap + 1e-9 < embargo && b.fit_purge_seconds() >= embargo) {
+            return Err(format!(
+                "window '{}': purge gap is {} seconds but the fit label '{}' binds the purge: its entry offset + horizon + delay \
+                 needs {} (the book label '{}' needs {}); the formula was fitted on that label, so move test_start later",
+                w.label,
+                gap,
+                b.fit.column,
+                embargo,
+                b.book.column,
+                opts.entry_offset + spec.horizon + opts.delay
+            ));
+        }
         if gap + 1e-9 < embargo {
             return Err(format!(
                 "window '{}': purge gap is {} seconds but entry offset + horizon + delay / embargo \
@@ -2970,6 +3058,7 @@ impl Accum {
             min_purge_seconds: min_gap,
             fit_label: opts.fit_label.clone(),
             labelled_rows: if layout.fit_label.is_none() && opts.labelled_rows.fit_label().is_some() { LabelledRows::Return } else { opts.labelled_rows.clone() },
+            book_label: opts.book_label.as_ref().map(BookLabel::json),
             economics,
             inference: inference_report,
             dropped_rows: dropped,
@@ -5208,7 +5297,7 @@ impl Report {
              \"band_select\":{},\"test_used_for_selection\":{},\
              \"candidate_count\":{}{}{}}},\
              \"pooled_seam\":{{\"reset_flat\":{},\"seam_cost\":{},\"seam_trades\":{}}},\
-             \"book\":{{\"missing_score\":{},\"missing_score_exits\":{},\"unpriced_target_rows\":{}}},\
+             \"book\":{{\"missing_score\":{},\"missing_score_exits\":{},\"unpriced_target_rows\":{}{}}},\
              \"sign_test\":{{\"positive\":{},\"total\":{},\"applicable\":{},\
              \"p_value\":{},\"method\":{}}},\
              \"lockbox\":{},\
@@ -5272,6 +5361,7 @@ impl Report {
             jstr(self.missing_score.name()),
             self.missing_score_exits,
             self.unpriced_target_rows,
+            self.book_label.as_deref().unwrap_or_default(),
             self.sign_test.positive,
             self.sign_test.total,
             self.sign_test.applicable,

@@ -122,6 +122,20 @@ pub fn entry_for<'a>(specs: &'a [TargetSpec], target: &str) -> Option<&'a Target
         .find(|s| s.column == target || s.name == target || s.return_column.as_deref() == Some(target))
 }
 
+/// #929: why `book` cannot price the long/flat book of a formula fitted on `fit`
+/// (`--book-target`, in the search and the walk-forward), or `None`.
+pub fn book_pair_refusal(fit: &TargetSpec, book: &TargetSpec) -> Option<String> {
+    if let Some(s) = [book, fit].into_iter().find(|s| s.kind != "forward_return") {
+        return Some(format!("--book-target needs forward_return labels on both sides, '{}' declares '{}'", s.column, s.kind));
+    }
+    book.return_column.is_none().then(|| {
+        format!(
+            "--book-target: book target '{}' declares no return_column, so the book would be priced on the fit label: declare a return_column in the target spec",
+            book.column
+        )
+    })
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Scale {
     /// The label is divided by a constant (1 for a raw return).
