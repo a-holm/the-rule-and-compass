@@ -406,6 +406,9 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
     match cmd {
         "schema" => {
             if verify {
+                if let Some(note) = registry::registry_age_note(&registry::schema_path(&data)) {
+                    eprintln!("{}", note);
+                }
                 match registry::verify_schema(&data) {
                     Ok(bad) if bad.is_empty() => eprintln!("schema ok: {}", registry::schema_path(&data)),
                     Ok(bad) => fail(&format!("schema hash mismatch for: {}", bad.join(", ")), 3),
