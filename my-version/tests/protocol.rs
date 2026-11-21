@@ -938,3 +938,41 @@ fn freeze_event_rules() {
     assert!(err.contains("read"), "{err}");
     assert_eq!(std::fs::read_to_string(&read_ledger).unwrap(), before);
 }
+
+#[test]
+fn every_protocol_subcommand_help_prints_its_own_usage() {
+    let generic = rcsr_cmd::rcsr().args(["protocol", "--help"]).output().expect("run rcsr");
+    assert_eq!(generic.status.code(), Some(0));
+    let generic = String::from_utf8_lossy(&generic.stdout).into_owned();
+    let subcommands = [
+        "windows",
+        "seal",
+        "verify",
+        "retire",
+        "candidates",
+        "selectors",
+        "regimes",
+        "cpcv",
+        "freeze",
+        "verdict",
+    ];
+    for sub in subcommands {
+        for flag in ["--help", "-h"] {
+            let o = rcsr_cmd::rcsr().args(["protocol", sub, flag]).output().expect("run rcsr");
+            assert_eq!(o.status.code(), Some(0), "protocol {sub} {flag}");
+            let text = String::from_utf8_lossy(&o.stdout).into_owned();
+            let first = text.lines().next().unwrap_or("");
+            assert!(
+                first.starts_with(&format!("rcsr protocol {sub} ")),
+                "protocol {sub} {flag}: first line is '{first}'"
+            );
+            assert_ne!(text, generic, "protocol {sub} {flag} prints the generic usage");
+            for other in subcommands.iter().filter(|o| **o != sub) {
+                assert!(
+                    !text.contains(&format!("\nrcsr protocol {other} ")) && !text.contains(&format!("\n  {other} ")),
+                    "protocol {sub} {flag} also prints the usage of {other}"
+                );
+            }
+        }
+    }
+}
