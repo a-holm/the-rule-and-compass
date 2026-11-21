@@ -1115,3 +1115,41 @@ fn every_appending_writer_carries_a_manifest_null_marker() {
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     assert_eq!(header_marker(&enriched).as_deref(), Some(want.as_str()), "rcsr enrich");
 }
+
+fn import_csv(dir: &Path, name: &str, manifest: Option<&str>) -> String {
+    let csv = p(dir, &format!("{name}.csv"));
+    std::fs::write(&csv, "t,x,y\n1,0.5,2.0\n2,1.5,3.0\n3,2.5,4.0\n4,3.5,5.0\n").unwrap();
+    if let Some(m) = manifest {
+        std::fs::write(format!("{csv}.manifest.json"), m).unwrap();
+    }
+    let out = p(dir, &format!("{name}.rcsb"));
+    let o = rcsr_cmd::rcsr().args(["import", &csv, &out, "--quiet"]).output().expect("run rcsr");
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    out
+}
+
+#[test]
+fn import_carries_the_null_manifest_marker() {
+    let s = Scratch::new("null-import");
+    let dir = s.path();
+    let manifest = format!("{{\"schema\":\"{}\",\"null\":{{\"label\":\"h1\",\"seed\":9}}}}\n", rcsr::permute_labels::SCHEMA);
+    let out = import_csv(dir, "marked", Some(&manifest));
+    let marker = rcsr::permute_labels::marker(&out).expect("the imported store is marked");
+    let expected = Json::parse("{\"label\":\"h1\",\"seed\":9}").unwrap();
+    assert_eq!(Json::parse(&marker).expect("the marker is JSON"), expected);
+    let header = rcsr::store::FileStore::open(&out).unwrap();
+    assert!(header.header().null_store().is_some(), "the marker is in the store header, not only in a sidecar");
+}
+
+#[test]
+fn import_without_a_null_manifest_is_unmarked() {
+    let s = Scratch::new("null-import-plain");
+    let dir = s.path();
+    let plain = import_csv(dir, "plain", None);
+    let other = import_csv(dir, "other", Some("{\"schema\":\"something-else/1\",\"null\":{\"label\":\"h1\",\"seed\":9}}\n"));
+    for out in [&plain, &other] {
+        assert_eq!(rcsr::permute_labels::marker(out), None, "{out}");
+        assert!(rcsr::store::FileStore::open(out).unwrap().header().null_store().is_none());
+    }
+    assert_eq!(std::fs::read(&plain).unwrap(), std::fs::read(&other).unwrap(), "an unmarked import writes the same bytes");
+}
