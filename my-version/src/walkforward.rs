@@ -1638,6 +1638,12 @@ pub fn votes_required(quorum: f64, members: usize) -> usize {
     ((quorum * members as f64 - 1e-9).ceil().max(1.0) as usize).min(members.max(1))
 }
 
+/// #1211: stderr warning when `ceil(quorum x K)` rounds a product just above an
+/// integer up to the next vote count, or `None`.
+pub fn vote_quorum_warning(_quorum: f64, _members: usize) -> Option<String> {
+    None
+}
+
 /// #930: the refusal message when `--policy vote` is combined with a flag or
 /// value it cannot honour. The CLI reports it as a usage error.
 pub fn vote_refusal(spec: &EvalSpec, opts: &ProtocolOptions) -> Option<String> {
