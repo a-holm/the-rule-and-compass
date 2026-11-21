@@ -218,7 +218,8 @@ pub fn rank_panel(opts: &RankOptions) -> Result<RankReport, String> {
         w.flush().map_err(|e| format!("{}: {}", file.display(), e))?;
         drop(w);
         let extra = AppendColumn { name: opts.name.clone(), file: file.clone(), replace: false };
-        store::write_store_appending_hashed(&opts.out, &panel, &[extra])
+        let null_store = crate::permute_labels::marker(&opts.data);
+        store::write_store_appending_hashed_stats_marked(&opts.out, &panel, &[extra], null_store.as_deref()).map(|(sha, _)| sha)
     })();
     let _ = std::fs::remove_file(&file);
     let output_sha256 = result?;
