@@ -1182,3 +1182,22 @@ fn ablation_score_book_label_refusals() {
     let (o, _) = ablation_score(dir, "ret.json", &data, &windows, &["--from-run", &run, "--return-col", "lbl_h168_fwd"]);
     usage_error(&o, "--return-col lbl_h168_fwd differs from the book label");
 }
+
+/// #1208: `rcsr trials` reads the daily book report of a weekly fit and the weekly report without it.
+#[test]
+fn trials_reads_book_target_reports() {
+    let scratch = Scratch::new("wf_book_target_trials");
+    let (data, spec) = (wf_csv(scratch.path()), wf_spec(scratch.path()));
+    let window = wf_window("w", 200, 207, 300);
+    for (name, extra) in [("weekly", vec![]), ("daily", vec!["--book-target", "lbl_h24_fwd"])] {
+        let mut args = wf_expr(&spec, &window);
+        args.extend_from_slice(&extra);
+        let o = wf(&data, &args);
+        assert_eq!(code(&o), 0, "{}", stderr(&o));
+        let path = scratch.path().join(format!("{name}.json"));
+        std::fs::write(&path, &o.stdout).unwrap();
+        let t = rcsr_cmd::rcsr().args(["trials", "--wf", path.to_str().unwrap(), "--draws", "50", "--block-len", "2"]).output().expect("run rcsr trials");
+        assert_eq!(code(&t), 0, "{name}: {}", stderr(&t));
+        assert!(!stderr(&t).contains("annualization"), "{name}: {}", stderr(&t));
+    }
+}

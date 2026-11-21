@@ -1032,3 +1032,29 @@ fn cpcv_assemble_carries_the_null_store_marker() {
     assert_eq!(code(&o), 2, "{}", stderr(&o));
     assert!(stderr(&o).contains("null_store") && stderr(&o).contains(&mixed[0]), "{}", stderr(&o));
 }
+
+/// #1208: a split report whose `periods_per_year` contradicts its `pooled.period_time` is refused
+/// by name; a consistent set assembles and its path files pass the same check under `--wf`.
+#[test]
+fn cpcv_refuses_ppy_contradicting_period_time() {
+    let s = Scratch::new("cpcv-ppy");
+    let dir = s.path().to_path_buf();
+    let (table, scheme) = cpcv_series::write_table(&dir);
+    let reports = cpcv_series::write_reports(&dir, "wf", &scheme, &|_| cpcv_series::ALL);
+    let out = dir.join("paths");
+    let summary = dir.join("summary.json");
+    ok(&assemble(&table, &reports, &out, &summary));
+    let first = out.join("path_1.json").to_string_lossy().into_owned();
+    let o = rcsr(&["trials", "--wf", &first, "--draws", "50", "--block-len", "2"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    let text = std::fs::read_to_string(&reports[2]).unwrap();
+    assert!(text.contains("\"periods_per_year\":8760"));
+    std::fs::write(&reports[2], text.replace("\"periods_per_year\":8760", "\"periods_per_year\":365")).unwrap();
+    let bad = dir.join("bad_paths");
+    let o = assemble(&table, &reports, &bad, &summary);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    let e = stderr(&o);
+    assert!(e.contains("annualization.periods_per_year") && e.contains("365") && e.contains("8760") && e.contains(&reports[2]), "{e}");
+    assert!(!bad.join("path_1.json").exists());
+}

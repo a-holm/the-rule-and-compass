@@ -16,6 +16,8 @@ use std::process::Output;
 
 const T0: i64 = 1_600_000_000;
 const STEP: i64 = 3600;
+/// #1208: one period of the twelve-periods-per-year fixtures (31536000 / 12 s).
+const MONTH: i64 = 2_628_000;
 
 fn run(args: &[&str]) -> Output {
     rcsr_cmd::rcsr().args(args).output().expect("run rcsr")
@@ -203,13 +205,14 @@ fn six_series(dir: &Path) -> (Vec<String>, Vec<Fx>) {
         let cost: Vec<f64> = (0..n).map(|t| 0.0005 * (1.0 + ((t + i) % 3) as f64)).collect();
         let mut fx = Fx::new(net.clone());
         fx.ppy = 12.0;
+        fx.time = (0..n).map(|t| (T0 + MONTH * t as i64) as f64).collect();
         fx.gross = Some(net.iter().zip(&cost).map(|(a, c)| a + c).collect());
         fx.exposure = Some((0..n).map(|t| 0.25 + 0.05 * ((t * i) % 4) as f64).collect());
         fx.bh_net = Some((0..n).map(|t| 0.008 * (0.7 * t as f64 + 2.0 * fi).cos()).collect());
         fx.entry_times = Some(20 + i as u32);
         fx.trades = Some(30 + i as u32);
-        let mid = T0 as f64 + (STEP * 6) as f64;
-        fx.windows = vec![(T0 as f64, mid), (mid, T0 as f64 + (STEP * 12) as f64)];
+        let mid = T0 as f64 + (MONTH * 6) as f64;
+        fx.windows = vec![(T0 as f64, mid), (mid, T0 as f64 + (MONTH * 12) as f64)];
         paths.push(write_fx(dir, &format!("s{i}"), &fx));
         fxs.push(fx);
     }
@@ -1514,7 +1517,7 @@ fn table_without_family_is_unchanged() {
     let (s, _) = six_series(&dir);
     let names = |paths: &[String]| paths.iter().map(|p| Path::new(p).file_name().unwrap().to_string_lossy().into_owned()).collect::<Vec<_>>();
     let (d, s) = (names(&d), names(&s));
-    write_text(&dir, "cal.csv", &format!("label,start,end\nbull,{},{}\nbear,{},{}\n", T0, T0 + 3600 * 6, T0 + 3600 * 6, T0 + 3600 * 12));
+    write_text(&dir, "cal.csv", &format!("label,start,end\nbull,{},{}\nbear,{},{}\n", T0, T0 + MONTH * 6, T0 + MONTH * 6, T0 + MONTH * 12));
     write_text(
         &dir,
         "rule.json",
