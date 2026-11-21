@@ -2652,7 +2652,8 @@ Long-only baseline ladder on one panel, one set of folds and one cost model.\n\
                             else 2025-07-01,2026-07-01; none opts out. A fold ending after START minus\n\
                             --purge-seconds is refused (exit 3)\n\
   --locked-test             read the locked test: needs --scheme locked, --ledger and --sealed;\n\
-                            appends a baseline_read to the ledger after the report files are staged, a second read is refused\n\
+                            appends a baseline_read to the ledger after the report files are staged, a second read is refused;\n\
+                            a null store (rcsr panel permute-labels) exits 2 before the read is authorised (#1304)\n\
   --ledger <file>           candidate ledger (with --locked-test)\n\
   --sealed <file>           sealed candidate list recorded in the ledger (with --locked-test)\n\
   --allow-unbound-ledger    with --locked-test: accept a sealed list whose candidates recorded no\n\
@@ -2896,6 +2897,10 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
     }
     if !locked_test && (ledger_path.is_some() || sealed_path.is_some()) {
         return Err(usage_err("--ledger and --sealed apply to --locked-test only".to_string()));
+    }
+    // #1304: the baseline read of a sealed list is spent on whatever data it reads.
+    if let Some(m) = locked_test.then(|| crate::permute_labels::marker(&data_path)).flatten() {
+        return Err(usage_err(crate::permute_labels::refusal(&data_path, &m, "a sealed baseline read of it would spend a lockbox read on null data")));
     }
     let mut read: Option<(protocol::Ledger, String, protocol::LockedRange)> = None;
     let mut bound_opts = opts.clone();

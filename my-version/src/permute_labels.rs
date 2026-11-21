@@ -14,7 +14,8 @@
 //! `null_store` member, #1304) and its manifest mark it as a null store, so a copy of
 //! the store bytes stays marked; a walk-forward report priced on it carries the marker
 //! as `null_store`, CPCV paths of such reports carry it on, `walkforward --ledger`
-//! refuses it, and `rcsr trials` reads a marked report only through `--table --null-wf`.
+//! (like `ladder --locked-test` and `protocol regimes --after-read`) refuses it, and
+//! `rcsr trials` reads a marked report only through `--table --null-wf`.
 //!
 //! A source with a row inside a locked range is refused. A row in the label
 //! purge before a range or in its embargo after it neither moves nor gives a
@@ -566,12 +567,22 @@ pub fn describe(m: &Json) -> String {
 /// #1304: why `walkforward --ledger` (and so `--locked-test`) refuses the null store `data`
 /// with marker `m`.
 pub fn ledger_refusal(data: &str, m: &str, locked_test: bool) -> String {
+    refusal(
+        data,
+        m,
+        if locked_test {
+            "a null store is never a protocol candidate, and a sealed read of it would spend a lockbox read"
+        } else {
+            "a null store is never a protocol candidate: drop --ledger"
+        },
+    )
+}
+
+/// `<data> is a null store (null_store label L, seed S); <why>` for the null store `data`
+/// with marker `m`.
+pub fn refusal(data: &str, m: &str, why: &str) -> String {
     let what = Json::parse(m).map_or_else(|| "null_store".to_string(), |j| describe(&j));
-    if locked_test {
-        format!("{} is a null store ({}); a null store is never a protocol candidate, and a sealed read of it would spend a lockbox read", data, what)
-    } else {
-        format!("{} is a null store ({}); a null store is never a protocol candidate: drop --ledger", data, what)
-    }
+    format!("{} is a null store ({}); {}", data, what, why)
 }
 
 /// A report JSON text with a `null_store` member holding `marker`; unchanged without one.
@@ -600,8 +611,9 @@ pub fn usage_text() -> &'static str {
   bytes stays marked, as does a store appended from it (rcsr enrich, rcsr panel append and rank); every
   other store writer starts unmarked. A source row inside a locked range exits 3;
   rows in a label purge or an embargo neither move nor give a value. A walkforward report priced on the
-  output carries null_store; walkforward --ledger (and so --locked-test) on the output exits 2, and rcsr
-  trials reads the report only with --table --null-wf. --out and its sidecars must not exist (exit 2).
+  output carries null_store; walkforward --ledger (and so --locked-test), ladder --locked-test and
+  protocol regimes --after-read on the output exit 2, and rcsr trials reads the report only with --table
+  --null-wf. --out and its sidecars must not exist (exit 2).
 "
 }
 
