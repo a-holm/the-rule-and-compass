@@ -1367,26 +1367,25 @@ fn subcommand_usage(sub: &str, rest: &[String]) -> Option<String> {
         return None;
     }
     let from_block = |text: &str| -> Option<String> {
-        let mut lines = text.lines();
-        let mut block = String::new();
         let head = format!("  {} ", sub);
-        for line in lines.by_ref() {
+        let mut block = String::new();
+        let mut inside = false;
+        for line in text.lines() {
             if line.starts_with(&head) {
+                inside = true;
                 block.push_str(&format!("rcsr protocol {}\n", line.trim_start()));
-                break;
+            } else if inside && (line.is_empty() || line.starts_with("   ")) {
+                block.push_str(line);
+                block.push('\n');
+            } else {
+                inside = false;
             }
         }
         if block.is_empty() {
-            return None;
+            None
+        } else {
+            Some(block.trim_end().to_string() + "\n")
         }
-        for line in lines {
-            if !(line.is_empty() || line.starts_with("   ")) {
-                break;
-            }
-            block.push_str(line);
-            block.push('\n');
-        }
-        Some(block.trim_end().to_string() + "\n")
     };
     match sub {
         "regimes" => Some(crate::regime_dating::usage().to_string()),
