@@ -723,15 +723,20 @@ fn window_metrics(report: &Json) -> Json {
 }
 
 /// The validation and test blocks of the run `j` as walk-forward windows, each with a training
-/// range that ends two days before it. `days` are the days with a book row, so the test block is
-/// the last `test_rows / 2` of them.
+/// range that ends two days before it. `days` are the days with a book row: the test block is the
+/// last `objective.test.rows / 2` of them and the validation block the
+/// `objective.validation.rows / 2` before it (`split.validation_time` and `test_rows` count fit
+/// rows only).
 fn run_blocks(j: &Json, days: &[i64]) -> [(&'static str, String); 2] {
-    let vt = arr(j, &["split", "validation_time"]);
-    let (vlo, vhi) = (num(&vt[0], &[]) as i64, num(&vt[1], &[]) as i64);
-    let test_rows = num(j, &["test_rows"]) as usize;
-    assert_eq!(test_rows % 2, 0, "both symbols hold every book stamp");
-    let test_start = T0 + DAY * days[days.len() - test_rows / 2];
-    let test_end = T0 + DAY * STRIDED_DAYS as i64;
+    let book_days = |slot: &str| {
+        let rows = num(j, &["objective", slot, "rows"]) as usize;
+        assert_eq!(rows % 2, 0, "{slot}: both symbols hold every book stamp");
+        rows / 2
+    };
+    let test = days.len() - book_days("test");
+    let validation = test - book_days("validation");
+    let at_day = |k: usize| T0 + DAY * days[k];
+    let (vlo, vhi, test_start, test_end) = (at_day(validation), at_day(test - 1), at_day(test), T0 + DAY * STRIDED_DAYS as i64);
     [("validation", format!("v,{T0},{},{vlo},{}", vlo - 2 * DAY, vhi + 1)), ("test", format!("t,{T0},{},{test_start},{test_end}", test_start - 2 * DAY))]
 }
 
@@ -780,7 +785,7 @@ fn dense_return_strided_label_walkforward_reproduces_objective() {
     let all_days: Vec<i64> = (0..STRIDED_DAYS as i64).collect();
     let third = |d: i64| d % 3 == 0;
     let two_in_three = |d: i64| d % 3 != 2;
-    let cases: [(&str, &dyn Fn(i64) -> bool, Option<i64>); 2] = [("third", &third, Some(3 * DAY)), ("two", &two_in_three, None)];
+    let cases: [(&str, &dyn Fn(i64) -> bool, Option<i64>); 2] = [("two", &two_in_three, None), ("third", &third, Some(3 * DAY))];
     for (tag, fit_day, stride) in cases {
         let data = hourly_csv(&dir, &format!("{tag}.csv"), fit_day, true);
         let spec = dense_spec(&dir, &format!("{tag}.json"), stride);
@@ -806,7 +811,7 @@ fn dense_return_strided_label_walkforward_reproduces_objective() {
     let run = dir.join("book-run.json").to_string_lossy().into_owned();
     let mut args = vec![
         "--data", data.as_str(), "--target-spec", spec.as_str(), "--vars", "g,x1", "--target", "y", "--book-target", "yd", "--time", "t", "--group-by", "s", "--fill", "drop", "--split", "temporal",
-        "--objective", "pnl", "--cost-bps", "5", "--validation-frac", "0.3", "--test-frac", "0.2", "--no-dev-log", "--quiet", "--json", "--out", run.as_str(),
+        "--objective", "pnl", "--cost-bps", "5", "--validation-frac", "0.3", "--test-frac", "0.2", "--no-dev-log", "--quiet", "--json", "--json-out", run.as_str(),
     ];
     args.extend_from_slice(&SHORT);
     let j = json(&rcsr(&args));
