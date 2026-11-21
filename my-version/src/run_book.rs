@@ -35,6 +35,27 @@ pub struct RunBook {
     pub constant: bool,
 }
 
+/// #1291: the book label of a run searched with `--book-target`
+/// (`objective.book_target`): its return column, horizon and cost priced the
+/// books, on every row with a finite book return.
+#[derive(Clone, Debug)]
+pub struct BookTarget {
+    pub column: String,
+    /// `objective.book_target_spec`; absent in a run written before #1291.
+    pub spec: Option<TargetSpec>,
+}
+
+/// #1291: `objective.book_target` and `objective.book_target_spec`; `None` for a run without `--book-target`.
+pub(crate) fn book_target_of(j: &Json) -> Result<Option<BookTarget>, String> {
+    let Some(obj) = j.get("objective") else { return Ok(None) };
+    let Some(column) = obj.get("book_target").and_then(Json::as_str) else { return Ok(None) };
+    let spec = match obj.get("book_target_spec") {
+        None | Some(Json::Null) => None,
+        Some(s) => Some(target::parse_object(s).map_err(|e| format!("run.json objective.book_target_spec: {}", e))?),
+    };
+    Ok(Some(BookTarget { column: column.to_string(), spec }))
+}
+
 /// `objective.cost.source`; a run without the block counts as a flag cost.
 pub(crate) fn cost_source_of(j: &Json) -> CostSource {
     match j

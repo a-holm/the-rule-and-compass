@@ -132,6 +132,34 @@ fn folds_keep_fit_validation_and_test_apart() {
     }
 }
 
+/// #1291: the ladder prices the rows of the search's books. A row with a finite return and no
+/// finite `--target` leaves every fold, unless the SR run priced `--book-target`.
+#[test]
+fn folds_take_only_rows_with_a_fit_label() {
+    use rcsr::walkforward::LabelledRows;
+    let f = fixture(1);
+    let mut panel = f.panel.clone();
+    for i in (0..panel.len()).step_by(3) {
+        panel.y[i] = f64::NAN;
+    }
+    let inp = |target: &str| ladder::Input { data: String::new(), target: target.to_string(), ret: None, time: "t".to_string(), group: None, features: Vec::new() };
+    let o = Options { cost: Some(target::CostDecl::new(Some(&f.spec), 5.0, target::CostSource::Flag)), ..options(&f) };
+    let rule = ladder::labelled_rows(&inp("y"), &o);
+    assert_eq!(rule, LabelledRows::FitLabel("y".to_string()));
+    assert_eq!(ladder::labelled_rows(&inp("ret"), &o), LabelledRows::Return, "--target equal to the return column");
+    let test_rows = |p: &Panel| -> Vec<usize> { ladder::make_folds(p, &f.rows, 2.0 * STEP, &[], 0.0).unwrap().iter().flat_map(|k| k.fit.iter().chain(&k.valid).chain(&k.test).copied().collect::<Vec<_>>()).collect() };
+    let mut kept = panel.clone();
+    ladder::keep_labelled_rows(&mut kept, &rule);
+    let rows = test_rows(&kept);
+    assert!(rows.iter().all(|&i| kept.y[i].is_finite()));
+    let all = test_rows(&panel);
+    assert_eq!(all.len(), test_rows(&f.panel).len(), "the return rule keeps every finite return");
+    assert_eq!(rows.len(), all.iter().filter(|&&i| panel.y[i].is_finite()).count());
+    let mut book = panel.clone();
+    ladder::keep_labelled_rows(&mut book, &LabelledRows::BookTarget("yd".to_string()));
+    assert_eq!(test_rows(&book), all, "a --book-target run keeps every finite return");
+}
+
 #[test]
 fn controls_are_in_every_table_with_exposure_and_beta() {
     let f = fixture(2);

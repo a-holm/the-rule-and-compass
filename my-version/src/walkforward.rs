@@ -128,6 +128,8 @@ pub struct ProtocolOptions {
     /// `split.fit_label`: the label report facts of the target (see
     /// [`crate::labels::fit_label_json`]).
     pub fit_label: Option<String>,
+    /// #1291: the rows that count as labelled.
+    pub labelled_rows: LabelledRows,
     /// The horizon comes from a target spec, not from `--horizon` alone; the
     /// report names it as the annualisation source.
     pub horizon_from_spec: bool,
@@ -288,6 +290,59 @@ pub struct FrontSource {
     pub ranks: Vec<usize>,
 }
 
+/// #1291: the rows that count as labelled. A labelled row is priced, enters
+/// the spacing and stride checks, the threshold and the constant control; the
+/// search's books hold the same rows.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LabelledRows {
+    /// A finite return: no target spec names a fit label apart from the return.
+    Return,
+    /// A finite return and a finite fit label in this column (the target spec's
+    /// label column): the rows `--fill drop` keeps in the search.
+    FitLabel(String),
+    /// A finite return of the book label in this column: the rows of a search
+    /// run with `--book-target` (`objective.book_target`).
+    BookTarget(String),
+}
+
+impl LabelledRows {
+    /// The search's book rows under the target spec entry `column` with `return_column`.
+    /// `every_return` holds when the search priced every finite return: a top-tercile book
+    /// (#493: a row without a label stays in its cross-section and earns its return) or a run
+    /// that filled missing labels (`--fill` other than drop or none).
+    pub fn for_spec(column: &str, return_column: Option<&str>, every_return: bool) -> LabelledRows {
+        match return_column {
+            Some(r) if r != column && !every_return => LabelledRows::FitLabel(column.to_string()),
+            _ => LabelledRows::Return,
+        }
+    }
+
+    /// The fit label column a labelled row needs finite, if any.
+    pub fn fit_label(&self) -> Option<&str> {
+        match self {
+            LabelledRows::FitLabel(c) => Some(c),
+            _ => None,
+        }
+    }
+
+    pub fn json(&self) -> String {
+        match self {
+            LabelledRows::Return => "{\"rule\":\"return\"}".to_string(),
+            LabelledRows::FitLabel(c) => format!("{{\"rule\":\"fit_label\",\"column\":{}}}", jstr(c)),
+            LabelledRows::BookTarget(c) => format!("{{\"rule\":\"book_target\",\"column\":{}}}", jstr(c)),
+        }
+    }
+}
+
+/// #1291: the return of a row, NaN when its fit label is not finite.
+fn labelled(ret: f64, fit_label: Option<f64>) -> f64 {
+    if fit_label.map_or(true, f64::is_finite) {
+        ret
+    } else {
+        f64::NAN
+    }
+}
+
 /// #1238: the run file a `--from-run` report priced and the SHA-256 of its bytes.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunRef {
@@ -324,6 +379,7 @@ impl Default for ProtocolOptions {
             run_bands: None,
             quorum: None,
             fit_label: None,
+            labelled_rows: LabelledRows::Return,
             horizon_from_spec: false,
             stride_seconds: None,
             threshold_fit: None,
@@ -869,6 +925,8 @@ pub struct Report {
     pub min_purge_seconds: f64,
     /// `split.fit_label` of the printed report; the reproduction hash leaves it out.
     pub fit_label: Option<String>,
+    /// `split.labelled_rows` of the printed report; the reproduction hash leaves it out.
+    pub labelled_rows: LabelledRows,
     pub economics: crate::wf_protocol::Economics,
     pub inference: Option<crate::wf_protocol::Inference>,
     dropped_rows: usize,
@@ -977,7 +1035,7 @@ fn run_table_clocked(
     opts: &ProtocolOptions,
     clock: std::time::Instant,
 ) -> Result<Report, String> {
-    let layout = resolve_layout(spec, &table.names, &table.numeric)?;
+    let layout = resolve_layout(spec, opts, &table.names, &table.numeric)?;
     let plan = gate_plan(spec, opts, &table.names, &table.numeric)?;
     let trees = parse_expressions(spec, opts, &layout, plan.as_ref())?;
     validate_windows(spec, opts)?;
@@ -1024,7 +1082,8 @@ fn run_table_clocked(
             s.write_row(&mut features[layout.vars.len()..], 0, r);
         }
         let g = group_ids.as_ref().map_or(0, |ids| ids[r]);
-        acc.add(t, g, &features, ret_in(opts, table.value(r, layout.target)), &trees);
+        let y = labelled(ret_in(opts, table.value(r, layout.target)), layout.fit_label.map(|c| table.value(r, c)));
+        acc.add(t, g, &features, y, &trees);
     }
     }
     let mut report = acc.finish(
@@ -1092,7 +1151,7 @@ fn run_store_clocked(
     let fs = FileStore::open(path)?;
     let names = fs.header().names();
     let numeric = fs.header().numeric();
-    let mut layout = resolve_layout(spec, &names, &numeric)?;
+    let mut layout = resolve_layout(spec, opts, &names, &numeric)?;
     layout.time_i64 = fs.header().dtypes()[layout.time] == store::DType::I64;
     let plan = gate_plan(spec, opts, &names, &numeric)?;
     let trees = parse_expressions(spec, opts, &layout, plan.as_ref())?;
@@ -1186,6 +1245,7 @@ fn run_store_clocked(
     }
     let mut needed: Vec<usize> = named.iter().map(|&p| layout.vars[p]).collect();
     needed.push(layout.target);
+    needed.extend(layout.fit_label);
     if time_f64 {
         needed.push(layout.time);
     }
@@ -1196,6 +1256,7 @@ fn run_store_clocked(
     };
     let var_at: Vec<(usize, usize)> = named.iter().map(|&p| (p, at(layout.vars[p]))).collect();
     let target_at = at(layout.target);
+    let fit_label_at = layout.fit_label.map(at);
     let time_at = time_f64.then(|| at(layout.time));
     let group_at = group_f64.map(at);
     let mut scan = ScanStats {
@@ -1245,6 +1306,7 @@ fn run_store_clocked(
         io_s += t_io.elapsed().as_secs_f64();
         let var_cols: Vec<(usize, &[f64])> = var_at.iter().map(|&(p, c)| (p, pg.col(c))).collect();
         let target_col = pg.col(target_at);
+        let fit_label_col = fit_label_at.map(|c| pg.col(c));
         let f64_time = time_at.map(|c| pg.col(c));
         let f64_group = group_at.map(|c| pg.col(c));
         for r in 0..len {
@@ -1259,7 +1321,7 @@ fn run_store_clocked(
                 s.write_row(&mut features[layout.vars.len()..], group, r);
             }
             let g = row_group(r, &group_codes, f64_group);
-            let y = ret_in(opts, target_col[r]);
+            let y = labelled(ret_in(opts, target_col[r]), fit_label_col.map(|c| c[r]));
             acc.add(t, g, &features, y, &trees);
         }
     }
@@ -1291,6 +1353,8 @@ struct Layout {
     /// The store keeps the time column as `i64`; read it exactly rather than
     /// through the `f64` value block (which is absent).
     time_i64: bool,
+    /// #1291: the fit label column of [`LabelledRows::FitLabel`].
+    fit_label: Option<usize>,
 }
 
 /// #1214: one gate the windows read: its spec, the run field or flag it came
@@ -1463,7 +1527,7 @@ impl GateStates {
     }
 }
 
-fn resolve_layout(spec: &EvalSpec, names: &[String], numeric: &[bool]) -> Result<Layout, String> {
+fn resolve_layout(spec: &EvalSpec, opts: &ProtocolOptions, names: &[String], numeric: &[bool]) -> Result<Layout, String> {
     let find = |name: &str| -> Result<usize, String> {
         names
             .iter()
@@ -1507,6 +1571,13 @@ fn resolve_layout(spec: &EvalSpec, names: &[String], numeric: &[bool]) -> Result
         }
     }
     let var_names = vars.iter().map(|&j| names[j].clone()).collect();
+    let fit_label = match opts.labelled_rows.fit_label() {
+        Some(name) => match names.iter().position(|n| n == name) {
+            Some(j) if numeric.get(j).copied().unwrap_or(false) => Some(j),
+            _ => return Err(format!("{} '{}' (the target spec's label column) is not a numeric column of the data: a row is labelled when its fit label and its return are finite, the rows of the search's books", FIT_LABEL_REFUSAL, name)),
+        },
+        None => None,
+    };
     Ok(Layout {
         target,
         time,
@@ -1515,8 +1586,12 @@ fn resolve_layout(spec: &EvalSpec, names: &[String], numeric: &[bool]) -> Result
         vars,
         var_names,
         time_i64: false,
+        fit_label,
     })
 }
+
+/// #1291: the start of the refusal of a data file without the fit label column (exit 2).
+pub const FIT_LABEL_REFUSAL: &str = "fit label column";
 
 /// The tree of every candidate. A switch candidate is `if(state, on, off)` over
 /// the state feature of its gate: its score on a row is the held branch's score.
@@ -2885,6 +2960,7 @@ impl Accum {
             min_group_step,
             min_purge_seconds: min_gap,
             fit_label: opts.fit_label.clone(),
+            labelled_rows: opts.labelled_rows.clone(),
             economics,
             inference: inference_report,
             dropped_rows: dropped,
@@ -4978,7 +5054,7 @@ impl Report {
         s.pop();
         s.push_str(&format!(
             ",\"split\":{{\"required_purge_seconds\":{},\"purge_seconds\":{},\"horizon_seconds\":{},\
-             \"embargo_seconds\":{},\"min_group_step_seconds\":{}{}}},\"economics\":{},\"inference\":{}}}",
+             \"embargo_seconds\":{},\"min_group_step_seconds\":{}{}{}}},\"economics\":{},\"inference\":{}}}",
             jnum(self.required_purge_seconds),
             jnum(self.min_purge_seconds),
             jnum(self.horizon),
@@ -4988,6 +5064,7 @@ impl Report {
                 (Some(f), true) => format!(",\"fit_label\":{}", f),
                 _ => String::new(),
             },
+            if paths { format!(",\"labelled_rows\":{}", self.labelled_rows.json()) } else { String::new() },
             self.economics.json(),
             self.inference.as_ref().map_or("null".to_string(), |i| i.json())
         ));

@@ -34,7 +34,7 @@ use crate::risk::{risk_stats, BetaAlpha, DEFAULT_SORTINO_MAR};
 use crate::target::TargetSpec;
 use crate::target_structure;
 use crate::trading_gpu::{band_positions, BandParams};
-use crate::walkforward::{quantile, PeriodSource, SECONDS_PER_YEAR};
+use crate::walkforward::{quantile, LabelledRows, PeriodSource, SECONDS_PER_YEAR};
 use std::time::Instant;
 
 pub const SCHEMA: &str = "rcsr-ladder/1";
@@ -2458,14 +2458,42 @@ fn switch_states(p: &Panel, gate: &crate::regime_gate::GateSpec, barriers: &[cra
     Ok(out)
 }
 
+/// The target spec's return column, when a spec declares the cost.
+fn declared_return(opts: &Options) -> Option<String> {
+    opts.cost.as_ref().and_then(|_| opts.spec.as_ref()).and_then(|s| s.return_column.clone())
+}
+
+/// The panel's return column: `--return-col`, else the target spec's, else `--target`.
+fn return_name(inp: &Input, opts: &Options) -> String {
+    inp.ret.clone().or_else(|| declared_return(opts)).unwrap_or_else(|| inp.target.clone())
+}
+
+/// #1291: the rows the ladder prices, the rows of the search's threshold
+/// books: a finite return and a finite `--target`, or every finite return when
+/// the SR run priced `--book-target` or filled missing labels.
+pub fn labelled_rows(inp: &Input, opts: &Options) -> LabelledRows {
+    let run = opts.sr_run.as_ref().map(|s| &s.run);
+    match run.and_then(|r| r.book_target.as_ref()) {
+        Some(b) => LabelledRows::BookTarget(b.column.clone()),
+        None => LabelledRows::for_spec(&inp.target, Some(return_name(inp, opts).as_str()), run.is_some_and(|r| r.fills_labels())),
+    }
+}
+
+/// #1291: under [`LabelledRows::FitLabel`] a row without a finite `y` gets a NaN
+/// return, so no fold takes it.
+pub fn keep_labelled_rows(p: &mut Panel, rule: &LabelledRows) {
+    if rule.fit_label().is_some() {
+        for (r, y) in p.ret.iter_mut().zip(&p.y) {
+            if !y.is_finite() {
+                *r = f64::NAN;
+            }
+        }
+    }
+}
+
 /// Load the columns the ladder needs from a CSV or a `.rcsb` store.
 pub fn load_panel(inp: &Input, opts: &Options) -> Result<Panel, String> {
-    let declared_ret = opts
-        .cost
-        .as_ref()
-        .and_then(|_| opts.spec.as_ref())
-        .and_then(|s| s.return_column.clone());
-    if let (Some(given), Some(declared)) = (&inp.ret, &declared_ret) {
+    if let (Some(given), Some(declared)) = (&inp.ret, &declared_return(opts)) {
         if given != declared {
             return Err(format!(
                 "--return-col {} differs from the target spec return column {}; remove the flag",
@@ -2473,7 +2501,7 @@ pub fn load_panel(inp: &Input, opts: &Options) -> Result<Panel, String> {
             ));
         }
     }
-    let ret_name = inp.ret.clone().or(declared_ret).unwrap_or_else(|| inp.target.clone());
+    let ret_name = return_name(inp, opts);
     let mut want: Vec<String> = vec![inp.target.clone(), ret_name.clone(), inp.time.clone()];
     if let Some(g) = &inp.group {
         want.push(g.clone());
@@ -2575,7 +2603,7 @@ Long-only baseline ladder on one panel, one set of folds and one cost model.\n\
 \n\
   --data <path>             CSV or .rcsb store (the pinned panel projection)\n\
   --target <col>            fit target (the label); the return is --return-col\n\
-  --return-col <col>        realised forward return of the row (default: --target)\n\
+  --return-col <col>        realised forward return of the row (default: --target). #1291: a fold takes a row when its return and its --target are finite, the rows of the search's threshold books; with an --sr-run searched with --book-target or a --fill other than drop every row with a finite return; the JSON split.labelled_rows {rule, column} names the rule\n\
   --time <col>              epoch seconds or ISO dates\n\
   --group <col>             symbol column (default: one group)\n\
   --features <a,b,...>      feature columns (default: every other numeric column)\n\
@@ -2933,7 +2961,9 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
         .iter()
         .map(|&(s, e)| crate::regime_gate::Barrier { start: s, end: e + (resolved.embargo.seconds as f64).max(opts.purge_seconds), kind: crate::regime_gate::BarrierKind::Locked })
         .collect();
-    let panel = load_panel(&inp, &opts).map_err(input_err)?;
+    let mut panel = load_panel(&inp, &opts).map_err(input_err)?;
+    let rows_rule = labelled_rows(&inp, &opts);
+    keep_labelled_rows(&mut panel, &rows_rule);
     let mut folds = make_folds(&panel, &rows, opts.purge_seconds, &guard, resolved.embargo.seconds as f64).map_err(input_err)?;
     if let Some(sr) = &mut opts.sr_run {
         let labelled: Vec<(String, f64, f64)> = folds.iter().map(|f| (f.label.clone(), f.test_start, f.test_end)).collect();
@@ -2960,15 +2990,16 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
         .as_ref()
         .and_then(|s| crate::target::label_report_for(&data_path, &s.column))
         .and_then(|r| crate::labels::fit_label_json(&r))
-        .map(|f| format!(",\"split\":{{\"fit_label\":{}}}", f))
+        .map(|f| format!("\"fit_label\":{},", f))
         .unwrap_or_default();
+    let split = format!(",\"split\":{{{}\"labelled_rows\":{}}}", fit_label, rows_rule.json());
     let finish = |json: String, hashed: bool| {
         let json = format!(
             "{},\"purge_seconds\":{},\"purge_source\":\"{}\"{}}}",
             json.trim_end().strip_suffix('}').unwrap_or(json.trim_end()),
             opts.purge_seconds,
             purge_source,
-            if hashed { "" } else { fit_label.as_str() }
+            if hashed { "" } else { split.as_str() }
         );
         if hashed {
             resolved.splice_hashed_report(&json, in_scope, locked_test, true)

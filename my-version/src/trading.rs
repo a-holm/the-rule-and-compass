@@ -3586,7 +3586,8 @@ pub struct FinalistReport {
     /// #928: object naming the front a re-selection read.
     pub reselected_from: Option<String>,
     /// #929: the label whose return column prices the book, when it is not the fit label.
-    pub book_target: Option<String>,
+    /// #1291: its spec is written as `book_target_spec`, so walk-forward prices the same book.
+    pub book_target: Option<crate::target::TargetSpec>,
     pub test: Result<PathStats, String>,
     /// #1180: the regime mask of `--pnl-mask`, when the books were priced under one.
     pub mask: Option<MaskReport>,
@@ -3671,7 +3672,7 @@ impl FinalistReport {
              \"validation_error\":{},\"test_error\":{},\"validation_objective\":{}{}}},\
              \"validation\":{},\"test\":{}}}",
             self.objective.name(),
-            self.book_target.as_deref().map(|b| format!("\"book_target\":{},", crate::devlog::text(b))).unwrap_or_default(),
+            self.book_target.as_ref().map(|b| format!("\"book_target\":{},\"book_target_spec\":{{{}}},", crate::devlog::text(&b.column), b.fields_json())).unwrap_or_default(),
             self.spec.position.name(),
             self.selection,
             self.selection_rule,
