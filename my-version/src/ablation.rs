@@ -1776,6 +1776,7 @@ fn usage() -> &'static str {
             scores the run's finalist (objective.finalist.expression_exact, else the rounded expression; the result carries expression_source) on every fold. Test rows of one group closer than the target spec horizon overlap and are refused (exit 2); a spec without stride_seconds over rows 2 horizons or more apart, or a stride_seconds wider than the smallest per-group step, is refused too (exit 2); a declared width makes one equal-weight period per floor(t / width) bucket; the result carries min_group_step_seconds. --target-spec sets the per-side cost\n\
             (cost_bps / 2), the return units (log is converted with exp_m1) and the return column; a --cost-bps that differs is refused.\n\
             the rows priced are the search's rows (#1291, the rule of walkforward and the ladder): with a target spec whose label differs from the return column, a row needs a finite return and a finite fit label; a run with --book-target or a filled --fill, and a spec of kind xs_rank, keep every finite return; result labelled_rows names the rule\n\
+            #1311: under rule fit_label the fit label column (the --from-run target_spec column, or the --target-spec entry column) is read whatever --target names; a --target that is not the fit label (column, name or return column) exits 2\n\
             #1311: a run searched with --book-target (--run and --from-run) is priced on its book label as walkforward --from-run prices it: objective.book_target_spec gives the return column, horizon, stride and cost\n\
             (replacing the run's or the --target-spec entry), --target names the fit label or the book label (column, name or return column; another label exits 2), a --return-col other than the book label's exits 2,\n\
             the purge is the larger of the two labels' entry offset + horizon + delay (purge_source target_spec), a run without objective.book_target_spec exits 2; the result adds book {target, fit_target, source run}\n\
@@ -2082,7 +2083,7 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
                 }
                 None => target,
             };
-            let inp = Input {
+            let mut inp = Input {
                 data: fl.need("--data")?.to_string(),
                 target,
                 ret: fl.opt("--return-col").map(str::to_string),
@@ -2098,8 +2099,24 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             let oof = run_file
                 .oof_flags_windows(&labelled, fl.has("--allow-in-sample"))
                 .map_err(|e| (3, format!("{}: {}", run_path, e)))?;
-            let mut panel = ladder::load_panel(&inp, &opts).map_err(|e| (3, e))?;
             let rows_rule = ladder::search_rows(opts.spec.as_ref(), &ladder::return_name(&inp, &opts), Some(&run_file));
+            // #1311: the fit_label rule reads the fit label, so it is the panel target whatever --target names.
+            if let (Some(col), Some(s)) = (rows_rule.fit_label(), &opts.spec) {
+                if let Some(given) = fl.opt("--target") {
+                    if crate::target::entry_for(std::slice::from_ref(s), given).is_none() {
+                        return Err((
+                            2,
+                            format!(
+                                "--target {} is not the fit label '{}' of {} (its column, name or return column): a priced row needs a finite '{}' (labelled_rows rule fit_label)",
+                                given, col, run_path, col
+                            ),
+                        ));
+                    }
+                }
+                inp.ret = Some(ladder::return_name(&inp, &opts));
+                inp.target = col.to_string();
+            }
+            let mut panel = ladder::load_panel(&inp, &opts).map_err(|e| (3, e))?;
             ladder::keep_labelled_rows(&mut panel, &rows_rule);
             let resolved = crate::lockbox::resolve_retired(fl.opt("--lockbox"), fl.opt("--lockbox-embargo"), fl.need("--data")?, fl.opt("--retired")).map_err(|e| (e.exit, e.message))?;
             let mut purge_source = if fl.opt("--purge-seconds").is_some() { "flag" } else { "protocol_default" };
