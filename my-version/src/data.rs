@@ -2359,10 +2359,11 @@ impl PrepReport {
                 ));
             }
             if self.time_non_monotonic > 0 {
+                let scope = if self.time_grouped { " within a group" } else { "" };
                 out.push(format!(
-                    "# preparation: warning: time is not monotonic in row order ({} step(s)); \
+                    "# preparation: warning: time is not monotonic{} in row order ({} step(s)); \
                      rows were ordered for the split, check the source",
-                    self.time_non_monotonic
+                    scope, self.time_non_monotonic
                 ));
             }
         }
