@@ -142,7 +142,8 @@ counts the sibling horizon tables. Output rcsr-trials-table/1.\n\
   --alpha <a>            family error rate of StepM and q of BH-FDR (default 0.05)\n\
   --locked-test <S,E>    refuse a report with a period or test window in [S, E) (repeatable)\n\
   --occam <files...>     run.json of a --select-rule occam re-selection or of rcsr compose: bits, p_occam and\n\
-                         bit_budget per row (report only), matched by the report's run_sha256 and archive rank\n\
+                         bit_budget per row (report only), matched by the report's run sha256 (selection.run_sha256, else cpcv.run_sha256, else run_sha256) and\n\
+                         archive rank (a --from-run report: the run finalist); a CPCV path row gets null\n\
   --markdown <file>      also write the table as Markdown\n\
   Metrics: net<bps> (annualised mean net over cash at 0), sharpe, sortino (MAR 0), calmar (net at the report cost\n\
   over |max_drawdown|), max_drawdown, exposure, entry_times, alpha_bh (mean of net - exposure x period_bh_net,\n\
