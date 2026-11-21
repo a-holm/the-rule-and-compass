@@ -1759,14 +1759,14 @@ fn occam_fx(dir: &Path) -> OccamFx {
          \"entry_price\":\"next open\",\"exit_price\":\"close\",\"offset\":0.0,\"scale\":{\"kind\":\"constant\",\"value\":1.0},\"clip\":null,\
          \"units\":\"log_return\",\"cost_bps\":null,\"cost_in_label\":false,\"construction_columns\":[],\"note\":null}]}",
     );
-    let run = dir.join("occam.run.json").to_string_lossy().into_owned();
+    let run_file = dir.join("occam.run.json").to_string_lossy().into_owned();
     let o = run(&[
         "--data", &data, "--target", "y", "--vars", "x1,x2", "--time", "t", "--split", "temporal", "--target-spec", &spec, "--cpu", "--seed", "3",
         "--metric", "squared", "--quiet", "--objective", "pnl", "--cost-bps", "5", "--validation-frac", "0.3", "--select-rule", "occam",
-        "--select-min-entries", "5", "--select-delta", "0.05", "--generations", "80", "--pop", "128", "--json-out", &run, "--no-dev-log",
+        "--select-min-entries", "5", "--select-delta", "0.05", "--generations", "80", "--pop", "128", "--json-out", &run_file, "--no-dev-log",
     ]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
-    OccamFx { dir: dir.to_path_buf(), data, run }
+    OccamFx { dir: dir.to_path_buf(), data, run: run_file }
 }
 
 impl OccamFx {
