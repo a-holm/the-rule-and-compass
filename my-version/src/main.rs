@@ -13615,7 +13615,9 @@ fn run_walkforward(args: &[String]) -> ! {
             windows_scheme.as_ref().map_or("null".to_string(), |s| format!("{:?}", s)),
         ));
     }
-    let report_json = || report.json_with_ledger(protocol_json.as_deref());
+    // #1272: a report priced on a null store carries its marker.
+    let null_store = rcsr::permute_labels::marker(&data_path);
+    let report_json = || rcsr::permute_labels::mark_report(report.json_with_ledger(protocol_json.as_deref()), null_store.as_deref());
     for w in &report.windows {
         let reasons = [
             w.band.as_ref().and_then(|b| b.fallback_reason.as_deref()),

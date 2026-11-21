@@ -121,3 +121,56 @@ fn the_selector_parser_accepts_and_and_the_symbol() {
     assert_eq!(expr::to_string(&a, &vars), expr::to_string(&b, &vars));
     assert!(expr::to_string(&c, &vars).contains("or"));
 }
+
+fn panel_split() -> SplitSpec {
+    SplitSpec {
+        group_col: Some(0),
+        ..temporal(Some(1))
+    }
+}
+
+#[test]
+fn grouped_panel_has_no_duplicate_time_warning() {
+    let clean = data::parse_table(
+        "s,t,x,y\n\
+         A,1,1,1\nA,2,2,2\nA,3,3,3\nA,4,4,4\nA,5,5,5\n\
+         B,1,1,1\nB,2,2,2\nB,3,3,3\nB,4,4,4\nB,5,5,5\n",
+    )
+    .unwrap();
+    let p = data::prepare_full_with(&clean, &["x".into()], "y", &panel_split(), &mut Mt::new(1), &prep())
+        .unwrap();
+    assert_eq!(p.prep.time_duplicates, 0);
+    assert_eq!(p.prep.time_non_monotonic, 0);
+    let lines = p.prep.text_lines(None, 0).join("\n");
+    assert!(!lines.contains("duplicate time instant"), "{lines}");
+    assert!(p.prep.json().contains("\"time_duplicates\":0"));
+
+    let dup = data::parse_table(
+        "s,t,x,y\n\
+         A,1,1,1\nA,2,2,2\nA,2,3,3\nA,4,4,4\nA,5,5,5\n\
+         B,1,1,1\nB,2,2,2\nB,3,3,3\nB,4,4,4\nB,5,5,5\n",
+    )
+    .unwrap();
+    let p = data::prepare_full_with(&dup, &["x".into()], "y", &panel_split(), &mut Mt::new(1), &prep())
+        .unwrap();
+    assert_eq!(p.prep.time_duplicates, 1);
+    let lines = p.prep.text_lines(None, 0).join("\n");
+    assert!(lines.contains("duplicate time instant"), "{lines}");
+    assert!(lines.contains("within a group"), "{lines}");
+}
+
+#[test]
+fn grouped_panel_backward_step_warns_within_a_group() {
+    let t = data::parse_table(
+        "s,t,x,y\n\
+         A,1,1,1\nA,3,2,2\nA,2,3,3\nA,4,4,4\nA,5,5,5\n\
+         B,1,1,1\nB,2,2,2\nB,3,3,3\nB,4,4,4\nB,5,5,5\n",
+    )
+    .unwrap();
+    let p = data::prepare_full_with(&t, &["x".into()], "y", &panel_split(), &mut Mt::new(1), &prep())
+        .unwrap();
+    assert_eq!(p.prep.time_duplicates, 0);
+    assert_eq!(p.prep.time_non_monotonic, 1);
+    let lines = p.prep.text_lines(None, 0).join("\n");
+    assert!(lines.contains("not monotonic within a group"), "{lines}");
+}
