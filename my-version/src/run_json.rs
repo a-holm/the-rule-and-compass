@@ -135,6 +135,10 @@ pub struct RunFile {
     pub cumulative_elapsed_seconds: Option<f64>,
     /// #1237: `compose.chosen` of a composed run; `None` for every other run.
     pub composite: Option<CompositeMarker>,
+    /// #1291: `objective.book_target` of a run searched with `--book-target`.
+    pub book_target: Option<crate::run_book::BookTarget>,
+    /// `preparation.fill`.
+    pub fill: Option<String>,
     /// The parsed document, for views such as `RunFile::book`.
     doc: Json,
 }
@@ -245,6 +249,8 @@ impl RunFile {
                 .and_then(|c| c.get("elapsed_seconds"))
                 .and_then(Json::as_f64),
             composite: CompositeMarker::of(&j),
+            book_target: crate::run_book::book_target_of(&j)?,
+            fill: j.get("preparation").and_then(|p| p.get("fill")).and_then(Json::as_str).map(str::to_string),
             doc: j.clone(),
         })
     }
@@ -262,6 +268,13 @@ impl RunFile {
     /// `objective.cost.source`; a run without the block counts as a flag cost.
     pub fn cost_source(&self) -> crate::target::CostSource {
         crate::run_book::cost_source_of(&self.doc)
+    }
+
+    /// #1291: the search filled missing labels (`preparation.fill` other than drop or none), so its
+    /// books priced every row with a finite return. A run without the block (`rcsr compose` needs
+    /// `--fill drop`) did not.
+    pub fn fills_labels(&self) -> bool {
+        !matches!(self.fill.as_deref(), None | Some("drop") | Some("none"))
     }
 
     /// Last time key the search trained or selected on.
