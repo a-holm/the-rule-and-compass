@@ -2,9 +2,13 @@
 //!
 //! The value columns of one label family (`lbl_<label>_*` without `t1` and
 //! `weight`) move together, per symbol, by one circular-block order over the
-//! rows whose `lbl_<label>_y` is finite. Time, symbol, `t1`, `weight`, every
-//! feature column and every row with a non-finite `y` keep their bytes, so the
-//! search, walk-forward and trials flags of the source store work unchanged.
+//! rows whose `lbl_<label>_y` and return are finite (the label pool). Rows with
+//! a NaN `y` and a finite return (the warm-up of the label's volatility window,
+//! gaps inside it) move the same way in a pool of their own, because the book
+//! prices every row with a finite return. Time, symbol, `t1`, `weight`, every
+//! feature column and every row without a finite return keep their bytes, so the
+//! priced rows and the search, walk-forward and trials flags of the source store
+//! stay the same.
 //!
 //! The output is an ordinary store with another data hash. Its manifest marks it
 //! as a null store; a walk-forward report priced on it carries the marker as
@@ -33,6 +37,8 @@ pub const SCHEMA: &str = "rcsr-null-store/1";
 /// The `order` of the marker: one order per symbol.
 pub const ORDER: &str = "per_symbol";
 const SEED_TAG: u64 = 0x4E55_4C4C_5045_524D;
+/// Mixed into the seed of a gap pool, so its order is independent of the label pool's.
+const GAP_TAG: u64 = 0x4741_5050_4F4F_4C31;
 const WRITER: &str = "rcsr panel permute-labels";
 
 type Fail = (i32, String);
@@ -50,7 +56,7 @@ pub struct Options {
     pub data: String,
     pub target_spec: String,
     pub label: String,
-    /// Block length in label rows (rows with a finite `y`) of one symbol.
+    /// Block length in rows of one pool of one symbol.
     pub block: usize,
     pub seed: u64,
     /// Feature columns to keep; `None` keeps every column.
@@ -69,13 +75,23 @@ pub struct Summary {
     /// The permuted columns, in store order.
     pub columns: Vec<String>,
     pub symbols: usize,
-    /// Rows that take part in the permutation.
+    /// Rows that take part in the permutation, both pools.
     pub moved_rows: usize,
-    /// Rows with a finite `y` in a label purge or an embargo; they keep their values.
+    /// Of `moved_rows`, the rows of the gap pools.
+    pub gap_rows: usize,
+    /// Rows of either pool in a label purge or an embargo; they keep their values.
     pub guarded_rows: usize,
     pub manifest: String,
     pub targets: String,
     pub schema: Option<String>,
+}
+
+/// The pool of a moving row: a finite `y` and return (`Label`), or a NaN `y` and a finite
+/// return (`Gap`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Pool {
+    Label,
+    Gap,
 }
 
 /// The order key of a symbol: the first 64 bits of the SHA-256 of its name, so the
@@ -85,22 +101,27 @@ pub fn symbol_key(name: &str) -> u64 {
 }
 
 /// The source row of every output row. The rows of one symbol (`symbols[i]`, key
-/// `keys[symbols[i]]`) and one segment (`Some`) form one series in time order (ties
-/// by row); [`block_permutation`] seeded from `(seed, key, segment)` reorders it. A
-/// row with segment `None` keeps its own values.
-pub fn source_rows(symbols: &[u32], keys: &[u64], time: &[i64], segment: &[Option<usize>], block: usize, seed: u64) -> Vec<usize> {
+/// `keys[symbols[i]]`), one pool and one segment (`slot[i]`) form one series in time
+/// order (ties by row); [`block_permutation`] seeded from `(seed, key, segment)`, and
+/// the gap tag for a gap pool, reorders it. A row with slot `None` keeps its own values.
+pub fn source_rows(symbols: &[u32], keys: &[u64], time: &[i64], slot: &[Option<(Pool, usize)>], block: usize, seed: u64) -> Vec<usize> {
     let mut src: Vec<usize> = (0..symbols.len()).collect();
-    let mut rows: Vec<usize> = (0..symbols.len()).filter(|&i| segment[i].is_some()).collect();
-    rows.sort_by_key(|&i| (keys[symbols[i] as usize], symbols[i], segment[i], time[i], i));
+    let mut rows: Vec<usize> = (0..symbols.len()).filter(|&i| slot[i].is_some()).collect();
+    rows.sort_by_key(|&i| (keys[symbols[i] as usize], symbols[i], slot[i], time[i], i));
     let mut lo = 0;
     while lo < rows.len() {
-        let (sym, seg) = (symbols[rows[lo]], segment[rows[lo]]);
+        let (sym, at) = (symbols[rows[lo]], slot[rows[lo]]);
         let mut hi = lo + 1;
-        while hi < rows.len() && symbols[rows[hi]] == sym && segment[rows[hi]] == seg {
+        while hi < rows.len() && symbols[rows[hi]] == sym && slot[rows[hi]] == at {
             hi += 1;
         }
         let series = &rows[lo..hi];
-        let mut rng = Mt::new(mix_seed(&[seed, keys[sym as usize], seg.unwrap_or(0) as u64, SEED_TAG]));
+        let (pool, seg) = at.expect("moving rows have a slot");
+        let mut parts = vec![seed, keys[sym as usize], seg as u64, SEED_TAG];
+        if pool == Pool::Gap {
+            parts.push(GAP_TAG);
+        }
+        let mut rng = Mt::new(mix_seed(&parts));
         for (k, &o) in block_permutation(series.len(), block, &mut rng).iter().enumerate() {
             src[series[k]] = series[o];
         }
@@ -286,6 +307,16 @@ pub fn permute(o: &Options) -> Result<Summary, Fail> {
     let time = read_time(&src, t_col)?;
     let (symbols, levels) = read_symbols(&src, s_col)?;
     let y = read_f64(&src, y_col)?;
+    // The book prices every row with a finite return: the return columns of the label's
+    // entries that move, else lbl_<label>_fwd.
+    let mut ret_cols: Vec<usize> = entries.iter().filter_map(|s| s.return_column.as_deref().and_then(|r| col(r))).filter(|c| moved.contains(c)).collect();
+    if ret_cols.is_empty() {
+        ret_cols.extend(col(&labels::column_name(&o.label, "fwd")).filter(|c| moved.contains(c)));
+    }
+    ret_cols.sort_unstable();
+    ret_cols.dedup();
+    let rets: Vec<Vec<f64>> = ret_cols.iter().map(|&c| read_f64(&src, c)).collect::<Result<_, _>>()?;
+    let priced = |i: usize| rets.iter().all(|r| r[i].is_finite());
 
     let resolved = lockbox::resolve(o.lockbox.as_deref(), &o.data).map_err(|e| (e.exit, e.message))?;
     let carried = carried_record(&o.data)?;
@@ -327,24 +358,33 @@ pub fn permute(o: &Options) -> Result<Summary, Fail> {
     let bounds: Vec<Lockbox> = ranges.iter().map(|(r, _)| *r).collect();
     let segs = Segments::with_embargo(&bounds, purge, embargo);
     let mut guarded_rows = 0usize;
-    let segment: Vec<Option<usize>> = (0..time.len())
+    let slot: Vec<Option<(Pool, usize)>> = (0..time.len())
         .map(|i| {
-            if !y[i].is_finite() {
-                return None;
-            }
+            let pool = match (y[i].is_finite(), priced(i), rets.is_empty()) {
+                (true, true, _) => Pool::Label,
+                (false, true, false) => Pool::Gap,
+                _ => return None,
+            };
             let raw = segs.raw(time[i] as f64);
             if segs.kind(raw) == SegmentKind::Development {
-                Some(raw)
+                Some((pool, raw))
             } else {
                 guarded_rows += 1;
                 None
             }
         })
         .collect();
-    let moved_rows = segment.iter().filter(|s| s.is_some()).count();
+    let mut pools = vec![[0usize; 2]; levels.len()];
+    for (i, s) in slot.iter().enumerate() {
+        if let Some((pool, _)) = s {
+            pools[symbols[i] as usize][(*pool == Pool::Gap) as usize] += 1;
+        }
+    }
+    let moved_rows: usize = pools.iter().map(|p| p[0] + p[1]).sum();
+    let gap_rows: usize = pools.iter().map(|p| p[1]).sum();
     let keys: Vec<u64> = levels.iter().map(|s| symbol_key(s)).collect();
-    let from = source_rows(&symbols, &keys, &time, &segment, o.block, o.seed);
-    drop((time, y, segment));
+    let from = source_rows(&symbols, &keys, &time, &slot, o.block, o.seed);
+    drop((time, y, slot, rets));
 
     let permuted: Vec<Vec<f64>> = moved
         .iter()
@@ -380,7 +420,7 @@ pub fn permute(o: &Options) -> Result<Summary, Fail> {
     let floor = lockbox::declared_embargo(&o.data).map_err(|e| (e.exit, e.message))?.map(|(_, s)| s);
     let columns: Vec<String> = moved.iter().map(|&c| names[c].clone()).collect();
     let null = format!(
-        "{{\"label\":{},\"block\":{},\"seed\":{},\"order\":\"{}\",\"source_sha256\":{},\"target_spec_sha256\":{},\"columns\":[{}],\"symbols\":{},\"moved_rows\":{},\"guarded_rows\":{},\"purge_seconds\":{},\"embargo_seconds\":{}}}",
+        "{{\"label\":{},\"block\":{},\"seed\":{},\"order\":\"{}\",\"source_sha256\":{},\"target_spec_sha256\":{},\"columns\":[{}],\"return_columns\":[{}],\"symbols\":{},\"moved_rows\":{},\"gap_rows\":{},\"guarded_rows\":{},\"pools\":[{}],\"purge_seconds\":{},\"embargo_seconds\":{}}}",
         jstr(&o.label),
         o.block,
         o.seed,
@@ -388,9 +428,17 @@ pub fn permute(o: &Options) -> Result<Summary, Fail> {
         jstr(&source_sha256),
         jstr(&manifest::sha256_hex(spec_text.as_bytes())),
         columns.iter().map(|c| jstr(c)).collect::<Vec<_>>().join(","),
+        ret_cols.iter().map(|&c| jstr(&names[c])).collect::<Vec<_>>().join(","),
         levels.len(),
         moved_rows,
+        gap_rows,
         guarded_rows,
+        levels
+            .iter()
+            .zip(&pools)
+            .map(|(s, p)| format!("{{\"symbol\":{},\"label_rows\":{},\"gap_rows\":{}}}", jstr(s), p[0], p[1]))
+            .collect::<Vec<_>>()
+            .join(","),
         purge,
         embargo
     );
@@ -436,6 +484,7 @@ pub fn permute(o: &Options) -> Result<Summary, Fail> {
         columns,
         symbols: levels.len(),
         moved_rows,
+        gap_rows,
         guarded_rows,
         manifest: manifest_path,
         targets,
@@ -510,17 +559,20 @@ pub fn usage_text() -> &'static str {
                 [--columns a,b,...] [--time ts] [--group-by symbol] [--lockbox S,E|none] [--lock-record R]
   The search-capacity null store (#1272). Every value column of the label family lbl_NAME_* (y, fwd,
   long_net, action, exit_ret, m_net, m_barrier and any lbl_NAME_ column the spec names, never t1 or
-  weight) moves per symbol by one seeded circular-block order over the rows with a finite lbl_NAME_y
-  (blocks of --block such rows; a random rotation, then the blocks shuffled). Time, symbol, t1, weight,
-  every feature column and every row with a non-finite y keep their bytes. The order of a symbol comes
-  from the seed and the symbol name only. --columns keeps only the named features plus time, symbol,
-  the family and the columns the label's spec entries name. <out stem>.targets.json is the spec file
-  unchanged; <out>.manifest.json (schema rcsr-null-store/1) records null {label, block, seed, order
-  per_symbol, source_sha256, columns} and carries the locked-test declaration and the lock record of the
-  source (--lock-record, or the lock_record object of a source sidecar). A source row inside a locked
-  range exits 3; rows in a label purge or an embargo neither move nor give a value. A walkforward report
-  priced on the output carries null_store, and rcsr trials --table reads it only with --null-wf.
-  --out and its sidecars must not exist (exit 2).
+  weight) moves per symbol by one seeded circular-block order (blocks of --block rows; a random rotation,
+  then the blocks shuffled) over the rows with a finite lbl_NAME_y and a finite return (the label pool).
+  Rows with a NaN y and a finite return (the label's volatility warm-up, gaps inside its window) move the
+  same way in a gap pool of their own with an independent order, so the null book prices the rows of the
+  real book with permuted returns. Time, symbol, t1, weight, every feature column and every row without
+  a finite return keep their bytes. The order of a pool
+  comes from the seed, the symbol name and the pool only. --columns keeps only the named features plus
+  time, symbol, the family and the columns the label's spec entries name. <out stem>.targets.json is the
+  spec file unchanged; <out>.manifest.json (schema rcsr-null-store/1) records null {label, block, seed,
+  order per_symbol, source_sha256, columns, pools per symbol: label_rows, gap_rows} and carries the
+  locked-test declaration and the lock record of the source (--lock-record, or the lock_record object of
+  a source sidecar). A source row inside a locked range exits 3; rows in a label purge or an embargo
+  neither move nor give a value. A walkforward report priced on the output carries null_store, and rcsr
+  trials --table reads it only with --null-wf. --out and its sidecars must not exist (exit 2).
 "
 }
 
@@ -578,11 +630,12 @@ pub fn cli(args: &[String]) -> ! {
     match permute(&opts) {
         Ok(s) => {
             eprintln!(
-                "permute-labels: {} column(s) [{}] over {} symbol(s), {} row(s) moved, {} row(s) kept in a purge or embargo band; source sha256 {}; output sha256 {}; manifest {}; targets {}{}",
+                "permute-labels: {} column(s) [{}] over {} symbol(s), {} row(s) moved ({} in gap pools), {} row(s) kept in a purge or embargo band; source sha256 {}; output sha256 {}; manifest {}; targets {}{}",
                 s.columns.len(),
                 s.columns.join(","),
                 s.symbols,
                 s.moved_rows,
+                s.gap_rows,
                 s.guarded_rows,
                 s.source_sha256,
                 s.output_sha256,
@@ -601,34 +654,59 @@ mod tests {
     use super::*;
 
     #[test]
-    fn source_rows_permute_each_symbol_and_segment_alone() {
-        // Two symbols interleaved in time order, a guarded row and a row of another segment.
-        let symbols = [0u32, 1, 0, 1, 0, 1, 0, 1, 0, 1];
-        let time: Vec<i64> = (0..10).map(|i| 100 + (i / 2) as i64).collect();
-        let segment = [Some(0), Some(0), Some(0), Some(0), None, Some(0), Some(0), Some(0), Some(2), Some(0)];
+    fn source_rows_permute_each_symbol_pool_and_segment_alone() {
+        // Two symbols interleaved in time order, a guarded row, a row of another segment and gap rows.
+        let symbols = [0u32, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1];
+        let time: Vec<i64> = (0..14).map(|i| 100 + (i / 2) as i64).collect();
+        let (l, g) = (Pool::Label, Pool::Gap);
+        let slot = [
+            Some((g, 0)),
+            Some((g, 0)),
+            Some((g, 0)),
+            Some((g, 0)),
+            Some((l, 0)),
+            Some((l, 0)),
+            None,
+            Some((l, 0)),
+            Some((l, 2)),
+            Some((l, 0)),
+            Some((l, 0)),
+            Some((l, 0)),
+            Some((l, 0)),
+            Some((l, 0)),
+        ];
         let keys = [symbol_key("A"), symbol_key("B")];
-        let src = source_rows(&symbols, &keys, &time, &segment, 2, 7);
-        assert_eq!(src[4], 4);
+        let src = source_rows(&symbols, &keys, &time, &slot, 2, 7);
+        assert_eq!(src[6], 6);
         assert_eq!(src[8], 8);
         for (i, &s) in src.iter().enumerate() {
             assert_eq!(symbols[s], symbols[i]);
-            assert_eq!(segment[s], segment[i]);
+            assert_eq!(slot[s], slot[i]);
         }
         let mut sorted = src.clone();
         sorted.sort_unstable();
-        assert_eq!(sorted, (0..10).collect::<Vec<_>>());
+        assert_eq!(sorted, (0..14).collect::<Vec<_>>());
     }
 
     #[test]
     fn a_symbol_order_does_not_depend_on_the_other_symbols() {
         let time: Vec<i64> = (0..40).collect();
-        let alone = source_rows(&[0; 40], &[symbol_key("A")], &time, &[Some(0); 40], 4, 3);
+        let label = Some((Pool::Label, 0));
+        let alone = source_rows(&[0; 40], &[symbol_key("A")], &time, &[label; 40], 4, 3);
         let symbols: Vec<u32> = (0..80).map(|i| (i % 2) as u32).collect();
         let t2: Vec<i64> = (0..80).map(|i| (i / 2) as i64).collect();
-        let mixed = source_rows(&symbols, &[symbol_key("Z"), symbol_key("A")], &t2, &[Some(0); 80], 4, 3);
+        let mixed = source_rows(&symbols, &[symbol_key("Z"), symbol_key("A")], &t2, &[label; 80], 4, 3);
         let a_rows: Vec<usize> = (0..80).filter(|i| i % 2 == 1).collect();
         let got: Vec<usize> = a_rows.iter().map(|&i| a_rows.iter().position(|&r| r == mixed[i]).unwrap()).collect();
         assert_eq!(got, alone);
+    }
+
+    #[test]
+    fn the_gap_pool_order_does_not_follow_the_label_pool_order() {
+        let time: Vec<i64> = (0..40).collect();
+        let label = source_rows(&[0; 40], &[symbol_key("A")], &time, &[Some((Pool::Label, 0)); 40], 4, 3);
+        let gap = source_rows(&[0; 40], &[symbol_key("A")], &time, &[Some((Pool::Gap, 0)); 40], 4, 3);
+        assert_ne!(label, gap);
     }
 
     #[test]

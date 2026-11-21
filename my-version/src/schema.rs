@@ -598,7 +598,7 @@ pub fn json() -> String {
 {{\"name\":\"--buckets\",\"type\":\"int\",\"default\":\"5\",\"description\":\"spread: quantile buckets; the spread is the lowest minus the highest bucket mean label, in bp\"}},\
 {{\"name\":\"--bucketing\",\"type\":\"enum\",\"default\":\"pooled\",\"description\":\"spread: pooled | cross-section; buckets from the feature quantiles of the whole range or of each timestamp\"}},\
 {{\"name\":\"--demean\",\"type\":\"enum\",\"default\":\"cross-section\",\"description\":\"spread: cross-section | none; subtract the per-timestamp mean label first\"}},\
-{{\"name\":\"--block\",\"type\":\"int\",\"default\":\"auto\",\"description\":\"spread: circular block bootstrap length in timestamps; auto is the larger of the label horizon and ceil(T^(1/3)). permute-labels: required block length in label rows (rows with a finite y) of one symbol\"}},\
+{{\"name\":\"--block\",\"type\":\"int\",\"default\":\"auto\",\"description\":\"spread: circular block bootstrap length in timestamps; auto is the larger of the label horizon and ceil(T^(1/3)). permute-labels: required block length in rows of one pool of one symbol (the label pool: finite y and return; the gap pool: NaN y, finite return)\"}},\
 {{\"name\":\"--draws\",\"type\":\"int\",\"default\":\"2000\",\"description\":\"spread: bootstrap draws\"}},\
 {{\"name\":\"--seed\",\"type\":\"int\",\"default\":\"1\",\"description\":\"spread: bootstrap seed. permute-labels: required permutation seed; the order of a symbol comes from it and the SHA-256 of the symbol name\"}},\
 {{\"name\":\"--level\",\"type\":\"float\",\"default\":\"0.95\",\"description\":\"spread: percentile interval level\"}},\

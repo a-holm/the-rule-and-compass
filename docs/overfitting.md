@@ -577,12 +577,12 @@ rcsr trials --wf <candidate reports> --table --null-wf <null reports> ...
 ```
 
 - Labels and book returns move together, with one order per symbol, so the P&L fitness, the robust selection and the walk-forward all price the permuted returns. The in-search null (`--null-runs`, `--null-block`) permutes the target while the regret reads the book's return column, so under `--fitness pnl` every null run would be the real run; it stays refused there.
-- Blocks count the label rows of a symbol (rows with a finite `y`), so a block of `B` rows spans `B` label periods whatever the stride. A block keeps the serial dependence of the returns inside it. The right length depends on the horizon, so `--block` has no default and is pre-registered with the seeds.
+- Blocks count the rows of one pool of a symbol (the label pool: rows with a finite `y` and return), so a block of `B` rows spans `B` label periods whatever the stride. A block keeps the serial dependence of the returns inside it. The right length depends on the horizon, so `--block` has no default and is pre-registered with the seeds.
 - Orders are per symbol: the order of a symbol depends only on the seed and its name. The cross-sectional alignment of returns at one timestamp breaks too; a shared order across symbols is not offered.
-- A row with a NaN `y` keeps every value, also a finite `fwd` (the warm-up of the label's volatility window); the book prices every row with a finite return, so those few rows keep their real returns in a null book.
+- A row with a NaN `y` and a finite return (the warm-up of the label's volatility window, a gap inside it) is priced by the book, so it moves in a gap pool of its own per symbol, with an order independent of the label pool's. The null book prices exactly the rows of the real book. A row keeps its own return only when the circular-block order maps its whole block onto itself, which matters in small pools. A row with every label column NaN keeps every value.
 - A null report carries `null_store`, so it never enters the table as a candidate, a `--baseline-wf` rung or a freeze population (exit 2); `--null-wf` reads it.
 
-Verify: `permute_labels_moves_values_within_each_symbol`, `permute_labels_moves_the_family_jointly`, `permute_labels_bytes_follow_the_seed`, `permute_labels_keeps_every_value_on_its_side_of_the_lock` and `null_store_runs_search_walkforward_and_the_table` (`tests/nulls.rs`).
+Verify: `permute_labels_moves_values_within_each_symbol`, `permute_labels_moves_the_family_jointly`, `permute_labels_bytes_follow_the_seed`, `permute_labels_keeps_every_value_on_its_side_of_the_lock`, `permute_labels_moves_gap_rows_in_their_own_pool` and `null_store_runs_search_walkforward_and_the_table` (`tests/nulls.rs`).
 
 ### 3.13 Baseline ladder and add-one-family ablation (implemented)
 

@@ -2251,7 +2251,8 @@ HOURLY V2 PANEL (#259):
   rcsr panel permute-labels --data panel.rcsb --target-spec panel.targets.json --label h24a --block 30 --seed 1 --out null.rcsb
                   [--columns a,b] [--time ts] [--group-by symbol] [--lockbox S,E|none] [--lock-record R]
                   the search-capacity null store: the label family moves per symbol by one seeded circular-block order
-                  over the rows with a finite y; features, time, symbol, t1 and weight keep their bytes; the manifest
+                  over the rows with a finite y (gap rows with a NaN y and a finite return in their own pool); features,
+                  time, symbol, t1 and weight keep their bytes; the manifest
                   marks it null and rcsr trials --table reads its reports only with --null-wf (#1272;
                   rcsr panel permute-labels --help)
   --input <dir>           archive directory (SYMBOL/SYMBOL-15m-YYYY-MM.zip); no network
