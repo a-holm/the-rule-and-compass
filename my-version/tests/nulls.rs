@@ -819,3 +819,152 @@ fn trials_wf_refuses_null_report() {
     let o = run(&["trials", "--wf", &real, "--table", "--null-wf", &nul, "--draws", "20"]);
     assert_eq!(code(&o), 0, "--null-wf still reads a null report: {}", stderr(&o));
 }
+
+/// A copy of the store `src` at `out` whose header carries `marker` as `null_store`.
+fn mark_store(src: &str, out: &str, marker: &str) {
+    let s = FileStore::open(src).unwrap();
+    let h = s.header();
+    let plans: Vec<store::ColumnPlan> = (0..h.n_cols)
+        .map(|c| {
+            let i = h.column(c).unwrap();
+            store::ColumnPlan { name: i.name, numeric: i.numeric, dtype: i.dtype, levels: i.levels, has_codes: i.has_codes }
+        })
+        .collect();
+    let rows = h.group_rows;
+    store::write_store_grouped_marked(out, &plans, h.n_rows, rows, Some(marker), |lo, _, cols| {
+        let g = lo / rows;
+        for (c, plan) in plans.iter().enumerate() {
+            match plan.dtype {
+                DType::F64 => cols[c].f64s.extend(s.read_f64_group(g, c)?),
+                DType::I64 => cols[c].i64s.extend(s.read_i64(g, c)?),
+                DType::U32 => {}
+            }
+            if plan.has_codes {
+                cols[c].codes.extend(s.read_codes(g, c)?);
+            }
+        }
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// `ladder --locked-test` spends the baseline read of a sealed list on any data: a store with
+/// a `null_store` header member, or an older null store marked by its manifest, is refused
+/// before the read is authorised; the real store then reads once.
+#[test]
+fn ladder_locked_test_refuses_null_store() {
+    let s = Scratch::new("null-ladder");
+    let dir = s.path();
+    let mut csv = String::from("ts,sym,f1,f2,y\n");
+    for g in 0..3i64 {
+        for i in 0..500i64 {
+            let f1 = (((i * 37 + g * 11) % 17) as f64 - 8.0) / 8.0;
+            let f2 = (((i * 19 + g * 5) % 13) as f64 - 6.0) / 6.0;
+            let y = 0.004 * f1 + (((i * 13 + g) % 7) as f64 - 3.0) * 0.001;
+            let _ = writeln!(csv, "{},s{},{},{},{}", T0 + i * HOUR, g, f1, f2, y);
+        }
+    }
+    let table = rcsr::data::parse_table_with_time(&csv, false, Some("ts")).unwrap();
+    let (plain, marked, legacy) = (p(dir, "p.rcsb"), p(dir, "n.rcsb"), p(dir, "legacy.rcsb"));
+    store::write_store_with_time(&plain, &table, 1000, Some(0)).unwrap();
+    mark_store(&plain, &marked, "{\"label\":\"y\",\"block\":5,\"seed\":11,\"order\":\"per_symbol\"}");
+    std::fs::copy(&plain, &legacy).unwrap();
+    write_text(dir, "legacy.rcsb.manifest.json", "{\"schema\":\"rcsr-null-store/1\",\"null\":{\"label\":\"y\",\"block\":5,\"seed\":12}}\n");
+    let windows = write_text(
+        dir,
+        "w.csv",
+        &format!(
+            "scheme,label,train_start,train_end,validation_start,test_start,test_end\nlocked,locked_0,{},{},{},{},{}\n",
+            T0,
+            T0 + 398 * HOUR,
+            T0 + 250 * HOUR,
+            T0 + 400 * HOUR,
+            T0 + 500 * HOUR
+        ),
+    );
+    let range = Lockbox { start: T0 + 400 * HOUR, end: T0 + 500 * HOUR };
+    for d in [&plain, &marked, &legacy] {
+        lockbox::write_sidecar(d, &range, "test").unwrap();
+    }
+    let (ledger, sealed) = (p(dir, "ledger.jsonl"), p(dir, "sealed.json"));
+    rcsr::protocol::Ledger::new(&ledger)
+        .add_candidate(&rcsr::protocol::Candidate {
+            id: "c1".into(),
+            spec_sha256: "a".repeat(64),
+            data_sha256: "b".repeat(64),
+            build_commit: "build".into(),
+            report_sha256: "c".repeat(64),
+            expression: "x".into(),
+            locked_test: Some(rcsr::protocol::LockedRange { start: range.start, end: range.end, source: "store".into() }),
+        })
+        .unwrap();
+    let o = run(&["protocol", "seal", "--ledger", &ledger, "--out", &sealed]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let ladder = |data: &str, out: &str| -> Output {
+        run(&[
+            "ladder", "--data", data, "--target", "y", "--time", "ts", "--group", "sym", "--features", "f1,f2", "--windows", &windows, "--scheme",
+            "locked", "--purge-seconds", "7200", "--gbm-trees", "10", "--draws", "50", "--max-fit-rows", "600", "--out", out, "--locked-test",
+            "--ledger", &ledger, "--sealed", &sealed,
+        ])
+    };
+    let before = std::fs::read(&ledger).unwrap();
+    for (data, seed) in [(&marked, 11), (&legacy, 12)] {
+        let out = p(dir, "null.ladder.json");
+        let o = ladder(data, &out);
+        assert_eq!(code(&o), 2, "{data}: stdout: {} stderr: {}", String::from_utf8_lossy(&o.stdout), stderr(&o));
+        let e = stderr(&o);
+        assert!(e.contains(data.as_str()) && e.contains(&format!("null_store label y, seed {seed}")) && e.contains("lockbox read"), "{e}");
+        assert!(std::fs::read(&ledger).unwrap() == before, "{data}: no read is recorded");
+        assert!(!Path::new(&rcsr::protocol::marker_path(data)).exists(), "{data}: no read marker");
+        assert!(!Path::new(&out).exists(), "{data}: no report");
+    }
+    let o = ladder(&plain, &p(dir, "real.ladder.json"));
+    assert_eq!(code(&o), 0, "the real store reads once: {}", stderr(&o));
+    assert!(std::fs::read_to_string(&ledger).unwrap().contains("\"event\":\"baseline_read\""));
+}
+
+/// `protocol regimes --after-read` writes the lock calendar into the ledger after the reads: a
+/// store marked as a null store (an older one, by its manifest) is refused before the ledger is
+/// touched.
+#[test]
+fn regimes_after_read_refuses_null_store() {
+    let s = Scratch::new("null-regimes");
+    let dir = s.path();
+    let lock = (T0 + 12 * DAY, T0 + 17 * DAY);
+    let mut text = String::from("ts,sym,x,close,y\n");
+    for i in 0..17 * 24i64 {
+        let day = (i / 24) as usize;
+        let close = if day >= 12 { [100.0, 150.0, 100.0, 150.0, 100.0][day - 12] } else { 100.0 + day as f64 };
+        let x = ((i * 37) % 17) as f64 - 8.0;
+        let _ = writeln!(text, "{},BTC,{},{},{}", T0 + i * HOUR, x, close, 0.0003 * x + (((i * 13) % 7) as f64 - 3.0) * 0.0004);
+    }
+    let data = write_text(dir, "store.csv", &text);
+    lockbox::write_sidecar(&data, &Lockbox { start: lock.0, end: lock.1 }, "test").unwrap();
+    let (ledger, sealed) = (p(dir, "ledger.jsonl"), p(dir, "sealed.json"));
+    let wf = |window: &str, extra: &[&str]| -> Output {
+        let mut a = vec![
+            "walkforward", "--data", &data, "--target", "y", "--time", "ts", "--horizon", "5", "--cost-bps", "5", "--periods-per-year", "365", "--json",
+            "--ledger", &ledger, "--expr", "x", "--window", window,
+        ];
+        a.extend_from_slice(extra);
+        run(&a)
+    };
+    let o = wf(&format!("dev,{},{},{},{}", T0, T0 + 100 * HOUR, T0 + 110 * HOUR, T0 + 200 * HOUR), &[]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let o = run(&["protocol", "seal", "--final", "--ledger", &ledger, "--out", &sealed]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let o = wf(&format!("locked,{},{},{},{}", lock.0 - 100 * HOUR, lock.0 - 10 * HOUR, lock.0, lock.1), &["--locked-test", "--sealed", &sealed]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    write_text(dir, "store.csv.manifest.json", "{\"schema\":\"rcsr-null-store/1\",\"null\":{\"label\":\"h24\",\"block\":5,\"seed\":4}}\n");
+    let out = p(dir, "lock-cal.csv");
+    let before = std::fs::read(&ledger).unwrap();
+    let o = run(&[
+        "protocol", "regimes", "--data", &data, "--time-col", "ts", "--price-col", "close", "--symbol-col", "sym", "--symbol", "BTC", "--out", &out, "--up",
+        "0.3", "--down", "0.3", "--min-days", "0", "--sideways-days", "0", "--after-read", "--ledger", &ledger, "--sealed", &sealed, "--expect-reads", "1",
+    ]);
+    assert_eq!(code(&o), 2, "stdout: {} stderr: {}", String::from_utf8_lossy(&o.stdout), stderr(&o));
+    let e = stderr(&o);
+    assert!(e.contains("null_store label h24, seed 4") && e.contains("--after-read"), "{e}");
+    assert!(std::fs::read(&ledger).unwrap() == before, "the ledger records no dating");
+    assert!(!Path::new(&out).exists(), "no calendar is written");
+}
