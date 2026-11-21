@@ -122,7 +122,7 @@ fn the_schema_sidecar_hashes_every_column_and_detects_a_change() {
     let body = std::fs::read_to_string(&schema).unwrap();
     assert!(body.contains("\"panel_version\":\"2\""));
     assert!(body.contains("\"schema_version\":1"));
-    assert!(body.contains("\"feature_registry_version\":1"));
+    assert!(body.contains("\"feature_registry_version\":2"));
     let hashes = registry::read_hashes(&schema).unwrap();
     assert_eq!(hashes.len(), names.len() + 2);
     for h in hashes.values() {
@@ -1145,7 +1145,7 @@ fn view_ids_of_fully_delivered_sizes_are_pinned() {
         .flat_map(|&s| (0..2).map(move |k| (s, k)))
         .map(|(s, k)| registry::select_view(&sixteen, s, 11, k).unwrap().id)
         .collect();
-    let golden: [&str; 6] = ["1a1456f550b1", "2bcfcc5a66bb", "3251a502d095", "32d98b3cf8d0", "79593916d737", "91885d916cc3"];
+    let golden: [&str; 6] = ["f30ba4bf48f7", "e4cbb58c88a4", "3be8953e8943", "e3a558b1191f", "57bfd28aa575", "0ce74c1aa424"];
     assert_eq!(got, golden, "{got:?}");
 }
 
@@ -1178,4 +1178,66 @@ fn all_appends_the_six_gate_columns_and_the_schema_verifies() {
     }
     let verify = rcsr_cmd::rcsr().args(["panel", "schema", "--data", &out, "--verify"]).output().unwrap();
     assert_eq!(verify.status.code(), Some(0), "{}", String::from_utf8_lossy(&verify.stderr));
+}
+
+#[test]
+fn old_registry_version_is_warned_not_refused() {
+    let (_scratch, dir) = tmp_dir("old-version");
+    let names: Vec<String> = feature_names().into_iter().take(8).collect();
+    let mut text = String::from("ts,symbol");
+    for n in &names {
+        text.push_str(&format!(",{}", n));
+    }
+    text.push('\n');
+    for r in 0..60 {
+        text.push_str(&format!("{},AAA", 1_700_000_000i64 + r as i64 * 3600));
+        for c in 0..names.len() {
+            text.push_str(&format!(",{}", (r + c) as f64 * 0.5));
+        }
+        text.push('\n');
+    }
+    let table = data::parse_table_with_time(&text, false, Some("ts")).unwrap();
+    let p = path(&dir, "old.rcsb");
+    store::write_store_with_time(&p, &table, 50, Some(0)).unwrap();
+    let schema = registry::write_schema(&p, "2").unwrap();
+    let verify = || rcsr_cmd::rcsr().args(["panel", "schema", "--data", &p, "--verify"]).output().unwrap();
+
+    let current = verify();
+    assert_eq!(current.status.code(), Some(0), "{}", String::from_utf8_lossy(&current.stderr));
+    assert!(!String::from_utf8_lossy(&current.stderr).contains("feature_registry_version"));
+    assert!(registry::registry_age_note(&schema).is_none());
+
+    let body = std::fs::read_to_string(&schema).unwrap();
+    let old = body.replacen("\"feature_registry_version\":2", "\"feature_registry_version\":1", 1);
+    assert_ne!(old, body);
+    std::fs::write(&schema, old).unwrap();
+
+    let out = verify();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(err.contains("feature_registry_version 1, this build has 2"), "{err}");
+    assert_eq!(err.matches("feature_registry_version 1").count(), 1, "{err}");
+
+    let note = registry::registry_age_note(&schema).unwrap();
+    assert!(note.contains("feature_registry_version 1, this build has 2"), "{note}");
+    let vars: Vec<String> = feature_names().into_iter().take(3).collect();
+    assert!(registry::check_vars(&p, &vars).is_ok());
+
+    let keyless = body.replacen("\"feature_registry_version\":2,", "", 1);
+    assert_ne!(keyless, body);
+    std::fs::write(&schema, keyless).unwrap();
+    assert_eq!(registry::recorded_version(&schema), Some(1));
+    assert!(registry::registry_age_note(&schema).is_some());
+}
+
+#[test]
+fn view_columns_do_not_depend_on_the_registry_version() {
+    let sixteen = family_columns(16);
+    for (size, view) in [(24usize, 0usize), (32, 1)] {
+        let old = registry::select_view_versioned(&sixteen, size, 11, view, &[], 1).unwrap();
+        let new = registry::select_view_versioned(&sixteen, size, 11, view, &[], registry::FEATURE_REGISTRY_VERSION).unwrap();
+        assert_eq!(old.columns, new.columns);
+        assert_ne!(old.id, new.id);
+        assert_eq!(new.id, registry::select_view(&sixteen, size, 11, view).unwrap().id);
+    }
 }

@@ -16,7 +16,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 pub const SCHEMA_VERSION: u32 = 1;
-pub const FEATURE_REGISTRY_VERSION: u32 = 1;
+pub const FEATURE_REGISTRY_VERSION: u32 = 2;
 pub const DEFAULT_PANEL_VERSION: &str = "2";
 
 /// Compact 52-feature parity is owned by #269; this module registers and
@@ -604,6 +604,26 @@ pub fn read_hashes(schema_file: &str) -> Result<BTreeMap<String, String>, String
     Ok(out)
 }
 
+/// Version recorded in a schema sidecar header; a sidecar without the key
+/// reads as version 1. None when the file cannot be read.
+pub fn recorded_version(schema_file: &str) -> Option<u32> {
+    const KEY: &str = "\"feature_registry_version\":";
+    let text = std::fs::read_to_string(schema_file).ok()?;
+    let head = text.lines().next()?;
+    let Some(at) = head.find(KEY) else { return Some(1) };
+    head[at + KEY.len()..].split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
+}
+
+/// One stderr line when the sidecar was written by an older registry.
+pub fn registry_age_note(schema_file: &str) -> Option<String> {
+    let v = recorded_version(schema_file)?;
+    (v < FEATURE_REGISTRY_VERSION).then(|| {
+        format!(
+            "warning: {schema_file} was written with feature_registry_version {v}, this build has {FEATURE_REGISTRY_VERSION}; column hashes still verify, registry text (formula, floor) may differ; run `rcsr panel schema --data <store>` to rewrite it"
+        )
+    })
+}
+
 /// Re-hash the store and compare with its schema file. Returns the names whose
 /// hash differs or that are missing from either side.
 pub fn verify_schema(store_path: &str) -> Result<Vec<String>, String> {
@@ -664,6 +684,9 @@ pub fn check_vars(store_path: &str, vars: &[String]) -> Result<(), String> {
     let schema_file = schema_path(store_path);
     if !Path::new(&schema_file).is_file() {
         return Ok(());
+    }
+    if let Some(note) = registry_age_note(&schema_file) {
+        eprintln!("{}", note);
     }
     let known = read_hashes(&schema_file)?;
     for v in vars {
@@ -791,6 +814,19 @@ pub fn select_view_excluding(
     view: usize,
     excluded: &[(String, String)],
 ) -> Result<View, ViewError> {
+    select_view_versioned(columns, size, seed, view, excluded, FEATURE_REGISTRY_VERSION)
+}
+
+/// `select_view_excluding` with the registry version that enters the view id.
+/// The drawn columns never depend on it.
+pub fn select_view_versioned(
+    columns: &[String],
+    size: usize,
+    seed: u64,
+    view: usize,
+    excluded: &[(String, String)],
+    registry_version: u32,
+) -> Result<View, ViewError> {
     check_view_size(size).map_err(ViewError::Invalid)?;
     let mut fams: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for c in columns {
@@ -863,7 +899,7 @@ pub fn select_view_excluding(
         })
         .collect();
     let families: Vec<(String, Vec<String>)> = picked.into_iter().collect();
-    let id_text = format!("{}|{}|{}|{}|{}", FEATURE_REGISTRY_VERSION, seed, view, size, cols.join(","));
+    let id_text = format!("{}|{}|{}|{}|{}", registry_version, seed, view, size, cols.join(","));
     let id = manifest::sha256_hex(id_text.as_bytes())[..12].to_string();
     Ok(View {
         id,
