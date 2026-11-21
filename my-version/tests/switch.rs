@@ -431,3 +431,62 @@ fn switch_force_skips_sweep_budget() {
     assert_eq!(code(&o), 0, "{}", stderr(&o));
 }
 
+
+/// #1248: `stamps` timestamps of three symbols and six columns; only the row
+/// count matters here.
+fn write_long_csv(dir: &Path, stamps: usize) -> String {
+    let mut text = String::from("t,s,x1,g,r,y\n");
+    for k in 0..stamps {
+        for sym in SYMBOLS {
+            let i = k as f64 * 3.0 + (sym.as_bytes()[0] - b'a') as f64;
+            let x1 = frac(i * 0.618_033_988_749_894_9) - 0.5;
+            let g = frac(i * 0.754_877_666_246_692_7) - 0.5;
+            let r = 0.01 * x1 * g.signum();
+            text.push_str(&format!("{},{},{:.4},{:.4},{:.5},{:.5}\n", T0 + STEP * k as i64, sym, x1, g, r, r));
+        }
+    }
+    let path = dir.join("long.csv");
+    std::fs::write(&path, text).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+fn long_switch(data: &str, spec: &str, extra: &[&str]) -> Output {
+    let mut args = vec![
+        "switch", "--data", data, "--target", "y", "--vars", "x1", "--time", "t", "--group-by", "s", "--split", "temporal",
+        "--target-spec", spec, "--objective", "pnl", "--cost-bps", "5", "--validation-frac", "0.02", "--test-frac", "0.02",
+        "--no-dev-log", "--quiet", "--a", "x1", "--b", "0 - x1", "--gate", "g", "--pnl-blocks", "64",
+    ];
+    args.extend_from_slice(extra);
+    rcsr(&args)
+}
+
+/// 21,000 rows, 64 blocks: the table estimate is about 9.0 MiB and the gate
+/// sweep estimate is 12,847,016 bytes (about 12.3 MiB), so this budget passes
+/// the table guard and refuses the sweep.
+const BETWEEN_BUDGET: &str = "11MiB";
+const BETWEEN_STAMPS: usize = 7_000;
+
+#[test]
+fn switch_cli_refuses_a_sweep_over_budget() {
+    let (_scratch, dir) = scratch();
+    let spec = write_spec(&dir);
+    let data = write_long_csv(&dir, BETWEEN_STAMPS);
+    let o = long_switch(&data, &spec, &["--max-memory", BETWEEN_BUDGET]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    let err = stderr(&o);
+    let need = rcsr::switch::gate_sweep_bytes(20_166, 64);
+    for needle in [need.to_string(), (11u64 << 20).to_string(), "64 blocks".to_string(), "--pnl-blocks".to_string()] {
+        assert!(err.contains(&needle), "want '{needle}' in {err}");
+    }
+}
+
+#[test]
+fn switch_cli_force_runs_a_sweep_over_budget() {
+    let (_scratch, dir) = scratch();
+    let spec = write_spec(&dir);
+    let data = write_long_csv(&dir, BETWEEN_STAMPS);
+    let o = long_switch(&data, &spec, &["--max-memory", BETWEEN_BUDGET, "--force", "--json"]);
+    let j = json(&o);
+    assert_eq!(num(&j, &["train_rows"]) as usize, 20_166);
+    assert_eq!(num(&j, &["book", "sweep_bytes"]) as u64, rcsr::switch::gate_sweep_bytes(20_166, 64));
+}
