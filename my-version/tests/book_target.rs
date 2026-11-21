@@ -1121,7 +1121,7 @@ fn ladder_sr_run_plain_unchanged() {
     assert!(json(&o).get("book").is_none());
 }
 
-const PINNED_FIT_LABEL_LADDER: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+const PINNED_FIT_LABEL_LADDER: &str = "2efe5dc3e3a654c0c7c6c4dd226a4ccacd94f80e30b44180f30041fbefe549d5";
 
 fn ablation_score(dir: &std::path::Path, name: &str, data: &str, windows: &str, extra: &[&str]) -> (Output, Option<Json>) {
     let out = dir.join(name).to_string_lossy().into_owned();
@@ -1146,7 +1146,7 @@ fn ablation_score_prices_book_label() {
     let scratch = Scratch::new("ablation_book_label");
     let dir = scratch.path();
     let (data, spec) = (wf_csv(dir), wf_spec(dir));
-    let run = wf_search(dir, &data, &spec, "book-run.json", &["--book-target", "lbl_h24_y"]);
+    let run = wf_search(dir, &data, &spec, "book-run.json", &["--book-target", "lbl_h24_y", "--arm", "A0"]);
     let windows = ladder_windows(dir);
     let r = wf_reference(&data, &run);
     let runs: [&[&str]; 2] = [&["--from-run", &run], &["--run", &run, "--target", "lbl_h168_y"]];
@@ -1170,7 +1170,7 @@ fn ablation_score_book_label_refusals() {
     let scratch = Scratch::new("ablation_book_refusals");
     let dir = scratch.path();
     let (data, spec) = (wf_csv(dir), wf_spec(dir));
-    let run = wf_search(dir, &data, &spec, "book-run.json", &["--book-target", "lbl_h24_y"]);
+    let run = wf_search(dir, &data, &spec, "book-run.json", &["--book-target", "lbl_h24_y", "--arm", "A0"]);
     let windows = ladder_windows(dir);
     let bare = without_book_spec(dir, &run);
     for mode in ["--from-run", "--run"] {
