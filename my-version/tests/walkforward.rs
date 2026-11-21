@@ -2731,7 +2731,7 @@ fn dropped_rows_counts_a_training_row_once_across_candidates() {
     let one = vec![window("w", 0.0, 8.0, 8.0, 10.0)];
 
     // Every candidate is NaN on row 1 only.
-    let all_nan = run(&["sqrt(x + 0.5)", "sqrt(x + 1)", "sqrt(x + 2)"], one.clone());
+    let all_nan = run(&["sqrt(x + 1)", "sqrt(x + 1.5)", "sqrt(x + 2)"], one.clone());
     assert_eq!(all_nan.windows[0].dropped_rows, 1);
     assert_eq!(top_dropped(&all_nan), 1);
 
