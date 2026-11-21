@@ -3214,3 +3214,68 @@ fn walkforward_vote_quorum_warning_stderr() {
     assert!(!String::from_utf8_lossy(&exact.stderr).contains("warning:"));
     assert!(String::from_utf8_lossy(&exact.stdout).contains("\"votes_required\":2"));
 }
+
+/// #1312: two `--from-run` run files edited from one run, the first in `preparation.fill`
+/// (`drop`, `zero`), the second in `target_spec.column` on the same `return_column`. Each edit
+/// changes the rows the #1291 rule prices, so each is another candidate.
+#[test]
+fn candidate_id_binds_run_fill_and_fit_column() {
+    use rcsr::devlog::Json;
+    let dir = Scratch::new("wf-run-rows-binding");
+    let frac = |v: f64| v - v.floor();
+    let mut csv = String::from("t,s,x1,lbl_a_y,lbl_b_y,lbl_fwd\n");
+    for d in 0..200i64 {
+        for (j, sym) in ["a", "b"].iter().enumerate() {
+            let i = (2 * d) as f64 + j as f64;
+            let x1 = frac(i * 0.618_033_988_7) - 0.5;
+            let r = 0.01 * x1 + 0.0005 * (frac(i * 0.324_717_957_2) - 0.5);
+            let b = if d % 5 == 2 { String::new() } else { r.to_string() };
+            csv.push_str(&format!("{},{sym},{x1},{r},{b},{r}\n", 1_609_718_400 + 86_400 * d));
+        }
+    }
+    let data = dir.path().join("d.csv").to_string_lossy().into_owned();
+    std::fs::write(&data, csv).unwrap();
+    let run_text = |column: &str, fill: &str| {
+        format!(
+            r#"{{"tool":"rcsr","variables":["x1"],
+            "target_spec":{{"column":"{column}","name":"lbl_b_y","kind":"forward_return","deprecated":false,
+                "return_column":"lbl_fwd","return_units":"log","horizon_seconds":86400,"entry_offset_seconds":0,
+                "delay_seconds":0,"entry_price":"open","exit_price":"close","offset":0.0,
+                "scale":{{"kind":"constant","value":1.0}},"clip":null,"units":"log_return","cost_bps":10,
+                "cost_in_label":false,"construction_columns":[],"note":null}},
+            "preparation":{{"fill":"{fill}"}},
+            "split":{{"train_time":[1609718400,1612310400],"validation_time":[1612396800,1614988800],"required_purge_seconds":86400,"purge_seconds":86400}},
+            "search":{{"candidates_evaluated":100}},
+            "objective":{{"spec":{{"threshold":0,"per_side_bps":5,"max_position":1,"cash_return":0}},"finalist":{{"expression":"x1"}}}},
+            "pareto":[{{"expression":"x1"}}]}}"#
+        )
+    };
+    let ledger = dir.path().join("ledger.jsonl").to_string_lossy().into_owned();
+    let read = |name: &str, column: &str, fill: &str| -> (String, String) {
+        let run = dir.path().join(name).to_string_lossy().into_owned();
+        std::fs::write(&run, run_text(column, fill)).unwrap();
+        let out = rcsr_cmd::rcsr()
+            .args([
+                "walkforward", "--data", &data, "--time", "t", "--group-by", "s", "--json", "--from-run", &run,
+                "--window", "w,1609718400,1615075200,1615161600,1622505600", "--ledger", &ledger,
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{name}: {}", String::from_utf8_lossy(&out.stderr));
+        let j = Json::parse(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+        let id = j.get("protocol").and_then(|p| p.get("candidate_id")).and_then(Json::as_str).unwrap().to_string();
+        let rows = match j.get("windows") {
+            Some(Json::Arr(w)) => w.iter().map(|w| w.get("test_rows").and_then(Json::as_f64).unwrap().to_string()).collect(),
+            _ => panic!("{name}: no windows"),
+        };
+        (id, rows)
+    };
+    let base = read("drop.json", "lbl_b_y", "drop");
+    let filled = read("zero.json", "lbl_b_y", "zero");
+    let other_label = read("label.json", "lbl_a_y", "drop");
+    assert_ne!(base.1, filled.1, "a filling run prices every finite return");
+    assert_ne!(base.1, other_label.1, "the fit label column picks the rows");
+    assert_ne!(base.0, filled.0, "preparation.fill is bound");
+    assert_ne!(base.0, other_label.0, "target_spec.column is bound");
+    assert_eq!(read("again.json", "lbl_b_y", "drop").0, base.0, "the same run gives the same candidate");
+}
