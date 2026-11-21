@@ -301,6 +301,18 @@ impl GateSweep {
     }
 }
 
+/// #1248: bytes the sweep of `rows` rows and `blocks` blocks allocates, rounded up.
+pub fn gate_sweep_bytes(rows: usize, blocks: usize) -> u64 {
+    let rows = rows as u64;
+    let w = rows + 2;
+    let block_arrays = 2 * blocks as u64 * w * 4;
+    // Per row: rank 8, order 4, keyed 16, valid 1, gate, seam and entry deltas
+    // 3 x 4, nine 4-byte output vectors, net, gross and fitness as f64 with
+    // slack (24 x 2).
+    let per_row = 8 + 4 + 16 + 1 + 3 * 4 + 9 * 4 + 24 * 2;
+    block_arrays + per_row * w
+}
+
 /// #1185: every cut of the composite `if(greater(gate, c), A, B)` in one sort
 /// and one sweep. `a` and `b` are the long rows of the two books, `time` the
 /// row timestamps (it counts distinct entry timestamps and time-level
@@ -308,6 +320,12 @@ impl GateSweep {
 /// or non-plain book, a non-finite time, fewer than 2 distinct non-NaN gate
 /// values.
 pub fn gate_sweep(book: &FitnessBook, a: &[bool], b: &[bool], gate: &[f64], time: &[f64]) -> Result<GateSweep, String> {
+    gate_sweep_within(book, a, b, gate, time, None)
+}
+
+/// [`gate_sweep`] that also errors, before the block arrays, when the sweep
+/// needs more than `limit` bytes.
+pub fn gate_sweep_within(book: &FitnessBook, a: &[bool], b: &[bool], gate: &[f64], time: &[f64], limit: Option<u64>) -> Result<GateSweep, String> {
     check_rows(book, "gate sweep", &[("A positions", a.len()), ("B positions", b.len()), ("gate values", gate.len()), ("times", time.len())])?;
     let n = book.len();
     let (stamps, tix) = stamp_index(time).map_err(|e| format!("gate sweep: {}", e))?;
@@ -320,6 +338,18 @@ pub fn gate_sweep(book: &FitnessBook, a: &[bool], b: &[bool], gate: &[f64], time
             "gate sweep: the gate has {} distinct non-NaN value(s) on the {} rows; a cut needs at least 2",
             distinct, n
         ));
+    }
+    if let Some(limit) = limit {
+        let need = gate_sweep_bytes(n, book.blocks());
+        if need > limit {
+            return Err(format!(
+                "the gate sweep needs an estimated {} bytes for {} rows and {} blocks, above the budget of {} bytes; use fewer --pnl-blocks or a larger --max-memory (--force skips the check)",
+                need,
+                n,
+                book.blocks(),
+                limit
+            ));
+        }
     }
     let mut rank = vec![-1i64; n];
     for (r, &(_, i)) in keyed.iter().enumerate() {
@@ -757,6 +787,12 @@ USAGE:
   k flips. It is a pruning bound, not evidence of an edge. A band, a minimum
   hold, --pnl-mask, --sample-rows and --gpu exit 2.
 
+  The gate sweep holds two i32 arrays of (training rows + 2) x --pnl-blocks
+  entries and several row-length vectors. An estimate above --max-memory (or
+  the detected budget) exits 2 with the estimate; use fewer --pnl-blocks or a
+  larger --max-memory, or pass --force to skip the check. The report shows the
+  estimate (book.sweep_bytes).
+
   --pnl-stat and --pnl-cvar-q set the statistic of the block fitness (book.stat
   and book.cvar_q, omitted under mean-sd). Under --pnl-excess xs-mean (report
   excess: xs_mean) net, gross, fitness, the bound and every gain are on the
@@ -859,6 +895,20 @@ pub struct Context<'a> {
     pub target: &'a str,
     pub per_side_bps: f64,
     pub segments: usize,
+    /// The memory budget in bytes; `None` is unlimited.
+    pub budget: Option<u64>,
+    /// `--force`: the sweep is not checked against the budget.
+    pub force: bool,
+}
+
+impl Context<'_> {
+    fn sweep_limit(&self) -> Option<u64> {
+        if self.force {
+            None
+        } else {
+            self.budget
+        }
+    }
 }
 
 fn eval_branch(branch: &Branch, columns: &[String], values: &[Vec<f64>], threshold: f64, n: usize) -> (Vec<bool>, usize) {
@@ -1022,6 +1072,7 @@ pub fn report(req: &Request, book: &FitnessBook, slice: &TradingSlice, values: &
         ctx.per_side_bps,
         threshold
     );
+    text_out.push_str(&format!("gate sweep memory: an estimated {} bytes\n", gate_sweep_bytes(n, book.blocks())));
     // #1232: the fitness flags, named only when they are not the default.
     let excess = book.excess_mode();
     let stat = book.stat();
@@ -1056,7 +1107,7 @@ pub fn report(req: &Request, book: &FitnessBook, slice: &TradingSlice, values: &
     let mut gates_json: Vec<String> = Vec::new();
     for gate in &req.gates {
         let g = eval_expr(gate, &columns, values, n);
-        let sw = gate_sweep(book, &a, &b, &g, time).map_err(|e| format!("--gate '{}': {}", gate.source, e))?;
+        let sw = gate_sweep_within(book, &a, &b, &g, time, ctx.sweep_limit()).map_err(|e| format!("--gate '{}': {}", gate.source, e))?;
         let best = sw.best().ok_or_else(|| format!("--gate '{}': no valid inner cut", gate.source))?;
         let grid = sw.grid(req.cuts);
         let grid_best = sw.best_of(grid.iter().copied());
@@ -1140,7 +1191,7 @@ pub fn report(req: &Request, book: &FitnessBook, slice: &TradingSlice, values: &
     }
     let json = format!(
         "{{\"schema\":\"rcsr-switch/1\",\"rows\":\"train\"{},\"target\":{},\"train_rows\":{},\"groups\":{},\"timestamps\":{},\"time_first\":{},\"time_last\":{},\
-         \"book\":{{\"per_side_bps\":{},\"threshold\":{},\"blocks\":{},\"lambda\":{},\"min_trades\":{},\"segments\":{}{}}},{},{},\
+         \"book\":{{\"per_side_bps\":{},\"threshold\":{},\"blocks\":{},\"lambda\":{},\"min_trades\":{},\"segments\":{}{},\"sweep_bytes\":{}}},{},{},\
          \"bound\":{{\"label\":\"pruning_bound\",\"is_evidence\":false,\"applies_to\":\"time-level gates\",\"exact\":{},\"gap_pairs\":{},\"timestamps\":{},\"reference\":{},\"free\":{},\"free_gain\":{},\"k\":[{}]}},\
          \"gates\":[{}]}}",
         excess_json,
@@ -1157,6 +1208,7 @@ pub fn report(req: &Request, book: &FitnessBook, slice: &TradingSlice, values: &
         book.min_trades(),
         ctx.segments,
         stat_json,
+        gate_sweep_bytes(n, book.blocks()),
         side_json("a", &req.a, &ta, a_nonfinite),
         side_json("b", &req.b, &tb, b_nonfinite),
         bound.gap_pairs == 0,
@@ -1435,6 +1487,41 @@ mod tests {
         let masked = FitnessBook::with_segments(&p.slice, &spec(5.0), 0.0, 1, 1.0, &[], Some(BookMask { on: &on, identity: "m" })).unwrap();
         assert!(gate_sweep(&masked, &a, &b, &g, time).unwrap_err().contains("mask"));
         assert!(switch_bound(&bk, &a, &b[1..], time, 2).unwrap_err().contains("length"));
+    }
+
+    #[test]
+    fn gate_sweep_bytes_counts_the_block_arrays() {
+        assert!(gate_sweep_bytes(4_400_000, 64) >= 2_252_800_000);
+        let one = gate_sweep_bytes(1000, 1);
+        let two = gate_sweep_bytes(1000, 2);
+        assert_eq!(two - one, 2 * 1002 * 4);
+        assert!(one > 1000 * (8 + 4 + 16 + 1));
+    }
+
+    /// #1248: the budget refuses before the block arrays, after the distinct
+    /// value check, and `--force` (no limit) runs the sweep.
+    #[test]
+    fn switch_refuses_over_budget() {
+        let mut rng = Mix(1248);
+        let p = panel(&mut rng, 3, 100, 0.0);
+        let bk = book(&p, 8, &[], 5.0);
+        let n = bk.len();
+        let (a, b) = (persistent(&mut rng, n, 0.9), persistent(&mut rng, n, 0.9));
+        let time = &p.slice.rows.time;
+        let g = gate_of(&mut rng, &p, 0);
+        let need = gate_sweep_bytes(n, 8);
+        let err = gate_sweep_within(&bk, &a, &b, &g, time, Some(need - 1)).err().expect("refused");
+        for needle in [need.to_string(), (need - 1).to_string(), "8 blocks".to_string(), "--pnl-blocks".to_string()] {
+            assert!(err.contains(&needle), "want '{needle}' in {err}");
+        }
+        assert!(gate_sweep_within(&bk, &a, &b, &g, time, Some(need)).is_ok());
+        assert!(gate_sweep_within(&bk, &a, &b, &g, time, None).is_ok());
+        let flat = vec![2.0; n];
+        assert!(gate_sweep_within(&bk, &a, &b, &flat, time, Some(0)).unwrap_err().contains("1 distinct"));
+        let ctx = |budget, force| Context { target: "y", per_side_bps: 5.0, segments: 1, budget, force };
+        assert_eq!(ctx(Some(7), false).sweep_limit(), Some(7));
+        assert_eq!(ctx(Some(7), true).sweep_limit(), None);
+        assert_eq!(ctx(None, false).sweep_limit(), None);
     }
 
     #[test]
