@@ -804,11 +804,13 @@ impl Drop for Faults {
 }
 
 /// #1089: run `cfg` with the fault `site` armed. The fault fires in the
-/// generation that the checkpoints with `generations <= 2` precede. Every
-/// finite error of a checkpoint with `generations >= 3` must be the exact CPU
-/// score of its tree, except a member carried unchanged from an earlier
-/// checkpoint (a device score of its own tree). A screening error of an
-/// unfitted tree, or a merged device score, is not within 1e-9 of it.
+/// generation that the checkpoints with `generations <= 2` precede. In every
+/// checkpoint with `generations >= 3`, a member not carried unchanged from an
+/// earlier checkpoint (same tree, same error bits) must hold the exact CPU
+/// score of its tree: a finite error within 1e-9 relative, a non-finite error
+/// only where that score is non-finite. A screening error of an unfitted tree,
+/// or a merged device score, fails the check. At `generations == 3` only the
+/// elite of each island is carried.
 #[cfg(feature = "cuda")]
 fn assert_no_device_score_after(site: &str, cfg: &search::Config) {
     if !rcsr::backend::probe().available() {
@@ -819,17 +821,22 @@ fn assert_no_device_score_after(site: &str, cfg: &search::Config) {
     let test = sample(96);
     let faults = Faults::arm(site);
     let mut seen = std::collections::HashSet::new();
-    let mut checked_at_three = 0usize;
     let mut worst = 0.0f64;
+    let mut wrong_inf = 0usize;
+    // (generations, members, carried, finite, non-finite)
+    let mut rows: Vec<(usize, usize, usize, usize, usize)> = Vec::new();
     let out = search::run_resumable(cfg, &train, &test, None, 1, |cp| {
+        let mut row = (cp.generations, 0, 0, 0, 0);
         for island in &cp.islands {
             for ind in &island.population {
+                row.1 += 1;
                 let key = (expr::structural_hash(&ind.tree), ind.error.to_bits());
                 if cp.generations <= 2 {
                     seen.insert(key);
                     continue;
                 }
-                if cp.generations < 3 || !ind.error.is_finite() || seen.contains(&key) {
+                if seen.contains(&key) {
+                    row.2 += 1;
                     continue;
                 }
                 let exact = train
@@ -839,22 +846,29 @@ fn assert_no_device_score_after(site: &str, cfg: &search::Config) {
                     .map(|(x, y)| (expr::eval(&ind.tree, x) - y).powi(2))
                     .sum::<f64>()
                     / train.y.len() as f64;
-                worst = worst.max((ind.error - exact).abs() / exact.max(1e-300));
-                if cp.generations == 3 {
-                    checked_at_three += 1;
+                if ind.error.is_finite() {
+                    row.3 += 1;
+                    worst = worst.max((ind.error - exact).abs() / exact.max(1e-300));
+                } else {
+                    row.4 += 1;
+                    wrong_inf += usize::from(exact.is_finite());
                 }
             }
         }
+        rows.push(row);
     })
     .expect("the run completes on the CPU after the device failure");
     drop(faults);
     let reason = out.backend_reason.expect("the run records why the device stopped");
     assert!(reason.contains(rcsr::gpu::INJECTED_REFUSAL), "{reason}");
+    let at_three = rows.iter().find(|r| r.0 == 3).copied().expect("a checkpoint at generation 3");
+    let checked = at_three.3 + at_three.4;
     assert!(
-        checked_at_three + 1 >= cfg.pop * cfg.islands,
-        "only {checked_at_three} members were checked at generation 3"
+        checked + cfg.islands >= cfg.pop * cfg.islands,
+        "only {checked} members were checked at generation 3; (generations, members, carried, finite, non-finite): {rows:?}"
     );
-    assert!(worst < 1e-9, "a population error is not the CPU score of its tree: relative gap {worst}");
+    assert_eq!(wrong_inf, 0, "a non-finite error on a tree with a finite CPU score: {rows:?}");
+    assert!(worst < 1e-9, "a population error is not the CPU score of its tree: relative gap {worst}; {rows:?}");
 }
 
 /// #1089: narrow admission, the re-score after the fit fails.
