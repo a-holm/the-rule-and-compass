@@ -779,6 +779,123 @@ fn gpu_run_ledger_books_checkpoint_io_and_uses_event_intervals() {
     assert!((0.0..=1.0).contains(&l.duty_run().value));
 }
 
+/// #1089, #456: a test that arms a fault holds the write side; the fault list is
+/// process-wide.
+#[cfg(feature = "cuda")]
+static FAULTS: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+#[cfg(feature = "cuda")]
+struct Faults(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+
+#[cfg(feature = "cuda")]
+impl Faults {
+    fn arm(sites: &str) -> Self {
+        let guard = FAULTS.write().unwrap_or_else(|e| e.into_inner());
+        rcsr::gpu::set_injected_faults_for_tests(sites);
+        Faults(guard)
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for Faults {
+    fn drop(&mut self) {
+        rcsr::gpu::set_injected_faults_for_tests("");
+    }
+}
+
+/// #1089: run `cfg` with the fault `site` armed. The fault fires in the
+/// generation that the checkpoints with `generations <= 2` precede. In every
+/// checkpoint with `generations >= 3`, a member not carried unchanged from an
+/// earlier checkpoint (same tree, same error bits) must hold the exact CPU
+/// score of its tree: a finite error within 1e-9 relative, a non-finite error
+/// only where that score is non-finite. A screening error of an unfitted tree,
+/// or a merged device score, fails the check. At `generations == 3` only the
+/// elite of each island is carried.
+#[cfg(feature = "cuda")]
+fn assert_no_device_score_after(site: &str, cfg: &search::Config) {
+    if !rcsr::backend::probe().available() {
+        rcsr::backend::skip_without_device("skipping: no usable CUDA device");
+        return;
+    }
+    let train = sample(96);
+    let test = sample(96);
+    let faults = Faults::arm(site);
+    let mut seen = std::collections::HashSet::new();
+    let mut worst = 0.0f64;
+    let mut wrong_inf = 0usize;
+    // (generations, members, carried, finite, non-finite)
+    let mut rows: Vec<(usize, usize, usize, usize, usize)> = Vec::new();
+    let out = search::run_resumable(cfg, &train, &test, None, 1, |cp| {
+        let mut row = (cp.generations, 0, 0, 0, 0);
+        for island in &cp.islands {
+            for ind in &island.population {
+                row.1 += 1;
+                let key = (expr::structural_hash(&ind.tree), ind.error.to_bits());
+                if cp.generations <= 2 {
+                    seen.insert(key);
+                    continue;
+                }
+                if seen.contains(&key) {
+                    row.2 += 1;
+                    continue;
+                }
+                let exact = train
+                    .x
+                    .iter()
+                    .zip(&train.y)
+                    .map(|(x, y)| (expr::eval(&ind.tree, x) - y).powi(2))
+                    .sum::<f64>()
+                    / train.y.len() as f64;
+                if ind.error.is_finite() {
+                    row.3 += 1;
+                    worst = worst.max((ind.error - exact).abs() / exact.max(1e-300));
+                } else {
+                    row.4 += 1;
+                    wrong_inf += usize::from(exact.is_finite());
+                }
+            }
+        }
+        rows.push(row);
+    })
+    .expect("the run completes on the CPU after the device failure");
+    drop(faults);
+    let reason = out.backend_reason.expect("the run records why the device stopped");
+    assert!(reason.contains(rcsr::gpu::INJECTED_REFUSAL), "{reason}");
+    let at_three = rows.iter().find(|r| r.0 == 3).copied().expect("a checkpoint at generation 3");
+    let checked = at_three.3 + at_three.4;
+    let need = cfg.pop * cfg.islands - cfg.islands;
+    assert!(
+        checked >= need && wrong_inf == 0 && worst < 1e-9,
+        "{checked} members checked at generation 3 (need {need}); {wrong_inf} non-finite errors on a tree with a \
+         finite CPU score (need 0); worst relative gap to the CPU score {worst} (need < 1e-9); \
+         (generations, members, carried, finite, non-finite): {rows:?}"
+    );
+}
+
+/// #1089: narrow admission, the re-score after the fit fails.
+#[cfg(feature = "cuda")]
+#[test]
+fn a_failed_rescore_leaves_no_screening_error() {
+    let mut cfg = config(41, true);
+    cfg.generations = 5;
+    cfg.pop = 40;
+    cfg.fit_strategy = rcsr::fit::FitStrategy::Gpu;
+    assert_no_device_score_after("rescore", &cfg);
+}
+
+/// #1089: the overlap pipeline's device fit fails.
+#[cfg(feature = "cuda")]
+#[test]
+fn a_failed_pipeline_fit_scores_the_generation_on_the_cpu() {
+    let mut cfg = config(43, true);
+    cfg.generations = 5;
+    cfg.pop = 40;
+    cfg.fit_strategy = rcsr::fit::FitStrategy::Gpu;
+    cfg.fit_admission = rcsr::fit::FitAdmission::All;
+    cfg.pipeline_depth = 2;
+    assert_no_device_score_after("pipeline_fit", &cfg);
+}
+
 /// #1079: `--adaptive-mix` learns from device-scored generations at the
 /// generation barrier: every island saves a full window with attempts in each
 /// generation, and a repeat run gives the same archive.
