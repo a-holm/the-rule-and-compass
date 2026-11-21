@@ -2154,7 +2154,7 @@ mod fitted_cut {
         assert_eq!(all, PINNED_DEFAULT_REPORTS, "{}", got.join("\n"));
     }
 
-    const PINNED_DEFAULT_REPORTS: &str = "b613101aacb8980c0938816d6c8b12f69fdb034752a926307f758ba1e9bbfd9f";
+    const PINNED_DEFAULT_REPORTS: &str = "8787d8d593136de9ee2fe5eb3e36541f0596abbe67fa57764fd1eb957c54de47";
 }
 
 #[test]
