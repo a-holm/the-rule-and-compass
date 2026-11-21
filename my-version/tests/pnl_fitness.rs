@@ -3580,8 +3580,10 @@ fn every_book_input_changes_the_hash() {
         assert!(!input.flags.is_empty(), "{}", input.id);
     }
     let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/trading.rs")).unwrap();
-    let hashed = source.lines().filter(|l| l.contains("fnv_u64(&mut hash") || l.contains("fnv_u64(&mut self.hash")).count();
-    assert_eq!(hashed, 25, "the hash inputs changed: update BOOK_INPUTS, hash_with_input_changed and this count");
+    // `with_layer` joins the hash of a gate-search book, which has no checkpoint and no --resume.
+    let book_source = &source[..source.find("pub fn with_layer").unwrap()];
+    let hashed = book_source.lines().filter(|l| l.contains("fnv_u64(&mut hash") || l.contains("fnv_u64(&mut self.hash")).count();
+    assert_eq!(hashed, 23, "the hash inputs changed: update BOOK_INPUTS, hash_with_input_changed and this count");
 }
 
 /// Every flag of the table is a flag of `rcsr --help`.
