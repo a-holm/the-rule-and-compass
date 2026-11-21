@@ -845,7 +845,7 @@ fn load_occam(paths: &[String]) -> Res<Vec<OccamRun>> {
 }
 
 /// The `occam` cell of a row: the run whose sha256 (or `reselected_from.sha256`) is the report's
-/// run sha256, its pareto member of the row's archive rank (else of the row's expression, else the finalist of a `--from-run` report).
+/// run sha256, its pareto member of the row's archive rank (else of the row's expression, a `--from-run` report: the run finalist first, its expression only when the run has no matching finalist).
 fn occam_cell(e: &Entry, runs: &[OccamRun]) -> String {
     let Some(sha) = &e.run_sha256 else { return "null".to_string() };
     for run in runs.iter().filter(|r| &r.sha256 == sha || r.from.as_ref() == Some(sha)) {
@@ -853,13 +853,11 @@ fn occam_cell(e: &Entry, runs: &[OccamRun]) -> String {
         // run's own `archive_rank` field names the finalist of `objective.finalist`.
         let by_position = |rank: f64| run.pareto.get((rank as usize).wrapping_sub(1)).filter(|_| rank >= 1.0 && rank.fract() == 0.0);
         let by_field = |rank: f64| run.pareto.iter().find(|m| num_at(m, &["archive_rank"]) == Some(rank));
+        let by_expression = || run.pareto.iter().find(|m| m.get("expression").and_then(Json::as_str) == e.expression.as_deref());
         let member = match e.archive_rank {
             Some(rank) => by_position(rank),
-            None => run
-                .pareto
-                .iter()
-                .find(|m| m.get("expression").and_then(Json::as_str) == e.expression.as_deref())
-                .or_else(|| if e.from_run { run.finalist_rank.and_then(by_field) } else { None }),
+            None if e.from_run => run.finalist_rank.and_then(by_field).or_else(by_expression),
+            None => by_expression(),
         };
         let Some(m) = member else { continue };
         let (bits, p, budget, source) = match m.get("occam") {
