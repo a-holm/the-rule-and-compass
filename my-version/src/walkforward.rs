@@ -2575,7 +2575,8 @@ impl Accum {
         let want_strata = opts.regimes.is_some() || !opts.regime_exprs.is_empty() || opts.period_series || emit_series;
         let mut strata_in = StrataIn::new(opts.regime_exprs.len());
         let mut entry_times = 0usize;
-        let validated = self.windows.iter().all(|d| d.validation_start.is_some());
+        let validated_windows = self.windows.iter().filter(|d| d.validation_start.is_some()).count();
+        let window_count = self.windows.len();
         for (window_index, mut d) in self.windows.into_iter().enumerate() {
             // #1199: the target grid, its period width and the rows that define it come from the rows before the gate.
             let grid_source = target_grid.then(|| {
@@ -3077,8 +3078,10 @@ impl Accum {
         };
         let selected_on = if vote {
             "none (all members vote; thresholds from validation or train rows)".to_string()
-        } else if expressions.len() > 1 && !validated {
+        } else if expressions.len() > 1 && validated_windows == 0 && window_count > 0 {
             "none (--all-members without a validation slice: the report book of every window is the first front member)".to_string()
+        } else if expressions.len() > 1 && validated_windows < window_count {
+            format!("validation ({validated_windows} of {window_count} windows); first front member where no validation slice")
         } else if expressions.len() > 1 {
             "validation".to_string()
         } else if spec.validation_frac > 0.0 {
