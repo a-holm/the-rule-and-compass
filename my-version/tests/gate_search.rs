@@ -611,3 +611,73 @@ fn gate_search_output_is_identical_at_one_and_four_threads() {
     let strip = |o: &Output| String::from_utf8_lossy(&o.stdout).replace("--threads 1", "--threads N").replace("--threads 4", "--threads N").replace("\"threads\":1", "\"threads\":N").replace("\"threads\":4", "\"threads\":N");
     assert_eq!(strip(&one), strip(&four));
 }
+
+const DAY: i64 = 24 * HOUR;
+
+/// The rows of symbol `sym` of the CSV `data`, written beside it.
+fn symbol_csv(data: &str, sym: &str) -> String {
+    let text = std::fs::read_to_string(data).unwrap();
+    let mut lines = text.lines();
+    let mut out = format!("{}\n", lines.next().unwrap());
+    for line in lines.filter(|l| l.split(',').nth(1) == Some(sym)) {
+        out.push_str(line);
+        out.push('\n');
+    }
+    let path = format!("{data}.{sym}.csv");
+    std::fs::write(&path, out).unwrap();
+    path
+}
+
+/// Window 0 of `walkforward --from-run run` on `data` with `window`.
+fn walk_window(data: &str, run: &str, window: &str) -> Json {
+    let args = ["walkforward", "--data", data, "--target", "y", "--time", "t", "--group-by", "s", "--from-run", run, "--window", window, "--allow-in-sample-windows", "--json"];
+    let report = json(&rcsr(&args));
+    assert_eq!(s(&report, &["gate", "source"]), "objective.finalist.switch");
+    match at(&report, &["windows"]) {
+        Json::Arr(a) => a[0].clone(),
+        _ => panic!("windows is not an array"),
+    }
+}
+
+/// #1279: `walkforward --from-run` of a gate-search run on a stride-24 label prices the run's
+/// validation and test books. The two-symbol window gives rows, trades and entries; the net is the
+/// sum of the windows of each symbol alone, because a period return is the mean over the rows
+/// priced at its stamp and the two symbols' gates differ.
+#[test]
+fn strided_gate_search_walkforward_reproduces_objective_validation_and_test() {
+    let scratch = Scratch::new("gate-search-strided-wf");
+    let dir = scratch.path().to_path_buf();
+    let data = strided_csv(&dir);
+    let spec = daily_spec(&dir);
+    let run = dir.join("run.json").to_string_lossy().into_owned();
+    let j = json(&strided_gate_search(&data, &spec, &["--out", run.as_str()]));
+    let sw = at(&j, &["objective", "finalist", "switch"]);
+    assert_eq!(num(sw, &["gate", "dwell"]), 24.0);
+    let one = [symbol_csv(&data, "a"), symbol_csv(&data, "b")];
+    let vt = arr(&j, &["split", "validation_time"]);
+    let (vlo, vhi) = (num(&vt[0], &[]) as i64, num(&vt[1], &[]) as i64);
+    // The test rows are the last test_rows / 2 labelled stamps of each symbol.
+    let test_start = T0 + DAY * (STRIDED_DAYS as i64 - num(&j, &["test_rows"]) as i64 / 2);
+    let test_end = T0 + DAY * STRIDED_DAYS as i64;
+    // A training range that ends two days before the block.
+    let windows = [
+        ("validation", format!("v,{T0},{},{vlo},{}", vlo - 2 * DAY, vhi + 1)),
+        ("test", format!("t,{T0},{},{test_start},{test_end}", test_start - 2 * DAY)),
+    ];
+    for (slot, window) in windows {
+        let want = at(&j, &["objective", slot]);
+        assert!(num(want, &["trades"]) > 0.0 && num(want, &["entries"]) > 0.0, "{slot}: the book must trade");
+        let m = at(&walk_window(&data, &run, &window), &["metrics"]).clone();
+        for key in ["rows", "trades", "entries"] {
+            assert_eq!(num(&m, &[key]), num(want, &[key]), "{slot} {key}");
+        }
+        let net: f64 = one
+            .iter()
+            .map(|d| {
+                let m = at(&walk_window(d, &run, &window), &["metrics"]).clone();
+                if num(&m, &["rows"]) == 0.0 { 0.0 } else { num(&m, &["mean_return"]) * num(&m, &["periods"]) }
+            })
+            .sum();
+        assert!((net - num(want, &["net_pnl"])).abs() <= 1e-12, "{slot}: walkforward net {net} vs objective {}", num(want, &["net_pnl"]));
+    }
+}
