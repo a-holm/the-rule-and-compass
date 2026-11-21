@@ -69,8 +69,9 @@ Campaign (--wf):\n\
   --wf <files...>        walk-forward --json reports with identical windows, cost, threshold rule (threshold.quantile, threshold.fixed,\n\
                          threshold.fit, threshold.cut_min_entries, threshold.cut_blocks, threshold.cut_lambda), policy\n\
                          and period grid (pooled.grid.rule, absent for the score grid, and pooled.period_time) and missing-score\n\
-                         rule (book.missing_score, absent in a report of a build that carried the position)\n\
-  --members <mode>       selected (default): one series per report, pooled.period_net; all: one series per\n\
+                         rule (book.missing_score, absent in a report of a build that carried the position); a report\n\
+                         with null_store (priced on a null store) exits 2 naming its label and seed (#1304)\n\
+  --members <mode>      selected (default): one series per report, pooled.period_net; all: one series per\n\
                          members[] row of a walkforward --front --all-members report (members[].series), named\n\
                          <report>#<archive_rank>; a report without members exits 2\n\
   --baseline <file>      rcsr ladder --emit-series report; the best of cash, buy_and_hold, constant_long_flat,\n\
@@ -126,7 +127,8 @@ counts the sibling horizon tables. Output rcsr-trials-table/1.\n\
   --cost-multiples <m,..> net<bps> metrics at m x cost_model.per_side_bps (default 1,2: net10 and net20 at 10 bp)\n\
   --null-wf <files...>   null walk-forward reports; null_q = share of their annual Sharpes below the row's. A report\n\
                          priced on a null store (null_store, rcsr panel permute-labels, #1272) is read only here: as\n\
-                         --wf, --baseline-wf or a freeze population path it exits 2\n\
+                         --wf (with or without --table, also with --members all), in --compare, as a --baseline-wf\n\
+                         rung or as a freeze population path it exits 2 (#1304)\n\
   --prior-trials <N0>    add N0 earlier trials to the nominal N of the picked rows' DSR\n\
   --family-table <files...> rcsr trials --table outputs of the sibling horizons over the same development span\n\
                          (#1269, repeatable). DSR, DSR 10 N_eff and MinBTL use N_eff plus each sibling's own\n\
@@ -270,8 +272,10 @@ pub(crate) fn read_report(path: &str) -> Res<Json> {
     Json::parse(text.trim()).map_or_else(|| input_err(format!("{}: not a JSON report", path)), Ok)
 }
 
+/// #1304: a report priced on a null store is never a campaign or comparison series.
 fn load_wf(path: &str) -> Res<Wf> {
     let j = read_report(path)?;
+    crate::trials_table::refuse_null_store(&j, path)?;
     wf_entry(&j, &j, "pooled", path, label_of(path))
 }
 
@@ -279,6 +283,7 @@ fn load_wf(path: &str) -> Res<Wf> {
 /// labelled `<report>#<archive_rank>`, with the series of `members[].series`.
 fn load_members(path: &str) -> Res<Vec<Wf>> {
     let j = read_report(path)?;
+    crate::trials_table::refuse_null_store(&j, path)?;
     let Some(Json::Arr(members)) = j.get("members") else {
         return usage_err(format!(
             "field 'members' is missing in {} (write the report with walkforward --front --all-members, or read it with --members selected)",

@@ -541,7 +541,7 @@ A pooled mean hides regimes. Report the strategy per regime with `rcsr walkforwa
 
 * The default dating is ex-post: it uses the whole range, so it labels the past with later closes. It is a reporting tool, never a feature.
 * `--mode causal` dates a day from closes at or before it. A planted look-ahead test pins this.
-* Rows of a locked range (purge before, embargo after) are dropped before their price is parsed and written as `not_dated`. Dating the sealed range needs `--after-read` with `--ledger`, `--sealed` and `--expect-reads`: the ledger must hold every read the final seal allows. The ledger records a `regime_dating` event with the calendar hash.
+* Rows of a locked range (purge before, embargo after) are dropped before their price is parsed and written as `not_dated`. Dating the sealed range needs `--after-read` with `--ledger`, `--sealed` and `--expect-reads`: the ledger must hold every read the final seal allows. The ledger records a `regime_dating` event with the calendar hash. A null store (`rcsr panel permute-labels`) with `--after-read` exits 2 before the ledger is read (#1304).
 * Any label set works as a calendar: rows `label,start,end`, UTC half-open, no overlap.
 * An always-long book has zero alpha against the equal-weight benchmark in every stratum. A positive alpha in one stratum and a negative one in another is the result to read, not the pooled mean.
 
