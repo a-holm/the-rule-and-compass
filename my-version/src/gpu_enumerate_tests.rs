@@ -52,25 +52,28 @@ impl Rng {
 /// 3 x 8,192 + 77 rows in five groups. x1 is noise with a tail where
 /// `exp(exp(x1))` overflows in f32; x2 takes three values, 0 among them, so
 /// `div(_, x2)` is not finite and trees of x2 alone have fewer than 16
-/// distinct values; x3 holds one value, so its trees are constant.
+/// distinct values; x3 takes five neighbouring f32 values, so its midpoint cuts
+/// lie halfway between neighbouring f32 values, where an f32 comparison
+/// differs from the f64 one; x4 holds one value, so its trees are constant.
 fn panel() -> (Vec<Vec<f64>>, TradingSlice) {
     let sizes = [6_000usize, 5_000, 7_000, 3_653, 3_000];
     let n: usize = sizes.iter().sum();
     let mut rng = Rng(1258);
-    let (mut x1, mut x2, x3) = (vec![0.0f64; n], vec![0.0f64; n], vec![1.5f64; n]);
+    let (mut x1, mut x2, mut x3, x4) = (vec![0.0f64; n], vec![0.0f64; n], vec![0.0f64; n], vec![1.5f64; n]);
     let (mut time, mut group, mut ret) = (Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n));
     let mut i = 0usize;
     for (g, &len) in sizes.iter().enumerate() {
         for k in 0..len {
             x1[i] = if i % 997 == 0 { 6.0 + (i % 5) as f64 } else { rng.gauss() };
             x2[i] = [-1.0, 0.0, 2.0][(i * 7 + i / 13) % 3];
+            x3[i] = f32::from_bits(1.5f32.to_bits() + ((i * 11) % 5) as u32) as f64;
             time.push(3600.0 * k as f64);
             group.push(g as u64);
             ret.push(0.004 * rng.gauss() + if x1[i] > x2[i] { 0.001 } else { -0.001 });
             i += 1;
         }
     }
-    (vec![x1, x2, x3], TradingSlice { rows: TradingRows { time, group, funding: Vec::new() }, ret })
+    (vec![x1, x2, x3, x4], TradingSlice { rows: TradingRows { time, group, funding: Vec::new() }, ret })
 }
 
 /// The observed book and `count - 1` shifted copies.
@@ -128,9 +131,10 @@ fn device_enumerate_totals_equal_the_cpu_book() {
     let (cols, slice) = panel();
     let n = slice.ret.len();
     assert_eq!(n, 3 * 8_192 + 77);
-    let class = Class::build(3, &ops(OPS10), 3, true).unwrap();
+    let class = Class::build(4, &ops(OPS10), 3, true).unwrap();
+    assert_eq!(class.scored().len(), 76);
     let nodes: Vec<crate::expr::Node> = class.scored().iter().map(|&e| class.node(e as usize)).collect();
-    let names: Vec<String> = ["x1", "x2", "x3"].iter().map(|s| s.to_string()).collect();
+    let names: Vec<String> = ["x1", "x2", "x3", "x4"].iter().map(|s| s.to_string()).collect();
     let cuts_list: &[usize] = if sanitized() { &[2, 16] } else { &[2, 16, 64] };
     let batch = if sanitized() { 8 } else { 64 };
     let (mut compared, mut host, mut constant, mut nonfinite) = (0usize, 0usize, 0usize, 0usize);
