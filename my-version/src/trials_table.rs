@@ -705,7 +705,7 @@ struct WfBaseline {
 }
 
 /// Rungs: `cash` (zeros), `buy_and_hold` (`pooled.period_bh_net` of the first report) and one per report, named by
-/// its `label` or file stem (`<directory>/<stem>` when two stems agree). Reports share the table's period grid and
+/// its `label` or file stem (`<directory>/<name>` for each report whose name agrees with another). Reports share the table's period grid and
 /// per-side cost; policy, band and hold may differ.
 fn load_baseline_wf(paths: &[String], time: &[f64], bps: Option<f64>, locked: &[(f64, f64)]) -> Res<WfBaseline> {
     struct Rung {
