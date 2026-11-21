@@ -7823,6 +7823,21 @@ fn cross_columns_json(carried: &[(String, usize)]) -> String {
     format!("  \"cross_columns\":[{}],\n", items.join(","))
 }
 
+/// `<out>.schema.json` describes the store that was at `out` before this run. Keep it as `<out>.schema.json.prev`, the
+/// way `<out>.enrich.json` keeps its previous generation, so no schema outlives the columns it hashes and no floor
+/// is read from it (#1274). `rcsr panel schema` writes the schema of the new store.
+fn retire_stale_schema(out: &str) {
+    let schema = crate::registry::schema_path(out);
+    if !Path::new(&schema).exists() {
+        return;
+    }
+    let prev = format!("{}.prev", schema);
+    let _ = std::fs::remove_file(&prev);
+    if let Err(e) = std::fs::rename(&schema, &prev) {
+        eprintln!("warning: could not retire {}: {}", schema, e);
+    }
+}
+
 /// Run an enrichment into a temporary output file.
 fn enrich(opts: &Options) -> Result<Report, String> {
     let started = Instant::now();
@@ -9863,6 +9878,7 @@ pub fn run(args: &[String]) -> ! {
     };
     if !opts.dry_run {
         if let Some(out) = &opts.out {
+            retire_stale_schema(out);
             let sidecar = format!("{}.enrich.json", out);
             let mut text = report.json();
             if let Some(lb) = opts.locked_test {

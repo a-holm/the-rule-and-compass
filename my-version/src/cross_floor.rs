@@ -148,11 +148,48 @@ pub fn recorded_floor(store_path: &str) -> Option<CrossFloor> {
     Some(CrossFloor { members: int_after(obj, "members")?, rank_members: int_after(obj, "rank_members")? })
 }
 
+/// SHA-256 of column `name` over every group, as `<store>.schema.json` records it; `None` when the store has no
+/// numeric column of that name.
+fn column_sha256(store_path: &str, name: &str) -> Option<String> {
+    let store = crate::store::FileStore::open(store_path).ok()?;
+    let c = store.header().column_index(name)?;
+    if store.header().dtypes()[c] != crate::store::DType::F64 {
+        return None;
+    }
+    let mut hasher = crate::manifest::Sha256Hasher::new();
+    let mut bytes: Vec<u8> = Vec::new();
+    for g in 0..store.header().n_groups() {
+        bytes.clear();
+        for v in store.read_f64_group(g, c).ok()? {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        hasher.update(&bytes);
+    }
+    Some(hasher.finalize())
+}
+
 /// The one resolver of a cross column's floor, used by `enrich` and by `panel append` and the schema writers: its
-/// per-column record in `<store>.schema.json`, else in `<store>.enrich.json` (which also lists the columns a run
-/// carried over as `cross_columns`), else the top-level `cross_floor` of `<store>.enrich.json`, else 20.
+/// record in `<store>.schema.json`, else in `<store>.enrich.json` (the per-column `min_members`, or `cross_columns`
+/// for the columns a run carried over), else the top-level `cross_floor` of `<store>.enrich.json`, else 20. A
+/// schema record counts only while its `sha256` equals the hash of the column's current data: a store rebuilt
+/// under an old schema file falls through to the next source.
 pub fn resolved_columns(store_path: &str, names: &[String]) -> BTreeMap<String, usize> {
-    let mut out = recorded_columns(store_path);
+    let mut out = BTreeMap::new();
+    if let Ok(text) = std::fs::read_to_string(format!("{}.enrich.json", store_path)) {
+        out.extend(column_floors(&text));
+    }
+    if let Ok(text) = std::fs::read_to_string(format!("{}.schema.json", store_path)) {
+        for line in text.lines().filter(|l| l.starts_with("{\"name\":")) {
+            let (Some(name), Some(sha), Some(k)) =
+                (crate::manifest::string_field(line, "name"), crate::manifest::string_field(line, "sha256"), int_after(line, "min_members"))
+            else {
+                continue;
+            };
+            if names.contains(&name) && is_floored(&name) && column_sha256(store_path, &name).as_deref() == Some(sha.as_str()) {
+                out.insert(name, k);
+            }
+        }
+    }
     let top = recorded_floor(store_path);
     for n in names.iter().filter(|n| is_floored(n)) {
         if let (false, Some(t)) = (out.contains_key(n), top) {
@@ -169,17 +206,6 @@ pub fn flag_text(name: &str, k: usize) -> String {
     } else {
         format!("--min-cross-members-rank {}", k)
     }
-}
-
-/// Per-column floors recorded next to a store, from its schema and enrich sidecars.
-pub fn recorded_columns(store_path: &str) -> BTreeMap<String, usize> {
-    let mut out = BTreeMap::new();
-    for ext in ["enrich.json", "schema.json"] {
-        if let Ok(text) = std::fs::read_to_string(format!("{}.{}", store_path, ext)) {
-            out.extend(column_floors(&text));
-        }
-    }
-    out
 }
 
 #[cfg(test)]
