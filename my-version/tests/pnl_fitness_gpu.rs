@@ -209,6 +209,24 @@ fn device_totals_equal_the_cpu_tree_on_a_small_book() {
     assert!(cpu.iter().any(|t| !t.nonfinite && t.flips > 2 && t.exits > 0), "a program trades");
 }
 
+/// #1273: the device scores the CPU-built `--cash-return train-mean` excess.
+#[test]
+fn device_cash_train_mean_parity() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    let f = fixture(&STARTS_SMALL, 16_401, 13);
+    let tm = FitnessBook::new(&f.slice, &TradingSpec { cash_mode: rcsr::trading::CashMode::TrainMean, ..spec(1) }, 900.0).expect("a profitable book");
+    let plain = book(&f, 1);
+    assert_ne!(tm.hash(), plain.hash());
+    let mean = f.slice.ret.iter().sum::<f64>() / f.slice.ret.len() as f64;
+    assert_eq!(tm.cash_return().to_bits(), mean.to_bits());
+    assert!(mean != 0.0 && tm.excess().iter().zip(plain.excess()).all(|(a, b)| *a == *b - mean || (a - (b - mean)).abs() <= 1e-15));
+    let cpu = assert_exact(&f, &tm, &programs(24, 17));
+    if cpu.is_empty() {
+        return;
+    }
+    assert!(cpu.iter().any(|t| !t.nonfinite && t.flips > 2 && t.exits > 0), "a program trades");
+}
+
 /// #1179: the device scores the CPU-built `--pnl-excess xs-mean` excess. The
 /// groups share timestamps, so the cross-sections hold one to twelve rows.
 #[test]

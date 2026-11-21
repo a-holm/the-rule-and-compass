@@ -287,6 +287,7 @@ fn enumerate_refuses_what_it_cannot_price() {
         (vec!["--ops", OPS10, "--min-holding", "3"], "--min-holding"),
         (vec!["--ops", OPS10, "--pnl-mask", "x3"], "--pnl-mask"),
         (vec!["--ops", OPS10, "--cash-return", "0.0001"], "--cash-return"),
+        (vec!["--ops", OPS10, "--cash-return", "train-mean"], "--cash-return"),
         (vec!["--ops", OPS10, "--missing-score", "hold"], "--missing-score"),
         (vec!["--ops", OPS10, "--pnl-mask-band", "0.1"], "--pnl-mask-band"),
         (vec!["--ops", OPS10, "--pnl-mask-dwell", "3"], "--pnl-mask-dwell"),

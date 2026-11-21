@@ -1725,6 +1725,7 @@ pub fn start_split(req: &Request, command: &str, split: Option<&crate::data::Tra
         || tspec.tau.is_some()
         || tspec.max_position != 1.0
         || tspec.cash_return != 0.0
+        || tspec.cash_mode != trading::CashMode::Constant
         || tspec.funding_col.is_some()
         || tspec.band.resolved > 0.0
         || tspec.band.multiple > 0.0

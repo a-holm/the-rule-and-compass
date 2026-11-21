@@ -1715,7 +1715,7 @@ fn run(req: &Request, inp: &Inputs) -> Result<(String, String, Vec<String>), Fai
     if book.is_masked() {
         return usage("--pnl-mask: the class is priced on the unmasked training book");
     }
-    if spec.cash_return != 0.0 {
+    if spec.cash_return != 0.0 || spec.cash_mode != crate::trading::CashMode::Constant {
         return usage("--cash-return: the book benchmarks against cash at 0 (no interest input)");
     }
     let class = Class::build(inp.vars.len(), inp.ops, req.max_size, true).map_err(|e| (2, e))?;

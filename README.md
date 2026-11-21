@@ -713,7 +713,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--lags K | --lag-set k,..|default] [--history-frac f]
      [--validation-frac f] [--select-by train|validation|aicc] [--require-validation]
      [--objective mse|pnl|sharpe|log_growth] [--position long_only|top_tercile] [--threshold f]
-     [--cost-bps f | --cost-override f] [--slippage-bps f] [--cash-return f] [--funding col]
+     [--cost-bps f | --cost-override f] [--slippage-bps f] [--cash-return f|train-mean] [--funding col]
      [--max-position f] [--min-trades n] [--min-holding n] [--band B] [--band-units score|sd] [--allow-short]
      [--fitness metric|pnl] [--pnl-blocks K] [--pnl-block-lambda L] [--pnl-stat mean-sd|mean-semi|cvar] [--pnl-cvar-q q] [--pnl-mask expr] [--pnl-mask-band h] [--pnl-mask-dwell D] [--gate-search --branch-on run.json|expr|cash --branch-off run.json|expr|cash] [--gate-band h] [--gate-dwell D] [--pnl-excess none|xs-mean] [--book-target col]
 |pnl]
@@ -878,6 +878,7 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
   `--pnl-mask <expr>` (with `--pnl-mask-band h` and `--pnl-mask-dwell D`) scores only the rows inside a causal regime gate, so bull and bear specialists can be searched: rows outside are flat, every run of on rows starts flat and pays its exit, a row without a return (an unlabelled row of a strided label) neither starts nor ends a run in any book or walk-forward window, and the training fitness and the validation and test books read one gate state, `rcsr-gate-state/1` (the whole readable prefix of the data file; `--pnl-mask-dwell` counts rows of the data file in every slice, so 168 is a week on hourly rows under any label stride; `--gpu` scores it on the device, except with `--band-units sd`, which exits 2; `docs/optimisation.md`).
   `--gate-search` (with `--branch-on`, `--branch-off`, `--gate-band h` and `--gate-dwell D`) searches a regime gate over `--vars` between two frozen branches: each candidate is scored at its best 16-quantile cut by the composite book, and the front is chosen and priced by `rcsr compose` (CPU only; `docs/compose.md`).
   `--pnl-excess xs-mean` (default `none`) scores the excess over the equal-weight mean return of the training rows at each timestamp instead of over cash, so the fitness pays for timing and selection relative to the cross-section, not for market beta; the validation and test books, robust selection and walk-forward stay absolute and `objective.validation` and `objective.test` gain `xs_excess_net` (needs `--fitness pnl` and `--cash-return 0`; `docs/optimisation.md`).
+  `--cash-return train-mean` (with `--fitness pnl`) credits the fitness book with the mean return of its training rows, the assets' own drift and never an interest rate; validation, test, reports and walk-forward keep cash at 0 (`docs/optimisation.md`).
   `--book-target COL` prices the book on another label of the same target spec (fit on `--target`); a row with a NaN fit label and a finite book return stays in the book and leaves the constant fit.
   `--reject-fixed-position` (off by default) rejects trees whose position cannot depend on the
   inputs, such as `gauss(c * x)` or `exp(c * x)` at threshold 0, before the constant fit and keeps them

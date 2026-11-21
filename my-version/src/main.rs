@@ -486,7 +486,17 @@ INPUT:
   --cost-override <f>        per-side cost that differs from the target spec cost on
                              purpose; the objective block says cost.source = flag
   --slippage-bps <f>         extra cost per side in basis points (default 0)
-  --cash-return <f>          return per row earned while flat (default 0)
+  --cash-return <f|train-mean>
+                             return per row earned while flat (default 0).
+                             train-mean (needs --fitness pnl) credits the
+                             fitness book with the mean return of its
+                             training rows (the drift of the assets' own
+                             returns, not an interest rate; the rows the
+                             book can trade under --pnl-mask). Validation,
+                             test, reports and walk-forward keep cash at 0.
+                             search_fitness gains cash_return and
+                             cash_return_source; the book hash covers the
+                             mode. Exit 2 with --pnl-excess xs-mean
   --funding <col>            per-row funding rate paid while long
   --max-position <f>         position cap in (0, 1] (default 1)
   --min-trades <n>           fewer trades on validation make a candidate
@@ -2973,6 +2983,7 @@ fn main() {
     let mut trade_cost_override: Option<f64> = None;
     let mut trade_slippage_bps = 0.0f64;
     let mut trade_cash_return = 0.0f64;
+    let mut cash_train_mean = false;
     let mut trade_funding: Option<String> = None;
     let mut trade_max_position = 1.0f64;
     let mut trade_min_trades = 1usize;
@@ -3314,7 +3325,9 @@ fn main() {
             }
             "--cash-return" => {
                 trading_flags.push("--cash-return");
-                trade_cash_return = parse_trade_number("--cash-return", &val!());
+                let v = val!();
+                cash_train_mean = v.trim() == "train-mean";
+                trade_cash_return = if cash_train_mean { 0.0 } else { parse_trade_number("--cash-return", &v) };
             }
             "--funding" => {
                 trading_flags.push("--funding");
@@ -5847,6 +5860,7 @@ fn main() {
             slippage_bps: trade_slippage_bps,
             funding_col: trade_funding.clone(),
             cash_return: trade_cash_return,
+            cash_mode: if cash_train_mean { rcsr::trading::CashMode::TrainMean } else { rcsr::trading::CashMode::Constant },
             min_trades: trade_min_trades,
             min_holding: trade_min_holding,
             band,
@@ -5858,6 +5872,9 @@ fn main() {
         };
         if let Err(e) = tspec.validate() {
             trading_usage(&e);
+        }
+        if cash_train_mean && !fitness_pnl {
+            trading_usage("--cash-return train-mean needs --fitness pnl");
         }
         trading_spec = Some(tspec);
     }
@@ -9281,7 +9298,7 @@ fn main() {
                 backend_json,
                 match &fitness_book {
                     Some(b) => format!(
-                        "\"search_fitness\":{{\"kind\":\"long_pnl_regret\",\"rows\":{},\"groups\":{},\"cost_per_side\":{},\"threshold\":{},\"bound\":{},\"min_trades\":{},\"band\":{},\"band_units\":\"{}\",\"min_holding\":{},\"backend\":\"cpu_f64\",\"book_hash\":\"{:016x}\",{}{}{}{}{}}},",
+                        "\"search_fitness\":{{\"kind\":\"long_pnl_regret\",\"rows\":{},\"groups\":{},\"cost_per_side\":{},\"threshold\":{},\"bound\":{},\"min_trades\":{},\"band\":{},\"band_units\":\"{}\",\"min_holding\":{},\"backend\":\"cpu_f64\",\"book_hash\":\"{:016x}\",{}{}{}{}{}{}}},",
                         b.len(),
                         b.groups(),
                         jnum(b.side()),
@@ -9330,6 +9347,11 @@ fn main() {
                         match b.excess_mode() {
                             rcsr::trading::PnlExcess::None => String::new(),
                             m => format!("\"excess\":\"{}\",", m.name()),
+                        },
+                        // #1273: omitted for a constant, so the default report is unchanged.
+                        match b.cash_mode() {
+                            rcsr::trading::CashMode::Constant => String::new(),
+                            rcsr::trading::CashMode::TrainMean => format!("\"cash_return\":{},\"cash_return_source\":\"train_mean\",", jnum(b.cash_return())),
                         },
                         // #481: what ranked the generations; `backend` above is
                         // the reported values, always exact CPU f64.
