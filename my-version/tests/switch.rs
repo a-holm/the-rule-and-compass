@@ -402,3 +402,44 @@ fn switch_none_output_is_unchanged() {
 
 const PINNED_SWITCH_JSON: &str = "f3730568d93d2314a5ae579e2c46f82e3fd0c0dd830349ec1dd740f2cd74dd31";
 const PINNED_SWITCH_TEXT: &str = "66f71ce9c94ea5e5dfb3591156bf77ee46b34b0a069fdb1a7753b3a4b605023f";
+
+/// #1248: the sweep budget. A 64-block book on the synthetic rows needs more
+/// than the sweep budget below and less than the table guard allows.
+const SWEEP_BUDGET: &str = "300KiB";
+const SWEEP_ARGS: [&str; 8] = ["--a", "x1", "--b", "0 - x1", "--gate", "g", "--pnl-blocks", "64"];
+
+#[test]
+fn switch_refuses_over_budget() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, "d.csv", 0, |_| None);
+    let spec = write_spec(&dir);
+    let o = switch(&data, &spec, &[&SWEEP_ARGS[..], &["--max-memory", SWEEP_BUDGET]].concat());
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    let err = stderr(&o);
+    for needle in ["estimated", "budget of", "64 blocks", "--pnl-blocks"] {
+        assert!(err.contains(needle), "want '{needle}' in {err}");
+    }
+}
+
+#[test]
+fn switch_reports_sweep_bytes() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, "d.csv", 0, |_| None);
+    let spec = write_spec(&dir);
+    let o = switch(&data, &spec, &[&SWEEP_ARGS[..], &["--max-memory", "1GiB", "--json"]].concat());
+    let j = json(&o);
+    let rows = num(&j, &["train_rows"]) as usize;
+    assert_eq!(num(&j, &["book", "sweep_bytes"]) as u64, rcsr::switch::gate_sweep_bytes(rows, 64));
+    let text = switch(&data, &spec, &[&SWEEP_ARGS[..], &["--max-memory", "1GiB"]].concat());
+    assert_eq!(code(&text), 0, "{}", stderr(&text));
+    assert!(String::from_utf8_lossy(&text.stdout).contains("gate sweep memory: an estimated"));
+}
+
+#[test]
+fn switch_force_skips_sweep_budget() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, "d.csv", 0, |_| None);
+    let spec = write_spec(&dir);
+    let o = switch(&data, &spec, &[&SWEEP_ARGS[..], &["--max-memory", SWEEP_BUDGET, "--force"]].concat());
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+}
