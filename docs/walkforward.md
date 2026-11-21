@@ -281,6 +281,7 @@ Every series has the length of `period_time` and, under `--period-grid target`, 
   (usage error, exit 2) and is required. A row where some member has no finite score has no vote count, so it
   follows `--missing-score` like a row with no score in the threshold book. `K = 1, Q = 1` is the threshold book
   bit for bit. `Q = 0.67` with `K = 3` needs 3 votes (`ceil(2.01)`); pass `0.66` for a majority of three.
+  When `Q x K` lies strictly above a whole number by at most 0.05, `rcsr walkforward` prints one `warning: --quorum ... requires N votes` line on stderr with the largest two-decimal quorum that needs fewer votes; the exit code and the report (including the reproduction hash) do not change.
   `--band B` (a whole number of votes) applies after voting: a flat book enters at `v >= ceil(Q x K)` and a long book
   exits when `v < ceil(Q x K) - B`; `--min-hold` then holds a long book for that many rows (cooldown scan). The
   vote count is priced as one strategy (one trial for the DSR unless `--trials` is given); the report lists

@@ -1640,8 +1640,26 @@ pub fn votes_required(quorum: f64, members: usize) -> usize {
 
 /// #1211: stderr warning when `ceil(quorum x K)` rounds a product just above an
 /// integer up to the next vote count, or `None`.
-pub fn vote_quorum_warning(_quorum: f64, _members: usize) -> Option<String> {
-    None
+pub fn vote_quorum_warning(quorum: f64, members: usize) -> Option<String> {
+    let p = quorum * members as f64;
+    let whole = p.floor();
+    let frac = p - whole;
+    if members == 0 || whole < 1.0 || frac <= 1e-9 || frac > 0.05 + 1e-9 {
+        return None;
+    }
+    let need = votes_required(quorum, members);
+    let lower = (whole / members as f64 * 100.0).floor() / 100.0;
+    Some(format!(
+        "warning: --quorum {} over {} members requires {} votes: ceil({} x {}) = ceil({}); use --quorum {} for {} votes",
+        quorum,
+        members,
+        need,
+        quorum,
+        members,
+        format!("{:.4}", p).trim_end_matches('0').trim_end_matches('.'),
+        lower,
+        votes_required(lower, members)
+    ))
 }
 
 /// #930: the refusal message when `--policy vote` is combined with a flag or
