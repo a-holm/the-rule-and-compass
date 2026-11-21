@@ -822,25 +822,33 @@ fn trials_wf_refuses_null_report() {
 
 /// A copy of the store `src` at `out` whose header carries `marker` as `null_store`.
 fn mark_store(src: &str, out: &str, marker: &str) {
+    copy_store(src, out, &|_| true, Some(marker));
+}
+
+/// A copy of the columns of `src` that `keep` accepts at `out`, whose header carries `marker`
+/// as `null_store` (no member for `None`).
+fn copy_store(src: &str, out: &str, keep: &dyn Fn(&str) -> bool, marker: Option<&str>) {
     let s = FileStore::open(src).unwrap();
     let h = s.header();
-    let plans: Vec<store::ColumnPlan> = (0..h.n_cols)
-        .map(|c| {
+    let cols: Vec<usize> = (0..h.n_cols).filter(|&c| keep(&h.column(c).unwrap().name)).collect();
+    let plans: Vec<store::ColumnPlan> = cols
+        .iter()
+        .map(|&c| {
             let i = h.column(c).unwrap();
             store::ColumnPlan { name: i.name, numeric: i.numeric, dtype: i.dtype, levels: i.levels, has_codes: i.has_codes }
         })
         .collect();
     let rows = h.group_rows;
-    store::write_store_grouped_marked(out, &plans, h.n_rows, rows, Some(marker), |lo, _, cols| {
+    store::write_store_grouped_marked(out, &plans, h.n_rows, rows, marker, |lo, _, out_cols| {
         let g = lo / rows;
-        for (c, plan) in plans.iter().enumerate() {
+        for (k, (&c, plan)) in cols.iter().zip(&plans).enumerate() {
             match plan.dtype {
-                DType::F64 => cols[c].f64s.extend(s.read_f64_group(g, c)?),
-                DType::I64 => cols[c].i64s.extend(s.read_i64(g, c)?),
+                DType::F64 => out_cols[k].f64s.extend(s.read_f64_group(g, c)?),
+                DType::I64 => out_cols[k].i64s.extend(s.read_i64(g, c)?),
                 DType::U32 => {}
             }
             if plan.has_codes {
-                cols[c].codes.extend(s.read_codes(g, c)?);
+                out_cols[k].codes.extend(s.read_codes(g, c)?);
             }
         }
         Ok(())
@@ -967,4 +975,143 @@ fn regimes_after_read_refuses_null_store() {
     assert!(e.contains("null_store label h24, seed 4") && e.contains("--after-read"), "{e}");
     assert!(std::fs::read(&ledger).unwrap() == before, "the ledger records no dating");
     assert!(!Path::new(&out).exists(), "no calendar is written");
+}
+
+// ---------------------------------------------------------------------------
+// #1313: a store that takes columns from a null store is marked
+// ---------------------------------------------------------------------------
+
+fn append(target: &str, family: &str, columns: &str, out: &str, extra: &[&str]) -> Output {
+    let mut args = vec!["panel", "append", "--data", target, "--family", family, "--columns", columns, "--out", out, "--locked-test", "none"];
+    args.extend_from_slice(extra);
+    run(&args)
+}
+
+fn ledger_lines(path: &str) -> usize {
+    std::fs::read(path).map_or(0, |b| b.iter().filter(|&&c| c == b'\n').count())
+}
+
+fn header_marker(path: &str) -> Option<String> {
+    FileStore::open(path).unwrap().header().null_store().map(str::to_string)
+}
+
+/// `panel append --family` takes the permuted labels of a null store (marked by its header, or
+/// by the manifest of a null store written before #1304) into a panel without them: the output
+/// carries the family's marker, so `walkforward --ledger` refuses it.
+#[test]
+fn panel_append_carries_the_family_null_marker() {
+    let s = Scratch::new("null-append-family");
+    let dir = s.path();
+    let (src, spec, null) = null_fixture(dir);
+    let nolbl = p(dir, "nolbl.rcsb");
+    copy_store(&src, &nolbl, &|n| !n.starts_with("lbl_"), None);
+    let legacy = p(dir, "legacy.rcsb");
+    copy_store(&null, &legacy, &|_| true, None);
+    write_text(dir, "legacy.rcsb.manifest.json", "{\"schema\":\"rcsr-null-store/1\",\"null\":{\"label\":\"h24\",\"block\":5,\"seed\":9,\"order\":\"per_symbol\"}}\n");
+    assert_eq!(header_marker(&legacy), None, "the legacy store is marked by its manifest only");
+    let ledger = p(dir, "ledger.jsonl");
+    let o = wf_expr(&src, &spec, &p(dir, "real.wf.json"), &["--ledger", &ledger]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let before = std::fs::read(&ledger).unwrap();
+    for (family, seed) in [(&null, 1), (&legacy, 9)] {
+        let want = rcsr::permute_labels::marker(family).expect("the family is a null store");
+        let out = p(dir, &format!("gap{seed}.rcsb"));
+        let o = append(&nolbl, family, "lbl_h24_fwd,lbl_h24_y", &out, &[]);
+        assert_eq!(code(&o), 0, "{family}: {}", stderr(&o));
+        let summary = stderr(&o);
+        let wf_out = p(dir, &format!("gap{seed}.wf.json"));
+        let o = wf_expr(&out, &spec, &wf_out, &["--ledger", &ledger]);
+        assert_eq!(
+            code(&o),
+            2,
+            "{family}: walkforward --ledger on the appended store; ledger lines {} -> {}; output null_store {:?}; {}",
+            before.iter().filter(|&&c| c == b'\n').count(),
+            ledger_lines(&ledger),
+            header_marker(&out),
+            stderr(&o)
+        );
+        let e = stderr(&o);
+        assert!(e.contains(out.as_str()) && e.contains(&format!("label h24, seed {seed}")) && e.contains("--ledger"), "{e}");
+        assert!(std::fs::read(&ledger).unwrap() == before, "{family}: the ledger keeps its bytes");
+        assert!(!Path::new(&wf_out).exists(), "{family}: no report is written");
+        assert_eq!(header_marker(&out).as_deref(), Some(want.as_str()), "{family}: the output carries the family's marker byte for byte");
+        assert!(summary.contains(&format!("null_store label h24, seed {seed}")), "{summary}");
+    }
+}
+
+/// A target and a family store marked by different null draws are refused before anything is
+/// written; a target and a family of one draw carry its marker.
+#[test]
+fn panel_append_refuses_two_null_markers() {
+    let s = Scratch::new("null-append-two");
+    let dir = s.path();
+    let (src, _spec, null) = null_fixture(dir);
+    let marker = rcsr::permute_labels::marker(&null).unwrap();
+    let other = marker.replacen("\"seed\":1,", "\"seed\":2,", 1);
+    assert_ne!(other, marker);
+    let (t_other, t_same) = (p(dir, "t-other.rcsb"), p(dir, "t-same.rcsb"));
+    copy_store(&src, &t_other, &|n| !n.starts_with("lbl_"), Some(&other));
+    copy_store(&src, &t_same, &|n| !n.starts_with("lbl_"), Some(&marker));
+    let work = dir.join("refused");
+    std::fs::create_dir_all(&work).unwrap();
+    let out = p(&work, "out.rcsb");
+    let scratch = p(&work, "scratch");
+    let o = append(&t_other, &null, "lbl_h24_fwd,lbl_h24_y", &out, &["--scratch", &scratch]);
+    assert_eq!(code(&o), 2, "output null_store {:?}: {}", Path::new(&out).exists().then(|| header_marker(&out)), stderr(&o));
+    let e = stderr(&o);
+    assert!(e.contains(t_other.as_str()) && e.contains(null.as_str()), "{e}");
+    assert!(e.contains("null_store label h24, seed 2") && e.contains("null_store label h24, seed 1"), "{e}");
+    let left: Vec<_> = std::fs::read_dir(&work).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert!(left.is_empty(), "no output, sidecar, scratch directory or temporary column file: {left:?}");
+
+    let out = p(dir, "same.rcsb");
+    let o = append(&t_same, &null, "lbl_h24_fwd,lbl_h24_y", &out, &[]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(header_marker(&out).as_deref(), Some(marker.as_str()));
+}
+
+/// A null store written before #1304 is marked by its manifest only. A store that takes its
+/// columns (the target of `panel append`, the input of `rcsr enrich` and `rcsr panel rank`)
+/// carries that marker in its header.
+#[test]
+fn every_appending_writer_carries_a_manifest_null_marker() {
+    let s = Scratch::new("null-append-legacy");
+    let dir = s.path();
+    let (src, spec, null) = null_fixture(dir);
+    let manifest = "{\"schema\":\"rcsr-null-store/1\",\"null\":{\"label\":\"h24\",\"block\":5,\"seed\":9,\"order\":\"per_symbol\"}}\n";
+    let target = p(dir, "legacy-target.rcsb");
+    copy_store(&null, &target, &|n| n != "lbl_h24_t1" && n != "lbl_h24_weight", None);
+    write_text(dir, "legacy-target.rcsb.manifest.json", manifest);
+    let want = rcsr::permute_labels::marker(&target).expect("the manifest marks the target");
+    let out = p(dir, "appended.rcsb");
+    let o = append(&target, &src, "lbl_h24_t1,lbl_h24_weight", &out, &[]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(header_marker(&out).as_deref(), Some(want.as_str()), "panel append: the target's manifest marker");
+
+    let legacy = p(dir, "legacy.rcsb");
+    copy_store(&null, &legacy, &|_| true, None);
+    write_text(dir, "legacy.rcsb.manifest.json", manifest);
+    let ranked = p(dir, "ranked.rcsb");
+    let o = run(&[
+        "panel", "rank", "--data", &legacy, "--column", "lbl_h24_fwd", "--name", "lbl_h24_xs", "--target-spec", &spec, "--min-members", "2", "--out",
+        &ranked,
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(header_marker(&ranked).as_deref(), Some(want.as_str()), "panel rank");
+
+    let mut csv = String::from("ts,symbol,open,high,low,close,volume\n");
+    for (k, sym) in SYMBOLS.iter().enumerate() {
+        for i in 0..96i64 {
+            let c = 100.0 + k as f64 + frac(i as f64 * 0.618_033_988_749_894_9);
+            let _ = writeln!(csv, "{},{},{},{},{},{},{}", T0 + i * HOUR, sym, c, c + 0.5, c - 0.5, c + 0.1, 10 + i);
+        }
+    }
+    let table = rcsr::data::parse_table_with_time(&csv, false, Some("ts")).unwrap();
+    let bars = p(dir, "bars.rcsb");
+    store::write_store_with_time(&bars, &table, 1000, Some(0)).unwrap();
+    write_text(dir, "bars.rcsb.manifest.json", manifest);
+    let enriched = p(dir, "enriched.rcsb");
+    let o = run(&["enrich", "--data", &bars, "--out", &enriched, "--cpu", "--features", "r1"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(header_marker(&enriched).as_deref(), Some(want.as_str()), "rcsr enrich");
 }
