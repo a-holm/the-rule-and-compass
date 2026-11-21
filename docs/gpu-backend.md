@@ -2654,7 +2654,7 @@ A non-finite prediction scores `+inf` with status 2; fewer flips than `--min-tra
 
 ## Enumerate device arm (issue #1258)
 
-`rcsr enumerate --gpu` scores the class of `rcsr enumerate` (`docs/optimisation.md` 3.6) on the device. Without `--gpu` the CPU arm runs as before. A build without `--features cuda`, a missing device or a non-finite `--threshold` exits 2 before any row is read; any device refusal or failure after the start exits 1 with its cause. There is no CPU fallback: a silent fallback hides device faults (#381), and the CPU arm at size 5 costs CPU days. The report states `arm` (`cpu` or `device`); the device report adds `device` and `device_fitness` per member. Above 4 nodes `--allow-large` is still required.
+`rcsr enumerate --gpu` scores the class of `rcsr enumerate` (`docs/optimisation.md` 3.6) on the device. Without `--gpu` the CPU arm runs as before. A build without `--features cuda` or a missing device exits 2 while the arguments are parsed, before any row is read; a non-finite `--threshold` exits 2 after the training rows are loaded, before any tree is scored; any device refusal or failure after the start exits 1 with its cause. There is no CPU fallback: a silent fallback hides device faults (#381), and the CPU arm at size 5 costs CPU days. The report states `arm` (`cpu` or `device`); the device report adds `device` and `device_fitness` per member. Above 4 nodes `--allow-large` is still required.
 
 **Pipeline.** The kernels live in `src/cuda/enumerate.h`, included at the end of `eval.cu`, so they run the interpreter `rc_exec_row` on the resident `f32` training columns of an `RcCtx` and allocate through its ledger (`rc_dev_alloc`). One batch of `T` trees:
 
