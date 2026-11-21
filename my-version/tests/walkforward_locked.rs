@@ -519,3 +519,88 @@ fn short_declared_embargo_keeps_h168_labels_after_the_end() {
     let (code, _, err) = wf(e0 + purge);
     assert_eq!(code, 0, "{err}");
 }
+
+/// #1312: daily rows of two symbols from 2021-01-04 and a target spec with two entries on one
+/// return column `lbl_fwd`. `lbl_b_y` is empty every fifth day, so under the #1291 row rule the
+/// entries price different rows.
+fn fit_label_pair(dir: &Path) -> (String, String) {
+    let frac = |v: f64| v - v.floor();
+    let mut csv = String::from("t,s,x1,lbl_a_y,lbl_b_y,lbl_fwd\n");
+    for d in 0..200i64 {
+        for (j, sym) in ["a", "b"].iter().enumerate() {
+            let i = (2 * d) as f64 + j as f64;
+            let x1 = frac(i * 0.618_033_988_7) - 0.5;
+            let r = 0.01 * x1 + 0.0005 * (frac(i * 0.324_717_957_2) - 0.5);
+            let b = if d % 5 == 2 { String::new() } else { r.to_string() };
+            csv.push_str(&format!("{},{sym},{x1},{r},{b},{r}\n", 1_609_718_400 + 86_400 * d));
+        }
+    }
+    let data = dir.join("d.csv");
+    std::fs::write(&data, csv).unwrap();
+    let entry = |c: &str| {
+        format!(
+            "{{\"column\":\"{c}\",\"name\":\"{c}\",\"kind\":\"forward_return\",\"deprecated\":false,\"return_column\":\"lbl_fwd\",\
+             \"return_units\":\"log\",\"horizon_seconds\":86400,\"entry_offset_seconds\":0,\"delay_seconds\":0,\"entry_price\":\"open\",\
+             \"exit_price\":\"close\",\"offset\":0.0,\"scale\":{{\"kind\":\"constant\",\"value\":1.0}},\"clip\":null,\"units\":\"log_return\",\
+             \"cost_bps\":10,\"cost_in_label\":false,\"construction_columns\":[],\"note\":null}}"
+        )
+    };
+    let spec = dir.join("spec.json");
+    std::fs::write(&spec, format!("{{\"schema\":\"rcsr-target-spec/1\",\"targets\":[{},{}]}}", entry("lbl_a_y"), entry("lbl_b_y"))).unwrap();
+    (s(&data), s(&spec))
+}
+
+/// #1312: the fit label column is part of the candidate id, so a sealed candidate is not read
+/// under another fit label on the same return column (exit 3).
+#[test]
+fn sealed_read_refuses_another_fit_label() {
+    let (_scratch, dir) = scratch("fit-label-seal");
+    let (data, spec) = fit_label_pair(&dir);
+    let dev = "dev,1609718400,1618358400,1618444800,1622505600";
+    let locked = "locked,1609718400,1622592000,1622678400,1626998400";
+    let wf = |label: &str, window: &str, extra: &[&str]| {
+        let mut a = vec![
+            "walkforward", "--data", &data, "--time", "t", "--group-by", "s", "--json", "--target-spec", &spec, "--target", label,
+            "--expr", "x1", "--vars", "x1", "--window", window, "--lockbox", "2021-06-03,2021-07-23",
+        ];
+        a.extend_from_slice(extra);
+        rcsr(&a)
+    };
+    let field = |text: &str, key: &str| -> String {
+        let at = text.find(&format!("\"{key}\":\"")).unwrap_or_else(|| panic!("no {key} in {text}"));
+        text[at + key.len() + 4..].split('"').next().unwrap().to_string()
+    };
+    let id_of = |out: &str| Json::parse(out.trim()).unwrap().get("protocol").and_then(|p| p.get("candidate_id")).and_then(Json::as_str).unwrap().to_string();
+    let test_rows = |j: &Json| match j.get("windows") {
+        Some(Json::Arr(w)) => w.iter().map(|w| w.get("test_rows").and_then(Json::as_f64).unwrap()).sum::<f64>(),
+        _ => panic!("no windows"),
+    };
+    let mut ids = Vec::new();
+    let mut specs = Vec::new();
+    let mut rows = Vec::new();
+    for label in ["lbl_a_y", "lbl_b_y"] {
+        let ledger = s(&dir.join(format!("L-{label}.jsonl")));
+        let (code, out, err) = wf(label, dev, &["--ledger", &ledger]);
+        assert_eq!(code, 0, "{label}: {err}");
+        ids.push(id_of(&out));
+        rows.push(test_rows(&Json::parse(out.trim()).unwrap()));
+        specs.push(field(&std::fs::read_to_string(&ledger).unwrap(), "spec_sha256"));
+    }
+    assert_ne!(rows[0], rows[1], "the two fit labels price different rows");
+    assert_ne!(ids[0], ids[1], "one candidate id for two row rules");
+    assert_ne!(specs[0], specs[1], "one spec_sha256 for two row rules");
+    let ledger = s(&dir.join("Ls.jsonl"));
+    let sealed = s(&dir.join("sealed.json"));
+    let (code, out, err) = wf("lbl_a_y", dev, &["--ledger", &ledger]);
+    assert_eq!(code, 0, "{err}");
+    let id = id_of(&out);
+    let (code, _, err) = rcsr(&["protocol", "seal", "--ledger", &ledger, "--out", &sealed, "--id", &id]);
+    assert_eq!(code, 0, "{err}");
+    let read = &["--ledger", ledger.as_str(), "--locked-test", "--sealed", sealed.as_str()];
+    let (code, _, err) = wf("lbl_b_y", locked, read);
+    assert_eq!(code, 3, "the read under the other fit label is refused: {err}");
+    assert!(err.contains("is not in the sealed list"), "{err}");
+    let (code, out, err) = wf("lbl_a_y", locked, read);
+    assert_eq!(code, 0, "the sealed fit label reads: {err}");
+    assert_eq!(id_of(&out), id);
+}

@@ -287,6 +287,33 @@ pub(crate) fn field_str(line: &str, key: &str) -> Option<String> {
     None
 }
 
+/// #1312: why the sealed list `text` holds no candidate id of a read on `data_sha256` with
+/// `build_commit`. A candidate id binds the procedure spec, the data and the build commit.
+fn unsealed_cause(text: &str, data_sha256: &str, build_commit: &str) -> String {
+    let entries: Vec<(String, String)> = text
+        .split("{\"id\":\"")
+        .skip(1)
+        .map(|chunk| {
+            let entry = format!("{{\"id\":\"{}", chunk);
+            (field_str(&entry, "data_sha256").unwrap_or_default(), field_str(&entry, "build_commit").unwrap_or_default())
+        })
+        .collect();
+    let mut builds: Vec<&str> = entries.iter().map(|(_, b)| b.as_str()).collect();
+    builds.sort_unstable();
+    builds.dedup();
+    if !builds.contains(&build_commit) {
+        format!(
+            ": the list holds no candidate of build {} (it was sealed by build {}); a candidate id binds the build commit",
+            build_commit,
+            builds.join(", ")
+        )
+    } else if !entries.iter().any(|(d, b)| d == data_sha256 && b == build_commit) {
+        format!(": the list holds no candidate of build {} on data {}", build_commit, data_sha256)
+    } else {
+        ": the sealed candidates of this data and build are other procedures (the expression, the row rule of the rows= line or another setting of procedure_spec differs)".to_string()
+    }
+}
+
 /// Read a non-negative integer field. A float, a negative number, a string or an
 /// overflow is `None`.
 fn field_u64(line: &str, key: &str) -> Option<u64> {
@@ -785,7 +812,7 @@ impl Ledger {
             .skip(1)
             .map(|chunk| format!("{{\"id\":\"{}", chunk))
             .find(|chunk| field_str(chunk, "id").as_deref() == Some(id))
-            .ok_or_else(|| format!("candidate {} is not in the sealed list; the runner refuses it", id))?;
+            .ok_or_else(|| format!("candidate {} is not in the sealed list; the runner refuses it{}", id, unsealed_cause(&text, data_sha256, build_commit)))?;
         let get = |k: &str| field_str(&entry, k).unwrap_or_default();
         let candidate = Candidate {
             id: id.to_string(),
@@ -1189,6 +1216,7 @@ pub fn procedure_spec(spec: &crate::walkforward::EvalSpec, o: &crate::walkforwar
         spec.band_select
     ));
     s.push_str(&format!("missing_score={}\n", o.missing_score.name()));
+    s.push_str(&format!("{}\n", o.row_rule.binding()));
     if spec.policy == crate::walkforward::Policy::Vote {
         s.push_str(&format!("quorum={:?}\n", o.quorum));
     }
@@ -1825,5 +1853,102 @@ impl Ledger {
             out.push("sealed list: not checked (pass --sealed)".to_string());
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::walkforward::{EvalSpec, Policy, ProtocolOptions, RowRule};
+
+    fn label(column: &str) -> String {
+        format!(
+            "{{\"column\":\"{column}\",\"name\":\"{column}\",\"kind\":\"forward_return\",\"deprecated\":false,\"return_column\":\"lbl_fwd\",\
+             \"return_units\":\"log\",\"horizon_seconds\":86400,\"entry_offset_seconds\":0,\"delay_seconds\":0,\"entry_price\":\"open\",\
+             \"exit_price\":\"close\",\"offset\":0.0,\"scale\":{{\"kind\":\"constant\",\"value\":1.0}},\"clip\":null,\"units\":\"log_return\",\
+             \"cost_bps\":10,\"cost_in_label\":false,\"construction_columns\":[],\"note\":null}}"
+        )
+    }
+
+    fn run(column: &str, fill: &str) -> crate::run_json::RunFile {
+        let text = format!(
+            "{{\"variables\":[\"x1\"],\"target_spec\":{},\"preparation\":{{\"fill\":\"{fill}\"}},\
+             \"objective\":{{\"spec\":{{\"threshold\":0,\"per_side_bps\":5}},\"finalist\":{{\"expression\":\"x1\"}}}},\
+             \"pareto\":[{{\"expression\":\"x1\"}}]}}",
+            label(column)
+        );
+        crate::run_json::RunFile::parse(&text).unwrap()
+    }
+
+    /// #1312 criterion 4: one `rows=` line in every procedure, whatever the source of the rows.
+    #[test]
+    fn procedure_spec_has_one_rows_line() {
+        let spec = EvalSpec {
+            expression: "x1".to_string(),
+            vars: vec!["x1".to_string()],
+            target: "lbl_fwd".to_string(),
+            time: "t".to_string(),
+            group: Some("s".to_string()),
+            windows: Vec::new(),
+            horizon: 86_400.0,
+            embargo: None,
+            cost_bps: 10.0,
+            threshold_quantile: 0.7,
+            threshold_fixed: None,
+            validation_frac: 0.0,
+            periods_per_year: None,
+            candidates: Vec::new(),
+            band_select: false,
+            pool_reset_flat: false,
+            allow_lockbox: false,
+            device_pnl: false,
+            control_seed: 0,
+            policy: Policy::Threshold,
+            band_width: 0.0,
+            min_hold: 1,
+            gpu: false,
+        };
+        let specs = crate::target::parse_file(&format!("{{\"schema\":\"rcsr-target-spec/1\",\"targets\":[{},{}]}}", label("lbl_a_y"), label("lbl_b_y"))).unwrap();
+        let (a, b) = (&specs[0], &specs[1]);
+        let drop_run = run("lbl_b_y", "drop");
+        let zero_run = run("lbl_b_y", "zero");
+        let front = run("lbl_a_y", "drop");
+        let cases = [
+            ("default", RowRule::default()),
+            ("plain", RowRule::of_search(None, "lbl_fwd", false, None, None)),
+            ("target-spec", RowRule::of_search(Some(a), "lbl_fwd", false, None, None)),
+            ("target-spec other label", RowRule::of_search(Some(b), "lbl_fwd", false, None, None)),
+            ("from-run", RowRule::of_search(drop_run.target_spec().as_ref(), "lbl_fwd", false, Some(&drop_run), None)),
+            ("from-run filled", RowRule::of_search(zero_run.target_spec().as_ref(), "lbl_fwd", false, Some(&zero_run), None)),
+            ("front", RowRule::of_search(front.target_spec().as_ref(), "lbl_fwd", false, Some(&front), None)),
+            ("book-target", RowRule::of_search(Some(a), "lbl_fwd", false, None, Some("lbl_b_y".to_string()))),
+            ("top-tercile", RowRule::of_search(Some(a), "lbl_fwd", true, None, None)),
+        ];
+        let mut texts: Vec<String> = Vec::new();
+        for (name, rule) in cases {
+            let text = procedure_spec(&spec, &ProtocolOptions { row_rule: rule.clone(), ..ProtocolOptions::default() });
+            let lines: Vec<&str> = text.lines().filter(|l| l.starts_with("rows=")).collect();
+            assert_eq!(lines, vec![rule.binding().as_str()], "{name}: {text}");
+            assert!(!texts.contains(&text), "{name} shares its procedure with another case: {text}");
+            texts.push(text);
+        }
+        assert_eq!(RowRule::of_search(Some(a), "lbl_fwd", false, None, None).binding(), "rows=rule=fit_label|fit=\"lbl_a_y\"|return=\"lbl_fwd\"|fill=-|top_tercile=false|book=-");
+        assert_eq!(
+            RowRule::of_search(zero_run.target_spec().as_ref(), "lbl_fwd", false, Some(&zero_run), None).binding(),
+            "rows=rule=return|fit=\"lbl_b_y\"|return=\"lbl_fwd\"|fill=\"zero\"|top_tercile=false|book=-",
+            "a filling run keeps every finite return and still binds its fill"
+        );
+    }
+
+    /// #1312: a read whose id is not sealed names the cause: another build, other data or another procedure.
+    #[test]
+    fn unsealed_refusal_names_the_cause() {
+        let list = "{\"version\":1,\"ledger_head\":\"h\",\"candidates\":[{\"id\":\"c1\",\"spec_sha256\":\"s\",\"data_sha256\":\"d\",\"build_commit\":\"b1\",\"report_sha256\":\"r\",\"expression\":\"x\"}]}\n";
+        let other_build = unsealed_cause(list, "d", "b2");
+        assert!(other_build.contains("no candidate of build b2 (it was sealed by build b1)"), "{other_build}");
+        let other_data = unsealed_cause(list, "e", "b1");
+        assert!(other_data.contains("no candidate of build b1 on data e"), "{other_data}");
+        let other_procedure = unsealed_cause(list, "d", "b1");
+        assert!(other_procedure.contains("other procedures"), "{other_procedure}");
     }
 }
