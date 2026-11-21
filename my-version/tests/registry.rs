@@ -1179,3 +1179,38 @@ fn all_appends_the_six_gate_columns_and_the_schema_verifies() {
     let verify = rcsr_cmd::rcsr().args(["panel", "schema", "--data", &out, "--verify"]).output().unwrap();
     assert_eq!(verify.status.code(), Some(0), "{}", String::from_utf8_lossy(&verify.stderr));
 }
+
+#[test]
+fn old_registry_version_is_warned_not_refused() {
+    let (_scratch, dir) = tmp_dir("old-version");
+    let (p, _) = registry_store(&dir, 8, 64, "old.rcsb");
+    let schema = registry::write_schema(&p, "2").unwrap();
+    let verify = || rcsr_cmd::rcsr().args(["panel", "schema", "--data", &p, "--verify"]).output().unwrap();
+
+    let current = verify();
+    assert_eq!(current.status.code(), Some(0), "{}", String::from_utf8_lossy(&current.stderr));
+    assert!(!String::from_utf8_lossy(&current.stderr).contains("feature_registry_version"));
+    assert!(registry::registry_age_note(&schema).is_none());
+
+    let body = std::fs::read_to_string(&schema).unwrap();
+    let old = body.replacen("\"feature_registry_version\":2", "\"feature_registry_version\":1", 1);
+    assert_ne!(old, body);
+    std::fs::write(&schema, old).unwrap();
+
+    let out = verify();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(err.contains("feature_registry_version 1, this build has 2"), "{err}");
+    assert_eq!(err.matches("feature_registry_version 1").count(), 1, "{err}");
+
+    let note = registry::registry_age_note(&schema).unwrap();
+    assert!(note.contains("feature_registry_version 1, this build has 2"), "{note}");
+    let vars: Vec<String> = feature_names().into_iter().take(3).collect();
+    assert!(registry::check_vars(&p, &vars).is_ok());
+
+    let keyless = body.replacen("\"feature_registry_version\":2,", "", 1);
+    assert_ne!(keyless, body);
+    std::fs::write(&schema, keyless).unwrap();
+    assert_eq!(registry::recorded_version(&schema), Some(1));
+    assert!(registry::registry_age_note(&schema).is_some());
+}
