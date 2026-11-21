@@ -933,6 +933,99 @@ fn ablation_score_period_staggered_daily() {
     assert_eq!(r.net_period.len(), test_rows / 3, "one period per test day, not per timestamp");
 }
 
+
+/// `data` with `y` blank on every third row of the test block (rows 300..400): a finite return, no fit label.
+fn blank_every_third_label(data: &str) -> String {
+    let text = std::fs::read_to_string(data).unwrap();
+    let out: Vec<String> = text
+        .lines()
+        .enumerate()
+        .map(|(k, line)| {
+            let i = k.wrapping_sub(1);
+            if k > 0 && (300..400).contains(&i) && i % 3 == 0 {
+                let mut cols: Vec<&str> = line.split(',').collect();
+                cols[4] = "";
+                cols.join(",")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+    let path = format!("{data}.sparse.csv");
+    std::fs::write(&path, out.join("\n") + "\n").unwrap();
+    path
+}
+
+fn period_count(report: &Json) -> usize {
+    match report.get("net_period").expect("net_period") {
+        Json::Arr(a) => a.len(),
+        _ => panic!("net_period is not an array"),
+    }
+}
+
+/// #1305: `ablation score` prices the rows of the search's books: a row with a finite return and no
+/// finite fit label is not priced, as in the ladder and walkforward.
+#[test]
+fn ablation_score_prices_search_rows() {
+    let (_scratch, dir) = scratch("search_rows");
+    let (data, run, windows) = scored_fixture(&dir, 900);
+    let sparse = blank_every_third_label(&data);
+    let all = score_cli(&sparse, &windows, 900, &dir.join("all.json"), &["--from-run", &run]);
+    assert_eq!(all.status.code(), Some(0), "{}", String::from_utf8_lossy(&all.stderr));
+    let report = Json::parse(std::fs::read_to_string(dir.join("all.json")).unwrap().trim()).unwrap();
+    let labelled = (300..400).filter(|i| i % 3 != 0).count();
+    assert_eq!(period_count(&report), labelled, "one period per priced row");
+    let dense = score_cli(&data, &windows, 900, &dir.join("dense.json"), &["--from-run", &run]);
+    assert_eq!(dense.status.code(), Some(0), "{}", String::from_utf8_lossy(&dense.stderr));
+    let dense = Json::parse(std::fs::read_to_string(dir.join("dense.json")).unwrap().trim()).unwrap();
+    assert_eq!(period_count(&dense), 100, "a store with every label prices every finite return");
+}
+
+/// #1305: a run searched with `--book-target` prices every finite return of its book label, so a
+/// row without a fit label stays priced.
+#[test]
+fn ablation_score_keeps_every_return_for_book_target() {
+    let (_scratch, dir) = scratch("book_rows");
+    let (data, run, windows) = scored_fixture(&dir, 900);
+    let text = std::fs::read_to_string(&run).unwrap();
+    let edited = text.replacen("\"objective\":{", "\"objective\":{\"book_target\":\"y\",", 1);
+    assert_ne!(edited, text, "the run holds an objective block");
+    let book_run = dir.join("book.run.json");
+    std::fs::write(&book_run, edited).unwrap();
+    let sparse = blank_every_third_label(&data);
+    let out = score_cli(&sparse, &windows, 900, &dir.join("book.json"), &["--from-run", book_run.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let report = Json::parse(std::fs::read_to_string(dir.join("book.json")).unwrap().trim()).unwrap();
+    assert_eq!(period_count(&report), 100, "every finite return is priced");
+}
+
+/// #1305: the report names the rule, and it equals the rule of `walkforward --from-run` on the same
+/// run and store.
+#[test]
+fn ablation_score_labelled_rows_matches_walkforward() {
+    let (_scratch, dir) = scratch("rule_parity");
+    let (data, run, windows) = scored_fixture(&dir, 900);
+    let sparse = blank_every_third_label(&data);
+    let res = dir.join("r.json");
+    let out = score_cli(&sparse, &windows, 900, &res, &["--from-run", &run]);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let report = Json::parse(std::fs::read_to_string(&res).unwrap().trim()).unwrap();
+    let rule = report.get("labelled_rows").and_then(|r| r.get("rule")).and_then(Json::as_str).expect("labelled_rows.rule");
+    let col = report.get("labelled_rows").and_then(|r| r.get("column")).and_then(Json::as_str);
+    let at = |i: i64| (T0 as i64 + 900 * i).to_string();
+    let window = format!("w0,{},{},{},{}", at(0), at(280), at(300), at(400));
+    let wf = rcsr_cmd::rcsr()
+        .args(["walkforward", "--data", &sparse, "--target", "y", "--time", "t", "--from-run", &run, "--window", &window, "--allow-in-sample-windows", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(wf.status.code(), Some(0), "{}", String::from_utf8_lossy(&wf.stderr));
+    let wf = Json::parse(String::from_utf8_lossy(&wf.stdout).trim()).unwrap();
+    let want = wf.get("split").and_then(|s| s.get("labelled_rows")).expect("split.labelled_rows");
+    assert_eq!(rule, "fit_label");
+    assert_eq!(Some(rule), want.get("rule").and_then(Json::as_str));
+    assert_eq!(col, want.get("column").and_then(Json::as_str));
+}
+
 // --- verdict ------------------------------------------------------------------------
 
 struct Scenario {

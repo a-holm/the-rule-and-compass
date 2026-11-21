@@ -1775,6 +1775,7 @@ fn usage() -> &'static str {
             [--headline-threshold 0.7] [--cost-bps 12 | --cost-override <bp>] [--purge-seconds 219600] [--target-spec <file>]\n\
             scores the run's finalist (objective.finalist.expression_exact, else the rounded expression; the result carries expression_source) on every fold. Test rows of one group closer than the target spec horizon overlap and are refused (exit 2); a spec without stride_seconds over rows 2 horizons or more apart, or a stride_seconds wider than the smallest per-group step, is refused too (exit 2); a declared width makes one equal-weight period per floor(t / width) bucket; the result carries min_group_step_seconds. --target-spec sets the per-side cost\n\
             (cost_bps / 2), the return units (log is converted with exp_m1) and the return column; a --cost-bps that differs is refused.\n\
+            the rows priced are the search's rows (#1291, the rule of walkforward and the ladder): with a target spec whose label differs from the return column, a row needs a finite return and a finite fit label; a run with --book-target or a filled --fill, and a spec of kind xs_rank, keep every finite return; result labelled_rows names the rule\n\
             --from-run prices the book the search selected: the run's target spec, per-side cost and fixed threshold\n\
             (objective.spec.threshold); it refuses --thresholds, --headline-threshold and --target-spec, and a run without an objective block\n
             A run that priced a band or a minimum hold is priced with it: half-width objective.spec.band_resolved as recorded, objective.spec.min_holding,\n
@@ -2082,7 +2083,9 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
             let oof = run_file
                 .oof_flags_windows(&labelled, fl.has("--allow-in-sample"))
                 .map_err(|e| (3, format!("{}: {}", run_path, e)))?;
-            let panel = ladder::load_panel(&inp, &opts).map_err(|e| (3, e))?;
+            let mut panel = ladder::load_panel(&inp, &opts).map_err(|e| (3, e))?;
+            let rows_rule = ladder::search_rows(opts.spec.as_ref(), &ladder::return_name(&inp, &opts), Some(&run_file));
+            ladder::keep_labelled_rows(&mut panel, &rows_rule);
             let resolved = crate::lockbox::resolve_retired(fl.opt("--lockbox"), fl.opt("--lockbox-embargo"), fl.need("--data")?, fl.opt("--retired")).map_err(|e| (e.exit, e.message))?;
             let mut purge_source = if fl.opt("--purge-seconds").is_some() { "flag" } else { "protocol_default" };
             if let Some(s) = &opts.spec {
@@ -2132,10 +2135,11 @@ fn run_inner(args: &[String]) -> Result<(), (i32, String)> {
                 fold_oof
             );
             json = format!(
-                "{},\"purge_seconds\":{},\"purge_source\":\"{}\"}}",
+                "{},\"purge_seconds\":{},\"purge_source\":\"{}\",\"labelled_rows\":{}}}",
                 json.trim_end().strip_suffix('}').unwrap_or(json.trim_end()),
                 jnum(opts.purge_seconds),
-                purge_source
+                purge_source,
+                rows_rule.json()
             );
             json = resolved.splice_report(&json, 0, false, true);
             let out = fl.need("--out")?;
