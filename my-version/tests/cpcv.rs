@@ -915,3 +915,39 @@ fn cpcv_assemble_carries_composite_marker() {
     assert_eq!(code(&o), 2, "{}", stderr(&o));
     assert!(stderr(&o).contains("selection.composite") && stderr(&o).contains(&mixed[2]), "{}", stderr(&o));
 }
+
+/// #1272: split reports priced on a null store (`null_store` of `walkforward`) give every path
+/// the marker; a report without it among marked ones exits 2 naming both.
+#[test]
+fn cpcv_assemble_carries_the_null_store_marker() {
+    let s = Scratch::new("cpcv-null-store");
+    let dir = s.path();
+    let (table, scheme) = cpcv_series::write_table(dir);
+    let mark = |report: &str| {
+        let text = std::fs::read_to_string(report).unwrap();
+        let end = text.rfind('}').unwrap();
+        let marker = "{\"label\":\"h24\",\"block\":5,\"seed\":1,\"order\":\"per_symbol\"}";
+        std::fs::write(report, format!("{},\"null_store\":{}{}", &text[..end], marker, &text[end..])).unwrap();
+    };
+    let reports = cpcv_series::write_reports(dir, "wf", &scheme, &|_| cpcv_series::NONE);
+    for r in &reports {
+        mark(r);
+    }
+    let paths = dir.join("paths");
+    ok(&assemble(&table, &reports, &paths, &dir.join("summary.json")));
+    for j in 0..scheme.paths() {
+        let p = read_json(&paths.join(format!("path_{}.json", j + 1)));
+        assert_eq!(at(&p, &["null_store", "seed"]).as_f64(), Some(1.0), "path {}", j + 1);
+        assert_eq!(at(&p, &["null_store", "label"]).as_str(), Some("h24"), "path {}", j + 1);
+    }
+    let plain = cpcv_series::write_reports(dir, "plain", &scheme, &|_| cpcv_series::NONE);
+    ok(&assemble(&table, &plain, &dir.join("plain_paths"), &dir.join("plain_summary.json")));
+    assert!(read_json(&dir.join("plain_paths").join("path_1.json")).get("null_store").is_none());
+    let mixed = cpcv_series::write_reports(dir, "mixed", &scheme, &|_| cpcv_series::NONE);
+    for r in mixed.iter().skip(1) {
+        mark(r);
+    }
+    let o = assemble(&table, &mixed, &dir.join("mixed_paths"), &dir.join("mixed_summary.json"));
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).contains("null_store") && stderr(&o).contains(&mixed[0]), "{}", stderr(&o));
+}

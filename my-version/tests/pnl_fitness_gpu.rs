@@ -96,6 +96,9 @@ fn book(f: &Fixture, min_trades: usize) -> FitnessBook {
 }
 
 fn evaluator(f: &Fixture, b: &FitnessBook) -> Option<GpuEvaluator> {
+    if !device_present() {
+        return None;
+    }
     let Some(mut ev) = GpuEvaluator::new(&f.cols, f.n, VARS, &f.y) else {
         rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return None;
@@ -345,6 +348,9 @@ fn a_context_without_a_book_or_with_a_refused_book_is_refused() {
     let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
     let f = fixture(&STARTS_SMALL, 16_401, 4);
     let b = book(&f, 1);
+    if !device_present() {
+        return;
+    }
     let Some(mut ev) = GpuEvaluator::new(&f.cols, f.n, VARS, &f.y) else {
         rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
@@ -548,8 +554,7 @@ fn device_block_stat_parity_when_cuts_meet_steps_and_segments() {
 #[test]
 fn device_block_stat_parity_with_a_band() {
     let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
-    if GpuEvaluator::new(&[0.0], 1, 1, &[0.0]).is_none() {
-        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
+    if !device_present() {
         return;
     }
     let f = fixture(&STARTS_SMALL, 16_401, 11);
@@ -678,8 +683,7 @@ fn pipelined_search_archives_device_long_pnl_scores() {
     let (sample, b) = search_fixture();
     let seen: Archived = Arc::default();
     let cfg = config(&b, &seen);
-    if GpuEvaluator::new(&[0.0], 1, 1, &[0.0]).is_none() {
-        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
+    if !device_present() {
         return;
     }
     let out = search::run(&cfg, &sample, &sample);
@@ -702,8 +706,7 @@ fn pipelined_device_fit_archives_device_long_pnl_scores() {
         fit_admission: rcsr::fit::FitAdmission::All,
         ..config(&b, &seen)
     };
-    if GpuEvaluator::new(&[0.0], 1, 1, &[0.0]).is_none() {
-        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
+    if !device_present() {
         return;
     }
     let out = search::run(&cfg, &sample, &sample);
@@ -724,8 +727,7 @@ fn synchronous_device_fit_archives_device_long_pnl_scores() {
         pipeline_depth: 0,
         ..config(&b, &seen)
     };
-    if GpuEvaluator::new(&[0.0], 1, 1, &[0.0]).is_none() {
-        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
+    if !device_present() {
         return;
     }
     let out = search::run(&cfg, &sample, &sample);
@@ -749,8 +751,7 @@ fn device_scored_members_get_the_cpu_book_descriptor() {
         qd_descriptor: rcsr::qd::DescriptorKind::Book,
         ..config(&b, &seen)
     };
-    if GpuEvaluator::new(&[0.0], 1, 1, &[0.0]).is_none() {
-        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
+    if !device_present() {
         return;
     }
     let out = search::run(&cfg, &sample, &sample);
@@ -770,6 +771,9 @@ fn a_refused_book_allocation_falls_back_to_the_cpu_scorer() {
         .flat_map(|v| sample.x.iter().map(move |r| r[v] as f32))
         .collect();
     let y: Vec<f32> = sample.y.iter().map(|&v| v as f32).collect();
+    if !device_present() {
+        return;
+    }
     // The device probe allocates once per process; take it before counting.
     let _ = rcsr::dispatch_gpu::device_rates();
     rcsr::enrich_gpu::set_alloc_fault_for_tests(u64::MAX);
@@ -810,6 +814,9 @@ fn tiled_residency_names_its_refusal() {
     );
     let f = fixture(&STARTS_SMALL, 16_401, 8);
     let b = book(&f, 1);
+    if !device_present() {
+        return;
+    }
     let Some(mut ev) = GpuEvaluator::new_tiled(f.cols.clone(), f.n, VARS, &f.y, 4096, None, None) else {
         rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
@@ -827,8 +834,7 @@ fn blocked_pipelined_search_archives_device_scores() {
     assert_eq!(b.blocks(), 3);
     let seen: Archived = Arc::default();
     let cfg = config(&b, &seen);
-    if GpuEvaluator::new(&[0.0], 1, 1, &[0.0]).is_none() {
-        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
+    if !device_present() {
         return;
     }
     let out = search::run(&cfg, &sample, &sample);
@@ -850,8 +856,7 @@ fn blocked_synchronous_device_fit_archives_device_scores() {
         pipeline_depth: 0,
         ..config(&b, &seen)
     };
-    if GpuEvaluator::new(&[0.0], 1, 1, &[0.0]).is_none() {
-        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
+    if !device_present() {
         return;
     }
     let out = search::run(&cfg, &sample, &sample);
@@ -866,8 +871,7 @@ fn blocked_synchronous_device_fit_archives_device_scores() {
 #[test]
 fn wide_block_stat_search_archives_device_scores() {
     let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
-    if GpuEvaluator::new(&[0.0], 1, 1, &[0.0]).is_none() {
-        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
+    if !device_present() {
         return;
     }
     for (blocks, stat) in [(12usize, BlockStat::Cvar(0.25)), (9, BlockStat::MeanSemi)] {
@@ -959,11 +963,7 @@ fn assert_pnl_gpu_fit_is_deterministic(label: &str, sample: &Sample, b: &Arc<Fit
 }
 
 fn skip_without_device() -> bool {
-    if GpuEvaluator::new(&[0.0], 1, 1, &[0.0]).is_none() {
-        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
-        return true;
-    }
-    false
+    !device_present()
 }
 
 #[test]
@@ -1169,8 +1169,7 @@ fn cli(data: &str, spec: &str, backend: &[&str]) -> rcsr::devlog::Json {
 #[test]
 fn cli_names_the_device_scorer_and_reports_exact_values() {
     let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
-    if GpuEvaluator::new(&[0.0], 1, 1, &[0.0]).is_none() {
-        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
+    if !device_present() {
         return;
     }
     let (_scratch, data, spec) = write_cli_fixture();
@@ -1194,8 +1193,7 @@ fn cli_names_the_device_scorer_and_reports_exact_values() {
 #[test]
 fn reject_fixed_position_runs_on_the_device() {
     let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
-    if GpuEvaluator::new(&[0.0], 1, 1, &[0.0]).is_none() {
-        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
+    if !device_present() {
         return;
     }
     let (scratch, data, spec) = write_cli_fixture();
@@ -1255,7 +1253,8 @@ impl Drop for Faults {
 }
 
 fn device_present() -> bool {
-    let present = GpuEvaluator::new(&[0.0], 1, 1, &[0.0]).is_some();
+    let present = rcsr::gpu::probe().available()
+        && GpuEvaluator::new(&[0.0], 1, 1, &[0.0]).is_some();
     if !present {
         rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
     }
@@ -1337,6 +1336,9 @@ fn a_failed_pipeline_stage_falls_back_labelled_in_auto_mode() {
 fn every_device_side_book_refusal_names_its_cause() {
     let f = fixture(&STARTS_SMALL, 16_401, 4);
     let b = book(&f, 1);
+    if !device_present() {
+        return;
+    }
     let Some(mut ev) = GpuEvaluator::new(&f.cols, f.n, VARS, &f.y) else {
         rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
@@ -1600,6 +1602,9 @@ fn a_hold_above_32_is_refused_by_the_device() {
     let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
     let f = fixture(&STARTS_SMALL, 16_401, 3);
     let b = band_book(&f, 0.1, BandUnits::Score, 33, 1);
+    if !device_present() {
+        return;
+    }
     let Some(mut ev) = GpuEvaluator::new(&f.cols, f.n, VARS, &f.y) else {
         rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
@@ -1662,8 +1667,7 @@ fn assert_archived_values_are_the_cpu_band_book(sample: &Sample, b: &FitnessBook
 #[test]
 fn band_pipelined_search_archives_device_scores() {
     let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
-    if GpuEvaluator::new(&[0.0], 1, 1, &[0.0]).is_none() {
-        rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
+    if !device_present() {
         return;
     }
     for (band, units, hold) in [(0.2, BandUnits::Score, 4), (0.5, BandUnits::Sd, 3)] {
@@ -1838,6 +1842,9 @@ struct DeviceRun {
 }
 
 fn device_run(f: &Fixture, trees: &[Node]) -> Option<DeviceRun> {
+    if !device_present() {
+        return None;
+    }
     let Some(mut ev) = GpuEvaluator::new(&f.cols, f.n, VARS, &f.y) else {
         rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return None;
@@ -2010,6 +2017,9 @@ fn device_mask_sd_band_stays_on_the_cpu() {
     let f = fixture(&STARTS_SMALL, 16_401, 11);
     let on = alternate_mask(f.n);
     let sd = masked(&f, &band_spec(1, 0.5, BandUnits::Sd, 12), 1, &[], &on);
+    if !device_present() {
+        return;
+    }
     let Some(mut ev) = GpuEvaluator::new(&f.cols, f.n, VARS, &f.y) else {
         rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
@@ -2145,6 +2155,9 @@ fn device_mask_all_on_is_the_plain_book() {
 fn device_mask_book_adds_no_device_bytes() {
     let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
     let f = fixture(&STARTS_SMALL, 16_401, 11);
+    if !device_present() {
+        return;
+    }
     let Some(mut ev) = GpuEvaluator::new(&f.cols, f.n, VARS, &f.y) else {
         rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
@@ -2522,6 +2535,9 @@ fn a_layered_book_is_refused_by_the_device_upload() {
     let f = fixture(&STARTS_SMALL, 16_401, 11);
     let layered = book(&f, 1).with_layer(Arc::new(ThresholdLayer)).expect("a plain book takes a layer");
     assert!(layered.has_layer());
+    if !device_present() {
+        return;
+    }
     let Some(mut ev) = GpuEvaluator::new(&f.cols, f.n, VARS, &f.y) else {
         rcsr::backend::skip_without_device("skipping GPU test: no usable CUDA device");
         return;
