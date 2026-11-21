@@ -11840,8 +11840,9 @@ USAGE:
   records (objective.book_target_spec; a run without it exits 2). A
   top-tercile book and a run whose --fill filled missing labels price every
   finite return, as the search did. Data without the fit label column exits
-  2. The JSON split records labelled_rows {{rule: fit_label|book_target|
-  return, column}}.
+  2 under --from-run and --front; with --target-spec the return alone labels
+  a row and stderr says so. The JSON split records labelled_rows {{rule:
+  fit_label|book_target|return, column}}.
   See docs/walkforward.md.
 
 OPTIONS:
@@ -13043,6 +13044,7 @@ fn run_walkforward(args: &[String]) -> ! {
         popts.stride_seconds = s.stride_seconds;
         popts.entry_offset = agree("--entry-offset", entry_offset_flag, s.entry_offset_seconds);
         popts.fit_label = target::label_report_for(&data_path, &s.column).and_then(|r| rcsr::labels::fit_label_json(&r));
+        popts.fit_label_required = front_run.is_some();
         let every_return = policy == walkforward::Policy::TopTercile || front_run.as_ref().is_some_and(|r| r.fills_labels());
         popts.labelled_rows = match book_target.take() {
             Some(b) => walkforward::LabelledRows::BookTarget(b),
@@ -13509,6 +13511,9 @@ fn run_walkforward(args: &[String]) -> ! {
             std::process::exit(if e.contains("overlapping returns") || e.contains("purge gap") || e.contains("are not in time order") || e.starts_with("--periods-per-year") || e.starts_with("missing stride_seconds") || e.starts_with("stride_seconds") || e.starts_with(walkforward::FIT_LABEL_REFUSAL) { EXIT_USAGE } else { EXIT_INPUT });
         }
     };
+    if let (Some(c), walkforward::LabelledRows::Return) = (popts.labelled_rows.fit_label(), &report.labelled_rows) {
+        eprintln!("note: the data has no column '{}' (the target spec's label column): a row is labelled by its finite return alone (split.labelled_rows)", c);
+    }
     if let (Some(path), Some(run)) = (&from_run_path, &front_run) {
         report.from_run = Some(walkforward::RunRef { run: path.clone(), run_sha256: run.sha256.clone() });
     }

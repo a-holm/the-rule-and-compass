@@ -130,6 +130,9 @@ pub struct ProtocolOptions {
     pub fit_label: Option<String>,
     /// #1291: the rows that count as labelled.
     pub labelled_rows: LabelledRows,
+    /// #1291: data without the fit label column is refused (the books of `--from-run` and
+    /// `--front` need it); otherwise the return alone labels a row.
+    pub fit_label_required: bool,
     /// The horizon comes from a target spec, not from `--horizon` alone; the
     /// report names it as the annualisation source.
     pub horizon_from_spec: bool,
@@ -380,6 +383,7 @@ impl Default for ProtocolOptions {
             quorum: None,
             fit_label: None,
             labelled_rows: LabelledRows::Return,
+            fit_label_required: false,
             horizon_from_spec: false,
             stride_seconds: None,
             threshold_fit: None,
@@ -1574,7 +1578,8 @@ fn resolve_layout(spec: &EvalSpec, opts: &ProtocolOptions, names: &[String], num
     let fit_label = match opts.labelled_rows.fit_label() {
         Some(name) => match names.iter().position(|n| n == name) {
             Some(j) if numeric.get(j).copied().unwrap_or(false) => Some(j),
-            _ => return Err(format!("{} '{}' (the target spec's label column) is not a numeric column of the data: a row is labelled when its fit label and its return are finite, the rows of the search's books", FIT_LABEL_REFUSAL, name)),
+            _ if opts.fit_label_required => return Err(format!("{} '{}' (the target spec's label column) is not a numeric column of the data: the run's books hold the rows whose fit label and return are finite", FIT_LABEL_REFUSAL, name)),
+            _ => None,
         },
         None => None,
     };
@@ -2960,7 +2965,7 @@ impl Accum {
             min_group_step,
             min_purge_seconds: min_gap,
             fit_label: opts.fit_label.clone(),
-            labelled_rows: opts.labelled_rows.clone(),
+            labelled_rows: if layout.fit_label.is_none() && opts.labelled_rows.fit_label().is_some() { LabelledRows::Return } else { opts.labelled_rows.clone() },
             economics,
             inference: inference_report,
             dropped_rows: dropped,
