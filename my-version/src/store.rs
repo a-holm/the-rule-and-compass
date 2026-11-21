@@ -1599,6 +1599,20 @@ where
     write_store_grouped_marked(path, plans, n_rows, group_rows, None, produce)
 }
 
+/// `Ok` when `m` is one JSON object, the only form of the `null_store` header member.
+fn check_null_store(m: &str) -> Result<(), String> {
+    let mut p = JsonParser { bytes: m.as_bytes(), pos: 0 };
+    let whole = matches!(p.value(), Ok(Json::Obj(_))) && {
+        p.ws();
+        p.pos == p.bytes.len()
+    };
+    if whole {
+        Ok(())
+    } else {
+        Err("the null_store header member must be one JSON object".to_string())
+    }
+}
+
 /// [`write_store_grouped`] whose header ends with the member `"null_store":<null_store>`
 /// (#1304) when `null_store` is a JSON object; `None` writes the same bytes as
 /// [`write_store_grouped`].
@@ -1614,14 +1628,7 @@ where
     F: FnMut(usize, usize, &mut [GroupColumn]) -> Result<(), String>,
 {
     if let Some(m) = null_store {
-        let mut p = JsonParser { bytes: m.as_bytes(), pos: 0 };
-        let whole = matches!(p.value(), Ok(Json::Obj(_))) && {
-            p.ws();
-            p.pos == p.bytes.len()
-        };
-        if !whole {
-            return Err("the null_store header member must be one JSON object".to_string());
-        }
+        check_null_store(m)?;
     }
     let group_rows = group_rows.max(1);
     let n_cols = plans.len();
@@ -1777,7 +1784,7 @@ pub fn write_store_appending(
     let mut file = File::create(path).map_err(|e| format!("{}: {}", path, e))?;
     let batch = append_batch_groups(source, extras.len());
     let mut out = std::io::BufWriter::with_capacity(APPEND_WRITE_BUFFER, &mut file);
-    write_store_appending_to(&mut out, path, source, extras, batch, &mut AppendStats::default())?;
+    write_store_appending_to(&mut out, path, source, extras, batch, None, &mut AppendStats::default())?;
     out.flush().map_err(|e| format!("{}: {}", path, e))
 }
 
@@ -1806,6 +1813,22 @@ pub fn write_store_appending_hashed_stats(
 ) -> Result<(String, AppendStats), String> {
     let batch = append_batch_groups(source, extras.len());
     write_store_appending_hashed_with(path, source, extras, batch)
+}
+
+/// [`write_store_appending_hashed_stats`] whose output header carries `null_store` (#1313):
+/// `None` keeps the member of `source` (the same bytes), `Some` must be one JSON object and
+/// replaces it, so a writer that takes columns from another marked input marks its output.
+pub fn write_store_appending_hashed_stats_marked(
+    path: &str,
+    source: &FileStore,
+    extras: &[AppendColumn],
+    null_store: Option<&str>,
+) -> Result<(String, AppendStats), String> {
+    if let Some(m) = null_store {
+        check_null_store(m)?;
+    }
+    let batch = append_batch_groups(source, extras.len());
+    write_store_appending_hashed_over(path, source, extras, batch, null_store, |file| file)
 }
 
 /// Where the append pass spends its time. The three timers partition the pass:
@@ -1915,7 +1938,7 @@ pub(crate) fn write_store_appending_hashed_with(
     extras: &[AppendColumn],
     batch: usize,
 ) -> Result<(String, AppendStats), String> {
-    write_store_appending_hashed_over(path, source, extras, batch, |file| file)
+    write_store_appending_hashed_over(path, source, extras, batch, None, |file| file)
 }
 
 /// [`write_store_appending_hashed_with`] with `wrap` applied to the temporary
@@ -1925,6 +1948,7 @@ fn write_store_appending_hashed_over<W: Write>(
     source: &FileStore,
     extras: &[AppendColumn],
     batch: usize,
+    null_store: Option<&str>,
     wrap: impl FnOnce(File) -> W,
 ) -> Result<(String, AppendStats), String> {
     let mut stats = AppendStats::default();
@@ -1932,7 +1956,7 @@ fn write_store_appending_hashed_over<W: Write>(
     let guard = TempGuard(tmp.clone());
     let mut file = wrap(File::create(&tmp).map_err(|e| format!("{}: {}", tmp, e))?);
     let (sha, tail) = with_hash_thread(&mut file, path, |out| {
-        write_store_appending_to(out, path, source, extras, batch, &mut stats)
+        write_store_appending_to(out, path, source, extras, batch, null_store, &mut stats)
     })?;
     stats.write_s += tail.write_s;
     stats.hash_wait_s += tail.hash_wait_s;
@@ -2060,6 +2084,7 @@ fn write_store_appending_to<W: Write + ?Sized>(
     source: &FileStore,
     extras: &[AppendColumn],
     batch: usize,
+    null_store: Option<&str>,
     stats: &mut AppendStats,
 ) -> Result<(), String> {
     if extras.is_empty() {
@@ -2170,7 +2195,7 @@ fn write_store_appending_to<W: Write + ?Sized>(
         n_cols: columns.len(),
         group_rows,
         columns,
-        null_store: source.header.null_store.clone(),
+        null_store: null_store.map(str::to_string).or_else(|| source.header.null_store.clone()),
     };
     let json = header_json(&header);
     if json.len() > u32::MAX as usize {
@@ -3013,6 +3038,56 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #1313: the marker argument of the appending writer. `None` keeps the member of the
+    /// source and its bytes, `Some` sets the member and leaves the data blocks unchanged, and a
+    /// member that is not one JSON object leaves no file.
+    #[test]
+    fn the_appending_writer_keeps_or_sets_the_null_store_member() {
+        let dir = std::env::temp_dir().join(format!("rcsr-1313-append-member-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| dir.join(name).to_string_lossy().into_owned();
+        let plans = vec![
+            ColumnPlan { name: "ts".to_string(), numeric: true, dtype: DType::I64, levels: vec![], has_codes: false },
+            ColumnPlan { name: "x".to_string(), numeric: true, dtype: DType::F64, levels: vec![], has_codes: false },
+        ];
+        let write = |name: &str, m: Option<&str>| -> FileStore {
+            write_store_grouped_marked(&path(name), &plans, 10, 4, m, |lo, hi, cols| {
+                cols[0].i64s.extend(lo as i64..hi as i64);
+                cols[1].f64s.extend((lo..hi).map(|r| r as f64 * 0.5));
+                Ok(())
+            })
+            .unwrap();
+            FileStore::open(&path(name)).unwrap()
+        };
+        let (plain, marked) = (write("plain.rcsb", None), write("marked.rcsb", Some("{\"label\":\"a\",\"seed\":1}")));
+        let extra = dir.join("f.bin");
+        std::fs::write(&extra, (0..10).flat_map(|r| (r as f64).to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+        let extras = [AppendColumn { name: "f".to_string(), file: extra, replace: false }];
+        let marker = "{\"label\":\"h24\",\"seed\":7}";
+        let append = |name: &str, src: &FileStore, m: Option<&str>| -> Result<(Vec<u8>, String), String> {
+            write_store_appending_hashed_stats_marked(&path(name), src, &extras, m).map(|(sha, _)| (std::fs::read(path(name)).unwrap(), sha))
+        };
+        write_store_appending(&path("base.rcsb"), &plain, &extras).unwrap();
+        let base = std::fs::read(path("base.rcsb")).unwrap();
+        let (kept, sha) = append("kept.rcsb", &plain, None).unwrap();
+        assert!(kept == base, "None writes the bytes of write_store_appending");
+        assert_eq!(sha, crate::manifest::sha256_hex(&kept));
+        let (set, _) = append("set.rcsb", &plain, Some(marker)).unwrap();
+        assert_eq!(FileStore::open(&path("set.rcsb")).unwrap().header().null_store(), Some(marker));
+        let len = |v: &[u8]| u32::from_le_bytes(v[12..16].try_into().unwrap()) as usize;
+        assert!(set[16 + len(&set)..] == base[16 + len(&base)..], "the data blocks do not depend on the member");
+        append("from-marked.rcsb", &marked, None).unwrap();
+        assert_eq!(FileStore::open(&path("from-marked.rcsb")).unwrap().header().null_store(), Some("{\"label\":\"a\",\"seed\":1}"));
+        append("over-marked.rcsb", &marked, Some(marker)).unwrap();
+        assert_eq!(FileStore::open(&path("over-marked.rcsb")).unwrap().header().null_store(), Some(marker));
+        for bad in ["[1]", "{\"a\":1} {}"] {
+            assert!(append("bad.rcsb", &plain, Some(bad)).unwrap_err().contains("null_store"), "{bad}");
+        }
+        let left: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).filter(|n| n.starts_with("bad")).collect();
+        assert!(left.is_empty(), "{left:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn write_raw(tag: &str, bytes: &[u8]) -> (std::path::PathBuf, File) {
         let path = std::env::temp_dir().join(format!(
             "rcsr-1076-{}-{}.bin",
@@ -3423,7 +3498,7 @@ mod tests {
         for batch in [1, 3] {
             let fx = append_fixture(&format!("wfail{}", batch), 4, 16, 4, 2);
             let out = fx.dir.join("never.rcsb").to_string_lossy().into_owned();
-            let err = write_store_appending_hashed_over(&out, &fx.source, &fx.extras, batch, |file| {
+            let err = write_store_appending_hashed_over(&out, &fx.source, &fx.extras, batch, None, |file| {
                 FailAfter { inner: file, limit: 700 }
             })
             .map(|_| ())
