@@ -388,3 +388,63 @@ fn progress_is_flag_gated_and_does_not_change_default_output() {
     );
 
 }
+
+/// #1348: a tracker restored from its snapshot continues exactly like the one
+/// that never stopped, down to the bits of every reading and of the next
+/// snapshot, at every cut of a scripted front history.
+#[test]
+fn a_restored_tracker_continues_exactly() {
+    let forms = [x(), sin_x(), cos_x(), exp_x()];
+    let script: Vec<(f64, Archive)> = (0..60usize)
+        .map(|g| {
+            let n = 1 + (g / 7) % 4;
+            let mut trees: Vec<expr::Node> = forms[..n].to_vec();
+            if g % 5 == 0 {
+                trees.rotate_left(1);
+            }
+            (100.0 / (1.0 + (g as f64).sqrt()) + 1e-3 * (g % 3) as f64, front(trees))
+        })
+        .collect();
+    for window in [1usize, 3, DEFAULT_WINDOW] {
+        let mut whole = ProgressStats::new(window);
+        let readings: Vec<Convergence> = script.iter().enumerate().map(|(g, (e, f))| whole.observe(g + 1, *e, f)).collect();
+        for cut in [0usize, 1, 2, 19, 20, 21, 59] {
+            let mut head = ProgressStats::new(window);
+            for (g, (e, f)) in script.iter().enumerate().take(cut) {
+                head.observe(g + 1, *e, f);
+            }
+            let snap = head.snapshot();
+            let (mut tail, exact) = ProgressStats::resume(Some(&snap), window, cut);
+            assert!(exact);
+            assert_eq!(tail.snapshot(), snap, "window {window} cut {cut}: the restore round-trips");
+            for (g, (e, f)) in script.iter().enumerate().skip(cut) {
+                let got = tail.observe(g + 1, *e, f);
+                for (a, b) in [
+                    (got.confidence, readings[g].confidence),
+                    (got.stability, readings[g].stability),
+                    (got.maturity, readings[g].maturity),
+                    (got.percent_converged, readings[g].percent_converged),
+                ] {
+                    assert_eq!(a.to_bits(), b.to_bits(), "window {window} cut {cut} generation {}", g + 1);
+                }
+            }
+            let (a, b) = (tail.snapshot(), whole.snapshot());
+            assert_eq!(a.jaccard_sum.to_bits(), b.jaccard_sum.to_bits());
+            assert_eq!(a, b, "window {window} cut {cut}: the final state");
+        }
+    }
+}
+
+/// #1348: a snapshot kept under another window does not restore; a missing one
+/// is exact only before the first generation.
+#[test]
+fn resume_without_a_usable_snapshot_is_exact_only_at_generation_zero() {
+    let mut stats = ProgressStats::new(5);
+    stats.observe(1, 1.0, &front(vec![x()]));
+    let snap = stats.snapshot();
+    assert!(ProgressStats::restore(&snap, 6).is_none());
+    assert!(!ProgressStats::resume(Some(&snap), 6, 1).1);
+    assert!(!ProgressStats::resume(None, 5, 1).1);
+    assert!(ProgressStats::resume(None, 5, 0).1);
+    assert!(!ProgressStats::resume(None, 5, 0).0.has_observed());
+}

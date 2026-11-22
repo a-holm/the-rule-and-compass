@@ -2857,3 +2857,66 @@ fn a_qd_policy_checkpoint_without_the_archive_is_refused() {
     assert_eq!(refused.status.code(), Some(2), "{err}");
     assert!(err.contains("has no QD archive"), "{err}");
 }
+
+fn convergence_bits(out: &Outcome) -> [u64; 4] {
+    let c = out.convergence;
+    [c.confidence, c.stability, c.maturity, c.percent_converged].map(f64::to_bits)
+}
+
+/// #1348: the tracker is saved and read back to the same bits, and its records
+/// are checked like every other section.
+#[test]
+fn the_convergence_tracker_round_trips_and_is_checked() {
+    let train = sample(40);
+    let test = sample(10);
+    let text = checkpoint_text(&Config { generations: 6, gpu: false, ..config(4) }, &train, &test);
+    let cp = Checkpoint::from_text(&text).expect("parse");
+    let snap = cp.progress.as_ref().expect("the checkpoint carries the tracker");
+    assert_eq!(snap.best.len(), 6);
+    assert!(!snap.fronts.is_empty() && !snap.seen.is_empty());
+    assert_eq!(cp.to_text(), text);
+    let again = Checkpoint::from_text(&cp.to_text()).expect("reparse");
+    assert_eq!(again.progress.as_ref(), Some(snap));
+    assert_eq!(again.progress.unwrap().jaccard_sum.to_bits(), snap.jaccard_sum.to_bits());
+
+    let mut lines: Vec<&str> = text.lines().collect();
+    let last = lines.iter().rposition(|l| l.starts_with("progress_best ")).expect("a best record");
+    lines.remove(last);
+    let without_last_best: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    let err = expect_err(Checkpoint::from_text(&without_last_best), "a progress record is missing");
+    assert!(err.contains("progress says"), "{err}");
+    let doubled = text.clone() + text.lines().find(|l| l.starts_with("progress 1 ")).unwrap() + "\n";
+    let err = expect_err(Checkpoint::from_text(&doubled), "a duplicate progress header");
+    assert!(err.contains("duplicate 'progress' record"), "{err}");
+    let v2 = text.replacen("\nprogress 1 ", "\nprogress 2 ", 1);
+    let err = expect_err(Checkpoint::from_text(&v2), "an unknown progress version");
+    assert!(err.contains("progress version 2 is not supported"), "{err}");
+}
+
+/// #1348: a resume at any generation reports the uninterrupted convergence
+/// readings, bit for bit; a checkpoint without the tracker resumes and says its
+/// block is not exact.
+#[test]
+fn a_resumed_run_reports_the_uninterrupted_convergence_readings() {
+    let train = sample(80);
+    let test = sample(20);
+    let cfg = |generations| Config { generations, gpu: false, ..config(9) };
+    let full = search::run(&cfg(20), &train, &test);
+    assert!(full.convergence_exact);
+    assert_ne!(convergence_bits(&full), [0; 4]);
+    for cut in [1usize, 4, 9, 19] {
+        let text = checkpoint_text(&cfg(cut), &train, &test);
+        let saved = Checkpoint::from_text(&text).expect("parse");
+        let resumed = search::run_resumable(&cfg(20), &train, &test, Some(saved), 0, |_| {}).expect("resume");
+        assert!(resumed.convergence_exact);
+        assert_eq!(convergence_bits(&resumed), convergence_bits(&full), "cut {cut}");
+        assert_eq!(resumed.converged_early, full.converged_early, "cut {cut}");
+    }
+    let text = checkpoint_text(&cfg(9), &train, &test);
+    let old: String = text.lines().filter(|l| !l.starts_with("progress")).map(|l| format!("{l}\n")).collect();
+    let saved = Checkpoint::from_text(&old).expect("an old checkpoint parses");
+    assert!(saved.progress.is_none());
+    let resumed = search::run_resumable(&cfg(20), &train, &test, Some(saved), 0, |_| {}).expect("old resume");
+    assert!(!resumed.convergence_exact);
+    assert_eq!(describe(&resumed), describe(&full), "the search itself is unchanged");
+}

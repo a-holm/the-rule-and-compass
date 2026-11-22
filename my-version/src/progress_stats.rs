@@ -113,6 +113,22 @@ impl Convergence {
     }
 }
 
+/// The state of a [`ProgressStats`] after some observations, in a form a
+/// checkpoint stores exactly: every float is kept as is (the checkpoint writes
+/// bit patterns) and every set is sorted, so equal states give equal bytes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProgressSnapshot {
+    pub window: usize,
+    pub best: Vec<(usize, f64)>,
+    /// One sorted list of form hashes per remembered generation.
+    pub fronts: Vec<Vec<u64>>,
+    pub jaccards: Vec<f64>,
+    pub jaccard_sum: f64,
+    /// `(form, first generation of its current run)`, sorted by form.
+    pub seen: Vec<(u64, usize)>,
+    pub current: Convergence,
+}
+
 /// Incremental convergence tracker. Cheap by construction: each observation
 /// hashes the current front (O(front size)) and keeps at most `w + 1` small
 /// snapshots.
@@ -148,6 +164,70 @@ impl ProgressStats {
     /// The comparison window in generations.
     pub fn window(&self) -> usize {
         self.window
+    }
+
+    /// The full tracker state, for a checkpoint.
+    pub fn snapshot(&self) -> ProgressSnapshot {
+        let mut seen: Vec<(u64, usize)> = self.seen.iter().map(|(k, v)| (*k, *v)).collect();
+        seen.sort_unstable();
+        ProgressSnapshot {
+            window: self.window,
+            best: self.best.iter().copied().collect(),
+            fronts: self
+                .fronts
+                .iter()
+                .map(|set| {
+                    let mut forms: Vec<u64> = set.iter().copied().collect();
+                    forms.sort_unstable();
+                    forms
+                })
+                .collect(),
+            jaccards: self.jaccards.iter().copied().collect(),
+            jaccard_sum: self.jaccard_sum,
+            seen,
+            current: self.current,
+        }
+    }
+
+    /// Continue from a saved state. `None` when the state was kept under a
+    /// different window (it would not continue the same readings).
+    pub fn restore(snapshot: &ProgressSnapshot, window: usize) -> Option<Self> {
+        if snapshot.window != window.max(1) {
+            return None;
+        }
+        Some(ProgressStats {
+            window: snapshot.window,
+            best: snapshot.best.iter().copied().collect(),
+            fronts: snapshot
+                .fronts
+                .iter()
+                .map(|forms| forms.iter().copied().collect())
+                .collect(),
+            jaccards: snapshot.jaccards.iter().copied().collect(),
+            jaccard_sum: snapshot.jaccard_sum,
+            seen: snapshot.seen.iter().copied().collect(),
+            current: snapshot.current,
+        })
+    }
+
+    /// True once [`ProgressStats::observe`] has run at least once.
+    pub fn has_observed(&self) -> bool {
+        !self.best.is_empty()
+    }
+
+    /// The tracker a search starts with after `generations_done` completed
+    /// generations, and whether its readings are exact. They are exact when
+    /// nothing has run yet or when the saved state restores; a checkpoint from
+    /// before the state was saved leaves a fresh tracker and `false`.
+    pub fn resume(
+        saved: Option<&ProgressSnapshot>,
+        window: usize,
+        generations_done: usize,
+    ) -> (Self, bool) {
+        match saved.and_then(|s| ProgressStats::restore(s, window)) {
+            Some(stats) => (stats, true),
+            None => (ProgressStats::new(window), generations_done == 0),
+        }
     }
 
     /// Observe one generation: its best error and its Pareto front.

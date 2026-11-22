@@ -30,7 +30,7 @@ use crate::pareto::{Archive, Sol};
 use crate::postfix::{unique_slots, Arena, FrontParents, Variation};
 // #18: convergence statistics live in their own module; the search only calls
 // `ProgressStats::observe` once per generation.
-use crate::progress_stats::{Convergence, ProgressStats};
+use crate::progress_stats::{Convergence, ProgressSnapshot, ProgressStats};
 // #120: the opt-in quality-diversity archive.
 use crate::qd::{self, QdArchive, QdReport};
 use crate::rng::Mt;
@@ -7378,6 +7378,9 @@ pub struct Outcome {
     /// search state is saved; `archive` is the search archive at the last
     /// generation, `test_errors` is empty and no end-of-run report ran.
     pub interim: bool,
+    /// #1348: the `convergence` readings continue every generation of the run.
+    /// False only for a resume from a checkpoint that predates the saved tracker.
+    pub convergence_exact: bool,
     /// #1082: distinct long/flat books of the final population under
     /// `--fitness pnl` on the node path; `None` otherwise.
     pub books: Option<crate::devlog::BookCounts>,
@@ -7602,6 +7605,7 @@ fn snapshot(
     final_archive: Option<&Archive>,
     candidates_evaluated: u64,
     qd: Option<&QdArchive>, // #1166
+    progress: &ProgressStats, // #1348
 ) -> Checkpoint {
     let (words, idx) = main_rng.state();
     Checkpoint {
@@ -7654,6 +7658,7 @@ fn snapshot(
         // #1166: trajectory state only under the policy; a passive archive is
         // rebuilt on resume, so its checkpoint keeps its bytes.
         qd: qd.filter(|_| cfg.qd_policy).map(QdArchive::state),
+        progress: Some(progress.snapshot()), // #1348
     }
 }
 
@@ -8246,6 +8251,7 @@ fn run_postfix_search(
     mut best_prev: f64,
     mut no_improve: usize,
     mut candidates: u64,
+    saved_progress: Option<ProgressSnapshot>, // #1348
     save_every: usize,
     mut on_checkpoint: Option<CheckpointFn<'_>>,
     backend_reason: Option<String>,
@@ -8266,7 +8272,11 @@ fn run_postfix_search(
         .map(|p| p.iter().map(|ind| ind.error).collect())
         .collect();
     let mut pool = Arena::from_trees(&trees, &errors, variation.width)?;
-    let mut progress_stats = ProgressStats::new(crate::progress_stats::DEFAULT_WINDOW);
+    let (mut progress_stats, convergence_exact) = ProgressStats::resume(
+        saved_progress.as_ref(),
+        crate::progress_stats::DEFAULT_WINDOW,
+        gens_done,
+    ); // #1348
     let mut gpu_stats: Vec<GpuGenStats> = Vec::new();
     let mut restart_flags = vec![false; n_islands];
     let t0 = std::time::Instant::now();
@@ -8574,6 +8584,7 @@ fn run_postfix_search(
                 None,
                 candidates,
                 None, // #1166: the flat path refuses a QD archive
+                &progress_stats, // #1348
             );
             emit(&mut on_checkpoint, &cp);
             io_stage_total += io_mark.elapsed().as_secs_f64();
@@ -8654,6 +8665,7 @@ fn run_postfix_search(
             None,
             candidates,
             None, // #1166
+            &progress_stats, // #1348
         );
         Some(cp)
     } else {
@@ -8752,6 +8764,7 @@ fn run_postfix_search(
         converged_early: reported_converged_early(converged_early, &convergence),
         seeds: Vec::new(),
         convergence,
+        convergence_exact,
         fit_samples: 0,
         fit_rows: 0,
         archive_refit: false,
@@ -9209,6 +9222,7 @@ fn run_search(
     let mut no_improve: usize;
     let mut candidates: u64;
     let mut saved_qd: Option<qd::QdState> = None; // #1166
+    let mut saved_progress: Option<ProgressSnapshot> = None; // #1348
     // #85: did any generation fit on a screening subset? Only then may the
     // final archive be refit; a request at least as large as the sample, or
     // `--no-fit`, stays an exact no-op.
@@ -9261,8 +9275,10 @@ fn run_search(
             candidates_evaluated: saved_candidates,
             main_rng,
             qd: qd_state,
+            progress: cp_progress,
             ..
         } = cp;
+        saved_progress = cp_progress; // #1348
         // #1166: under the policy the archive chose this trajectory's parents;
         // an empty one would continue a different search.
         if cfg.qd_policy {
@@ -9506,6 +9522,7 @@ fn run_search(
                         best_prev,
                         no_improve,
                         candidates,
+                        saved_progress.take(), // #1348
                         save_every,
                         on_checkpoint,
                         backend_reason,
@@ -9543,8 +9560,13 @@ fn run_search(
 
     // #18: one tracker, updated once per generation from the archive. It holds
     // no population state, so it cannot affect the search trajectory.
-    let mut progress_stats = ProgressStats::new(crate::progress_stats::DEFAULT_WINDOW);
-    let mut stats_observed = false;
+    let (mut progress_stats, convergence_exact) = ProgressStats::resume(
+        saved_progress.as_ref(),
+        crate::progress_stats::DEFAULT_WINDOW,
+        gens_done,
+    ); // #1348
+    let restored = saved_progress.is_some() && convergence_exact;
+    let mut stats_observed = progress_stats.has_observed();
     // #120: the descriptor archive. Under the passive `--qd` it observes
     // evaluated individuals and never feeds back into selection, so turning it
     // on cannot change the trajectory or the Pareto front, and a resume rebuilds
@@ -10240,6 +10262,7 @@ fn run_search(
                     None,
                     candidates,
                     qd_archive.as_ref(), // #1166
+                    &progress_stats, // #1348
                 );
                 emit(&mut on_checkpoint, &cp);
                 io_stage_total += io_mark.elapsed().as_secs_f64();
@@ -10303,6 +10326,7 @@ fn run_search(
             None,
             candidates,
             qd_archive.as_ref(), // #1166
+            &progress_stats, // #1348
         );
         Some(cp)
     } else {
@@ -10422,7 +10446,7 @@ fn run_search(
     // #26: a GPU-guided run's in-loop readings are on the f32 proxy; take the
     // final reading from the rebuilt f64 archive so the reported statistics
     // describe the numbers the user sees.
-    if !interim && (!stats_observed || gpu_used || resumed) {
+    if !interim && (!stats_observed || gpu_used || (resumed && !restored)) {
         let best = final_archive
             .items
             .iter()
@@ -10528,6 +10552,7 @@ fn run_search(
         candidates_evaluated: candidates,
         fixed_position_fallback,
         interim,
+        convergence_exact,
         fit_accept: fit_accept_report(cfg, &run_fit),
         books: book_counts(&islands, cfg), // #1082
     })
