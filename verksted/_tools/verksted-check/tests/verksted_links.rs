@@ -39,7 +39,7 @@ fn workshop_holds_no_python() {
 }
 
 #[test]
-#[ignore = "enabled by the wire-up package"]
+#[ignore = "enabled by #1359"]
 fn workshop_graph_links_every_pipeline_to_its_stages() {
     let problems = check::graph_stage_problems(&workshop_root());
     assert!(problems.is_empty(), "pipeline contracts miss stage links:\n{}", problems.join("\n"));
