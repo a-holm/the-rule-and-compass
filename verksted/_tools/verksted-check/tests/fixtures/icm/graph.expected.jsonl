@@ -1,0 +1,36 @@
+{"root": "fixture-tree"}
+{"node": "01_pipe/CONTEXT.md", "type": "pipeline", "title": "Pipe \"one\" å", "description": "Single quoted: kept as is", "tags": "[alpha, beta]"}
+{"node": "01_pipe/stages/01_a/CONTEXT.md", "type": "stage", "title": "Stage a", "description": "First stage.", "tags": "a, b"}
+{"node": "01_pipe/stages/02_b/CONTEXT.md", "type": "stage", "title": "Stage å b", "description": "Bygg årsplan, ikke \"x\"", "tags": ""}
+{"node": "AGENTS.md", "type": "", "title": "Fixture workshop", "description": "", "tags": ""}
+{"node": "CLAUDE.md", "type": "", "title": "CLAUDE", "description": "", "tags": ""}
+{"node": "GEMINI.md", "type": "", "title": "GEMINI", "description": "", "tags": ""}
+{"node": "_shared/CLAUDE.md", "type": "", "title": "CLAUDE", "description": "", "tags": ""}
+{"node": "_shared/rules.md", "type": "reference", "title": "Shared rules", "description": "Rules that every pipeline loads.", "tags": "rules, shared"}
+{"node": "_shared/with space.md", "type": "", "title": "Spaced note", "description": "", "tags": ""}
+{"node": "references/CLAUDE.md", "type": "", "title": "Excluded", "description": "", "tags": ""}
+{"node": "references/Zeta note.md", "type": "", "title": "Zeta upper case", "description": "Sorts before lowercase.", "tags": ""}
+{"node": "references/a.md", "type": "", "title": "Alpha note", "description": "Describes alpha.", "tags": ""}
+{"node": "references/agents.md", "type": "", "title": "Excluded", "description": "", "tags": ""}
+{"node": "references/b.md", "type": "", "title": "Bravo heading", "description": "Quoted å description", "tags": ""}
+{"node": "references/c.md", "type": "", "title": "c", "description": "", "tags": ""}
+{"node": "references/d.md", "type": "", "title": "No description", "description": "", "tags": ""}
+{"node": "references/emptyfolder/other.md", "type": "", "title": "In empty folder", "description": "", "tags": ""}
+{"node": "references/index.md", "type": "", "title": "Excluded", "description": "", "tags": ""}
+{"node": "references/log.md", "type": "", "title": "Excluded", "description": "", "tags": ""}
+{"node": "references/rec/CONTEXT.md", "type": "", "title": "Record", "description": "", "tags": ""}
+{"node": "references/sub/deep.md", "type": "", "title": "Deep", "description": "", "tags": ""}
+{"node": "references/åpen.md", "type": "", "title": "Åpen", "description": "Unicode file name.", "tags": ""}
+{"edge": ["01_pipe/CONTEXT.md", "_shared/rules.md"]}
+{"edge": ["01_pipe/CONTEXT.md", "01_pipe/stages/01_a/CONTEXT.md"]}
+{"edge": ["01_pipe/CONTEXT.md", "01_pipe/stages/02_b/CONTEXT.md"]}
+{"edge": ["01_pipe/stages/01_a/CONTEXT.md", "01_pipe/CONTEXT.md"]}
+{"edge": ["01_pipe/stages/01_a/CONTEXT.md", "01_pipe/stages/02_b/CONTEXT.md"]}
+{"edge": ["AGENTS.md", "01_pipe/CONTEXT.md"]}
+{"edge": ["AGENTS.md", "01_pipe/stages/01_a/CONTEXT.md"]}
+{"edge": ["AGENTS.md", "_shared/with space.md"]}
+{"edge": ["AGENTS.md", "references/a.md"]}
+{"edge": ["CLAUDE.md", "AGENTS.md"]}
+{"edge": ["_shared/CLAUDE.md", "AGENTS.md"]}
+{"edge": ["_shared/rules.md", "AGENTS.md"]}
+{"edge": ["references/a.md", "references/b.md"]}

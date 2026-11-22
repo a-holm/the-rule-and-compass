@@ -154,7 +154,7 @@ fn run_bash(args: &[&str], log: &Path, guard: &Guard) -> Option<String> {
 }
 
 fn tools_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../verksted/_tools")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
 }
 
 fn shell_files(dir: &Path, out: &mut Vec<PathBuf>) {
