@@ -2013,7 +2013,7 @@ fn run_ladder_rungs(p: &Panel, folds: &[Fold], opts: &Options) -> Result<Report,
         let z = rungs.iter().find(|r| r.name == "zero_param" && !r.pos.is_empty());
         z.map(|r| {
             let (net, _) = price(p, &pool, &r.pos, &r.priced, opts.cost_bps * 1e-4);
-            pool.periods_priced(&net, &z.priced).iter().sum::<f64>()
+            pool.periods_priced(&net, &r.priced).iter().sum::<f64>()
         })
     };
     if let Some(z) = zero_net {
