@@ -37,7 +37,7 @@ while true; do
   now=$(date +%s)
   for w in "$@"; do
     [ -d "$w" ] || continue
-    newest=$(find "$w" -path "$w/my-version/target" -prune -o -name .git -prune -o -type f -printf '%T@\n' 2>/dev/null | sort -n | tail -n 1 | cut -d. -f1)
+    newest=$(find "$w" -path "$w/$CRATE/target" -prune -o -name .git -prune -o -type f -printf '%T@\n' 2>/dev/null | sort -n | tail -n 1 | cut -d. -f1)
     age=$(( (now - ${newest:-0}) / 60 ))
     if [ "$age" -ge "$minutes" ] && ! busy_under "$w"; then
       echo "SILENT ${age}min: $w"

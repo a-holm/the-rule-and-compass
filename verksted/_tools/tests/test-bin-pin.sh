@@ -3,6 +3,7 @@
 # Hermetic test of bin-pin.sh with a scratch git worktree and stub binaries.
 # Writes: a temp dir that it removes.
 set -uo pipefail
+export RCSR_CRATE=crate-x
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PIN=$HERE/../bin-pin.sh
 T=$(mktemp -d)
@@ -18,7 +19,7 @@ check() {
 git_q() { git -c user.name=t -c user.email=t@t.invalid "$@"; }
 
 wt=$T/wt
-rel=$wt/my-version/target/release
+rel=$wt/crate-x/target/release
 mkdir -p "$rel"
 git -C "$wt" init -q
 echo target > "$wt/.gitignore"

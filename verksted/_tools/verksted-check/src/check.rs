@@ -1,5 +1,5 @@
 //! Check logic of the verksted workshop. Pure std; no `crate::` paths, so the file compiles as a
-//! crate module and through `#[path]` in `my-version/tests/verksted_links.rs`.
+//! crate module and through `#[path]` in the engine crate test `verksted_links.rs`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
