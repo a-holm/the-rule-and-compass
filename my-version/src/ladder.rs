@@ -1220,7 +1220,7 @@ fn trend_rung(
                 let pos = band_positions_flat(&test_x, &tg, &params).unwrap_or_else(|_| vec![0.0; test_x.len()]);
                 for (k, (&x, &q)) in test_x.iter().zip(&pos).enumerate() {
                     r.score[s + k] = x;
-                    r.priced[s + k] = x.is_finite();
+                    r.priced[s + k] = true;
                     r.pos[s + k] = q;
                 }
                 chosen.push(format!("{}@{}", cols[ci].0, jnum(TREND_BANDS[bi])));
