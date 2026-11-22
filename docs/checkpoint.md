@@ -379,3 +379,7 @@ and `--json` includes:
 
 The text-mode `# checkpoint: ...` line goes to stderr, like the rest of the
 human-readable log.
+
+## Book rule line (#1207)
+
+A checkpoint records `book missing_score flat`, the rule of the books that selection and re-selection price (see "Rows with no finite score" in walkforward.md), and run.json records `book.missing_score`. `--reselect` and `--reselect-run` exit 2 naming `book.missing_score` when the source has no such record (a file of a build that carried the position across a missing score) or names another rule than the build's. `--resume` does not read it: the search fitness book gives a non-finite prediction the regret `+inf`.

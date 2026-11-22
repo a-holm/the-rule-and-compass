@@ -572,6 +572,25 @@ impl Pool {
         self.idx.len()
     }
 
+    /// #1207: the equal-weight mean over the priced rows of each period; a period
+    /// with no priced row is 0. An empty `priced` prices every row.
+    fn periods_priced(&self, v: &[f64], priced: &[bool]) -> Vec<f64> {
+        if priced.iter().all(|&b| b) {
+            return self.periods(v);
+        }
+        (0..self.period_times.len())
+            .map(|b| {
+                let (s, e) = (self.period_bounds[b], self.period_bounds[b + 1]);
+                let (sum, n) = self.by_time[s..e].iter().filter(|&&k| priced[k]).fold((0.0, 0usize), |(a, c), &k| (a + v[k], c + 1));
+                if n == 0 {
+                    0.0
+                } else {
+                    sum / n as f64
+                }
+            })
+            .collect()
+    }
+
     /// Equal-weight mean of a per-row vector for each period.
     fn periods(&self, v: &[f64]) -> Vec<f64> {
         (0..self.period_times.len())
@@ -585,23 +604,77 @@ impl Pool {
 }
 
 /// Per-row net and gross of `pos` (aligned with the pool) at `side` per side.
-fn price(p: &Panel, pool: &Pool, pos: &[f64], side: f64) -> (Vec<f64>, Vec<f64>) {
+/// `priced` (#1207) is empty when every row is priced, else it marks the rows
+/// with a finite score: the others are no priced period.
+fn price(p: &Panel, pool: &Pool, pos: &[f64], priced: &[bool], side: f64) -> (Vec<f64>, Vec<f64>) {
     let mut net = Vec::with_capacity(pool.len());
     let mut gross = Vec::with_capacity(pool.len());
     for &(s, e) in &pool.ranges {
         let rows = &pool.idx[s..e];
         let r: Vec<f64> = rows.iter().map(|&i| p.ret[i]).collect();
         let g: Vec<u64> = rows.iter().map(|&i| p.group[i]).collect();
-        net.extend(baselines::net_rows(&pos[s..e], &r, &g, side));
-        gross.extend(pos[s..e].iter().zip(&r).map(|(a, b)| a * b));
+        if priced.is_empty() {
+            net.extend(baselines::net_rows(&pos[s..e], &r, &g, side));
+            gross.extend(pos[s..e].iter().zip(&r).map(|(a, b)| a * b));
+        } else {
+            net.extend(net_rows_priced(&pos[s..e], &r, &g, &priced[s..e], side));
+            gross.extend((0..e - s).map(|k| if priced[s + k] { pos[s + k] * r[k] } else { 0.0 }));
+        }
     }
     (net, gross)
 }
 
-fn net_sum_slice(p: &Panel, rows: &[usize], pos: &[f64], side: f64) -> f64 {
+/// #1207: `baselines::net_rows` under the walk-forward `flat` rule. A row that
+/// is not priced earns and pays nothing and ends its run: the run pays its exit
+/// at its last priced row and the next priced row starts flat. Rows are in group
+/// and time order.
+fn net_rows_priced(pos: &[f64], r: &[f64], g: &[u64], priced: &[bool], side: f64) -> Vec<f64> {
+    if priced.iter().all(|&b| b) {
+        return baselines::net_rows(pos, r, g, side);
+    }
+    let runs = crate::trading::score_runs(g, priced, crate::trading::MissingScore::Flat);
+    let kept: Vec<usize> = (0..g.len()).filter(|&k| runs.run[k].is_some()).collect();
+    let kept_groups: Vec<u64> = kept.iter().map(|&k| g[k]).collect();
+    let kept_runs: Vec<u32> = kept.iter().map(|&k| runs.run[k].unwrap_or(0)).collect();
+    let keys = crate::trading::run_book_keys(&kept_groups, &kept_runs, g.iter().copied());
+    let kept_pos: Vec<f64> = kept.iter().map(|&k| pos[k]).collect();
+    let kept_ret: Vec<f64> = kept.iter().map(|&k| r[k]).collect();
+    let kept_net = baselines::net_rows(&kept_pos, &kept_ret, &keys, side);
+    let mut out = vec![0.0; g.len()];
+    for (j, &k) in kept.iter().enumerate() {
+        out[k] = kept_net[j];
+    }
+    out
+}
+
+/// #1207: `band_positions` under the `flat` rule: a row whose value is not finite is not priced,
+/// ends its run and is flat, and the band state restarts with the next run. Rows are in group and
+/// time order; with every row finite this is `band_positions` exactly.
+fn band_positions_flat(x: &[f64], groups: &[u64], params: &BandParams) -> Result<Vec<f64>, String> {
+    let priced: Vec<bool> = x.iter().map(|v| v.is_finite()).collect();
+    if priced.iter().all(|&b| b) {
+        return band_positions(x, groups, params);
+    }
+    let runs = crate::trading::score_runs(groups, &priced, crate::trading::MissingScore::Flat);
+    let kept: Vec<usize> = (0..x.len()).filter(|&k| runs.run[k].is_some()).collect();
+    let kept_groups: Vec<u64> = kept.iter().map(|&k| groups[k]).collect();
+    let kept_runs: Vec<u32> = kept.iter().map(|&k| runs.run[k].unwrap_or(0)).collect();
+    let keys = crate::trading::run_book_keys(&kept_groups, &kept_runs, groups.iter().copied());
+    let kept_x: Vec<f64> = kept.iter().map(|&k| x[k]).collect();
+    let kept_pos = band_positions(&kept_x, &keys, params)?;
+    let mut out = vec![0.0; x.len()];
+    for (j, &k) in kept.iter().enumerate() {
+        out[k] = kept_pos[j];
+    }
+    Ok(out)
+}
+
+/// #1207: the net of a long/flat book of `rows` under the `flat` rule for the rows whose score is not finite.
+fn net_sum_scored(p: &Panel, rows: &[usize], scores: &[f64], pos: &[f64], side: f64) -> f64 {
     let r: Vec<f64> = rows.iter().map(|&i| p.ret[i]).collect();
     let g: Vec<u64> = rows.iter().map(|&i| p.group[i]).collect();
-    baselines::net_rows(pos, &r, &g, side).iter().sum()
+    let priced: Vec<bool> = scores.iter().map(|s| s.is_finite()).collect();
+    net_rows_priced(pos, &r, &g, &priced, side).iter().sum()
 }
 
 // ---------------------------------------------------------------------------
@@ -990,6 +1063,8 @@ struct Rung {
     pos: Vec<f64>,
     /// Scores aligned with the pool, when the rung predicts something.
     score: Vec<f64>,
+    /// #1207: the pool rows the rung prices (a finite score); empty prices every row.
+    priced: Vec<bool>,
     /// Scores are predictions of the target (so an MSE applies).
     predicts_target: bool,
     params: String,
@@ -1008,6 +1083,7 @@ impl Rung {
             role: "",
             pos: Vec::new(),
             score: Vec::new(),
+            priced: Vec::new(),
             predicts_target: false,
             params: String::new(),
             fits: 0,
@@ -1042,6 +1118,7 @@ fn score_rung(
     let side = opts.cost_bps * 1e-4;
     r.pos = vec![0.0; pool.len()];
     r.score = vec![f64::NAN; pool.len()];
+    r.priced = vec![true; pool.len()];
     let mut chosen = Vec::new();
     for (fi, fold) in folds.iter().enumerate() {
         let (fit_s, valid_s, test_s) = scorer(fold);
@@ -1052,7 +1129,7 @@ fn score_rung(
                 continue;
             }
             let pos: Vec<f64> = valid_s.iter().map(|&s| if s > theta { 1.0 } else { 0.0 }).collect();
-            let net = net_sum_slice(p, &fold.valid, &pos, side);
+            let net = net_sum_scored(p, &fold.valid, &valid_s, &pos, side);
             if net > best.0 {
                 best = (net, theta, q);
             }
@@ -1061,6 +1138,7 @@ fn score_rung(
         for (k, &sc) in test_s.iter().enumerate() {
             r.score[s + k] = sc;
             r.pos[s + k] = if best.1.is_finite() && sc > best.1 { 1.0 } else { 0.0 };
+            r.priced[s + k] = sc.is_finite() || !best.1.is_finite();
         }
         chosen.push(best.2);
         let _ = e;
@@ -1103,6 +1181,7 @@ fn trend_rung(
     let side = opts.cost_bps * 1e-4;
     let mut r = Rung::new(name, "model");
     r.pos = vec![0.0; pool.len()];
+    r.priced = vec![true; pool.len()];
     r.score = vec![f64::NAN; pool.len()];
     let mut chosen: Vec<String> = Vec::new();
     for (fi, f) in folds.iter().enumerate() {
@@ -1120,8 +1199,8 @@ fn trend_rung(
             for (bi, &m) in TREND_BANDS.iter().enumerate() {
                 let band = m * sd;
                 let Ok(params) = BandParams::new(theta, band, 1) else { continue };
-                let Ok(pos) = band_positions(&valid_x, &vg, &params) else { continue };
-                let net = net_sum_slice(p, &f.valid, &pos, side);
+                let Ok(pos) = band_positions_flat(&valid_x, &vg, &params) else { continue };
+                let net = net_sum_scored(p, &f.valid, &valid_x, &pos, side);
                 if best.map_or(true, |b| net > b.0) {
                     best = Some((net, ci, bi, theta, band));
                 }
@@ -1132,9 +1211,10 @@ fn trend_rung(
             Some((_, ci, bi, theta, band)) => {
                 let test_x = rows_of(cols[ci].1, &f.test);
                 let params = BandParams { threshold: theta, band, min_hold: 1 };
-                let pos = band_positions(&test_x, &tg, &params).unwrap_or_else(|_| vec![0.0; test_x.len()]);
+                let pos = band_positions_flat(&test_x, &tg, &params).unwrap_or_else(|_| vec![0.0; test_x.len()]);
                 for (k, (&x, &q)) in test_x.iter().zip(&pos).enumerate() {
                     r.score[s + k] = x;
+                    r.priced[s + k] = x.is_finite();
                     r.pos[s + k] = q;
                 }
                 chosen.push(format!("{}@{}", cols[ci].0, jnum(TREND_BANDS[bi])));
@@ -1407,14 +1487,14 @@ fn build_rows(
             continue;
         }
         let free = r.name == "equal_weight_universe";
-        let (net, gross) = price(p, pool, &r.pos, if free { 0.0 } else { side });
-        let net_p = pool.periods(&net);
-        let gross_p = pool.periods(&gross);
-        let n = r.pos.len() as f64;
+        let (net, gross) = price(p, pool, &r.pos, &r.priced, if free { 0.0 } else { side });
+        let net_p = pool.periods_priced(&net, &r.priced);
+        let gross_p = pool.periods_priced(&gross, &r.priced);
+        let n = if r.priced.is_empty() { r.pos.len() } else { r.priced.iter().filter(|&&b| b).count() } as f64;
         row.exposure = r.pos.iter().sum::<f64>() / n;
         for &c in &opts.cost_grid {
-            let (nc, _) = price(p, pool, &r.pos, if free { 0.0 } else { c * 1e-4 });
-            row.net_by_cost.push((c, pool.periods(&nc).iter().sum()));
+            let (nc, _) = price(p, pool, &r.pos, &r.priced, if free { 0.0 } else { c * 1e-4 });
+            row.net_by_cost.push((c, pool.periods_priced(&nc, &r.priced).iter().sum()));
         }
         let rs = risk_stats(&net_p, pool.ppy, DEFAULT_SORTINO_MAR);
         row.mean_period_net = rs.mean;
@@ -1442,6 +1522,10 @@ fn build_rows(
                 if g != prev_g {
                     prev = 0.0;
                     prev_g = g;
+                }
+                if !r.priced.is_empty() && !r.priced[k] {
+                    prev = 0.0;
+                    continue;
                 }
                 let cur = r.pos[k];
                 dp += (cur - prev).abs();
@@ -1680,6 +1764,7 @@ fn run_ladder_rungs(p: &Panel, folds: &[Fold], opts: &Options) -> Result<Report,
         let mut r = Rung::new("best_single_feature", "model");
         r.pos = vec![0.0; n];
         r.score = vec![f64::NAN; n];
+        r.priced = vec![true; n];
         let side = opts.cost_bps * 1e-4;
         for (fi, f) in folds.iter().enumerate() {
             let mut best: Option<(f64, usize, f64, f64)> = None;
@@ -1698,8 +1783,9 @@ fn run_ladder_rungs(p: &Panel, folds: &[Fold], opts: &Options) -> Result<Report,
                     if !theta.is_finite() {
                         continue;
                     }
-                    let pos: Vec<f64> = f.valid.iter().map(|&i| if sgn * col[i] > theta { 1.0 } else { 0.0 }).collect();
-                    let net = net_sum_slice(p, &f.valid, &pos, side);
+                    let valid_x: Vec<f64> = f.valid.iter().map(|&i| sgn * col[i]).collect();
+                    let pos: Vec<f64> = valid_x.iter().map(|&v| if v > theta { 1.0 } else { 0.0 }).collect();
+                    let net = net_sum_scored(p, &f.valid, &valid_x, &pos, side);
                     if best.map_or(true, |b| net > b.0) {
                         best = Some((net, j, sgn, theta));
                     }
@@ -1712,6 +1798,7 @@ fn run_ladder_rungs(p: &Panel, folds: &[Fold], opts: &Options) -> Result<Report,
                     let sc = sgn * p.x[j][i];
                     r.score[s + k] = sc;
                     r.pos[s + k] = if sc > theta { 1.0 } else { 0.0 };
+                    r.priced[s + k] = sc.is_finite();
                 }
             } else {
                 names_by_fold.push("none".to_string());
@@ -1758,6 +1845,7 @@ fn run_ladder_rungs(p: &Panel, folds: &[Fold], opts: &Options) -> Result<Report,
             let mut r = Rung::new("naive_reversal", "model");
             r.pos = pool.idx.iter().map(|&i| if col[i] < 0.0 { 1.0 } else { 0.0 }).collect();
             r.score = pool.idx.iter().map(|&i| -col[i]).collect();
+            r.priced = r.score.iter().map(|s| s.is_finite()).collect();
             r.params = "long iff the lagged return column is negative".to_string();
             r
         }
@@ -1769,6 +1857,7 @@ fn run_ladder_rungs(p: &Panel, folds: &[Fold], opts: &Options) -> Result<Report,
             let mut r = Rung::new("top_tercile_long", "model");
             r.pos = pos;
             r.score = ols_pool_score.clone();
+            r.priced = r.score.iter().map(|s| s.is_finite()).collect();
             r.params = "long the top tercile of the ols_ridge score per timestamp, cash otherwise".to_string();
             r
         }
@@ -1841,6 +1930,7 @@ fn run_ladder_rungs(p: &Panel, folds: &[Fold], opts: &Options) -> Result<Report,
         let mut r = Rung::new("symbolic_regression", "model");
         r.pos = vec![0.0; n];
         r.score = vec![f64::NAN; n];
+        r.priced = vec![true; n];
         let banded = sr_run.has_band();
         let params = if banded { Some(BandParams::new(sr_run.threshold, sr_run.band.resolved, sr_run.min_holding)?) } else { None };
         for (fi, f) in folds.iter().enumerate() {
@@ -1855,10 +1945,11 @@ fn run_ladder_rungs(p: &Panel, folds: &[Fold], opts: &Options) -> Result<Report,
                 let sc = crate::expr::eval(&tree, &row);
                 r.score[s + k] = sc;
                 r.pos[s + k] = if sc > sr_run.threshold { 1.0 } else { 0.0 };
+                r.priced[s + k] = sc.is_finite();
             }
             if let Some(params) = &params {
                 let groups: Vec<u64> = f.test.iter().map(|&i| p.group[i]).collect();
-                let pos = band_positions(&r.score[s..s + f.test.len()], &groups, params)?;
+                let pos = band_positions_flat(&r.score[s..s + f.test.len()], &groups, params)?;
                 r.pos[s..s + f.test.len()].copy_from_slice(&pos);
             }
         }
@@ -1939,8 +2030,8 @@ fn run_ladder_rungs(p: &Panel, folds: &[Fold], opts: &Options) -> Result<Report,
     let zero_net = {
         let z = rungs.iter().find(|r| r.name == "zero_param" && !r.pos.is_empty());
         z.map(|r| {
-            let (net, _) = price(p, &pool, &r.pos, opts.cost_bps * 1e-4);
-            pool.periods(&net).iter().sum::<f64>()
+            let (net, _) = price(p, &pool, &r.pos, &r.priced, opts.cost_bps * 1e-4);
+            pool.periods_priced(&net, &r.priced).iter().sum::<f64>()
         })
     };
     if let Some(z) = zero_net {
@@ -3180,5 +3271,141 @@ mod resume_cost_tests {
         assert_eq!(sr_wall_of(&run("")), (Some(10.0), Some("process")));
         let incomplete = run(",\"cumulative\":{\"complete\":false}");
         assert_eq!(sr_wall_of(&incomplete), (Some(10.0), Some("process")));
+    }
+}
+
+#[cfg(test)]
+mod missing_score_tests {
+    use super::*;
+
+    const T0: f64 = 1_640_995_200.0;
+
+    /// Two symbols, hourly rows 0..299, return +0.001 and -0.005 on rows 120..159.
+    fn panel() -> Panel {
+        let (mut time, mut group, mut ret) = (Vec::new(), Vec::new(), Vec::new());
+        for g in 0..2u64 {
+            for t in 0..300usize {
+                time.push(T0 + t as f64 * 3600.0);
+                group.push(g);
+                ret.push(if (120..160).contains(&t) { -0.005 } else { 0.001 });
+            }
+        }
+        Panel::new(vec!["x".to_string()], vec![vec![0.0; 600]], time, group, ret.clone(), ret, Vec::new()).unwrap()
+    }
+
+    fn fold(first: usize, last: usize) -> Fold {
+        let rows = |a: usize, b: usize| -> Vec<usize> { (0..2).flat_map(|g| (a..b).map(move |t| g * 300 + t)).collect() };
+        Fold { label: "f".to_string(), test_start: 0.0, test_end: 0.0, fit: rows(0, first), valid: rows(first, last), test: rows(last, 300) }
+    }
+
+    /// A rung whose test score has a NaN stretch on rows 230..259 of both symbols.
+    fn stretch_rung(nan: bool) -> (Panel, Fold, Pool, Rung) {
+        let p = panel();
+        let f = fold(100, 200);
+        let folds = vec![f];
+        let pool = Pool::new(&p, &folds, None);
+        let opts = Options::default();
+        let mut scorer = |fold: &Fold| {
+            let test: Vec<f64> = (0..fold.test.len()).map(|k| if nan && (30..60).contains(&(k % 100)) { f64::NAN } else { 2.0 }).collect();
+            (vec![0.0; fold.fit.len()], vec![2.0; fold.valid.len()], test)
+        };
+        let rung = score_rung(&p, &folds, &pool, &opts, Rung::new("t", "model"), &mut scorer);
+        let fold = folds.into_iter().next().unwrap();
+        (p, fold, pool, rung)
+    }
+
+    #[test]
+    fn ladder_score_rung_prices_a_missing_score_flat() {
+        let (p, fold, pool, r) = stretch_rung(true);
+        let side = 10e-4;
+        let missing: Vec<bool> = (0..pool.len()).map(|k| (30..60).contains(&(k % 100))).collect();
+        assert_eq!(r.priced, missing.iter().map(|m| !m).collect::<Vec<bool>>());
+        let (net, gross) = price(&p, &pool, &r.pos, &r.priced, side);
+        for k in 0..pool.len() {
+            if missing[k] {
+                assert_eq!((net[k], gross[k]), (0.0, 0.0), "row {k} is no priced period");
+            }
+        }
+        // Each symbol: the first run exits at its last priced row (the row before the stretch), the second pays its entry and its final exit.
+        let cost: f64 = gross.iter().sum::<f64>() - net.iter().sum::<f64>();
+        let pred: Vec<f64> = fold.test.iter().enumerate().map(|(k, _)| if missing[k] { f64::NAN } else { 2.0 }).collect();
+        let rows = crate::trading::TradingRows {
+            time: fold.test.iter().map(|&i| p.time[i]).collect(),
+            group: fold.test.iter().map(|&i| p.group[i]).collect(),
+            funding: Vec::new(),
+        };
+        let ret: Vec<f64> = fold.test.iter().map(|&i| p.ret[i]).collect();
+        let spec = crate::trading::TradingSpec { cost_bps: 10.0, threshold: 0.5, ..crate::trading::TradingSpec::default() };
+        let book = crate::trading::evaluate(&pred, &ret, &rows, &spec).unwrap();
+        assert!((cost - 0.008).abs() < 1e-12, "cost {cost}");
+        assert!((cost - book.total_cost).abs() < 1e-12, "{cost} vs {}", book.total_cost);
+        assert!((net.iter().sum::<f64>() - book.net_pnl).abs() < 1e-12);
+    }
+
+    #[test]
+    fn ladder_rung_with_full_coverage_is_priced_as_before() {
+        let (p, _, pool, r) = stretch_rung(false);
+        assert!(r.priced.iter().all(|&b| b));
+        let (net, gross) = price(&p, &pool, &r.pos, &r.priced, 10e-4);
+        let (net0, gross0) = price(&p, &pool, &r.pos, &[], 10e-4);
+        assert_eq!(net, net0);
+        assert_eq!(gross, gross0);
+        assert_eq!(pool.periods_priced(&net, &r.priced), pool.periods(&net));
+    }
+
+    /// A trend rung on a column that alternates +-1 before the test rows and is 2 on them, with a NaN stretch on rows 230..259.
+    fn trend(nan: bool) -> (Panel, Fold, Pool, Rung) {
+        let base = panel();
+        let col: Vec<f64> = (0..600)
+            .map(|i| {
+                let t = i % 300;
+                if t < 200 {
+                    if t % 2 == 0 { 1.0 } else { -1.0 }
+                } else if nan && (230..260).contains(&t) {
+                    f64::NAN
+                } else {
+                    2.0
+                }
+            })
+            .collect();
+        let p = Panel::new(vec!["tr".to_string()], vec![col], base.time.clone(), base.group.clone(), base.y.clone(), base.ret.clone(), Vec::new()).unwrap();
+        let folds = vec![fold(100, 200)];
+        let pool = Pool::new(&p, &folds, None);
+        let opts = Options { trend_rungs: true, ..Options::default() };
+        let rung = trend_rung(&p, &folds, &pool, &opts, "trend_ma", &["tr"], &[]);
+        let fold = folds.into_iter().next().unwrap();
+        (p, fold, pool, rung)
+    }
+
+    #[test]
+    fn ladder_trend_rung_prices_a_missing_score_flat() {
+        let (p, _, pool, r) = trend(true);
+        let missing: Vec<bool> = (0..pool.len()).map(|k| (30..60).contains(&(k % 100))).collect();
+        assert_eq!(r.priced, missing.iter().map(|m| !m).collect::<Vec<bool>>());
+        let (net, gross) = price(&p, &pool, &r.pos, &r.priced, 10e-4);
+        for k in 0..pool.len() {
+            if missing[k] {
+                assert_eq!((net[k], gross[k]), (0.0, 0.0), "row {k} is no priced period");
+            }
+        }
+        // Each symbol: the first run exits at its last priced row, the second pays its entry and its final exit.
+        let cost = gross.iter().sum::<f64>() - net.iter().sum::<f64>();
+        assert!((cost - 0.008).abs() < 1e-12, "cost {cost}");
+        let periods = pool.periods_priced(&net, &r.priced);
+        assert!(periods.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn ladder_trend_rung_with_full_coverage_is_priced_as_before() {
+        let (p, fold, pool, r) = trend(false);
+        assert!(r.priced.iter().all(|&b| b));
+        let groups: Vec<u64> = fold.test.iter().map(|&i| p.group[i]).collect();
+        let x: Vec<f64> = fold.test.iter().map(|&i| p.x[0][i]).collect();
+        let selected = r.params.clone();
+        assert!(selected.contains("tr@"), "{selected}");
+        let (net, _) = price(&p, &pool, &r.pos, &r.priced, 10e-4);
+        let (net0, _) = price(&p, &pool, &r.pos, &[], 10e-4);
+        assert_eq!(net, net0);
+        assert_eq!(band_positions_flat(&x, &groups, &BandParams::new(0.0, 0.0, 1).unwrap()).unwrap(), band_positions(&x, &groups, &BandParams::new(0.0, 0.0, 1).unwrap()).unwrap());
     }
 }

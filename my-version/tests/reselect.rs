@@ -291,6 +291,34 @@ fn reselect_refusals() {
 }
 
 #[test]
+fn reselect_refuses_a_run_without_the_missing_score_rule() {
+    let fx = fixture();
+    ok(&fx.search("a", &[]));
+    assert_eq!(at(&fx.run_json("a"), &["book", "missing_score"]).as_str(), Some("flat"));
+    assert!(checkpoint_line(&fx, "a", "book missing_score ").starts_with("book missing_score flat"));
+
+    let run = std::fs::read_to_string(fx.path("a.run.json")).unwrap();
+    let rule = "\"book\":{\"missing_score\":\"flat\"},";
+    assert!(run.contains(rule));
+    for (tag, text) in [("none", run.replacen(rule, "", 1)), ("hold", run.replacen("\"missing_score\":\"flat\"", "\"missing_score\":\"hold\"", 1))] {
+        let front = fx.path(&format!("{tag}.src.json"));
+        std::fs::write(&front, text).unwrap();
+        let out = fx.path(&format!("{tag}.run.json"));
+        let o = fx.rcsr(&fx.data, &["--reselect-run", front.as_str(), "--json-out", out.as_str(), "--no-dev-log", "--select-rule", "robust"]);
+        assert_eq!(code(&o), 2, "{tag}: {}", stderr(&o));
+        assert!(stderr(&o).contains("book.missing_score"), "{tag}: {}", stderr(&o));
+    }
+
+    let ck = std::fs::read_to_string(fx.path("a.ckpt")).unwrap();
+    let old = fx.path("old_rule.ckpt");
+    let kept: Vec<&str> = ck.lines().filter(|l| !l.starts_with("book missing_score ")).collect();
+    std::fs::write(&old, kept.join("\n") + "\n").unwrap();
+    let o = fx.rcsr(&fx.data, &["--reselect", old.as_str(), "--select-rule", "robust", "--no-dev-log"]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).contains("book.missing_score"), "{}", stderr(&o));
+}
+
+#[test]
 fn reselect_accepts_other_build() {
     let fx = fixture();
     ok(&fx.search("a", &[]));
@@ -406,7 +434,7 @@ impl Fixture {
             .map(|(k, (e, c))| format!("{{\"archive_rank\":{},\"expression_exact\":\"{e}\",\"complexity\":{c},\"train_error\":1.0}}", k + 1))
             .collect();
         let text = format!(
-            "{{\"variables\":[\"x1\",\"x2\"],\"train_rows\":{TRAIN_ROWS},\"split\":{{\"mode\":\"temporal\"}},\"generations_run\":0,\"pareto\":[{}]}}",
+            "{{\"variables\":[\"x1\",\"x2\"],\"book\":{{\"missing_score\":\"flat\"}},\"train_rows\":{TRAIN_ROWS},\"split\":{{\"mode\":\"temporal\"}},\"generations_run\":0,\"pareto\":[{}]}}",
             items.join(",")
         );
         let path = self.path(name);

@@ -2252,6 +2252,8 @@ struct Accum {
     /// `--policy vote`: the final read scores every member on the test rows.
     vote: bool,
     threshold_fit: Option<CutFit>,
+    /// #1207: the rule of the books that select a candidate or fit a cut.
+    missing_score: MissingScore,
     /// #1214: the gate plan, the states' first feature index and count, the warm-up
     /// of every gate at every window start and the gate rows the pass read.
     gate_plan: Option<GatePlan>,
@@ -2327,6 +2329,7 @@ impl Accum {
             test_candidates: Vec::new(),
             vote: spec.policy == Policy::Vote,
             threshold_fit: opts.threshold_fit,
+            missing_score: opts.missing_score,
             gate_plan: None,
             n_states: 0,
             gate_warm: Vec::new(),
@@ -2394,7 +2397,7 @@ impl Accum {
                     d.window.label
                 ));
             }
-            chosen.push(select_candidate(d, spec, trees, has_validation, self.threshold_fit.as_ref())?.candidate);
+            chosen.push(select_candidate(d, spec, trees, has_validation, self.threshold_fit.as_ref(), self.missing_score)?.candidate);
         }
         if self.vote {
             self.test_candidates = (0..trees.len()).collect();
@@ -2452,6 +2455,7 @@ impl Accum {
             test_candidates: Vec::new(),
             vote: false,
             threshold_fit: None,
+            missing_score: self.missing_score,
             gate_plan: self.gate_plan.as_ref().map(|p| GatePlan { switches: vec![p.switches.get(k).copied().flatten()], regimes: Vec::new(), ..p.clone() }),
             n_states: self.n_states,
             gate_warm: self.gate_warm.clone(),
@@ -2627,7 +2631,7 @@ impl Accum {
                 ));
             }
             let Selected { mut candidate, mut validation_error, mut threshold, band_selection, mut thresholds, mut cuts } =
-                select_candidate(&d, spec, trees, has_validation, opts.threshold_fit.as_ref())?;
+                select_candidate(&d, spec, trees, has_validation, opts.threshold_fit.as_ref(), opts.missing_score)?;
             let cut = if vote { None } else { cuts[candidate].take() };
             let member_thresholds = if vote { thresholds.clone() } else { Vec::new() };
             if vote {
@@ -4007,37 +4011,7 @@ pub fn reference_cell(
 /// group id, so the carried seam applies to it; every later run gets a key
 /// that no group of the window, no other run and no carried book uses.
 fn run_keys(groups: &[u64], runs: &[u32], rows: &[RowBase], previous: &HashMap<u64, f64>) -> Vec<u64> {
-    if runs.iter().all(|&r| r == 0) {
-        return groups.to_vec();
-    }
-    let mix = |mut x: u64| {
-        x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        x ^ (x >> 31)
-    };
-    let mut used: std::collections::HashSet<u64> = rows.iter().map(|r| r.group).chain(previous.keys().copied()).collect();
-    let mut out = Vec::with_capacity(groups.len());
-    let mut last: Option<(u64, u32, u64)> = None;
-    for (&g, &r) in groups.iter().zip(runs) {
-        if r == 0 {
-            out.push(g);
-            continue;
-        }
-        let key = match last {
-            Some((lg, lr, key)) if lg == g && lr == r => key,
-            _ => {
-                let mut key = mix(g ^ mix(r as u64));
-                while !used.insert(key) {
-                    key = mix(key);
-                }
-                last = Some((g, r, key));
-                key
-            }
-        };
-        out.push(key);
-    }
-    out
+    crate::trading::run_book_keys(groups, runs, rows.iter().map(|r| r.group).chain(previous.keys().copied()))
 }
 
 /// `previous` carries each group's last position. Pass a fresh map for a
@@ -6036,11 +6010,16 @@ fn profile_shares() -> Vec<f64> {
 /// #1094: the cut of one candidate in one window from its source rows (the
 /// validation slice, else the training rows), with `reference` as the
 /// fallback. The test rows are not an input.
-fn fit_cut(rows: &[RowBase], scores: &[f64], reference: f64, fit: &CutFit, cost_bps: f64, source: ThresholdSource) -> CutReport {
-    let mut idx: Vec<usize> = (0..rows.len()).filter(|&i| scores[i].is_finite() && rows[i].target.is_finite()).collect();
-    idx.sort_by(|&a, &b| {
-        rows[a].group.cmp(&rows[b].group).then_with(|| rows[a].time.total_cmp(&rows[b].time)).then_with(|| a.cmp(&b))
-    });
+fn fit_cut(rows: &[RowBase], scores: &[f64], reference: f64, fit: &CutFit, cost_bps: f64, missing: MissingScore, source: ThresholdSource) -> CutReport {
+    let groups: Vec<u64> = rows.iter().map(|r| r.group).collect();
+    let times: Vec<f64> = rows.iter().map(|r| r.time).collect();
+    let targets: Vec<f64> = rows.iter().map(|r| r.target).collect();
+    let book = crate::trading::book_rows(&groups, &times, &targets, scores, missing);
+    // Under `Hold` a leading row without a score has nothing to hold: it is flat and earns no return.
+    let keep: Vec<usize> = (0..book.rows.len()).filter(|&k| book.scores[k].is_finite()).collect();
+    let idx: Vec<usize> = keep.iter().map(|&k| book.rows[k]).collect();
+    let keys: Vec<u64> = keep.iter().map(|&k| book.keys[k]).collect();
+    let pred: Vec<f64> = keep.iter().map(|&k| book.scores[k]).collect();
     let mut report = CutReport {
         source: ThresholdSource::Fixed,
         value: reference,
@@ -6058,12 +6037,11 @@ fn fit_cut(rows: &[RowBase], scores: &[f64], reference: f64, fit: &CutFit, cost_
         report.fallback = Some("no_rows");
         return report;
     }
-    let pred: Vec<f64> = idx.iter().map(|&i| scores[i]).collect();
     let time: Vec<f64> = idx.iter().map(|&i| rows[i].time).collect();
     let slice = data::TradingSlice {
         rows: crate::trading::TradingRows {
             time: time.clone(),
-            group: idx.iter().map(|&i| rows[i].group).collect(),
+            group: keys,
             funding: Vec::new(),
         },
         ret: idx.iter().map(|&i| rows[i].target).collect(),
@@ -6124,6 +6102,7 @@ fn select_candidate(
     trees: &[Node],
     has_validation: bool,
     fit: Option<&CutFit>,
+    missing: MissingScore,
 ) -> Result<Selected, String> {
             let mut best: Option<(usize, f64, f64)> = None;
             let mut thresholds = vec![f64::NAN; d.train_scores.len()];
@@ -6151,9 +6130,9 @@ fn select_candidate(
                     f64::NAN
                 } else if let (Some(fit), Some(theta)) = (fit, spec.threshold_fixed) {
                     let report = if has_validation {
-                        fit_cut(&d.validation_rows, &d.validation_scores[c], theta, fit, spec.cost_bps, ThresholdSource::ValidationFitness)
+                        fit_cut(&d.validation_rows, &d.validation_scores[c], theta, fit, spec.cost_bps, missing, ThresholdSource::ValidationFitness)
                     } else {
-                        fit_cut(&d.train_rows, &d.train_row_scores[c], theta, fit, spec.cost_bps, ThresholdSource::TrainFitness)
+                        fit_cut(&d.train_rows, &d.train_row_scores[c], theta, fit, spec.cost_bps, missing, ThresholdSource::TrainFitness)
                     };
                     let value = report.value;
                     cuts[c] = Some(report);
@@ -6190,6 +6169,7 @@ fn select_candidate(
                 };
                 let options = crate::selection::BandOptions {
                     cost_bps: spec.cost_bps,
+                    missing_score: missing,
                     ..crate::selection::BandOptions::default()
                 };
                 let mut candidates: Vec<crate::selection::BandCandidate<'_>> =
@@ -6467,5 +6447,48 @@ mod group_key_tests {
         assert_eq!(group_key(-0.0), group_key(0.0));
         assert_eq!(group_key(f64::NAN), u64::MAX);
         assert_ne!(group_key(1.0), group_key(-1.0));
+    }
+}
+
+#[cfg(test)]
+mod missing_score_cut_tests {
+    use super::*;
+
+    /// Two symbols, hourly rows 0..299, return +0.001 and -0.005 on rows 120..159.
+    fn rows() -> Vec<RowBase> {
+        let mut out = Vec::new();
+        for g in 0..2u64 {
+            for t in 0..300usize {
+                out.push(RowBase { time: t as f64 * 3600.0, group: g, target: if (120..160).contains(&t) { -0.005 } else { 0.001 } });
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn threshold_fit_cut_book_follows_the_missing_score_rule() {
+        let rows = rows();
+        let scores: Vec<f64> =
+            (0..600).map(|i| if (120..160).contains(&(i % 300)) { f64::NAN } else { 1.0 + ((i as f64) * 0.618_033_988_749_894_9).fract() }).collect();
+        let fit = CutFit { min_entry_times: 1, blocks: 1, lambda: 1.0 };
+        let trading_rows = crate::trading::TradingRows {
+            time: rows.iter().map(|r| r.time).collect(),
+            group: rows.iter().map(|r| r.group).collect(),
+            funding: Vec::new(),
+        };
+        let targets: Vec<f64> = rows.iter().map(|r| r.target).collect();
+        let mut nets = Vec::new();
+        for rule in [crate::trading::MissingScore::Flat, crate::trading::MissingScore::Hold] {
+            let report = fit_cut(&rows, &scores, 0.5, &fit, 10.0, rule, ThresholdSource::ValidationFitness);
+            assert_eq!(report.fallback, None, "{}: {:?}", rule.name(), report.fallback_detail);
+            let spec = crate::trading::TradingSpec { cost_bps: 10.0, threshold: 0.5, missing_score: rule, ..crate::trading::TradingSpec::default() };
+            let book = crate::trading::evaluate(&scores, &targets, &trading_rows, &spec).unwrap();
+            let reference = report.reference.expect("a reference cut");
+            assert!((reference.net - book.net_pnl).abs() < 1e-12, "{}: cut {} vs book {}", rule.name(), reference.net, book.net_pnl);
+            assert_eq!(report.rows, if rule == crate::trading::MissingScore::Flat { 520 } else { 600 });
+            nets.push(reference.net);
+        }
+        // `flat` pays a second round trip per symbol and skips the stretch loss; `hold` earns the loss.
+        assert!(nets[0] > nets[1]);
     }
 }
