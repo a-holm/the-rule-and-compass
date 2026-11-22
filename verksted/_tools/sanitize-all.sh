@@ -43,7 +43,8 @@ while [ $# -gt 0 ]; do
     *) usage >&2; exit 2 ;;
   esac
 done
-plan=${RCSR_SANITIZER_PLAN:-$wt/$CRATE/tests/sanitizer.plan}
+C=$(crate_dir "$wt") || { echo "sanitize-all: no single engine crate under $wt" >&2; exit 2; }
+plan=${RCSR_SANITIZER_PLAN:-$C/tests/sanitizer.plan}
 [ -f "$plan" ] || { echo "sanitize-all: plan $plan missing" >&2; exit 2; }
 
 san_real=$(realpath "$SANITIZER" 2>/dev/null || true)
