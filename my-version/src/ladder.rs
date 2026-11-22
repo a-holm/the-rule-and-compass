@@ -669,18 +669,12 @@ fn band_positions_flat(x: &[f64], groups: &[u64], params: &BandParams) -> Result
     Ok(out)
 }
 
-/// #1207: [`net_sum_slice`] under the `flat` rule for the rows whose score is not finite.
+/// #1207: the net of a long/flat book of `rows` under the `flat` rule for the rows whose score is not finite.
 fn net_sum_scored(p: &Panel, rows: &[usize], scores: &[f64], pos: &[f64], side: f64) -> f64 {
     let r: Vec<f64> = rows.iter().map(|&i| p.ret[i]).collect();
     let g: Vec<u64> = rows.iter().map(|&i| p.group[i]).collect();
     let priced: Vec<bool> = scores.iter().map(|s| s.is_finite()).collect();
     net_rows_priced(pos, &r, &g, &priced, side).iter().sum()
-}
-
-fn net_sum_slice(p: &Panel, rows: &[usize], pos: &[f64], side: f64) -> f64 {
-    let r: Vec<f64> = rows.iter().map(|&i| p.ret[i]).collect();
-    let g: Vec<u64> = rows.iter().map(|&i| p.group[i]).collect();
-    baselines::net_rows(pos, &r, &g, side).iter().sum()
 }
 
 // ---------------------------------------------------------------------------
@@ -1220,7 +1214,7 @@ fn trend_rung(
                 let pos = band_positions_flat(&test_x, &tg, &params).unwrap_or_else(|_| vec![0.0; test_x.len()]);
                 for (k, (&x, &q)) in test_x.iter().zip(&pos).enumerate() {
                     r.score[s + k] = x;
-                    r.priced[s + k] = true;
+                    r.priced[s + k] = x.is_finite();
                     r.pos[s + k] = q;
                 }
                 chosen.push(format!("{}@{}", cols[ci].0, jnum(TREND_BANDS[bi])));
