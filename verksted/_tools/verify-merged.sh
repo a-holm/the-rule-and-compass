@@ -73,7 +73,7 @@ if [ -e "$w" ]; then
   [ -z "$(git -C "$w" status --porcelain)" ] || fail "$w is not clean"
   git -C "$w" checkout -q --detach "origin/$BASE" || fail "cannot check out origin/$BASE in $w"
 else
-  git -C "$RCSR_ROOT" worktree add -q --detach "$w" "origin/$BASE" || fail "cannot create $w"
+  git -C "$RCSR_ROOT" worktree add -q --detach "$WT/${w#"$wt_real"/}" "origin/$BASE" || fail "cannot create $w"
 fi
 
 if [ "$tip" -eq 0 ]; then
