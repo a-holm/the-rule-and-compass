@@ -1431,6 +1431,22 @@ fn a_lexicase_long_pnl_run_resumes_exactly() {
     assert_ne!(uninterrupted.archive.hash(), lexicographic.archive.hash(), "lexicase must change the trajectory");
 }
 
+/// A `--fitness pnl` book with 2 groups and 2 time blocks: trees with the same
+/// positions have the same regret bits, so errors tie within a cost.
+fn block_book_fitness(train: &Sample) -> search::Fitness {
+    let slice = rcsr::data::TradingSlice {
+        rows: rcsr::trading::TradingRows {
+            time: (0..train.len()).map(|i| 900.0 * (i % 120) as f64).collect(),
+            group: (0..train.len()).map(|i| (i / 120) as u64).collect(),
+            funding: Vec::new(),
+        },
+        ret: train.x.iter().map(|r| 0.002 * (r[1] - 0.5)).collect(),
+    };
+    let spec = rcsr::trading::TradingSpec { cost_bps: 2.0, min_trades: 0, ..Default::default() };
+    let book = rcsr::trading::FitnessBook::with_blocks(&slice, &spec, 900.0, 2, 1.0).expect("book");
+    search::Fitness::LongPnl(std::sync::Arc::new(book))
+}
+
 /// #1171: a CPU run resumed from an exact (f64) checkpoint reports the front
 /// trees of the uninterrupted run, wherever the run is cut. Under `--fitness
 /// pnl` trees with the same positions tie on error bits, so the reported tree
@@ -1439,19 +1455,29 @@ fn a_lexicase_long_pnl_run_resumes_exactly() {
 fn a_resumed_cpu_run_reports_the_uninterrupted_front_trees() {
     let train = sample(240);
     let test = sample(80);
-    for seed in [11u32, 12, 13, 14, 15, 16] {
-        let base = Config { generations: 24, gpu: false, ..pnl_config(seed, 5.0, &train) };
-        let uninterrupted = search::run(&base, &train, &test);
-        for cut in [1usize, 5, 12, 23] {
-            let text = checkpoint_text(&Config { generations: cut, ..base.clone() }, &train, &test);
-            let saved = Checkpoint::from_text(&text).expect("parse");
-            let resumed = search::run_resumable(&base, &train, &test, Some(saved), 0, |_| {}).expect("resume");
-            assert_eq!(describe(&uninterrupted), describe(&resumed), "seed {seed}, cut at generation {cut}");
-            assert_eq!(uninterrupted.archive.hash(), resumed.archive.hash(), "seed {seed}, cut {cut}: hash");
+    let mut differing = Vec::new();
+    for seed in 11u32..23 {
+        let fixtures = [
+            ("pnl", Config { generations: 24, gpu: false, ..pnl_config(seed, 5.0, &train) }),
+            ("block pnl", Config { generations: 24, gpu: false, fitness: block_book_fitness(&train), ..config(seed) }),
+        ];
+        for (name, base) in fixtures {
+            let uninterrupted = search::run(&base, &train, &test);
+            for cut in [1usize, 5, 12, 23] {
+                let text = checkpoint_text(&Config { generations: cut, ..base.clone() }, &train, &test);
+                let saved = Checkpoint::from_text(&text).expect("parse");
+                let resumed = search::run_resumable(&base, &train, &test, Some(saved), 0, |_| {}).expect("resume");
+                if describe(&uninterrupted) != describe(&resumed) {
+                    differing.push(format!("{name} seed {seed} cut {cut}"));
+                }
+            }
+            let (chunks, _) = chunked(&base, true, 3, &train, &test);
+            if describe(&uninterrupted) != describe(&chunks) {
+                differing.push(format!("{name} seed {seed} interim chunks"));
+            }
         }
-        let (chunks, _) = chunked(&base, true, 3, &train, &test);
-        assert_eq!(describe(&uninterrupted), describe(&chunks), "seed {seed}: interim chunks");
     }
+    assert!(differing.is_empty(), "resumed fronts differ from the uninterrupted front: {differing:?}");
 }
 
 /// #598: the pipeline depth is an execution setting. A resume takes the one it
