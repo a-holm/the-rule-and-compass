@@ -1733,9 +1733,25 @@ fn pit_join(
             }
             route.symbols_cpu += symbols;
             route.rows_cpu += rows;
-            panel_pit::join(block, params)
+            let out = panel_pit::join(block, params)?;
+            refuse_lookahead(&out, "cpu")?;
+            Ok(out)
         }
     }
+}
+
+/// A join that read a membership row not yet visible must not enter the store.
+/// `backend` is `device` or `cpu`.
+fn refuse_lookahead(out: &panel_pit::PitOutput, backend: &str) -> Result<(), String> {
+    let n = out.lookahead_violations;
+    if n == 0 {
+        return Ok(());
+    }
+    Err(if backend == "device" {
+        format!("lookahead: the device join reported {} rows", n)
+    } else {
+        format!("point-in-time join: {} rows read a membership row that was not visible yet", n)
+    })
 }
 
 #[cfg(feature = "cuda")]
@@ -1749,6 +1765,7 @@ fn device_pit(
     }
     let (out, stats) = crate::panel_pit_gpu::join(block, params)
         .ok_or_else(|| "launch: the device PIT join failed".to_string())?;
+    refuse_lookahead(&out, "device")?;
     route.passes += 1;
     route.h2d_bytes += stats.h2d_bytes;
     route.d2h_bytes += stats.d2h_bytes;
@@ -2857,5 +2874,28 @@ pub fn jump_declared(prev: Option<i64>, at: i64, relists: &[i64], gap_days: i64)
     match prev {
         Some(p) => at - p > gap_days * 86_400 || relists.iter().any(|&r| p < r && r <= at),
         None => true,
+    }
+}
+
+#[cfg(test)]
+mod lookahead_tests {
+    use super::*;
+
+    fn output(violations: u64) -> panel_pit::PitOutput {
+        panel_pit::PitOutput { lookahead_violations: violations, ..Default::default() }
+    }
+
+    #[test]
+    fn a_join_with_lookahead_rows_is_refused() {
+        assert_eq!(refuse_lookahead(&output(0), "device"), Ok(()));
+        assert_eq!(refuse_lookahead(&output(0), "cpu"), Ok(()));
+        assert_eq!(
+            refuse_lookahead(&output(3), "device"),
+            Err("lookahead: the device join reported 3 rows".to_string())
+        );
+        assert_eq!(
+            refuse_lookahead(&output(3), "cpu"),
+            Err("point-in-time join: 3 rows read a membership row that was not visible yet".to_string())
+        );
     }
 }

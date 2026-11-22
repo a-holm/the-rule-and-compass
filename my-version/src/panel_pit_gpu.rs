@@ -33,6 +33,8 @@ struct RawStats {
 
 #[repr(C)]
 struct HostOut {
+    n: c_int,
+    n_kept: c_int,
     leaf: *mut i32,
     keep: *mut u8,
     found: *mut u8,
@@ -69,6 +71,7 @@ extern "C" {
     ) -> c_int;
     fn rc_pit_check(ctx: *mut Raw, idx: *const c_int, violations: *mut u64) -> c_int;
     fn rc_pit_download(ctx: *mut Raw, out: *mut HostOut) -> c_int;
+    fn rc_pit_n_kept(ctx: *mut Raw) -> c_int;
 }
 
 /// Default rows per merge cursor.
@@ -152,6 +155,7 @@ impl PitGpu {
 
     /// Run with an explicit block and chunk size. Neither may change the bytes.
     pub fn run_with(&mut self, p: PitParams, threads: usize, chunk_rows: usize) -> bool {
+        self.params = None;
         if p.step <= 0 || chunk_rows == 0 {
             return false;
         }
@@ -200,9 +204,11 @@ impl PitGpu {
         self.params?;
         let started = std::time::Instant::now();
         let n = self.n;
-        let mut raw = RawStats::default();
-        unsafe { rc_pit_last_stats(self.ctx, &mut raw) };
-        let n_kept = raw.n_kept.max(0) as usize;
+        let kept_count = unsafe { rc_pit_n_kept(self.ctx) };
+        if kept_count < 0 {
+            return None;
+        }
+        let n_kept = kept_count as usize;
         let mut leaf = vec![0i32; n];
         let mut keep = vec![0u8; n];
         let mut found = vec![0u8; n];
@@ -211,6 +217,8 @@ impl PitGpu {
         let mut chain_ord = vec![0i32; n];
         let mut kept = vec![0i32; n_kept];
         let mut out = HostOut {
+            n: n as c_int,
+            n_kept: n_kept as c_int,
             leaf: leaf.as_mut_ptr(),
             keep: keep.as_mut_ptr(),
             found: found.as_mut_ptr(),
