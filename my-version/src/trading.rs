@@ -1754,34 +1754,76 @@ pub const FITNESS_BLOCK_SHIFT: u8 = 2;
 pub const FITNESS_MASK_OFF: u8 = 0x20;
 
 /// One input of the fitness book hash ([`FitnessBook::hash`], the `--resume`
-/// guard) with the flags that set it.
+/// guard) with the flags that set it. `hashed` names the hash words the row
+/// covers, as folded by the book hash and listed by [`FitnessBook::hash_inputs`].
 pub struct BookInput {
     pub id: &'static str,
     pub what: &'static str,
     pub flags: &'static [&'static str],
+    pub hashed: &'static [&'static str],
 }
 
+/// Hash words of a book with a position layer that no table row names: a
+/// gate-search book has no checkpoint and no `--resume`.
+pub const BOOK_LAYER_INPUTS: &[&str] = &["layer_tag", "layer_identity"];
+
 /// Every input of the book hash. The `--resume` conflict message names these
-/// flags; a new hashed input needs a row here.
+/// flags; a hash word without a row here fails `every_book_input_changes_the_hash`.
 pub const BOOK_INPUTS: &[BookInput] = &[
-    BookInput { id: "cost", what: "the per-side cost", flags: &["--cost-bps", "--cost-override", "--slippage-bps"] },
-    BookInput { id: "cash", what: "the cash return", flags: &["--cash-return"] },
-    BookInput { id: "funding", what: "the funding column", flags: &["--funding"] },
-    BookInput { id: "excess", what: "the excess benchmark", flags: &["--pnl-excess"] },
-    BookInput { id: "threshold", what: "the threshold", flags: &["--threshold"] },
-    BookInput { id: "min_trades", what: "the minimum trades", flags: &["--min-trades"] },
-    BookInput { id: "band", what: "the band", flags: &["--band"] },
-    BookInput { id: "band_units", what: "the band units", flags: &["--band-units"] },
-    BookInput { id: "min_hold", what: "the minimum hold", flags: &["--min-holding"] },
-    BookInput { id: "blocks", what: "the time blocks", flags: &["--pnl-blocks"] },
-    BookInput { id: "lambda", what: "the block spread weight", flags: &["--pnl-block-lambda"] },
-    BookInput { id: "stat", what: "the block statistic", flags: &["--pnl-stat", "--pnl-cvar-q"] },
-    BookInput { id: "mask", what: "the regime mask", flags: &["--pnl-mask", "--pnl-mask-band", "--pnl-mask-dwell"] },
-    BookInput { id: "segments", what: "the interval split", flags: &["--split-table", "--split-id", "--embargo"] },
+    BookInput { id: "cost", what: "the per-side cost", flags: &["--cost-bps", "--cost-override", "--slippage-bps"], hashed: &["side"] },
+    BookInput { id: "cash", what: "the cash return", flags: &["--cash-return"], hashed: &["excess", "cash_tag"] },
+    BookInput { id: "funding", what: "the funding column", flags: &["--funding"], hashed: &["excess"] },
+    BookInput { id: "excess", what: "the excess benchmark", flags: &["--pnl-excess"], hashed: &["excess", "xs_mean_tag"] },
+    BookInput { id: "threshold", what: "the threshold", flags: &["--threshold"], hashed: &["threshold"] },
+    BookInput { id: "min_trades", what: "the minimum trades", flags: &["--min-trades"], hashed: &["min_trades"] },
+    BookInput { id: "band", what: "the band", flags: &["--band"], hashed: &["band"] },
+    BookInput {
+        id: "band_units",
+        what: "the band units",
+        flags: &["--band-units"],
+        hashed: &["band_units", "sd_algorithm", "masked_sd_algorithm"],
+    },
+    BookInput { id: "min_hold", what: "the minimum hold", flags: &["--min-holding"], hashed: &["min_holding"] },
+    BookInput {
+        id: "blocks",
+        what: "the time blocks",
+        flags: &["--pnl-blocks"],
+        hashed: &["blocks", "block_bounds", "block_ids", "flags"],
+    },
+    BookInput { id: "lambda", what: "the block spread weight", flags: &["--pnl-block-lambda"], hashed: &["lambda"] },
+    BookInput {
+        id: "stat",
+        what: "the block statistic",
+        flags: &["--pnl-stat", "--pnl-cvar-q"],
+        hashed: &["stat_tag", "stat_code", "stat_param"],
+    },
+    BookInput {
+        id: "mask",
+        what: "the regime mask",
+        flags: &["--pnl-mask", "--pnl-mask-band", "--pnl-mask-dwell"],
+        hashed: &["mask_tag", "mask_off_rows", "mask_identity", "flags"],
+    },
+    BookInput { id: "segments", what: "the interval split", flags: &["--split-table", "--split-id", "--embargo"], hashed: &["flags"] },
     BookInput {
         id: "rows",
-        what: "the training rows",
-        flags: &["--data", "--time", "--group-by", "--split", "--validation-frac", "--test-frac", "--target-spec"],
+        what: "the training rows and the return column",
+        flags: &[
+            "--data",
+            "--time",
+            "--group-by",
+            "--split",
+            "--validation-frac",
+            "--test-frac",
+            "--target-spec",
+            "--target",
+            "--book-target",
+            "--filter",
+            "--exclude",
+            "--train-select",
+            "--sample-rows",
+            "--gap",
+        ],
+        hashed: &["excess", "flags"],
     },
 ];
 
@@ -1980,6 +2022,28 @@ impl BookShape {
     }
 }
 
+/// The state of the fitness book hash. Every word is folded under the id of the
+/// input it belongs to, and the ids are recorded in fold order, so the set of
+/// hashed inputs is a property of the hash function itself.
+#[derive(Clone, Debug)]
+struct BookHasher {
+    state: u64,
+    inputs: Vec<&'static str>,
+}
+
+impl BookHasher {
+    fn new() -> Self {
+        BookHasher { state: 0xcbf2_9ce4_8422_2325u64, inputs: Vec::new() }
+    }
+
+    fn fold(&mut self, id: &'static str, v: u64) {
+        if self.inputs.last() != Some(&id) && !self.inputs.contains(&id) {
+            self.inputs.push(id);
+        }
+        fnv_u64(&mut self.state, v);
+    }
+}
+
 /// #1180: the regime mask of a [`FitnessBook`]: `on[i]` is the gate state of
 /// training row `i`; `identity` names the gate (expression, band and dwell) for
 /// the book hash.
@@ -2002,7 +2066,7 @@ pub struct FitnessBook {
     threshold: f64,
     bound: f64,
     min_trades: usize,
-    hash: u64,
+    hasher: BookHasher,
     lambda: f64,
     block_bounds: Vec<f64>,
     /// #925: `--band B` and its units, and the minimum hold.
@@ -2280,52 +2344,52 @@ impl FitnessBook {
             }
             block_id = ids;
         }
-        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        let mut hasher = BookHasher::new();
         for e in &excess {
-            fnv_u64(&mut hash, e.to_bits());
+            hasher.fold("excess", e.to_bits());
         }
         for f in &flags {
-            fnv_u64(&mut hash, *f as u64);
+            hasher.fold("flags", *f as u64);
         }
-        fnv_u64(&mut hash, side.to_bits());
-        fnv_u64(&mut hash, spec.threshold.to_bits());
-        fnv_u64(&mut hash, spec.min_trades as u64);
+        hasher.fold("side", side.to_bits());
+        hasher.fold("threshold", spec.threshold.to_bits());
+        hasher.fold("min_trades", spec.min_trades as u64);
         if blocks > 1 {
-            fnv_u64(&mut hash, blocks as u64);
-            fnv_u64(&mut hash, lambda.to_bits());
+            hasher.fold("blocks", blocks as u64);
+            hasher.fold("lambda", lambda.to_bits());
             for b in &block_bounds {
-                fnv_u64(&mut hash, b.to_bits());
+                hasher.fold("block_bounds", b.to_bits());
             }
             if blocks > FITNESS_MAX_BLOCKS {
                 for id in &block_id {
-                    fnv_u64(&mut hash, *id as u64);
+                    hasher.fold("block_ids", *id as u64);
                 }
             }
         }
         let band = spec.band.multiple;
         if band != 0.0 || spec.min_holding != 1 || spec.band.units != BandUnits::Score {
-            fnv_u64(&mut hash, band.to_bits());
-            fnv_u64(&mut hash, if spec.band.units == BandUnits::Sd { 1 } else { 0 });
-            fnv_u64(&mut hash, spec.min_holding as u64);
+            hasher.fold("band", band.to_bits());
+            hasher.fold("band_units", if spec.band.units == BandUnits::Sd { 1 } else { 0 });
+            hasher.fold("min_holding", spec.min_holding as u64);
             if spec.band.units == BandUnits::Sd {
-                fnv_u64(&mut hash, SCORE_SD_ALGORITHM);
+                hasher.fold("sd_algorithm", SCORE_SD_ALGORITHM);
             }
         }
         if let Some(m) = &mask {
-            fnv_u64(&mut hash, 0x6d61_736b_u64);
-            fnv_u64(&mut hash, off_rows as u64);
+            hasher.fold("mask_tag", 0x6d61_736b_u64);
+            hasher.fold("mask_off_rows", off_rows as u64);
             for b in m.identity.bytes() {
-                fnv_u64(&mut hash, b as u64);
+                hasher.fold("mask_identity", b as u64);
             }
         }
         if spec.pnl_excess == PnlExcess::XsMean {
-            fnv_u64(&mut hash, 0x7873_6d65_616e_u64);
+            hasher.fold("xs_mean_tag", 0x7873_6d65_616e_u64);
         }
         if spec.cash_mode == CashMode::TrainMean {
-            fnv_u64(&mut hash, 0x746d_6561_6e_u64);
+            hasher.fold("cash_tag", 0x746d_6561_6e_u64);
         }
         if mask.is_some() && spec.band.units == BandUnits::Sd {
-            fnv_u64(&mut hash, MASKED_SD_ALGORITHM);
+            hasher.fold("masked_sd_algorithm", MASKED_SD_ALGORITHM);
         }
         Ok(FitnessBook {
             excess,
@@ -2335,7 +2399,7 @@ impl FitnessBook {
             threshold: spec.threshold,
             bound,
             min_trades: spec.min_trades,
-            hash,
+            hasher,
             lambda,
             block_bounds,
             band,
@@ -2381,11 +2445,11 @@ impl FitnessBook {
             return Err("the block statistic of the book is already set".to_string());
         }
         if stat != BlockStat::MeanSd {
-            fnv_u64(&mut self.hash, 0x7374_6174_u64);
-            fnv_u64(&mut self.hash, stat.code() as u64);
+            self.hasher.fold("stat_tag", 0x7374_6174_u64);
+            self.hasher.fold("stat_code", stat.code() as u64);
             match stat {
-                BlockStat::Cvar(q) => fnv_u64(&mut self.hash, q.to_bits()),
-                _ => fnv_u64(&mut self.hash, self.lambda.to_bits()),
+                BlockStat::Cvar(q) => self.hasher.fold("stat_param", q.to_bits()),
+                _ => self.hasher.fold("stat_param", self.lambda.to_bits()),
             }
         }
         self.stat = stat;
@@ -2438,7 +2502,12 @@ impl FitnessBook {
     }
 
     pub fn hash(&self) -> u64 {
-        self.hash
+        self.hasher.state
+    }
+
+    /// The hash words folded into [`FitnessBook::hash`], each once, in fold order.
+    pub fn hash_inputs(&self) -> &[&'static str] {
+        &self.hasher.inputs
     }
 
     /// Excess return per row (return minus funding minus cash, or minus the
@@ -2776,9 +2845,9 @@ impl FitnessBook {
         if !(self.threshold > f64::MIN && self.threshold < f64::MAX) {
             return Err(format!("a position layer needs a threshold strictly between f64::MIN and f64::MAX, got {}", self.threshold));
         }
-        fnv_u64(&mut self.hash, 0x6c61_7965_72u64);
+        self.hasher.fold("layer_tag", 0x6c61_7965_72u64);
         for b in layer.identity().bytes() {
-            fnv_u64(&mut self.hash, b as u64);
+            self.hasher.fold("layer_identity", b as u64);
         }
         self.layer = Some(layer);
         Ok(self)
