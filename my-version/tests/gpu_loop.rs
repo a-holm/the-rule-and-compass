@@ -803,6 +803,30 @@ impl Drop for Faults {
     }
 }
 
+/// #1331: the gaps between the errors a run kept and the exact CPU scores of
+/// their trees. A finite error on a tree whose exact score is not finite is a
+/// stale score; its gap is NaN, which `f64::max` would drop.
+#[derive(Default)]
+struct GapTally {
+    worst: f64,
+    stale_finite: usize,
+    wrong_inf: usize,
+}
+
+impl GapTally {
+    fn record(&mut self, error: f64, exact: f64) {
+        if error.is_finite() {
+            if exact.is_finite() {
+                self.worst = self.worst.max((error - exact).abs() / exact.max(1e-300));
+            } else {
+                self.stale_finite += 1;
+            }
+        } else {
+            self.wrong_inf += usize::from(exact.is_finite());
+        }
+    }
+}
+
 /// #1089: run `cfg` with the fault `site` armed. The fault fires in the
 /// generation that the checkpoints with `generations <= 2` precede. In every
 /// checkpoint with `generations >= 3`, a member not carried unchanged from an
@@ -821,8 +845,7 @@ fn assert_no_device_score_after(site: &str, cfg: &search::Config) {
     let test = sample(96);
     let faults = Faults::arm(site);
     let mut seen = std::collections::HashSet::new();
-    let mut worst = 0.0f64;
-    let mut wrong_inf = 0usize;
+    let mut gaps = GapTally::default();
     // (generations, members, carried, finite, non-finite)
     let mut rows: Vec<(usize, usize, usize, usize, usize)> = Vec::new();
     let out = search::run_resumable(cfg, &train, &test, None, 1, |cp| {
@@ -848,11 +871,10 @@ fn assert_no_device_score_after(site: &str, cfg: &search::Config) {
                     / train.y.len() as f64;
                 if ind.error.is_finite() {
                     row.3 += 1;
-                    worst = worst.max((ind.error - exact).abs() / exact.max(1e-300));
                 } else {
                     row.4 += 1;
-                    wrong_inf += usize::from(exact.is_finite());
                 }
+                gaps.record(ind.error, exact);
             }
         }
         rows.push(row);
@@ -865,10 +887,14 @@ fn assert_no_device_score_after(site: &str, cfg: &search::Config) {
     let checked = at_three.3 + at_three.4;
     let need = cfg.pop * cfg.islands - cfg.islands;
     assert!(
-        checked >= need && wrong_inf == 0 && worst < 1e-9,
-        "{checked} members checked at generation 3 (need {need}); {wrong_inf} non-finite errors on a tree with a \
-         finite CPU score (need 0); worst relative gap to the CPU score {worst} (need < 1e-9); \
-         (generations, members, carried, finite, non-finite): {rows:?}"
+        checked >= need && gaps.wrong_inf == 0 && gaps.stale_finite == 0 && gaps.worst < 1e-9,
+        "{checked} members checked at generation 3 (need {need}); {} non-finite errors on a tree with a \
+         finite CPU score (need 0); {} finite errors on a tree with a non-finite CPU score (need 0); worst relative gap \
+         to the CPU score {} (need < 1e-9); \
+         (generations, members, carried, finite, non-finite): {rows:?}",
+        gaps.wrong_inf,
+        gaps.stale_finite,
+        gaps.worst
     );
 }
 
@@ -929,4 +955,141 @@ fn adaptive_mix_learns_on_the_device() {
     let (again, again_mixes) = run();
     assert_eq!(archive, again, "the archive differs between two runs");
     assert_eq!(mixes, again_mixes, "the learned windows differ between two runs");
+}
+
+/// #1331: a finite error against a non-finite exact score is counted, not
+/// dropped as a NaN gap.
+#[test]
+fn a_finite_error_on_a_non_finite_exact_score_is_counted() {
+    for exact in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let mut t = GapTally::default();
+        t.record(1.0, exact);
+        assert_eq!((t.stale_finite, t.wrong_inf), (1, 0), "exact {exact}");
+        assert_eq!(t.worst, 0.0, "exact {exact}: the gap is not a number and is not a gap");
+    }
+    let mut t = GapTally::default();
+    t.record(1.0, 1.0 + 1e-12);
+    assert_eq!(t.stale_finite, 0);
+    assert!(t.worst > 0.0 && t.worst < 1e-9, "{}", t.worst);
+    t.record(f64::INFINITY, 2.0);
+    assert_eq!(t.wrong_inf, 1);
+    t.record(f64::INFINITY, f64::INFINITY);
+    t.record(f64::INFINITY, f64::NAN);
+    assert_eq!((t.stale_finite, t.wrong_inf), (0, 1));
+}
+
+/// #1078, #1117: a `--fitness pnl --fit-accept fitness` search on the device
+/// refuses some fits and counts them on the device path.
+#[cfg(feature = "cuda")]
+struct AcceptRun {
+    archive: Vec<(u64, usize, u64)>,
+    hash: u64,
+    fit_accept: Option<rcsr::search::FitAcceptReport>,
+    /// Per generation `(accepted, rejected)` from the dev log.
+    log: Vec<Option<(u64, u64)>>,
+    wall_s: f64,
+}
+
+#[cfg(feature = "cuda")]
+fn pnl_panel() -> (Sample, std::sync::Arc<rcsr::trading::FitnessBook>) {
+    let mut state = 17u64;
+    let mut unit = move || {
+        state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        (state >> 11) as f64 / (1u64 << 53) as f64
+    };
+    let mut rows = rcsr::trading::TradingRows::default();
+    let mut x = Vec::new();
+    let mut ret = Vec::new();
+    for i in 0..2_400usize {
+        let g = i / 600;
+        rows.group.push(g as u64);
+        rows.time.push(1.6e9 + 900.0 * (i - 600 * g) as f64);
+        let signal = unit() - 0.5;
+        x.push(vec![signal, unit() * 4.0 - 2.0]);
+        ret.push(0.004 * signal + 0.003 * (unit() - 0.5));
+    }
+    let slice = rcsr::data::TradingSlice { rows, ret: ret.clone() };
+    let spec = rcsr::trading::TradingSpec { cost_bps: 2.0, min_trades: 0, ..Default::default() };
+    let book = rcsr::trading::FitnessBook::new(&slice, &spec, 900.0).expect("a profitable book");
+    (Sample { x, y: ret, w: Vec::new(), ys: Vec::new(), pairs: None }, std::sync::Arc::new(book))
+}
+
+#[cfg(feature = "cuda")]
+fn accept_run(accept: rcsr::search::FitAccept, seed: u32) -> AcceptRun {
+    let (sample, book) = pnl_panel();
+    let records = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = records.clone();
+    let cfg = Config {
+        generations: 12,
+        islands: 2,
+        pop: 64,
+        max_complexity: 14,
+        fit_iters: 6,
+        patience: 0,
+        seed,
+        metric: Metric::Squared,
+        ops: vec![Op::Add, Op::Sub, Op::Mul, Op::Div],
+        fitness: rcsr::search::Fitness::LongPnl(book),
+        fit_strategy: rcsr::fit::FitStrategy::Gpu,
+        fit_accept: accept,
+        gpu: true,
+        gpu_required: true,
+        gpu_notes: false,
+        dispatch: rcsr::dispatch::DispatchMode::Device,
+        dev_log: Some(std::sync::Arc::new(move |r: &rcsr::devlog::GenRecord| {
+            sink.lock().unwrap().push((r.fit.accept, r.wall_s));
+        })),
+        ..Default::default()
+    };
+    let out = search::run(&cfg, &sample, &sample);
+    let records = records.lock().unwrap().clone();
+    AcceptRun {
+        archive: describe(&out),
+        hash: out.archive.hash(),
+        fit_accept: out.fit_accept,
+        log: records.iter().map(|r| r.0).collect(),
+        wall_s: records.iter().map(|r| r.1).sum(),
+    }
+}
+
+/// #1078, #1117: on the device, `fit.rejected` is above 0 in the dev log,
+/// `by_path.device` is non-zero, the totals equal the sums over the paths, and
+/// two runs with the same seed give the same archive, counts and log. The
+/// default `always` arm counts nothing. The wall ratio is printed, not asserted.
+#[cfg(feature = "cuda")]
+#[test]
+fn fit_accept_fitness_runs_on_the_device_and_is_repeatable() {
+    if !rcsr::backend::probe().available() {
+        rcsr::backend::skip_without_device("skipping: no usable CUDA device");
+        return;
+    }
+    let first = accept_run(rcsr::search::FitAccept::Fitness, 7);
+    let again = accept_run(rcsr::search::FitAccept::Fitness, 7);
+    let report = first.fit_accept.as_ref().expect("counts under fitness");
+    let rejected_in_log: u64 = first.log.iter().map(|c| c.expect("every record carries the counts under fitness").1).sum();
+    let (kept, refused) = report.path("device").expect("a device path");
+    eprintln!(
+        "fit_accept: dev log rejected {rejected_in_log}, device path (accepted {kept}, rejected {refused}), totals {:?}",
+        report.totals()
+    );
+    assert!(rejected_in_log > 0, "the gate refused no fit in the dev log");
+    assert!(kept + refused > 0, "no device decision was counted");
+    let sum = rcsr::search::FitPath::ALL.iter().fold((0, 0), |s, p| {
+        let (a, r) = report.path(p.name()).unwrap();
+        (s.0 + a, s.1 + r)
+    });
+    assert_eq!(report.totals(), sum, "the totals differ from the sums over the paths");
+    assert_eq!(first.archive, again.archive, "the front differs between two runs");
+    assert_eq!(first.hash, again.hash, "the archive hash differs between two runs");
+    assert_eq!(first.fit_accept, again.fit_accept, "the counts differ between two runs");
+    assert_eq!(first.log, again.log, "the dev log counts differ between two runs");
+    let always = accept_run(rcsr::search::FitAccept::Always, 7);
+    assert!(always.fit_accept.is_none() && always.log.iter().all(|c| c.is_none()), "the always arm counts decisions");
+    eprintln!(
+        "fit_accept wall: fitness {:.3} s, again {:.3} s, always {:.3} s, fitness/always {:.3}",
+        first.wall_s,
+        again.wall_s,
+        always.wall_s,
+        first.wall_s / always.wall_s
+    );
 }
