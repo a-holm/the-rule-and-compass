@@ -222,7 +222,7 @@ fn frontmatter_targets(front: &str) -> Vec<String> {
 }
 
 /// One link target relative to the file's folder: skips web links, anchors and placeholders.
-fn check_target(dir: &Path, rel: &str, target: &str, report: &mut Report) {
+fn check_target(dir: &Path, dir_abs: &Path, ctx: &Ctx, rel: &str, target: &str, report: &mut Report) {
     if has_scheme(target) || target.starts_with('#') || target.contains('{') {
         return;
     }
@@ -231,19 +231,21 @@ fn check_target(dir: &Path, rel: &str, target: &str, report: &mut Report) {
         return;
     }
     report.checked += 1;
-    if !dir.join(percent_decode(path_part)).exists() {
+    let decoded = percent_decode(path_part);
+    if !dir.join(&decoded).exists() && !ctx.loosely_ok(dir_abs, &decoded) {
         report.broken.push(format!("{rel}: link {target}"));
     }
 }
 
-fn check_file(root: &Path, file: &Path, report: &mut Report) {
+fn check_file(root: &Path, file: &Path, ctx: &Ctx, report: &mut Report) {
     let text = fs::read_to_string(file).unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
     let text = text.strip_prefix('\u{feff}').unwrap_or(&text).replace("\r\n", "\n");
     let (front, body) = split_front(&text);
     let rel = file.strip_prefix(root).unwrap_or(file).display().to_string();
     let dir = file.parent().expect("file has a parent");
+    let dir_abs = ctx.dir_abs(root, dir);
     for target in frontmatter_targets(front) {
-        check_target(dir, &rel, &target, report);
+        check_target(dir, &dir_abs, ctx, &rel, &target, report);
     }
     let mut fence: Option<&str> = None;
     let mut in_inputs = false;
@@ -290,19 +292,29 @@ fn check_file(root: &Path, file: &Path, report: &mut Report) {
             }
         }
         for target in targets {
-            check_target(dir, &rel, &target, report);
+            check_target(dir, &dir_abs, ctx, &rel, &target, report);
         }
 
         let is_bullet = trimmed.starts_with("- ") || trimmed.starts_with("* ");
         if in_inputs && is_bullet {
             let line_strict = strict || lower.contains("reference");
-            for span in backtick_spans(line) {
+            for raw in backtick_spans(line) {
+                let mut span = raw.to_string();
+                if ctx.external && span.contains(CRATE_PLACEHOLDER) {
+                    let Some(name) = &ctx.crate_name else {
+                        report.checked += 1;
+                        report.broken.push(format!("{rel}: input `{raw}` (no engine crate directory found)"));
+                        continue;
+                    };
+                    span = span.replace(CRATE_PLACEHOLDER, name);
+                }
+                let span = span.as_str();
                 if !looks_like_path(span) {
                     continue;
                 }
                 report.checked += 1;
                 let candidates = [dir.join(span), root.join(span)];
-                if candidates.iter().any(|c| c.exists()) {
+                if candidates.iter().any(|c| c.exists()) || ctx.loosely_ok(&dir_abs, span) {
                     continue;
                 }
                 if !line_strict {
@@ -314,38 +326,172 @@ fn check_file(root: &Path, file: &Path, report: &mut Report) {
                         continue;
                     }
                 }
-                report.broken.push(format!("{rel}: input `{span}`"));
+                report.broken.push(format!("{rel}: input `{raw}`"));
             }
         }
     }
 }
 
+#[allow(dead_code)]
 pub fn check_tree(root: &Path) -> Report {
+    check_tree_with(root, false)
+}
+
+// Engine crate guard: the crate directory is resolved at run time by package name.
+
+const CRATE_PACKAGE: &str = "rule-and-compass";
+
+fn declares_package(manifest: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(manifest) else { return false };
+    let mut in_package = false;
+    for line in text.lines() {
+        if line.starts_with('[') {
+            in_package = line == "[package]";
+        } else if in_package {
+            let value = line
+                .strip_prefix("name")
+                .map(|r| r.trim_start_matches(' '))
+                .and_then(|r| r.strip_prefix('='))
+                .map(|r| r.trim_matches(' '));
+            if value == Some(&format!("\"{CRATE_PACKAGE}\"")) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The one first-level directory of `repo` whose `Cargo.toml` declares package `rule-and-compass`
+/// (`RCSR_CRATE` names it instead). None when no or several directories match.
+pub fn crate_dir(repo: &Path) -> Option<PathBuf> {
+    if let Some(name) = std::env::var_os("RCSR_CRATE").filter(|n| !n.is_empty()) {
+        return Some(repo.join(name));
+    }
+    let mut hits: Vec<PathBuf> = fs::read_dir(repo)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            let hidden = p.file_name().and_then(|n| n.to_str()).map_or(true, |n| n.starts_with('.'));
+            !hidden && p.is_dir() && declares_package(&p.join("Cargo.toml"))
+        })
+        .collect();
+    if hits.len() == 1 { hits.pop() } else { None }
+}
+
+const CRATE_PLACEHOLDER: &str = "<crate>";
+
+/// Where one check run resolves references: the workshop root, its repo and the engine crate name.
+struct Ctx {
+    root_abs: PathBuf,
+    external: bool,
+    crate_name: Option<String>,
+}
+
+impl Ctx {
+    fn new(root: &Path, external: bool) -> Ctx {
+        let root_abs = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let crate_name = root_abs
+            .parent()
+            .and_then(crate_dir)
+            .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()));
+        Ctx { root_abs, external, crate_name }
+    }
+
+    /// The absolute folder of a file under `root`.
+    fn dir_abs(&self, root: &Path, dir: &Path) -> PathBuf {
+        match dir.strip_prefix(root) {
+            Ok(rel) => self.root_abs.join(rel),
+            Err(_) => dir.to_path_buf(),
+        }
+    }
+
+    /// A reference that resolves outside the workshop passes in the default mode when its folder exists.
+    fn loosely_ok(&self, dir_abs: &Path, target: &str) -> bool {
+        if self.external {
+            return false;
+        }
+        let resolved = normalize(&dir_abs.join(target));
+        !resolved.starts_with(&self.root_abs) && resolved.parent().is_some_and(Path::exists)
+    }
+}
+
+/// Like `check_tree`; `external` checks references outside the workshop strictly.
+pub fn check_tree_with(root: &Path, external: bool) -> Report {
+    let ctx = Ctx::new(root, external);
     let mut files = Vec::new();
     collect_markdown(root, &mut files);
     let mut report = Report::default();
     for file in &files {
         report.files += 1;
-        check_file(root, file, &mut report);
+        check_file(root, file, &ctx, &mut report);
     }
     report
 }
 
-// Engine crate guard: the crate directory is resolved at run time by package name.
-
-/// The one first-level directory of `repo` whose `Cargo.toml` declares package `rule-and-compass`.
-pub fn crate_dir(_repo: &Path) -> Option<PathBuf> {
-    None
+fn crate_name_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let mut entries: Vec<PathBuf> = fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).collect();
+    entries.sort();
+    for path in entries {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let skipped = name.starts_with('.') || SKIP_DIRS.contains(&name) || is_fixtures(&path, name);
+        if skipped && path.is_dir() {
+            continue;
+        }
+        out.push(path.clone());
+        if path.is_dir() {
+            crate_name_files(&path, out);
+        }
+    }
 }
 
-/// Like `check_tree`; `external` checks references outside the workshop strictly.
-pub fn check_tree_with(root: &Path, _external: bool) -> Report {
-    check_tree(root)
+/// True when `line` holds `name` as a path segment: a word boundary on both sides and a `/` next to it.
+fn names_segment(line: &str, name: &str) -> bool {
+    let mut from = 0;
+    while let Some(i) = line[from..].find(name) {
+        let start = from + i;
+        let end = start + name.len();
+        from = start + 1;
+        let before = line[..start].chars().next_back();
+        let after = line[end..].chars().next();
+        let before_ok = before.is_none_or(|c| c.is_whitespace() || "'\"`/}(=".contains(c));
+        let after_ok = after.is_none_or(|c| c.is_whitespace() || "/'\"`)],.:;".contains(c));
+        if before_ok && after_ok && (before == Some('/') || after == Some('/')) {
+            return true;
+        }
+    }
+    false
 }
 
-/// Tracked workshop text that names the engine crate directory as a path.
-pub fn crate_name_problems(_root: &Path) -> Vec<String> {
-    Vec::new()
+fn crate_name_problems_for(root: &Path, name: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    crate_name_files(root, &mut paths);
+    let mut problems = Vec::new();
+    for path in paths {
+        let rel = rel_of(root, &path);
+        if path.file_name().is_some_and(|n| n == name) {
+            problems.push(format!("{rel}: path named like the engine crate directory"));
+        }
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&path) else { continue };
+        for (i, line) in text.lines().enumerate() {
+            if names_segment(line, name) {
+                problems.push(format!("{rel}:{}: names the engine crate directory `{name}` as a path", i + 1));
+            }
+        }
+    }
+    problems
+}
+
+/// Tracked workshop text that names the engine crate directory as a path. The name is read at run time.
+pub fn crate_name_problems(root: &Path) -> Vec<String> {
+    let ctx = Ctx::new(root, false);
+    match ctx.crate_name {
+        Some(name) => crate_name_problems_for(root, &name),
+        None => Vec::new(),
+    }
 }
 
 // ICM rules: the strict link check, the graph and the reference rules.
@@ -1335,6 +1481,7 @@ pub fn walk_problems(root: &Path, strict: bool) -> Vec<String> {
     problems.extend(claude_problems(root));
     problems.extend(header_problems(root));
     problems.extend(refs_problems(root));
+    problems.extend(crate_name_problems(root));
     if strict {
         problems.extend(index_problems(root));
         problems.extend(orphan_problems(root));
@@ -1711,10 +1858,10 @@ mod tests {
         assert_eq!(
             report.broken,
             [
-                "s/CONTEXT.md: link ../../docs/gone.md",
                 "s/CONTEXT.md: input `../../<crate>/src/missing.rs`",
                 "s/CONTEXT.md: input `../../docs/gone.md`",
                 "s/CONTEXT.md: input `../../nodir/gone.md`",
+                "s/CONTEXT.md: link ../../docs/gone.md",
             ]
         );
         let _ = fs::remove_dir_all(root.parent().expect("base"));

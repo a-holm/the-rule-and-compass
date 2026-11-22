@@ -62,6 +62,7 @@ fn usage_errors_exit_2() {
 #[test]
 fn links_exit_1_with_the_broken_link_on_stdout() {
     let root = workshop("links");
+    write(&base.join("pkg/src/other.rs"), "");
     assert_eq!(code(&run(&["links", s(&root)])), 0);
     write(&root.join("x.md"), "[b](missing.md)\n");
     let o = run(&["links", s(&root)]);
