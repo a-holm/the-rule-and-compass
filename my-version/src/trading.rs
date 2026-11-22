@@ -333,11 +333,6 @@ pub struct BookRows {
 /// with a finite target is priced and carries the score before it.
 pub fn book_rows(groups: &[u64], times: &[f64], targets: &[f64], scores: &[f64], rule: MissingScore) -> BookRows {
     let n = groups.len().min(times.len()).min(targets.len()).min(scores.len());
-    let mut rows: Vec<usize> = (0..n).filter(|&i| targets[i].is_finite() && scores[i].is_finite()).collect();
-    rows.sort_by(|&a, &b| groups[a].cmp(&groups[b]).then_with(|| times[a].total_cmp(&times[b])).then_with(|| a.cmp(&b)));
-    let _ = rule;
-    return BookRows { keys: rows.iter().map(|&i| groups[i]).collect(), scores: rows.iter().map(|&i| scores[i]).collect(), rows };
-    let n = groups.len().min(times.len()).min(targets.len()).min(scores.len());
     let mut labelled: Vec<usize> = (0..n).filter(|&i| targets[i].is_finite()).collect();
     labelled.sort_by(|&a, &b| groups[a].cmp(&groups[b]).then_with(|| times[a].total_cmp(&times[b])).then_with(|| a.cmp(&b)));
     let lab_groups: Vec<u64> = labelled.iter().map(|&i| groups[i]).collect();

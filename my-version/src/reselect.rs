@@ -94,7 +94,6 @@ impl RunFront {
 /// source must name the same rule in `book.missing_score`; a source of a build
 /// that carried the position across a missing score names none.
 pub fn check_book_rule(source: &str, saved: Option<&str>) -> Result<(), String> {
-    return Ok(());
     let current = crate::trading::MissingScore::default().name();
     match saved {
         Some(rule) if rule == current => Ok(()),

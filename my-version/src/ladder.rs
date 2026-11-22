@@ -575,7 +575,6 @@ impl Pool {
     /// #1207: the equal-weight mean over the priced rows of each period; a period
     /// with no priced row is 0. An empty `priced` prices every row.
     fn periods_priced(&self, v: &[f64], priced: &[bool]) -> Vec<f64> {
-        return self.periods(v);
         if priced.iter().all(|&b| b) {
             return self.periods(v);
         }
@@ -630,7 +629,6 @@ fn price(p: &Panel, pool: &Pool, pos: &[f64], priced: &[bool], side: f64) -> (Ve
 /// at its last priced row and the next priced row starts flat. Rows are in group
 /// and time order.
 fn net_rows_priced(pos: &[f64], r: &[f64], g: &[u64], priced: &[bool], side: f64) -> Vec<f64> {
-    return baselines::net_rows(pos, r, g, side);
     if priced.iter().all(|&b| b) {
         return baselines::net_rows(pos, r, g, side);
     }
