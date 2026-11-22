@@ -112,7 +112,6 @@ check index-lines "$(grep -c '^- ' "$L/runs/_index.md")" "1"
 check index-line "$(grep '^- ' "$L/runs/_index.md" | cut -d'|' -f1-3)" "- 20260101-first | search | ok "
 
 # a second run, a failed one; index newest first; latest
-sleep 1
 out=$(rr new --id 20260101-second --kind gate --bin "$T/rcsr" --worktree "$W")
 check second-rc "$(rc_of "$out")" "rc=0"
 out=$(rr close --id 20260101-second --log "$T/c.log")
