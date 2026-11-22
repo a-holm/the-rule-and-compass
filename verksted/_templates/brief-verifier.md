@@ -1,13 +1,15 @@
-# Brief clerk section: merge PR <PR> for issue <N>
+# Brief verifier section: merge PR <PR> for issue <N>
 
 Hard rules: never `pkill` or `killall` (kill only a pid you started, with `kill <pid>`); a wait uses `wait-for.sh`, never `pgrep -f`; no Python. A lint in `verksted_tools` fails on `pkill` and `killall` in scripts.
 
-Used with `../_shared/brief.md`; `../_tools/brief.sh clerk --issue <N> --pr <PR>` prints the dispatch prompt. Replace every angle-bracket placeholder.
+Used with `../_shared/brief.md`; `../_tools/brief.sh verifier --issue <N> --pr <PR>` prints the dispatch prompt. Replace every angle-bracket placeholder.
 
 Repo root, GitHub repo, use `gh`. Base branch `$BASE` (`integration/gpu-hardening`). Never merge to `main`. Never force-push, never rebase, never `git stash`, no Python, no pkill. A wait uses `verksted/_tools/wait-for.sh` (`--log`, `--file`, `--pid`), never `pgrep -f`. Do not run cargo, do not edit code; you only verify and merge. The orchestrator already accepted the PR's design deviations; your job is to check the evidence and merge.
 
+- Your scratch worktree is `$WT/verifier-<PR>`: create it with `git -C <an existing worktree> worktree add --detach "$WT/verifier-<PR>" origin/<base>` and remove it before the report (rule 59).
+
 For the PR you are given:
-1. Write the claims of the hand-back summary to a claims file, one row per line `<label>|<log path>|<ERE>` (test counts, red runs, sanitizer 0 errors, warnings 0, speedups, wall times). Run `verksted/_tools/clerk-check.sh <PR> --claims <file>`. It fetches origin and prints state, base, mergeable, head, the changed files, the diff stat, the worktree of the head branch (must be clean and at the PR head: the merge removes it), the conflicts and one row per claim.
+1. Write the claims of the hand-back summary to a claims file, one row per line `<label>|<log path>|<ERE>` (test counts, red runs, sanitizer 0 errors, warnings 0, speedups, wall times). Run `verksted/_tools/verifier-check.sh <PR> --claims <file>`. It fetches origin and prints state, base, mergeable, head, the changed files, the diff stat, the worktree of the head branch (must be clean and at the PR head: the merge removes it), the conflicts and one row per claim.
 2. State must be OPEN and the base `$BASE`; the tool retries while mergeable is UNKNOWN. If it says CONFLICTING: still check scope and evidence, then stop without merging and report "CONFLICTING", the conflicting files and your evidence verdict, so the PR agent can merge the base itself.
 3. Own changes must match the issue's scope: no unrelated files (`out of scope` rows), no reverted base files. Report anything unexpected and do not merge.
 4. Evidence: every claim must be `found` in a cited log under `$GATES`. Re-read counts with `verksted/_tools/test-summary.sh <log>`. A claim with no log is "unverified". A contradicted claim blocks the merge: report it. When the diff adds a `<crate>/tests/*.rs` file, require a claim for `--test sanitizer_plan` (`0 failed`); without it the PR is unverified.

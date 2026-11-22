@@ -10,7 +10,7 @@ One job: write the brief of each ticket from the template.
 
 **Reference (every run):**
 - `../../../_shared/rules.md`
-- `../../../_templates/brief.md`, `../../../_templates/brief-research.md`, `../../../_templates/brief-clerk.md`
+- `../../../_templates/brief.md`, `../../../_templates/brief-research.md`, `../../../_templates/brief-verifier.md`
 - `../../../_tools/brief.sh`
 - `../../../_shared/brief.md`
 - `../../CONTEXT.md`
@@ -20,7 +20,7 @@ Do NOT load: other tickets' briefs, the agents' reports.
 ## Process
 
 1. If an input is missing or empty, stop and say which.
-2. For each row of `wave.md` run `verksted/_tools/brief.sh impl|research|clerk --issue <N> ...` and save the prompt as `output/brief-<N>.md`. Fill the ticket section of the template (`_templates/brief.md`, `brief-research.md` or `brief-clerk.md`) with the owned and forbidden files, the design link and the acceptance criteria, and append only those field lines (the steps stay in the template, which the agent reads). A research brief says "no code, no branch, no commit". An implementation brief quotes the decision comment URL.
+2. For each row of `wave.md` run `verksted/_tools/brief.sh impl|research|verifier --issue <N> ...` (add `--model opus` or `--model fable` for a planning brief; the default is sonnet) and save the prompt as `output/brief-<N>.md`. Fill the ticket section of the template (`_templates/brief.md`, `brief-research.md` or `brief-verifier.md`) with the owned and forbidden files, the design link and the acceptance criteria, and append only those field lines (the steps stay in the template, which the agent reads). A research brief says "no code, no branch, no commit". An implementation brief quotes the decision comment URL.
 3. Line 1 of every brief is the no-resume line "You are not resumed automatically; block in your own turn until everything is done." The prompt names the values N, SLUG, W, BRANCH, BASE, G, EPIC and PR. `brief.sh` refuses a missing value and a leftover placeholder; never pass a literal `<N>`.
 
 ## Outputs
