@@ -47,7 +47,7 @@ verksted/_tools/rc-run.sh run "$W" "$N" <what> -- ./target/release/rcsr <args>  
 ps -eo pcpu,args | grep -E 'cargo|rustc'          # look first: one cargo at a time
 ```
 
-The log is `$G/issue$N-<tag>.log`; its last line is `RC_DONE rc=<n>`. Lock holds stay under 10 minutes. Exit 75 means the slot or lock gave up: rerun. Exit 70 means the Xid count rose: stop. Count results:
+The log is `$G/issue$N-<tag>.log`; its last line is `RC_DONE rc=<n>`. Lock holds stay under 10 minutes. Exit 75 means the slot or lock gave up: rerun. Exit 70 means a new `NVRM: Xid` line appeared since the hold started: stop all GPU work and report. A falling total is not a fault (rule 31). Count results:
 
 ```sh
 verksted/_tools/test-summary.sh "$G/issue$N-<what>.log"        # passed, failed, ignored, warnings
@@ -118,14 +118,14 @@ The word list lives outside git (`$RCSR_BANNED_WORDS`, else `~/.config/rcsr/bann
 ## Merge
 
 ```sh
-verksted/_tools/clerk-check.sh <pr> --claims <file>             # read-only evidence check before the merge
+verksted/_tools/verifier-check.sh <pr> --claims <file>             # read-only evidence check before the merge
 gh pr merge <pr> --squash --delete-branch --subject "fix(area): subject (#<pr>)" --body-file <file>
 gh pr view <pr> --json state,mergeCommit
 ```
 
-Ticket PRs merge into the integration branch only, squashed, by the merge clerk. `main` only on the lead's written instruction. Hand-write subject and body. Never `Closes`. The worktree is removed afterwards with `wt-done.sh` (next section).
+Ticket PRs merge into the integration branch only, squashed, by the verifier. `main` only on the lead's written instruction. Hand-write subject and body. Never `Closes`. The worktree is removed afterwards with `wt-done.sh` (next section).
 
-`gh pr merge --delete-branch` also removes the worktree that has the head branch checked out (gh 2.103.3; the exact conditions are not verified), so `clerk-check.sh` checks before the merge that this worktree is clean and at the PR head. Afterwards an already-gone worktree is expected, not an error.
+`gh pr merge --delete-branch` also removes the worktree that has the head branch checked out (gh 2.103.3; the exact conditions are not verified), so `verifier-check.sh` checks before the merge that this worktree is clean and at the PR head. Afterwards an already-gone worktree is expected, not an error.
 
 ## Close and clean up (this ticket only)
 
@@ -185,7 +185,7 @@ rcsr schema
 ```sh
 verksted/_tools/brief.sh impl --issue "$N" --slug "$SLUG" --epic <n>     # prints the dispatch prompt
 verksted/_tools/brief.sh research --issue "$N" --slug "$SLUG"
-verksted/_tools/brief.sh clerk --issue "$N" --pr <pr>
+verksted/_tools/brief.sh verifier --issue "$N" --pr <pr>
 verksted/_tools/issue-lint.sh <body.md> --number "$N"                    # issue body against the template
 ```
 
