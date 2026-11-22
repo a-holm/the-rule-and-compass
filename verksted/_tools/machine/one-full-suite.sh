@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One full-suite build/test at a time, machine-wide, at the lowest CPU and I/O
 # priority (SCHED_IDLE) so the desktop always wins.
-# Usage: one-full-suite.sh bash -c 'cd <worktree>/my-version && cargo test --release'
+# Usage: one-full-suite.sh bash -c 'cd <worktree>/<crate dir> && cargo test --release'
 # While the pause file exists, new runs wait before queueing for the lock.
 set -euo pipefail
 LOCK="${RCSR_TEST_LOCK:-/mnt/lager/tmp/opencode/full-suite.lock}"

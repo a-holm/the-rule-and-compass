@@ -4,6 +4,7 @@
 # or failed target does not stop the others and fails the gate, no hold exceeds the cap, an Xid rise stops the run.
 # Writes: a temp dir that it removes.
 set -uo pipefail
+export RCSR_CRATE=crate-x
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 GATE=$HERE/../gate.sh
 T=$(mktemp -d)
@@ -15,7 +16,7 @@ check() {
     fails=$((fails + 1))
   fi
 }
-mkdir -p "$T/gates" "$T/wt/my-version"
+mkdir -p "$T/gates" "$T/wt/crate-x"
 git -C "$T/wt" init -q
 
 # The stub lock gets `bash -c <cmd>`. It records <cmd> and answers by the target at the end of a CUDA command, using

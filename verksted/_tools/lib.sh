@@ -7,6 +7,8 @@
 VERKSTED=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 RCSR_ROOT=${RCSR_ROOT:-$(git -C "$VERKSTED" rev-parse --show-toplevel)}
 ROOT=$(dirname "$(git -C "$RCSR_ROOT" rev-parse --path-format=absolute --git-common-dir)")
+CRATE=${RCSR_CRATE:-$(awk '/^\[/ { bin = ($0 == "[[bin]]") } bin && $0 == "name = \"rcsr\"" { n = split(FILENAME, p, "/"); print p[n - 1]; exit }' "$RCSR_ROOT"/*/Cargo.toml 2> /dev/null)}
+VLOCAL=${RCSR_LOCAL:-$ROOT/verksted/_local}
 WT=$ROOT/worktrees
 BASE=${RCSR_BASE:-integration/gpu-hardening}
 GATES=${RCSR_GATES:-/mnt/lager/tmp/rcsr-gates}

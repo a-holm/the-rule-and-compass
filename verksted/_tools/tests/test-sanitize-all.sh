@@ -3,6 +3,7 @@
 # Hermetic test of sanitize-all.sh with a stub slot, lock, cargo, sanitizer and Xid command.
 # Writes: a temp dir that it removes.
 set -uo pipefail
+export RCSR_CRATE=crate-x
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 . "$HERE/lib/fakes.sh"
 ALL=$HERE/../sanitize-all.sh
@@ -31,8 +32,8 @@ hasnt() {
   fi
 }
 
-mkdir -p "$T/gates" "$T/wt/my-version" "$T/bin" "$T/cuda-13.0/bin"
-touch "$T/wt/my-version/Cargo.toml"
+mkdir -p "$T/gates" "$T/wt/crate-x" "$T/bin" "$T/cuda-13.0/bin"
+touch "$T/wt/crate-x/Cargo.toml"
 cat > "$T/plan" <<'PLAN'
 # comment line
 gpu_parity      *            skip           device fault under memcheck

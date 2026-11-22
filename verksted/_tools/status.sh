@@ -3,7 +3,7 @@
 # One read-only report for the orchestrator. Sections and their lines:
 #   git:     clock (UTC and local); origin/$BASE tip (short sha, subject); open PRs: number, branch, head, updatedAt
 #   agents:  one line per worktree under $WT: branch, dirty y/n, minutes since the newest file change outside
-#            my-version/target and .git, SILENT when 45 or more and no cargo, rustc, nvcc, rcsr or flock process
+#            the engine crate target directory and .git, SILENT when 45 or more and no cargo, rustc, nvcc, rcsr or flock process
 #            has its cwd inside
 #   machine: test-lock holder (pid and command, from /proc/*/fd links to $LOCKFILE), held build slots, PAUSE and
 #            STREAMING present y/n, desktop-busy exit code, GPU utilisation and memory, Xid count, load average,
@@ -79,7 +79,7 @@ if want agents; then
     fi
     branch=$(git -C "$w" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")
     if [ -n "$(git -C "$w" status --porcelain 2>/dev/null | head -n 1)" ]; then dirty=y; else dirty=n; fi
-    newest=$(find "$w" -path "$w/my-version/target" -prune -o -name .git -prune -o -type f -printf '%T@\n' 2>/dev/null |
+    newest=$(find "$w" -path "$w/$CRATE/target" -prune -o -name .git -prune -o -type f -printf '%T@\n' 2>/dev/null |
       sort -n | tail -n 1 | cut -d. -f1)
     age=$(((now - ${newest:-0}) / 60))
     flag=""

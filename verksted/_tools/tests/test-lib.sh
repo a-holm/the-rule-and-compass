@@ -20,7 +20,7 @@ lib() {
   local snippet=$1
   shift
   env -u RCSR_ROOT -u RCSR_BASE -u RCSR_GATES -u RCSR_MACHINE_DIR -u RCSR_SLOT_SCRIPT \
-    -u RCSR_LOCK_SCRIPT -u RCSR_SANITIZER -u RCSR_XID_CMD "$@" \
+    -u RCSR_LOCK_SCRIPT -u RCSR_SANITIZER -u RCSR_XID_CMD -u RCSR_CRATE -u RCSR_LOCAL "$@" \
     bash -c "set -uo pipefail; source '$LIB'; $snippet"
 }
 git_q() { git -c user.name=t -c user.email=t@t.invalid "$@"; }
@@ -60,6 +60,13 @@ check ROOT-main "$(lib 'echo $ROOT' RCSR_ROOT="$main_top")" "$main_top"
 check ROOT-from-worktree "$(lib 'echo $ROOT' RCSR_ROOT="$side_top")" "$main_top"
 check RCSR_ROOT-from-worktree "$(lib 'echo $RCSR_ROOT' RCSR_ROOT="$side_top")" "$side_top"
 check WT "$(lib 'echo $WT' RCSR_ROOT="$side_top")" "$main_top/worktrees"
+
+# CRATE and VLOCAL
+check CRATE-override "$(lib 'echo $CRATE' RCSR_CRATE=/tmp/y)" "/tmp/y"
+check CRATE-default-found "$([ -f "$want_top/$(lib 'echo $CRATE')/Cargo.toml" ] && echo yes || echo no)" "yes"
+check CRATE-none "$(lib 'echo "[$CRATE]"' RCSR_ROOT="$main_top")" "[]"
+check VLOCAL-default "$(lib 'echo $VLOCAL' RCSR_ROOT="$side_top")" "$main_top/verksted/_local"
+check VLOCAL-override "$(lib 'echo $VLOCAL' RCSR_LOCAL=/tmp/x)" "/tmp/x"
 
 # need_gates
 out=$(lib 'need_gates; echo reached' RCSR_GATES="$T/nogates" 2>&1); rc=$?
