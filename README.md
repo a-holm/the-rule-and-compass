@@ -731,7 +731,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--no-dedup] [--no-simd] [--predictor-samples N]
      [--pipeline-depth N] [--threads N] [--variation auto|node|postfix]
      [--no-front-parents] [--prune] [--no-prune] [--prune-rows N] [--prune-budget N] [--reject-constant-offspring] [--reject-fixed-position]
-     [--selection lexicographic|afp|lexicase] [--lexicase-cases K] [--migration-interval N] [--restart-interval N] [--restart-policy archive|island] [--restart-isolation N] [--explore-islands K] [--front-scope global|island] [--migration-policy ring|ring-tournament]
+     [--selection lexicographic|afp|lexicase] [--lexicase-cases K] [--same-book-guard] [--migration-interval N] [--restart-interval N] [--restart-policy archive|island] [--restart-isolation N] [--explore-islands K] [--front-scope global|island] [--migration-policy ring|ring-tournament]
      [--mutation-mix classic|extended] [--crossover-internal P] [--adaptive-mix]
      [--fit-samples N]
      [--patience N]
@@ -1351,6 +1351,14 @@ constant can move the mean the arm says so instead of fabricating a fit. With `-
   losses under the metric fitness, `(group, time block)` sub-book regrets under `--fitness pnl`. A
   formula that is best on some rows, symbols or periods gets parents even when it does not win the
   aggregate. CPU node path; needs a metric with a per-row loss; the default stays `lexicographic`;
+- **distinct long/flat books** under `--fitness pnl`: every scored candidate carries a
+  book signature (per-block gross bits, flips and exits and the long rows of the book
+  the regret prices, masked and blocked as `--pnl-mask` and `--pnl-blocks` set it, from
+  the totals the scorer already reduces on the CPU and the device), the development log
+  and run.json `search.books` count the distinct books per island and over all
+  islands, and the opt-in `--same-book-guard` draws parent tournaments over distinct
+  books (one entrant per book, its simplest holder) instead of members. Node path
+  and lexicographic selection only; saved search setting; off by default;
 - **opt-in island-local restarts** (`--restart-policy island`, `--restart-isolation W`):
   the default rule restarts an island only while its best is worse than the
   archive best, which ring migration makes false for every island within a few

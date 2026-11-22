@@ -388,6 +388,7 @@ mod tests {
             inf_rows: None,
             edit: None,
             cases: None,
+            book: None,
         }
     }
 

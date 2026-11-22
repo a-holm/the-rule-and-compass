@@ -522,6 +522,9 @@ pub struct Config {
     /// under the metric fitness, sub-books under `--fitness pnl`). Saved search
     /// setting, read only under lexicase.
     pub lexicase_cases: usize,
+    /// #1082: parent tournaments draw over the book representatives of an
+    /// island (`--same-book-guard`). Saved search setting.
+    pub same_book_guard: bool,
     /// #1022: which stall rule restarts an island. Saved search setting.
     pub restart_policy: RestartPolicy,
     /// #1022: generations a restarted island takes no front parent and no
@@ -901,6 +904,7 @@ impl Default for Config {
             variation: VariationMode::Auto,
             selection: Selection::Lexicographic,
             lexicase_cases: DEFAULT_LEXICASE_CASES,
+            same_book_guard: false, // #1082
             restart_policy: RestartPolicy::Archive,
             restart_isolation: 25,
             explore_islands: 0,
@@ -1068,6 +1072,10 @@ struct Ind {
     /// kept sub-book from the prediction vector that produced `error`. Any
     /// write of `error` clears it; never saved.
     cases: Option<std::sync::Arc<[f32]>>,
+    /// #1082: the long/flat book of the evaluation that produced `error`
+    /// under `--fitness pnl`; `None` for a non-finite error, a metric fitness,
+    /// or a route that reported no book totals. Any write of `error` clears it.
+    book: Option<crate::trading::BookSig>,
 }
 
 impl Ind {
@@ -1075,6 +1083,13 @@ impl Ind {
         self.error = error;
         self.inf_rows = None;
         self.cases = None;
+        self.book = None;
+    }
+
+    /// #1082: `set_error` with the book signature of the same evaluation.
+    fn set_scored(&mut self, error: f64, book: Option<crate::trading::BookSig>) {
+        self.set_error(error);
+        self.book = book.filter(|_| error.is_finite());
     }
 
     /// #500: mark a `+inf` error as confirmed on the CPU for rows `rows`.
@@ -1116,16 +1131,16 @@ impl Ind {
         // fallback. The folded path applies whenever scoring already produces
         // predictions, which is every metric except the squared reuse case.
         let want_descriptor = cfg.qd_bins > 0 && !train.sample.is_multi();
-        let (error, descriptor, cases) = if cfg.accepts_dimensions(&tree) {
+        let (error, descriptor, cases, book) = if cfg.accepts_dimensions(&tree) {
             match fitted {
                 Some(fit) if can_reuse_sse(cfg, train, &fit, hash) => {
                     let d = want_descriptor.then(|| qd_descriptor_of(&tree, train, cfg)); // #1084
-                    (fit.sse / train.sample.len() as f64, d, None)
+                    (fit.sse / train.sample.len() as f64, d, None, None)
                 }
-                _ => fitness_scored(&tree, train, cfg, want_descriptor, lexicase::stores_cases(cfg)), // #27 #480 #1023
+                _ => fitness_scored(&tree, train, cfg, want_descriptor, lexicase::stores_cases(cfg)), // #27 #480 #1023 #1082
             }
         } else {
-            (f64::INFINITY, None, None)
+            (f64::INFINITY, None, None, None)
         };
         Ind {
             tree,
@@ -1136,6 +1151,7 @@ impl Ind {
             inf_rows: None,
             edit: None,
             cases,
+            book,
         }
     }
 
@@ -1165,6 +1181,7 @@ impl Ind {
             inf_rows: None,
             edit: None,
             cases: None,
+            book: None,
         }
     }
 
@@ -1177,12 +1194,12 @@ impl Ind {
     fn score_in_place(&mut self, train: &EvalSample, cfg: &Config) {
         // #25: re-evaluation must not resurrect a rejected candidate.
         let want_descriptor = cfg.qd_bins > 0 && !train.sample.is_multi();
-        let (error, descriptor, cases) = if cfg.accepts_dimensions(&self.tree) {
-            fitness_scored(&self.tree, train, cfg, want_descriptor, lexicase::stores_cases(cfg)) // #27 #480 #1023
+        let (error, descriptor, cases, book) = if cfg.accepts_dimensions(&self.tree) {
+            fitness_scored(&self.tree, train, cfg, want_descriptor, lexicase::stores_cases(cfg)) // #27 #480 #1023 #1082
         } else {
-            (f64::INFINITY, None, None)
+            (f64::INFINITY, None, None, None)
         };
-        self.set_error(error);
+        self.set_scored(error, book);
         self.descriptor = descriptor;
         self.cases = cases;
     }
@@ -1259,6 +1276,7 @@ impl Ind {
             error: self.error,
             complexity: self.complexity,
             age: self.age,
+            book: self.book,
         }
     }
 
@@ -1276,6 +1294,8 @@ impl Ind {
             inf_rows: None,
             edit: None,
             cases: None,
+            // #1082: stored only under --same-book-guard.
+            book: ind.book.filter(|_| ind.error.is_finite()),
         }
     }
 }
@@ -1397,6 +1417,8 @@ struct GpuSearch {
     /// for a fit-only arm and for an order/rank run. `score_pool` uses this,
     /// never the fit objective, so a `correlation` run cannot be ranked by SSE.
     score: Option<crate::metrics::ScoreObjective>,
+    /// #1082: time blocks of the uploaded long/flat book; 0 without one.
+    pnl_blocks: usize,
     /// #290: true once at least one batch actually ran on the device. The
     /// route planner can keep a tiny batch on the CPU even in a GPU run, so the
     /// backend claim must come from what ran, not from the capability flag.
@@ -1590,11 +1612,14 @@ impl GpuSearch {
                 // #481: the book is the first allocation after the rows, once
                 // per run.
                 let long_pnl = score == Some(crate::metrics::ScoreObjective::LongPnl);
+                let pnl_blocks = if long_pnl { pnl_book.map_or(0, |b| b.blocks()) } else { 0 };
                 if long_pnl {
                     let Some(book) = pnl_book else {
                         return Err("the long_pnl fitness book was not rebuilt".to_string());
                     };
                     ev.set_pnl_book(book)?;
+                    // #1082: the book totals of every long_pnl batch give the signatures.
+                    ev.keep_pnl_totals(true);
                 }
                 // #289: a classification score uploads its label sign once per
                 // sample, whether or not the device also fits constants. The
@@ -1687,6 +1712,7 @@ impl GpuSearch {
                     native_metric,
                     native_stat,
                     score,
+                    pnl_blocks,
                     device_eval_used: false,
                     device_fit_used: false,
                     memory_plan: None,
@@ -2171,6 +2197,21 @@ impl GpuSearch {
         Some(PendingCheck { full, ticket, check })
     }
 
+    /// #1082: the book signature of each of the `n` candidates of the last
+    /// `long_pnl` batch; all `None` without a book or when the device kept no
+    /// totals.
+    fn kept_books(
+        ev: &mut crate::gpu::GpuEvaluator,
+        pnl_blocks: usize,
+        score: Option<crate::metrics::ScoreObjective>,
+        n: usize,
+    ) -> Vec<Option<crate::trading::BookSig>> {
+        let kept = (pnl_blocks > 0 && score == Some(crate::metrics::ScoreObjective::LongPnl))
+            .then(|| ev.kept_pnl_signatures(n, pnl_blocks))
+            .flatten();
+        kept.unwrap_or_else(|| vec![None; n])
+    }
+
     /// #895: the calling thread and every pool worker round subnormals as IEEE does.
     fn pool_is_gradual(&self) -> bool {
         let workers = self.fallback.as_ref().map_or(&[false][..], |p| &p.worker_gradual);
@@ -2198,20 +2239,20 @@ impl GpuSearch {
     fn check_end(&mut self, islands: &mut [Vec<Ind>], pending: PendingCheck, generation: usize) {
         let PendingCheck { full, ticket, mut check } = pending;
         let wait_start = std::time::Instant::now();
-        let (errors, seconds, work) = self
+        let (errors, books, seconds, work) = self
             .fallback
             .as_ref()
             .expect("a GPU search owns its fallback pool")
-            .finish_checked(ticket);
+            .finish_signed(ticket);
         check.pool_s += wait_start.elapsed().as_secs_f64();
         check.early_rows = work.early_rows;
         let stats = self.stats.entry(generation).or_default();
         stats.nonfinite_early += work.early as usize;
         stats.nonfinite_no_book += work.no_book as usize;
-        for (&(i, j), e) in full.iter().zip(errors) {
+        for ((&(i, j), e), book) in full.iter().zip(errors).zip(books) {
             stats.nonfinite_cpu_finite += e.is_finite() as usize;
             check.finite += e.is_finite() as u64;
-            islands[i][j].set_error(e);
+            islands[i][j].set_scored(e, book);
             islands[i][j].confirm_inf(Some(self.rows_version));
         }
         stats.nonfinite_seconds += seconds;
@@ -2489,9 +2530,11 @@ impl GpuSearch {
                 // a stale result would be read by the next call.
                 gpu_error = Some("CUDA batch evaluation failed".to_string());
             } else {
-                for (&(i, j), (&value, &status)) in slots
+                let books = Self::kept_books(&mut self.ev, self.pnl_blocks, self.score, slots.len());
+                for ((&(i, j), (&value, &status)), &book) in slots
                     .iter()
                     .zip(batch.values.iter().zip(batch.status.iter()))
+                    .zip(books.iter())
                 {
                     // #287/#289: a non-finite row is `+inf` with a status; an
                     // Ok value is already the configured statistic (mean, RSS +
@@ -2506,7 +2549,7 @@ impl GpuSearch {
                         nonfinite.push((i, j));
                         f64::INFINITY
                     };
-                    islands[i][j].set_error(error);
+                    islands[i][j].set_scored(error, book);
                 }
                 // The generation is complete: the just-evaluated arena becomes
                 // the readable front, and the next generation writes into the
@@ -2521,14 +2564,14 @@ impl GpuSearch {
             // errors are merged in candidate order, independent of completion
             // order and worker count. The results are discarded on a failed
             // batch, which the caller re-scores in full.
-            let (errors, seconds) = self
+            let (errors, books, seconds, _) = self
                 .fallback
                 .as_ref()
                 .expect("a GPU search owns its fallback pool")
-                .finish(ticket);
+                .finish_signed(ticket);
             if gpu_error.is_none() {
-                for (&(i, j), &e) in on_cpu.iter().zip(errors.iter()) {
-                    islands[i][j].set_error(e);
+                for ((&(i, j), &e), &book) in on_cpu.iter().zip(errors.iter()).zip(books.iter()) {
+                    islands[i][j].set_scored(e, book);
                     islands[i][j].confirm_inf(Some(self.rows_version));
                 }
             }
@@ -2969,7 +3012,8 @@ fn rescore_pending_cpu(
     if jobs.is_empty() {
         return 0.0;
     }
-    let (errors, seconds) = pool.score(jobs, train, cfg);
+    let ticket = pool.submit(jobs, train, cfg);
+    let (errors, books, seconds, _) = pool.finish_signed(ticket);
     // Deterministic merge: `errors` is indexed by the (island, slot) order the
     // jobs were collected in, independent of which worker finished first or
     // how many workers there were. The tree and complexity were already set by
@@ -2979,7 +3023,7 @@ fn rescore_pending_cpu(
     for pop in islands.iter_mut() {
         for ind in pop.iter_mut() {
             if ind.error.is_nan() {
-                ind.set_error(errors[k]);
+                ind.set_scored(errors[k], books[k]);
                 k += 1;
             }
         }
@@ -3012,10 +3056,10 @@ struct FallbackPool {
     worker_gradual: Vec<bool>,
 }
 
-/// Borrowed scoring context for one [`FallbackPool::score`] call. The raw
-/// pointers are only dereferenced by workers between `score` sending the chunks
-/// and receiving the last result; `score` blocks on that result before the
-/// borrow ends, so they cannot outlive `train`/`cfg`.
+/// Borrowed scoring context for one [`FallbackPool::submit`] call. The raw
+/// pointers are only dereferenced by workers between `submit` sending the
+/// chunks and the ticket receiving the last result; the caller collects the
+/// ticket before the borrow ends, so they cannot outlive `train`/`cfg`.
 #[cfg(feature = "cuda")]
 #[derive(Clone, Copy)]
 struct ScoreContext(*const EvalSample<'static>, *const Config);
@@ -3051,7 +3095,7 @@ unsafe impl Sync for FitContext {}
 #[cfg(feature = "cuda")]
 enum ChunkWork {
     /// #896: `checked` jobs belong to the device `+inf` check and run through
-    /// [`score_tree_checked_work`].
+    /// [`score_tree_checked_signed`].
     Score { jobs: Vec<(usize, Node)>, ctx: ScoreContext, checked: bool },
     /// #958: exact CPU fallback fits.
     Fit { jobs: Vec<FallbackFitJob>, ctx: FitContext },
@@ -3069,7 +3113,7 @@ struct FallbackChunk {
 
 #[cfg(feature = "cuda")]
 enum ChunkOutput {
-    Errors(Vec<f64>, CheckWork),
+    Errors(Vec<f64>, Vec<Option<crate::trading::BookSig>>, CheckWork),
     Fits(Vec<FallbackFitJob>),
 }
 
@@ -3120,17 +3164,20 @@ impl FallbackPool {
                                 // this result before the borrow ends.
                                 let (train, cfg) = unsafe { (&*ctx.0, &*ctx.1) };
                                 let mut errors = Vec::with_capacity(jobs.len());
+                                let mut books = Vec::with_capacity(jobs.len());
                                 let mut work = CheckWork::default();
                                 for (_, tree) in &jobs {
-                                    if checked {
-                                        let (error, w) = score_tree_checked_work(tree, train, cfg);
+                                    let (error, book) = if checked {
+                                        let (error, book, w) = score_tree_checked_signed(tree, train, cfg);
                                         work.add(w);
-                                        errors.push(error);
+                                        (error, book)
                                     } else {
-                                        errors.push(score_tree(tree, train, cfg));
-                                    }
+                                        score_tree_signed(tree, train, cfg)
+                                    };
+                                    errors.push(error);
+                                    books.push(book);
                                 }
-                                ChunkOutput::Errors(errors, work)
+                                ChunkOutput::Errors(errors, books, work)
                             }
                             ChunkWork::Fit { mut jobs, ctx } => {
                                 // SAFETY: see `FitContext`.
@@ -3173,7 +3220,7 @@ impl FallbackPool {
     }
 
     /// #896: [`Self::submit`] for the jobs of the device `+inf` check, which
-    /// run through [`score_tree_checked_work`].
+    /// run through [`score_tree_checked_signed`].
     fn submit_checked(&self, jobs: Vec<(usize, Node)>, train: &EvalSample, cfg: &Config) -> FallbackTicket {
         self.submit_jobs(jobs, train, cfg, true)
     }
@@ -3256,24 +3303,35 @@ impl FallbackPool {
     }
 
     /// #896: [`Self::finish`] plus the work the early-exit passes did.
-    fn finish_checked(&self, mut ticket: FallbackTicket) -> (Vec<f64>, f64, CheckWork) {
+    fn finish_checked(&self, ticket: FallbackTicket) -> (Vec<f64>, f64, CheckWork) {
+        let (out, _, seconds, work) = self.finish_signed(ticket);
+        (out, seconds, work)
+    }
+
+    /// #1082: [`Self::finish_checked`] with the book signature of each error.
+    fn finish_signed(
+        &self,
+        mut ticket: FallbackTicket,
+    ) -> (Vec<f64>, Vec<Option<crate::trading::BookSig>>, f64, CheckWork) {
         let mut work = CheckWork::default();
         let mut out = vec![f64::NAN; ticket.total];
+        let mut books = vec![None; ticket.total];
         while let Some(result) = ticket.next_result() {
-            let ChunkOutput::Errors(errors, w) = result.out else {
+            let ChunkOutput::Errors(errors, sigs, w) = result.out else {
                 unreachable!("a scoring ticket returns errors")
             };
             work.add(w);
-            for (offset, error) in errors.into_iter().enumerate() {
+            for (offset, (error, book)) in errors.into_iter().zip(sigs).enumerate() {
                 // `start` is the chunk ordinal; the absolute job index is
                 // recomputed from the chunk's own position in the job list.
                 let idx = result.start * ticket.chunk_len + offset;
                 if idx < ticket.total {
                     out[idx] = error;
+                    books[idx] = book;
                 }
             }
         }
-        (out, ticket.started.elapsed().as_secs_f64(), work)
+        (out, books, ticket.started.elapsed().as_secs_f64(), work)
     }
 
     /// #958: collect a fit ticket: the jobs in submission order and the instant
@@ -3295,13 +3353,6 @@ impl FallbackPool {
             .map(|job| job.expect("every submitted fit came back"))
             .collect();
         (jobs, last)
-    }
-
-    /// Score `jobs` on the pool and return errors in the same order, plus the
-    /// wall-clock fallback seconds.
-    fn score(&self, jobs: Vec<(usize, Node)>, train: &EvalSample, cfg: &Config) -> (Vec<f64>, f64) {
-        let ticket = self.submit(jobs, train, cfg);
-        self.finish(ticket)
     }
 
     fn workers(&self) -> usize {
@@ -3721,7 +3772,7 @@ fn eval_pipeline_jobs(
     g: &mut GpuSearch,
     jobs: &[PipelineJob],
     generation: usize,
-) -> Result<(Vec<usize>, Vec<(f64, DeviceInf)>), String> {
+) -> Result<(Vec<usize>, Vec<(f64, DeviceInf, Option<crate::trading::BookSig>)>), String> {
     if generation >= 2 && crate::gpu::injected_fault("pipeline") {
         return Err(format!("{}the pipeline batch", crate::gpu::INJECTED_REFUSAL));
     }
@@ -3756,17 +3807,19 @@ fn eval_pipeline_jobs(
     if batch.ms < 0.0 || !batch.is_consistent() || batch.values.len() != pop.len() {
         return Err("CUDA batch evaluation failed".to_string());
     }
+    let books = GpuSearch::kept_books(&mut g.ev, g.pnl_blocks, g.score, pop.len());
     let errs = batch
         .values
         .iter()
         .zip(batch.status.iter())
-        .map(|(&value, &status)| {
+        .zip(books)
+        .map(|((&value, &status), book)| {
             if !status.is_ok() {
-                (f64::INFINITY, DeviceInf::Range)
+                (f64::INFINITY, DeviceInf::Range, None)
             } else if value == f64::INFINITY && objective == crate::metrics::ScoreObjective::LongPnl {
-                (value, DeviceInf::TradeFloor)
+                (value, DeviceInf::TradeFloor, None)
             } else {
-                (value, DeviceInf::None)
+                (value, DeviceInf::None, book)
             }
         })
         .collect();
@@ -3796,13 +3849,14 @@ fn score_pipeline_batch(
         // the route ledger and the backend claim come from what ran.
         g.device_eval_used = true;
     }
-    for (&k, &(e, bad)) in kept.iter().zip(&errs) {
+    for (&k, &(e, bad, book)) in kept.iter().zip(&errs) {
         let (i, j) = (jobs[k].0, jobs[k].1);
         results[i][j] = Some(PipelineResult {
             error: e,
             nonfinite: bad,
             offered: offered_hash[k],
             tree: None,
+            book,
         });
     }
     let Some(arm) = fit else {
@@ -3900,13 +3954,14 @@ fn fit_pipeline_queue(
         let rescore_start = std::time::Instant::now();
         let (kept2, errs2) = eval_pipeline_jobs(g, &refit, generation)?;
         g.drain_eval_ms += rescore_start.elapsed().as_secs_f64() * 1000.0;
-        for (&pos, &(err, bad)) in kept2.iter().zip(&errs2) {
+        for (&pos, &(err, bad, book)) in kept2.iter().zip(&errs2) {
             let (i, j, tree) = &refit[pos];
             results[*i][*j] = Some(PipelineResult {
                 error: err,
                 nonfinite: bad,
                 offered: offered_hash[fitted[pos]],
                 tree: Some(tree.clone()),
+                book,
             });
         }
     }
@@ -3970,13 +4025,14 @@ fn finish_pipeline_fallbacks(
         .map(|s| (s.island, s.slot, expr::simplify(&s.tree)))
         .collect();
     let (kept, errs) = eval_pipeline_jobs(g, &scored, generation)?;
-    for (&pos, &(err, bad)) in kept.iter().zip(&errs) {
+    for (&pos, &(err, bad, book)) in kept.iter().zip(&errs) {
         let (i, j, tree) = &scored[pos];
         results[*i][*j] = Some(PipelineResult {
             error: err,
             nonfinite: bad,
             offered: done.settled[pos].tag,
             tree: Some(tree.clone()),
+            book,
         });
     }
     Ok(())
@@ -4612,12 +4668,14 @@ fn fitness_error_and_descriptor(
     cfg: &Config,
     want_descriptor: bool,
 ) -> (f64, Option<qd::Descriptor>) {
-    let (error, descriptor, _) = fitness_scored(tree, data, cfg, want_descriptor, false);
+    let (error, descriptor, _, _) = fitness_scored(tree, data, cfg, want_descriptor, false);
     (error, descriptor)
 }
 
 /// #1023: [`fitness_error_and_descriptor`] and, when `want_cases` and the
 /// regret is finite, the sub-book regrets of the same prediction vector.
+/// #1082: the fourth value is the book signature of the regret (`None` under a
+/// metric fitness or for a non-finite regret).
 #[allow(clippy::type_complexity)]
 fn fitness_scored(
     tree: &Node,
@@ -4625,28 +4683,28 @@ fn fitness_scored(
     cfg: &Config,
     want_descriptor: bool,
     want_cases: bool,
-) -> (f64, Option<qd::Descriptor>, Option<std::sync::Arc<[f32]>>) {
+) -> (f64, Option<qd::Descriptor>, Option<std::sync::Arc<[f32]>>, Option<crate::trading::BookSig>) {
     let Some(book) = cfg.fitness.book() else {
         let (error, descriptor) = eval_error_and_descriptor(tree, data, cfg.metric, want_descriptor);
-        return (error, descriptor, None);
+        return (error, descriptor, None, None);
     };
     let s = data.sample;
     if s.is_empty() || s.len() != book.len() {
         debug_assert!(false, "fitness book has {} rows, the sample {}", book.len(), s.len());
-        return (f64::INFINITY, None, None);
+        return (f64::INFINITY, None, None, None);
     }
     let nvars = s.x.first().map(Vec::len).unwrap_or(0);
     let run = || with_predictions(tree, data, |pred| {
-        let (error, descriptor) = if want_descriptor && cfg.qd_descriptor == qd::DescriptorKind::Book {
-            // #1084: the descriptor reads the reduction that gives the regret.
-            let (error, shape) = book.regret_and_shape(pred);
-            (error, Some(qd::book_descriptor(&shape)))
+        // #1084, #1082: the book descriptor and the signature read the
+        // reduction that gives the regret.
+        let (error, shape, sig) = book.regret_shape_signed(pred);
+        let descriptor = if want_descriptor && cfg.qd_descriptor == qd::DescriptorKind::Book {
+            Some(qd::book_descriptor(&shape))
         } else {
-            let error = book.regret(pred);
-            (error, want_descriptor.then(|| qd::descriptor_from_prediction(tree, pred, nvars)))
+            want_descriptor.then(|| qd::descriptor_from_prediction(tree, pred, nvars))
         };
         let cases = (want_cases && error.is_finite()).then(|| book.case_errors(pred).into());
-        (error, descriptor, cases)
+        (error, descriptor, cases, sig)
     });
     if book.has_layer() {
         crate::gate_search::with_candidate(tree, run)
@@ -4783,6 +4841,14 @@ fn score_tree_checked(tree: &Node, data: &EvalSample, cfg: &Config) -> f64 {
 }
 
 /// #896: [`score_tree_checked`] and the work it saved.
+#[cfg(test)]
+fn score_tree_checked_work(tree: &Node, data: &EvalSample, cfg: &Config) -> (f64, CheckWork) {
+    let (error, _, work) = score_tree_checked_signed(tree, data, cfg);
+    (error, work)
+}
+
+/// #896: [`score_tree`] for a slot of the device `+inf` check and the work it
+/// saved; #1082: with the book signature of the error.
 ///
 /// The compiled program and the tile kernel are the ones [`PredBuf::fill`]
 /// uses, and every row value depends on its own row only, so a row range gives
@@ -4794,11 +4860,16 @@ fn score_tree_checked(tree: &Node, data: &EvalSample, cfg: &Config) -> f64 {
 /// threshold the book counts no flip, so the score is `+inf` without it.
 /// Anything else, and every shape this does not model, takes [`score_tree`].
 #[cfg(any(feature = "cuda", test))]
-fn score_tree_checked_work(tree: &Node, data: &EvalSample, cfg: &Config) -> (f64, CheckWork) {
+fn score_tree_checked_signed(
+    tree: &Node,
+    data: &EvalSample,
+    cfg: &Config,
+) -> (f64, Option<crate::trading::BookSig>, CheckWork) {
     let mut work = CheckWork::default();
     let s = data.sample;
     let (Some(cols), Some(program)) = (&data.cols, crate::eval_soa::compile(tree)) else {
-        return (score_tree(tree, data, cfg), work);
+        let (error, book) = score_tree_signed(tree, data, cfg);
+        return (error, book, work);
     };
     let book = cfg.fitness.book();
     let modelled = !s.is_multi()
@@ -4810,11 +4881,13 @@ fn score_tree_checked_work(tree: &Node, data: &EvalSample, cfg: &Config) -> (f64
             None => !cfg.metric.is_implicit(),
         };
     if !modelled {
-        return (score_tree(tree, data, cfg), work);
+        let (error, book) = score_tree_signed(tree, data, cfg);
+        return (error, book, work);
     }
     PRED_BUF.with(|cell| {
         let Ok(mut buf) = cell.try_borrow_mut() else {
-            return (score_tree(tree, data, cfg), CheckWork::default());
+            let (error, book) = score_tree_signed(tree, data, cfg);
+            return (error, book, CheckWork::default());
         };
         let PredBuf { pred, scratch } = &mut *buf;
         pred.clear();
@@ -4829,21 +4902,21 @@ fn score_tree_checked_work(tree: &Node, data: &EvalSample, cfg: &Config) -> (f64
                 if !p.is_finite() && decides(mask, start + k) {
                     work.early = 1;
                     work.early_rows = end as u64;
-                    return (f64::INFINITY, work);
+                    return (f64::INFINITY, None, work);
                 }
                 long |= book.is_some_and(|b| p > b.threshold());
             }
             start = end;
         }
-        let error = match book {
+        let (error, sig) = match book {
             Some(b) if !long && b.min_trades() >= 1 => {
                 work.no_book = 1;
-                f64::INFINITY
+                (f64::INFINITY, None)
             }
-            Some(b) => b.regret(pred),
-            None => crate::metrics::score_sample(pred, s, cfg.metric, expr::count_constants(tree)),
+            Some(b) => b.regret_signed(pred),
+            None => (crate::metrics::score_sample(pred, s, cfg.metric, expr::count_constants(tree)), None),
         };
-        (error, work)
+        (error, sig, work)
     })
 }
 
@@ -5100,10 +5173,16 @@ thread_local! {
 // multi-output path has its own per-output fit/metric and keeps its existing
 // scalar walk.
 fn score_tree(tree: &Node, data: &EvalSample, cfg: &Config) -> f64 {
+    score_tree_signed(tree, data, cfg).0
+}
+
+/// #1082: [`score_tree`] and the book signature of its error.
+fn score_tree_signed(tree: &Node, data: &EvalSample, cfg: &Config) -> (f64, Option<crate::trading::BookSig>) {
     if data.sample.is_multi() {
-        multi::combined_error(tree, data.sample, cfg.metric, cfg.fit_iters)
+        (multi::combined_error(tree, data.sample, cfg.metric, cfg.fit_iters), None)
     } else {
-        fitness_error_and_descriptor(tree, data, cfg, false).0
+        let (error, _, _, book) = fitness_scored(tree, data, cfg, false, false);
+        (error, book)
     }
 }
 
@@ -5670,6 +5749,7 @@ fn refresh_after_fit(ind: &mut Ind, cfg: &Config) {
     ind.complexity = cfg.complexity_model.complexity(&ind.tree);
     if !cfg.accepts_dimensions(&ind.tree) {
         ind.error = f64::INFINITY;
+        ind.book = None;
     }
 }
 
@@ -6278,6 +6358,75 @@ fn tournament(island: &[Ind], rng: &mut Mt, k: usize) -> usize {
     best
 }
 
+/// #1082: one island index per long/flat book: the holder [`better`] ranks
+/// first (one book has one error, so the simplest; the first index on a tie).
+/// A member without a signature is its own representative. Indices keep the
+/// order of each book's first holder.
+fn book_representatives(island: &[Ind]) -> Vec<usize> {
+    let mut reps: Vec<usize> = Vec::with_capacity(island.len());
+    let mut slot: std::collections::HashMap<crate::trading::BookSig, usize> = std::collections::HashMap::new();
+    for (i, ind) in island.iter().enumerate() {
+        match ind.book.filter(|_| ind.error.is_finite()) {
+            Some(sig) => match slot.get(&sig) {
+                Some(&k) => {
+                    if better(ind, &island[reps[k]]) {
+                        reps[k] = i;
+                    }
+                }
+                None => {
+                    slot.insert(sig, reps.len());
+                    reps.push(i);
+                }
+            },
+            None => reps.push(i),
+        }
+    }
+    reps
+}
+
+/// #1082: [`tournament`] whose `k` entrants are drawn from the representatives
+/// `reps` instead of the whole island, so a book with several copies enters as
+/// often as a book with one. Empty `reps` is [`tournament`] exactly.
+fn tournament_over(island: &[Ind], reps: &[usize], rng: &mut Mt, k: usize) -> usize {
+    if reps.is_empty() {
+        return tournament(island, rng, k);
+    }
+    let n = reps.len();
+    let mut best = reps[rng.usize_below(n)];
+    for _ in 1..k {
+        let c = reps[rng.usize_below(n)];
+        if better(&island[c], &island[best]) {
+            best = c;
+        }
+    }
+    best
+}
+
+/// #1082: distinct long/flat books among the finite members of every island
+/// and over all islands; `None` without a fitness book. A reading only: it
+/// draws nothing and writes nothing back.
+fn book_counts(islands: &[Vec<Ind>], cfg: &Config) -> Option<crate::devlog::BookCounts> {
+    cfg.fitness.book()?;
+    let mut counts = crate::devlog::BookCounts::default();
+    let mut all: HashSet<crate::trading::BookSig> = HashSet::new();
+    for pop in islands {
+        let mut mine: HashSet<crate::trading::BookSig> = HashSet::new();
+        for ind in pop.iter().filter(|ind| ind.error.is_finite()) {
+            match ind.book {
+                Some(sig) => {
+                    counts.signed += 1;
+                    mine.insert(sig);
+                    all.insert(sig);
+                }
+                None => counts.unsigned += 1,
+            }
+        }
+        counts.islands.push(mine.len());
+    }
+    counts.distinct = all.len();
+    Some(counts)
+}
+
 // #76: fraction of parent draws that come from the global Pareto front.
 //
 // The front is non-dominated, so every member is the best expression found at
@@ -6305,11 +6454,13 @@ fn front_parent<'a>(front: &'a [Sol], rng: &mut Mt, p: f64) -> Option<&'a Node> 
 
 /// #76: one parent, from the front with probability `p`, else the island
 /// tournament. The draw uses the island's own RNG, so a run remains
-/// deterministic for a given seed.
-fn pick_parent<'a>(island: &'a [Ind], front: &'a [Sol], rng: &mut Mt, p: f64) -> &'a Node {
+/// deterministic for a given seed. #1082: the tournament draws over the book
+/// representatives `reps` ([`tournament_over`]); empty `reps` is the plain
+/// tournament.
+fn pick_parent<'a>(island: &'a [Ind], reps: &[usize], front: &'a [Sol], rng: &mut Mt, p: f64) -> &'a Node {
     match front_parent(front, rng, p) {
         Some(tree) => tree,
-        None => &island[tournament(island, rng, 4)].tree,
+        None => &island[tournament_over(island, reps, rng, 4)].tree,
     }
 }
 
@@ -6334,8 +6485,10 @@ struct Parents<'a> {
 /// The QD branch reads the archive snapshot only; it never mutates the archive
 /// inside a generation. It keeps the 5% global-front draw that the issue
 /// reserves for the diversity policy. An island whose source is not `shared`
-/// (isolated after a restart, #1067) skips the QD branch.
-fn pick_parent_policy(island: &[Ind], parents: &Parents<'_>, rng: &mut Mt) -> Node {
+/// (isolated after a restart, #1067) skips the QD branch. #1082: the island
+/// tournament draws over the book representatives `reps`; empty `reps` is the
+/// plain tournament.
+fn pick_parent_policy(island: &[Ind], parents: &Parents<'_>, rng: &mut Mt, reps: &[usize]) -> Node {
     if let (Some((qd, qd_control)), true) = (parents.qd, parents.source.shared) {
         // The issue reserves 5 % of QD parent draws for the global front.
         if let Some(tree) = front_parent(parents.front, rng, 0.05) {
@@ -6359,7 +6512,7 @@ fn pick_parent_policy(island: &[Ind], parents: &Parents<'_>, rng: &mut Mt) -> No
             None => island[pool.select(island, rng)].tree.clone(),
         };
     }
-    pick_parent(island, parents.front, rng, parents.source.front_p).clone()
+    pick_parent(island, reps, parents.front, rng, parents.source.front_p).clone()
 }
 
 // #465: age-fitness Pareto survivor selection (`--selection afp`).
@@ -6422,9 +6575,10 @@ fn pick_parent_aged(
     afp: bool,
     rank: &[u32],
     crowd: &[f64],
+    reps: &[usize],
 ) -> (Node, u32) {
     if !afp || parents.qd.is_some() {
-        return (pick_parent_policy(island, parents, rng), 0);
+        return (pick_parent_policy(island, parents, rng, reps), 0);
     }
     match front_parent(parents.front, rng, parents.source.front_p) {
         Some(tree) => (tree.clone(), 0),
@@ -6472,6 +6626,8 @@ struct PipelineResult {
     nonfinite: DeviceInf,
     offered: u64,
     tree: Option<Node>,
+    /// #1082: the book signature of `error`.
+    book: Option<crate::trading::BookSig>,
 }
 
 /// #601: the fewest planned candidates one overlap fit call carries. A fit
@@ -6695,6 +6851,8 @@ fn evolve_island(
     } else {
         (Vec::new(), Vec::new())
     };
+    // #1082: the parents' book representatives; empty leaves the tournament as is.
+    let book_reps = if cfg.same_book_guard { book_representatives(isl) } else { Vec::new() };
     let pop = cfg.pop;
     let mut next: Vec<Ind> = Vec::with_capacity(pop);
 
@@ -6759,7 +6917,7 @@ fn evolve_island(
             // #120: with the policy on, a UCB/stratified cell elite supplies most
             // parents; 5% still come from the global Pareto front. With the policy
             // off this is exactly the #76 draw.
-            let (p1, mut age) = pick_parent_aged(isl, &parents, rng, afp, &par_rank, &par_crowd);
+            let (p1, mut age) = pick_parent_aged(isl, &parents, rng, afp, &par_rank, &par_crowd, &book_reps);
             let parent_err = if track {
                 parent_errors.get(&expr::structural_hash(&p1)).copied()
             } else {
@@ -6768,7 +6926,7 @@ fn evolve_island(
             let mut used = 0u8; // #471: bit per edit kind applied to this child
             let mut child = p1;
             if rng.bool(0.5) {
-                let (parent2, age2) = pick_parent_aged(isl, &parents, rng, afp, &par_rank, &par_crowd);
+                let (parent2, age2) = pick_parent_aged(isl, &parents, rng, afp, &par_rank, &par_crowd, &book_reps);
                 age = age.max(age2);
                 crossover_with_opts(&mut child, &parent2, rng, Some(aggs), opts.crossover_internal);
             }
@@ -7197,6 +7355,9 @@ pub struct Outcome {
     /// search state is saved; `archive` is the search archive at the last
     /// generation, `test_errors` is empty and no end-of-run report ran.
     pub interim: bool,
+    /// #1082: distinct long/flat books of the final population under
+    /// `--fitness pnl` on the node path; `None` otherwise.
+    pub books: Option<crate::devlog::BookCounts>,
 }
 
 /// #256: the reported `converged_early`. `stopped` is the loop-control flag
@@ -7673,6 +7834,9 @@ fn postfix_variation_for(cfg: &Config, train: &Sample) -> Result<Variation, Stri
     if cfg.selection == Selection::Lexicase {
         return Err("--selection lexicase runs on the node path".to_string()); // #1023
     }
+    if cfg.same_book_guard {
+        return Err("--same-book-guard runs on the node path".to_string()); // #1082
+    }
     if cfg.fit_iters != 0 {
         return Err("constant fitting is enabled".to_string());
     }
@@ -8030,6 +8194,7 @@ fn dev_generation(
         migrants: 0,
         migrants_skipped: 0,
         lexicase_cases: None,
+        books: None,
     }
 }
 
@@ -8362,6 +8527,7 @@ fn run_postfix_search(
                             inf_rows: None,
                             edit: None,
                             cases: None,
+                            book: None,
                         })
                         .collect()
                 })
@@ -8441,6 +8607,7 @@ fn run_postfix_search(
                         inf_rows: None,
                         edit: None,
                         cases: None,
+                        book: None,
                     })
                     .collect()
             })
@@ -8578,6 +8745,7 @@ fn run_postfix_search(
         fixed_position_fallback,
         interim,
         fit_accept: fit_accept_report(cfg, &run_fit),
+        books: None, // #1082: the flat path carries no book signature
     })
 }
 
@@ -9692,11 +9860,11 @@ fn run_search(
                                     ind.complexity = cfg.complexity_model.complexity(&tree);
                                     ind.tree = tree;
                                 }
-                                ind.set_error(if cfg.accepts_dimensions(&ind.tree) {
-                                    r.error
+                                if cfg.accepts_dimensions(&ind.tree) {
+                                    ind.set_scored(r.error, r.book); // #1082
                                 } else {
-                                    f64::INFINITY
-                                });
+                                    ind.set_error(f64::INFINITY);
+                                }
                                 match r.nonfinite {
                                     DeviceInf::None => {}
                                     DeviceInf::Range => nonfinite_slots.push((i, j)),
@@ -9939,6 +10107,7 @@ fn run_search(
                     }),
                 );
                 rec.lexicase_cases = lex_cases.as_ref().map(|c| c.len()); // #1023
+                rec.books = book_counts(&islands, cfg); // #1082
                 dev_rec = Some(rec);
             }
 
@@ -10333,6 +10502,7 @@ fn run_search(
         fixed_position_fallback,
         interim,
         fit_accept: fit_accept_report(cfg, &run_fit),
+        books: book_counts(&islands, cfg), // #1082
     })
 }
 
@@ -10619,6 +10789,7 @@ mod tests {
             inf_rows: None,
             edit: None,
             cases: None,
+            book: None,
         }
     }
 
@@ -10930,6 +11101,7 @@ mod tests {
             inf_rows: None,
             edit: None,
             cases: None,
+            book: None,
         };
         refresh_after_fit(&mut ind, &cfg);
         let want = expr::simplify(&tree);
@@ -11660,12 +11832,13 @@ mod tests {
             inf_rows: None,
             edit: None,
             cases: None,
+            book: None,
         }];
 
         let mut rng = Mt::new(11);
         let mut seen = [0usize; 2];
         for _ in 0..100 {
-            let t = pick_parent(&island, &front, &mut rng, 1.0);
+            let t = pick_parent(&island, &[], &front, &mut rng, 1.0);
             let k = if t == &front[0].tree {
                 0
             } else if t == &front[1].tree {
@@ -11680,7 +11853,7 @@ mod tests {
         let mut rng = Mt::new(11);
         for _ in 0..100 {
             assert!(
-                pick_parent(&island, &front, &mut rng, 0.0) == &island[0].tree,
+                pick_parent(&island, &[], &front, &mut rng, 0.0) == &island[0].tree,
                 "p = 0.0 must use the island tournament"
             );
         }
@@ -11933,6 +12106,7 @@ mod tests {
             inf_rows: None,
             edit: None,
             cases: None,
+            book: None,
         };
 
         ind.refit_and_reeval(&first_data, &first, &cfg, None);
@@ -13104,7 +13278,7 @@ mod tests {
             }
         }
         let mut results: Vec<Vec<Option<PipelineResult>>> = vec![vec![None; 3]; 2];
-        results[0][0] = Some(PipelineResult { error: 42.0, nonfinite: DeviceInf::None, offered: 0, tree: None });
+        results[0][0] = Some(PipelineResult { error: 42.0, nonfinite: DeviceInf::None, offered: 0, tree: None, book: None });
         finish_pipeline_loss(&mut islands, &mut results, &rows, &cfg, &FallbackPool::new(2, 2), None);
         assert!(results.iter().flatten().all(|r| r.is_none()), "device results are dropped");
         let mut differs = false;
@@ -13442,7 +13616,7 @@ mod tests {
     }
 
     fn aged_ind(tree: Node, error: f64, complexity: f64, age: u32) -> Ind {
-        Ind { tree, error, complexity, descriptor: None, age, inf_rows: None, edit: None, cases: None }
+        Ind { tree, error, complexity, descriptor: None, age, inf_rows: None, edit: None, cases: None, book: None }
     }
 
     /// #465: the lowest-error individual always survives, whatever its age or
@@ -15229,5 +15403,126 @@ mod tests {
         assert_eq!(mix.len(), 3);
         let attempts: u64 = mix.encode().chunks(2).map(|c| c[0]).sum();
         assert!(attempts > 0);
+    }
+
+    // ---- #1082: book signatures, representatives and the distinct-book count ----
+
+    fn book_rows(n: usize) -> Sample {
+        let x: Vec<Vec<f64>> = (0..n).map(|i| vec![-1.0 + 2.0 * i as f64 / (n - 1) as f64]).collect();
+        let y = x.iter().map(|r| r[0]).collect();
+        Sample { x, y, w: Vec::new(), ys: Vec::new(), pairs: None }
+    }
+
+    fn booked(error: f64, complexity: f64, book: Option<u64>) -> Ind {
+        let mut ind = aged_ind(crate::expr::input(0), error, complexity, 0);
+        ind.book = book.and_then(crate::trading::BookSig::new);
+        ind
+    }
+
+    #[test]
+    fn set_error_clears_the_book_signature() {
+        let mut ind = booked(0.5, 3.0, Some(7));
+        ind.set_error(0.5);
+        assert_eq!(ind.book, None, "a plain error write drops the book");
+        ind.set_scored(0.25, crate::trading::BookSig::new(9));
+        assert_eq!(ind.book.map(|b| b.get()), Some(9));
+        ind.set_scored(f64::INFINITY, crate::trading::BookSig::new(9));
+        assert_eq!(ind.book, None, "a non-finite error has no book");
+    }
+
+    #[test]
+    fn book_representatives_keep_the_simplest_first_holder() {
+        let island = vec![
+            booked(0.4, 5.0, Some(1)),           // 0: book A
+            booked(0.4, 3.0, Some(1)),           // 1: book A, simpler
+            booked(0.6, 4.0, Some(2)),           // 2: book B
+            booked(0.4, 3.0, Some(1)),           // 3: book A, tie with 1
+            booked(0.7, 2.0, None),              // 4: unsigned
+            booked(f64::INFINITY, 1.0, Some(1)), // 5: non-finite
+            booked(0.6, 4.0, Some(2)),           // 6: book B, tie with 2
+        ];
+        assert_eq!(book_representatives(&island), vec![1, 2, 4, 5]);
+        assert!(book_representatives(&[]).is_empty());
+    }
+
+    #[test]
+    fn book_tournament_draws_only_representatives() {
+        // Ten copies of book A, one of B, one of C.
+        let mut island: Vec<Ind> = (0..10).map(|_| booked(0.5, 3.0, Some(1))).collect();
+        island.push(booked(0.6, 3.0, Some(2)));
+        island.push(booked(0.7, 3.0, Some(3)));
+        let reps = book_representatives(&island);
+        assert_eq!(reps, vec![0, 10, 11]);
+        let mut rng = Mt::new(11);
+        let mut guard = [0usize; 12];
+        let mut plain = [0usize; 12];
+        for _ in 0..1200 {
+            guard[tournament_over(&island, &reps, &mut rng, 1)] += 1;
+            plain[tournament(&island, &mut rng, 1)] += 1;
+        }
+        for (i, n) in guard.iter().enumerate() {
+            if reps.contains(&i) {
+                assert!(*n >= 300, "representative {i} drawn {n} times of 1200");
+            } else {
+                assert_eq!(*n, 0, "a copy is never an entrant");
+            }
+        }
+        let copies_of_a: usize = plain[..10].iter().sum();
+        assert!(copies_of_a >= 900, "the plain tournament draws book A {copies_of_a} times of 1200");
+        for _ in 0..200 {
+            assert!(reps.contains(&tournament_over(&island, &reps, &mut rng, 4)));
+        }
+    }
+
+    #[test]
+    fn book_tournament_without_representatives_is_the_plain_tournament() {
+        let island: Vec<Ind> = (0..17)
+            .map(|i| booked(0.1 * (i % 5) as f64, (i % 3) as f64, Some(1 + (i % 4) as u64)))
+            .collect();
+        let mut a = Mt::new(5);
+        let mut b = Mt::new(5);
+        for _ in 0..1000 {
+            assert_eq!(tournament(&island, &mut a, 4), tournament_over(&island, &[], &mut b, 4));
+        }
+        assert_eq!(a.state(), b.state(), "the same draws in the same order");
+    }
+
+    #[test]
+    fn book_counts_per_island_and_over_islands() {
+        let s = book_rows(64);
+        let cfg = Config { fitness: Fitness::LongPnl(pnl_book(&s)), ..Config::default() };
+        let islands = vec![
+            vec![
+                booked(0.5, 3.0, Some(1)),
+                booked(0.5, 4.0, Some(1)),
+                booked(0.6, 3.0, Some(2)),
+                booked(f64::INFINITY, 3.0, None),
+                booked(0.8, 3.0, None),
+            ],
+            vec![booked(0.6, 3.0, Some(2)), booked(0.9, 3.0, Some(3))],
+        ];
+        let c = book_counts(&islands, &cfg).expect("a fitness book counts books");
+        assert_eq!(c.islands, vec![2, 2]);
+        assert_eq!((c.distinct, c.signed, c.unsigned), (3, 5, 1));
+        assert!(book_counts(&islands, &Config::default()).is_none(), "a metric fitness counts nothing");
+    }
+
+    #[test]
+    fn a_cpu_score_carries_the_book_of_its_regret() {
+        let s = book_rows(64);
+        let book = pnl_book(&s);
+        let cfg = Config { fitness: Fitness::LongPnl(book.clone()), ..Config::default() };
+        let view = EvalSample::new(&s, &cfg);
+        let tree = crate::expr::input(0);
+        let ind = Ind::evaluated(tree.clone(), &view, &cfg);
+        let pred: Vec<f64> = s.x.iter().map(|r| r[0]).collect();
+        let (regret, sig) = book.regret_signed(&pred);
+        assert_eq!(ind.error.to_bits(), regret.to_bits());
+        assert!(sig.is_some());
+        assert_eq!(ind.book, sig);
+        assert_eq!(score_tree_signed(&tree, &view, &cfg), (regret, sig));
+        let metric = Config::default();
+        let view = EvalSample::new(&s, &metric);
+        assert_eq!(Ind::evaluated(tree, &view, &metric).book, None);
     }
 }

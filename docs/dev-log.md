@@ -246,6 +246,8 @@ Emitted at the same boundary as `--progress`, once per completed generation
 | `migrants` | full | #1029: migrants copied at this generation's migration step (0 on every other generation; the record is reported after the step) |
 | `migrants_skipped` | full | #1029: migrants not copied because the destination already held a member with the migrant's error bits (`--migration-policy ring-tournament`; 0 under `ring`) |
 | `selection.mode`, `selection.cases` | both | #1023: present only under `--selection lexicase`: `"lexicase"` and the number of cases the generation selected on (rows under the metric fitness, sub-books under `--fitness pnl`); every other selection writes no `selection` key, so its lines keep their bytes |
+| `books.distinct`, `books.signed`, `books.unsigned` | both | #1082: under `--fitness pnl` on the node path only (absent otherwise). `signed` counts the finite members whose error carries a book signature (the per-block gross bits, flips and exits and the whole-book long rows of the evaluation that produced the error, CPU or device), `unsigned` the finite members without one (loaded from a checkpoint written without `--same-book-guard`, or scored by a route that reported no totals), `distinct` the distinct signatures among the signed members of all islands. `signed - distinct` is the number of copies of books another member already holds |
+| `books.islands` | full | #1082: distinct signatures among the signed members of each island, in island order |
 
 The six `phases` (excluding the two summed CPU times) are disjoint windows on
 the search's main thread and add up to `wall`. `fit_cpu` and `eval_cpu` overlap

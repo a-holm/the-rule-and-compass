@@ -37,6 +37,7 @@
 //! | `mix <i> <numbers>` | #471: adaptive edit counts of island i, 14 numbers per generation |
 //! | `rng <i|main> <idx> <624 words>` | exact MT19937 state |
 //! | `ind <i> <error> <complexity> <tree>` | one population member |
+//! | `books <i> <sig|->...` | #1082: book signature of each member of island i (16 hex digits), written only under `--same-book-guard` |
 //! | `qd_archive 1 <mode> <cells> <records> <fallbacks> <known_tag> <observed> <entries> <known>` | #1166: QD archive header, written only under `--qd-policy` |
 //! | `qd_visits` / `qd_centroid` / `qd_observed` / `qd_entry` / `qd_known` | #1166: the archive's visit counts, centroids, Lloyd sample, cell fronts and descriptor cache |
 //!
@@ -88,6 +89,9 @@ pub struct Individual {
     /// #465: generations since the lineage began. Written only by
     /// `--selection afp` runs; every other checkpoint reads back 0.
     pub age: u32,
+    /// #1082: the book signature. Written only by `--same-book-guard` runs;
+    /// every other checkpoint reads back `None`.
+    pub book: Option<crate::trading::BookSig>,
 }
 
 /// One island: its RNG stream and its population, in order.
@@ -491,6 +495,21 @@ fn next_token<'a>(
     Ok(token)
 }
 
+/// #1082: a book signature as 16 hex digits, `-` for none.
+fn encode_book(book: Option<crate::trading::BookSig>) -> String {
+    book.map_or_else(|| "-".to_string(), |b| format!("{:016x}", b.get()))
+}
+
+fn decode_book(token: &str) -> Option<Option<crate::trading::BookSig>> {
+    if token == "-" {
+        return Some(None);
+    }
+    if token.len() != 16 {
+        return None;
+    }
+    u64::from_str_radix(token, 16).ok().and_then(crate::trading::BookSig::new).map(Some)
+}
+
 pub(crate) fn encode_f64(v: f64) -> String {
     if v.is_nan() {
         "NaN".to_string()
@@ -734,6 +753,10 @@ impl Checkpoint {
                 let ages: Vec<String> = isl.population.iter().map(|ind| ind.age.to_string()).collect();
                 writeln!(out, "ages {} {}", i, ages.join(" ")).unwrap();
             }
+            if self.config.same_book_guard {
+                let books: Vec<String> = isl.population.iter().map(|ind| encode_book(ind.book)).collect();
+                writeln!(out, "books {} {}", i, books.join(" ")).unwrap();
+            }
         }
         if let Some(q) = &self.qd {
             write_qd(q, &mut out); // #1166
@@ -779,6 +802,7 @@ impl Checkpoint {
         let mut island_mix: Vec<Option<crate::mix::MixWindow>> = Vec::new();
         let mut island_pops: Vec<Option<Vec<Individual>>> = Vec::new();
         let mut island_ages: Vec<Option<Vec<u32>>> = Vec::new();
+        let mut island_books: Vec<Option<Vec<Option<crate::trading::BookSig>>>> = Vec::new();
         let mut main_rng: Option<Mt> = None;
         let mut error_kind: Option<ErrorKind> = None;
         let mut stored_archive_hash: Option<u64> = None;
@@ -1110,6 +1134,7 @@ impl Checkpoint {
                             error,
                             complexity,
                             age: 0,
+                            book: None,
                         });
                 }
                 "ages" => {
@@ -1123,6 +1148,22 @@ impl Checkpoint {
                     }
                     if island_ages[i].replace(ages).is_some() {
                         return Err(format!("line {}: duplicate ages record for island {}", lineno, i));
+                    }
+                }
+                "books" => {
+                    let i = parse_num::<usize>(&parts, 1, lineno, "books island")?;
+                    let mut books = Vec::with_capacity(parts.len().saturating_sub(2));
+                    for token in parts.iter().skip(2) {
+                        books.push(
+                            decode_book(token)
+                                .ok_or_else(|| format!("line {}: books value '{}' is not 16 hex digits or -", lineno, token))?,
+                        );
+                    }
+                    if island_books.len() <= i {
+                        island_books.resize_with(i + 1, || None);
+                    }
+                    if island_books[i].replace(books).is_some() {
+                        return Err(format!("line {}: duplicate books record for island {}", lineno, i));
                     }
                 }
                 other if other.starts_with("qd_") => qd.record(&parts, lineno)?, // #1166
@@ -1217,6 +1258,26 @@ impl Checkpoint {
                 }
                 None if config.selection == crate::search::Selection::Afp => {
                     return Err(format!("checkpoint is incomplete: island {} has no ages", i));
+                }
+                None => {}
+            }
+            // #1082: the guard draws its tournaments from these signatures.
+            match island_books.get_mut(i).and_then(|s| s.take()) {
+                Some(books) if books.len() == population.len() => {
+                    for (ind, book) in population.iter_mut().zip(books) {
+                        ind.book = book;
+                    }
+                }
+                Some(books) => {
+                    return Err(format!(
+                        "checkpoint is inconsistent: island {} has {} book signature(s) for {} individual(s)",
+                        i,
+                        books.len(),
+                        population.len()
+                    ));
+                }
+                None if config.same_book_guard => {
+                    return Err(format!("checkpoint is incomplete: island {} has no books record", i));
                 }
                 None => {}
             }

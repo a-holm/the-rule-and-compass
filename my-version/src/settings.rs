@@ -648,6 +648,29 @@ pub static TABLE: &[&dyn Setting] = &[
         active: Some(lexicase_selection),
         conflict: Conflict::SavedKey,
     },
+    &Row::<bool> {
+        flag: "--same-book-guard",
+        key: "same_book_guard",
+        group: Group::Island,
+        schema_type: "flag",
+        schema_default: "false",
+        schema: "#1082: under --fitness pnl, parent tournaments draw over distinct long/flat books instead of members: every book enters with one representative, its simplest holder (the first on a tie), so a book held by several trees is not selected several times. A book is identified by its signature: the per-block gross bits, flips and exits and the whole-book long rows of the totals the regret of the evaluation that produced the error reads (rows outside the --pnl-mask gate are flat, the blocks are the --pnl-blocks blocks), on the CPU and the device. The elite, front parents, migration, restarts and the archive are unchanged (the Pareto archive already keeps one member per book, the simplest). Needs --fitness pnl; exit 2 with --selection afp, --selection lexicase, --qd-policy or --variation postfix (auto picks the node path). Saved search setting: a resume refuses a different value; a checkpoint without it loads as off; on adds one books record per island to the checkpoint",
+        help: "  --same-book-guard          under --fitness pnl, parent tournaments draw over
+                             distinct long/flat books: one entrant per book,
+                             its simplest holder, so copies of one book are
+                             not selected several times. Needs --fitness pnl;
+                             refuses --selection afp and lexicase, --qd-policy
+                             and --variation postfix. Saved search setting
+                             (#1082)",
+        bench: None,
+        gui: false,
+        get: |c| &c.same_book_guard,
+        set: |c| &mut c.same_book_guard,
+        cli: Cli::Flag(true),
+        write: Write::UnlessDefault,
+        active: None,
+        conflict: Conflict::Saved,
+    },
     &Row::<RestartPolicy> {
         flag: "--restart-policy",
         key: "restart_policy",

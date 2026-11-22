@@ -71,7 +71,7 @@ Campaign (--wf):\n\
                          and period grid (pooled.grid.rule, absent for the score grid, and pooled.period_time) and missing-score\n\
                          rule (book.missing_score, absent in a report of a build that carried the position); a report\n\
                          with null_store (priced on a null store) exits 2 naming its label and seed (#1304)\n\
-  --members <mode>      selected (default): one series per report, pooled.period_net; all: one series per\n\
+  --members <mode>       selected (default): one series per report, pooled.period_net; all: one series per\n\
                          members[] row of a walkforward --front --all-members report (members[].series), named\n\
                          <report>#<archive_rank>; a report without members exits 2\n\
   --baseline <file>      rcsr ladder --emit-series report; the best of cash, buy_and_hold, constant_long_flat,\n\
