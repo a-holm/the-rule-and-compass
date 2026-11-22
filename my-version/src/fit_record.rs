@@ -8,14 +8,16 @@
 //!               u32 len(cols) u32 len(y) f32 cols f32 y
 //!               [flags&4: u32 len(cols64) u32 len(y64) u32 len(w) f64 cols64 f64 y64 f64 w]
 //!               [flags&2: u32 len(tsign) f64 tsign]
-//! call-<k>.bin  "RCFITCAL" u32 version=1 u32 data u32 flags(1 = pair mask set)
-//!               u32 iters i32 loss i32 polish u32 nprog u32 kmax
+//! call-<k>.bin  "RCFITCAL" u32 version=2 u32 data u32 flags(1 = pair mask set)
+//!               u32 iters u32 max_iters i32 loss i32 polish u32 nprog u32 kmax
 //!               u32 nwords u32 words u32 off[nprog+1] i32 pcount[nprog]
 //!               f64 c0[nprog*kmax] u32 has_cbase [f64 cbase[nprog*kmax]] i32 gauge[2*nprog]
 //!               f32 ms i32 status[nprog] f64 sse[nprog] f64 c[nprog*kmax]
 //! ```
 //! Flags of a data file: 1 weights present, 2 label sign present, 4 f64 twin
 //! uploaded by `set_fit_data`.
+//! #1042: a version-1 call has no `max_iters` word and replays with
+//! `max_iters = iters`.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -23,7 +25,8 @@ use std::sync::OnceLock;
 
 const DATA_MAGIC: &[u8; 8] = b"RCFITDAT";
 const CALL_MAGIC: &[u8; 8] = b"RCFITCAL";
-const VERSION: u32 = 1;
+const DATA_VERSION: u32 = 1;
+const CALL_VERSION: u32 = 2;
 
 /// Call flag: a slope pair mask was resident, so the replay cannot reproduce it.
 pub const CALL_PAIRS: u32 = 1;
@@ -53,6 +56,8 @@ pub struct RecCall {
     pub data: u32,
     pub flags: u32,
     pub iters: u32,
+    /// #1042: the damped trial budget of the squared arm, at least `iters`.
+    pub max_iters: u32,
     pub loss: i32,
     pub polish: i32,
     pub nprog: u32,
@@ -117,15 +122,16 @@ impl<'a> Reader<'a> {
             None => Err("truncated fit record".to_string()),
         }
     }
-    fn magic(&mut self, want: &[u8; 8]) -> Result<(), String> {
+    /// The magic and a version in `1..=newest`; returns the version.
+    fn magic(&mut self, want: &[u8; 8], newest: u32) -> Result<u32, String> {
         if self.take(8)? != want {
             return Err(format!("bad magic, want {}", String::from_utf8_lossy(want)));
         }
         let v = self.u32()?;
-        if v != VERSION {
+        if v == 0 || v > newest {
             return Err(format!("unsupported fit record version {}", v));
         }
-        Ok(())
+        Ok(v)
     }
     fn u32(&mut self) -> Result<u32, String> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
@@ -158,7 +164,7 @@ impl RecData {
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer(Vec::new());
         w.0.extend_from_slice(DATA_MAGIC);
-        w.u32(VERSION);
+        w.u32(DATA_VERSION);
         w.u32(self.n as u32);
         w.u32(self.v as u32);
         let has_w = self.twin.as_ref().is_some_and(|t| !t.w.is_empty());
@@ -185,7 +191,7 @@ impl RecData {
 
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
         let mut r = Reader { b: bytes, at: 0 };
-        r.magic(DATA_MAGIC)?;
+        r.magic(DATA_MAGIC, DATA_VERSION)?;
         let n = r.u32()? as usize;
         let v = r.u32()? as usize;
         let flags = r.u32()?;
@@ -216,10 +222,11 @@ impl RecCall {
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer(Vec::new());
         w.0.extend_from_slice(CALL_MAGIC);
-        w.u32(VERSION);
+        w.u32(CALL_VERSION);
         w.u32(self.data);
         w.u32(self.flags);
         w.u32(self.iters);
+        w.u32(self.max_iters);
         w.i32(self.loss);
         w.i32(self.polish);
         w.u32(self.nprog);
@@ -243,10 +250,11 @@ impl RecCall {
 
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
         let mut r = Reader { b: bytes, at: 0 };
-        r.magic(CALL_MAGIC)?;
+        let version = r.magic(CALL_MAGIC, CALL_VERSION)?;
         let data = r.u32()?;
         let flags = r.u32()?;
         let iters = r.u32()?;
+        let max_iters = if version >= 2 { r.u32()? } else { iters };
         let loss = r.i32()?;
         let polish = r.i32()?;
         let nprog = r.u32()?;
@@ -267,7 +275,7 @@ impl RecCall {
         if r.at != bytes.len() {
             return Err("trailing bytes in call record".to_string());
         }
-        Ok(RecCall { data, flags, iters, loss, polish, nprog, kmax, words, off, pcount, c0, cbase, gauge, ms, status, sse, c })
+        Ok(RecCall { data, flags, iters, max_iters, loss, polish, nprog, kmax, words, off, pcount, c0, cbase, gauge, ms, status, sse, c })
     }
 }
 
@@ -444,6 +452,10 @@ impl EvalRec {
 pub struct ReplayLine {
     pub call: u32,
     pub inst: String,
+    /// #1042: the damped budget the replay launched with; `0` in a replay
+    /// file that does not carry it.
+    pub iters: u32,
+    pub max_iters: u32,
     pub ms_median: f64,
     pub lm: Vec<u64>,
     pub polish: Vec<u64>,
@@ -473,9 +485,11 @@ impl ReplayLine {
     pub fn json(&self, ms: &[f32], status: &[i32], out_hash: u64, same: bool, stable: bool) -> String {
         let hashes: Vec<String> = self.cand_hash.iter().map(|&h| hex(h)).collect();
         format!(
-            "{{\"call\":{},\"nprog\":{},\"instantiation\":\"{}\",\"ms\":{},\"ms_median\":{},\"lm_cycles\":{},\"polish_cycles\":{},\"status\":{},\"cand_hash\":[{}],\"out_hash\":{},\"same_as_recorded\":{},\"stable\":{}}}",
+            "{{\"call\":{},\"nprog\":{},\"iters\":{},\"max_iters\":{},\"instantiation\":\"{}\",\"ms\":{},\"ms_median\":{},\"lm_cycles\":{},\"polish_cycles\":{},\"status\":{},\"cand_hash\":[{}],\"out_hash\":{},\"same_as_recorded\":{},\"stable\":{}}}",
             self.call,
             self.cand_hash.len(),
+            self.iters,
+            self.max_iters,
             self.inst,
             list(ms),
             self.ms_median,
@@ -564,6 +578,8 @@ pub fn parse_replay(text: &str) -> Result<(Vec<ReplayLine>, ReplaySummary), Stri
         lines.push(ReplayLine {
             call: field(raw, "call").and_then(|v| v.parse().ok()).ok_or_else(bad)?,
             inst: unquote(field(raw, "instantiation").ok_or_else(bad)?).to_string(),
+            iters: field(raw, "iters").and_then(|v| v.parse().ok()).unwrap_or(0),
+            max_iters: field(raw, "max_iters").and_then(|v| v.parse().ok()).unwrap_or(0),
             ms_median: field(raw, "ms_median").and_then(|v| v.parse().ok()).ok_or_else(bad)?,
             lm: field(raw, "lm_cycles").and_then(nums).ok_or_else(bad)?,
             polish: field(raw, "polish_cycles").and_then(nums).ok_or_else(bad)?,
@@ -646,7 +662,7 @@ pub fn compare_replays(a: &str, b: &str, allow_device_mismatch: bool) -> Result<
             }
         }
         out.push_str(&t.row(&format!("call {}", x.call)));
-        out.push_str(&format!("  [{}]\n", x.inst));
+        out.push_str(&format!("  [{}]  max_iters {} -> {}\n", x.inst, x.max_iters, y.max_iters));
         total.add(&t);
         match by_inst.iter_mut().find(|(n, _)| *n == x.inst) {
             Some((_, s)) => s.add(&t),
@@ -687,6 +703,7 @@ mod tests {
             data: 2,
             flags: CALL_PAIRS,
             iters: 40,
+            max_iters: 160,
             loss: 4,
             polish: 1,
             nprog: nprog as u32,
@@ -723,7 +740,7 @@ mod tests {
         assert_eq!(bits(&back.sse), bits(&call.sse));
         assert_eq!(bits(&back.c), bits(&call.c));
         assert_eq!(back.ms.to_bits(), call.ms.to_bits());
-        assert_eq!((back.data, back.flags, back.iters, back.loss, back.polish), (2, CALL_PAIRS, 40, 4, 1));
+        assert_eq!((back.data, back.flags, back.iters, back.max_iters, back.loss, back.polish), (2, CALL_PAIRS, 40, 160, 4, 1));
         let mut none = call.clone();
         none.cbase = None;
         assert!(RecCall::decode(&none.encode()).unwrap().cbase.is_none());
@@ -760,5 +777,62 @@ mod tests {
         assert!(RecData::decode(&bytes).is_err());
         let ok = data.encode();
         assert!(RecData::decode(&ok[..ok.len() - 1]).is_err());
+    }
+
+    /// #1042: a version-1 call (no `max_iters` word) decodes with
+    /// `max_iters = iters`, and a version past the newest is refused.
+    #[test]
+    fn a_version_1_call_replays_with_max_iters_equal_to_iters() {
+        let mut rng = Lcg(1042);
+        let call = sample_call(&mut rng);
+        let v2 = call.encode();
+        assert_eq!(&v2[8..12], &2u32.to_le_bytes());
+        let mut v1 = v2.clone();
+        v1[8..12].copy_from_slice(&1u32.to_le_bytes());
+        v1.drain(24..28);
+        let back = RecCall::decode(&v1).unwrap();
+        assert_eq!((back.iters, back.max_iters), (40, 40));
+        assert_eq!(bits(&back.c), bits(&call.c));
+        assert_eq!(back.status, call.status);
+        let mut v3 = v2;
+        v3[8..12].copy_from_slice(&3u32.to_le_bytes());
+        assert!(RecCall::decode(&v3).unwrap_err().contains("version 3"));
+        let data = RecData { n: 1, v: 1, cols: vec![1.0], y: vec![2.0], twin: None, tsign: Vec::new() };
+        let mut d2 = data.encode();
+        d2[8..12].copy_from_slice(&2u32.to_le_bytes());
+        assert!(RecData::decode(&d2).unwrap_err().contains("version 2"));
+    }
+
+    /// #1042: a replay line carries the budget it launched with, an older line
+    /// without it reads as 0, and the compare report names both budgets.
+    #[test]
+    fn replay_lines_carry_and_compare_the_budget() {
+        let line = |max_iters: u32| ReplayLine {
+            call: 0,
+            inst: "16x256".to_string(),
+            iters: 8,
+            max_iters,
+            ms_median: 1.0,
+            lm: vec![10, 20],
+            polish: vec![5, 5],
+            cand_hash: vec![1, 2],
+        };
+        let summary = ReplaySummary {
+            calls: 1,
+            candidates: 2,
+            ms_total: 1.0,
+            toolkit: "13.0".to_string(),
+            device: "dev".to_string(),
+            recording_hash: format!("{:016x}", 7u64),
+        };
+        let file = |l: &ReplayLine| format!("{}\n{}\n", l.json(&[1.0], &[0, 9], 3, true, true), summary.json(1));
+        let (a, b) = (file(&line(8)), file(&line(32)));
+        let (parsed, _) = parse_replay(&b).unwrap();
+        assert_eq!((parsed[0].iters, parsed[0].max_iters), (8, 32));
+        let old = a.replace("\"iters\":8,\"max_iters\":8,", "");
+        let (parsed, _) = parse_replay(&old).unwrap();
+        assert_eq!((parsed[0].iters, parsed[0].max_iters), (0, 0));
+        let report = compare_replays(&a, &b, false).unwrap();
+        assert!(report.contains("max_iters 8 -> 32"), "{report}");
     }
 }

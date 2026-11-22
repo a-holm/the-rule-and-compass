@@ -320,6 +320,10 @@ pub struct Config {
     pub init_depth: usize,
     /// Levenberg–Marquardt iterations for constant fitting (0 disables).
     pub fit_iters: usize,
+    /// #1042: damped trial budget of the device fit kernel's squared arm; `0`
+    /// means `4 * fit_iters` (see [`Config::fit_max_iters_effective`]). Saved
+    /// search state.
+    pub fit_max_iters: usize,
     /// #116: exact constant-fitting arm. `Exact` is the historical CPU LM;
     /// `Auto`/`Linear` use the closed-form linear least-squares arm for trees
     /// affine in every constant and fall back to LM otherwise. Changing it
@@ -844,6 +848,7 @@ impl Default for Config {
             restart_interval: 60,
             init_depth: 3,
             fit_iters: 8,
+            fit_max_iters: 0, // #1042: 4 * fit_iters
             fit_strategy: crate::fit::FitStrategy::Exact, // #116
             fit_irls: crate::fit::FitIrls::Nested,
             fit_polish: crate::fit::FitPolish::F64,
@@ -912,7 +917,20 @@ impl Default for Config {
     }
 }
 
+/// #1042: the damped trial budget of the device fit kernel for `fit_iters`
+/// and a requested `fit_max_iters`: `0` means `4 * fit_iters`, and the
+/// budget is never below `fit_iters`.
+pub fn fit_max_iters_budget(fit_iters: usize, fit_max_iters: usize) -> usize {
+    let asked = if fit_max_iters == 0 { 4 * fit_iters } else { fit_max_iters };
+    asked.max(fit_iters)
+}
+
 impl Config {
+    /// #1042: the damped trial budget the device fit kernel runs with.
+    pub fn fit_max_iters_effective(&self) -> usize {
+        fit_max_iters_budget(self.fit_iters, self.fit_max_iters)
+    }
+
     /// #611: whether the candidate fit runs a reweighted L1 schedule.
     pub fn fit_irls_active(&self) -> bool {
         self.fit_irls != crate::fit::FitIrls::Nested
@@ -952,6 +970,10 @@ impl Config {
         settings::differences(Group::Fit, self, other, &mut diff);
         compare!(init_depth, "init_depth");
         compare!(fit_iters, "fit_iters");
+        // #1042: `0` and `4 * fit_iters` are the same budget.
+        if self.fit_max_iters_effective() != other.fit_max_iters_effective() {
+            diff.push("fit_max_iters");
+        }
         compare!(fit_strategy, "fit_strategy"); // #116
         compare!(fit_polish, "fit_polish");
         compare!(fit_irls, "fit_irls"); // #611
@@ -1327,6 +1349,8 @@ struct GpuSearch {
     fit_fallback_by_cause: BTreeMap<String, usize>,
     /// #265: fallbacks whose CPU refit lowered the exact error, by cause.
     fit_fallback_improved_by_cause: BTreeMap<String, usize>,
+    /// #1042: routed fallbacks whose device answer beat the CPU refit, by cause.
+    fit_fallback_device_kept_by_cause: BTreeMap<String, usize>,
     /// #286: finite device answers grouped by label (`rank_deficient`,
     /// `recovered`, `no_improvement`, `start_unusable`,
     /// `recovered_skipped`). None of these is a CPU fallback.
@@ -1661,6 +1685,7 @@ impl GpuSearch {
                     fit_admitted_wide: 0,
                     fit_fallback_by_cause: BTreeMap::new(),
                     fit_fallback_improved_by_cause: BTreeMap::new(),
+                    fit_fallback_device_kept_by_cause: BTreeMap::new(),
                     fit_status_by_label: BTreeMap::new(),
                     fit_fold_count: 0,
                     fit_fallback_skipped_by_cause: BTreeMap::new(),
@@ -1885,6 +1910,12 @@ impl GpuSearch {
             for _ in 0..n {
                 count_improved(&mut self.fit_fallback_improved_by_cause, cause);
                 count_improved(&mut self.stats.entry(generation).or_default().fit_fallback_improved_by_cause, cause);
+            }
+        }
+        for (cause, n) in counts.device_kept {
+            for _ in 0..n {
+                count_improved(&mut self.fit_fallback_device_kept_by_cause, cause);
+                count_improved(&mut self.stats.entry(generation).or_default().fit_fallback_device_kept_by_cause, cause);
             }
         }
         for (cause, n) in counts.skipped {
@@ -2608,6 +2639,7 @@ impl GpuSearch {
             self.fit_fallback_by_cause.clone(),
             self.fit_fallback_improved_by_cause.clone(),
         );
+        ledger.record_fit_device_kept(self.fit_fallback_device_kept_by_cause.clone());
         GpuRunStats {
             generations: self
                 .stats
@@ -2622,6 +2654,7 @@ impl GpuSearch {
             fit_admitted_wide: self.fit_admitted_wide,
             fit_fallback_by_cause: self.fit_fallback_by_cause.clone(),
             fit_fallback_improved_by_cause: self.fit_fallback_improved_by_cause.clone(),
+            fit_fallback_device_kept_by_cause: self.fit_fallback_device_kept_by_cause.clone(),
             fit_status_by_label: self.fit_status_by_label.clone(),
             fit_fold_count: self.fit_fold_count,
             fit_fallback_skipped_by_cause: self.fit_fallback_skipped_by_cause.clone(),
@@ -2649,6 +2682,7 @@ fit_fallback_bounded: self.fit_fallback_bounded,
             fit_twin_bytes: fit_ev.fit_twin().1,
             fit_subsample_hash: self.fit_sub.as_ref().and_then(|s| s.hash),
             fit_polish: crate::fit::FitPolish::F64,
+            fit_max_iters: 0,
             fit_admission: crate::fit::FitAdmission::Screened,
             ledger,
             memory_plan: self.memory_plan.clone(),
@@ -2760,6 +2794,7 @@ fn refit_cannot_win(job: &FallbackFitJob, x: &[Vec<f64>], y: &[f64], w: &[f64], 
 /// #968: one exact CPU fallback fit. A job that carries its device constants
 /// (a routed tail status) keeps the lower exact error of the two answers; a tie
 /// keeps the CPU fit, and a non-finite device error never wins.
+/// #1042: `device_kept` records that the device answer won.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn run_fallback_fit(
     job: &mut FallbackFitJob,
@@ -2779,6 +2814,7 @@ fn run_fallback_fit(
         let dev = exact_error(&device, x, y, w, metric);
         if dev.is_finite() && (cpu.is_nan() || dev < cpu) {
             job.tree = device;
+            job.device_kept = true;
         }
     }
 }
@@ -2850,6 +2886,10 @@ struct FallbackFitJob {
     /// #968: the tree at its device constants, for a routed tail status. The
     /// job keeps the lower error of this and the exact CPU fit.
     device: Option<Node>,
+    /// #1042: the device answer of a routed tail fit had the lower exact
+    /// error and replaced the CPU fit. `improved` still compares the CPU fit
+    /// with the start.
+    device_kept: bool,
     /// #1024: run the threshold step after the LM; carried by the job so a pool
     /// thread needs no scope.
     thresholds: bool,
@@ -2866,6 +2906,7 @@ impl FallbackFitJob {
             cause: None,
             skipped: false,
             device: None,
+            device_kept: false,
             thresholds: false,
         }
     }
@@ -7117,6 +7158,8 @@ pub struct GpuGenStats {
     pub fit_fallback_by_cause: BTreeMap<String, usize>,
     /// #265: fallbacks whose CPU refit lowered the exact error, by cause.
     pub fit_fallback_improved_by_cause: BTreeMap<String, usize>,
+    /// #1042: routed fallbacks whose device answer beat the CPU refit, by cause.
+    pub fit_fallback_device_kept_by_cause: BTreeMap<String, usize>,
     /// #255: wall seconds this generation spent in the exact CPU fallback
     /// fits. A subset of the run's `fit.host_seconds`.
     pub fit_fallback_seconds: f64,
@@ -7172,6 +7215,8 @@ pub struct GpuRunStats {
     pub fit_fallback_by_cause: BTreeMap<String, usize>,
     /// #265: fallbacks whose CPU refit lowered the exact error, by cause.
     pub fit_fallback_improved_by_cause: BTreeMap<String, usize>,
+    /// #1042: routed fallbacks whose device answer beat the CPU refit, by cause.
+    pub fit_fallback_device_kept_by_cause: BTreeMap<String, usize>,
     /// #286: finite device answers by label; every entry is a non-fallback.
     pub fit_status_by_label: BTreeMap<String, usize>,
     /// #982: constants removed by the fold before the fit.
@@ -7204,6 +7249,8 @@ pub struct GpuRunStats {
     pub fit_tail_early: usize,
     /// #496: arithmetic of the device fit polish.
     pub fit_polish: crate::fit::FitPolish,
+    /// #1042: the damped trial budget of the device fit kernel.
+    pub fit_max_iters: usize,
     /// #169: wall time spent in the whole fit stage, milliseconds.
     pub fit_host_ms: f64,
     /// #284/#255: summed pool seconds of the CPU fallback fits (overlap plus join wait), milliseconds.
@@ -8327,6 +8374,7 @@ fn run_postfix_search(
             fit_admitted_wide: 0,
             fit_fallback_by_cause: Default::default(),
             fit_fallback_improved_by_cause: Default::default(),
+            fit_fallback_device_kept_by_cause: Default::default(),
             fit_fallback_seconds: 0.0,
             fit_gate_seconds: 0.0,
             fit_fallback_bounded: 0,
@@ -8672,6 +8720,7 @@ fn run_postfix_search(
     stats.fit_fallback_max = cfg.fit_fallback_max;
     stats.fit_admission = cfg.fit_admission;
     stats.fit_polish = cfg.fit_polish;
+    stats.fit_max_iters = cfg.fit_max_iters_effective();
 
     Ok(Outcome {
         archive: final_archive,
@@ -10383,6 +10432,7 @@ fn run_search(
             s.fit_rescore_s = refit_report.rescore_s;
             s.fit_admission = cfg.fit_admission;
             s.fit_polish = cfg.fit_polish;
+            s.fit_max_iters = cfg.fit_max_iters_effective();
 // #284: absorb the device intervals and fit leaves, then add the
             // exclusive main-thread stages. Fit is a sub-window of the measured
             // eval window, so it is partitioned out exactly once.
@@ -11256,6 +11306,61 @@ mod tests {
         assert_eq!(map.get("ill_conditioned"), Some(&2));
         assert_eq!(map.get("non_finite"), Some(&1));
         assert_eq!(map.values().sum::<usize>(), 3);
+    }
+
+    /// #1042: a routed tail fit whose device constants have the lower exact
+    /// error keeps them and counts once under its cause; one whose CPU refit
+    /// wins counts nothing. `improved` compares the CPU fit with the start in
+    /// both, exactly as in the same job without device constants.
+    #[test]
+    fn routed_tail_fit_counts_a_kept_device_answer() {
+        let s = sample();
+        let line = |a: f64| node(Op::Mul, vec![constant(a), input(0)]);
+        let run = |iters: usize, device: Option<Node>| {
+            let mut job = FallbackFitJob::new(0, 0, line(0.25))
+                .with_cause(FitFallbackCause::Unconverged)
+                .with_device(device);
+            run_fallback_fit(&mut job, &s.x, &s.y, &s.w, iters, Metric::Squared);
+            job
+        };
+        // `iters = 0` leaves the CPU answer at the start; the device holds the
+        // exact constant (`y = x0` on these rows), so it wins.
+        let kept = run(0, Some(line(1.0)));
+        let alone = run(0, None);
+        assert_eq!(exact_error(&kept.tree, &s.x, &s.y, &s.w, Metric::Squared), 0.0);
+        assert!(kept.device_kept && !alone.device_kept);
+        assert_eq!(kept.improved, alone.improved, "improved compares the CPU fit with the start");
+        // A refit that lowers the error beats a device answer above the start.
+        let lost = run(8, Some(line(0.0)));
+        let alone = run(8, None);
+        assert!(!lost.device_kept);
+        assert!(lost.improved && alone.improved);
+        let mut counter = BTreeMap::new();
+        for job in [&kept, &lost] {
+            if job.device_kept {
+                count_improved(&mut counter, job.cause.expect("a routed cause"));
+            }
+        }
+        assert_eq!(counter.get("unconverged"), Some(&1));
+        assert_eq!(counter.values().sum::<usize>(), 1);
+    }
+
+    /// #1042: `0` means `4 * fit_iters`, the budget is never below `fit_iters`,
+    /// and the two spellings of the default are the same search setting.
+    #[test]
+    fn fit_max_iters_resolves_to_four_times_fit_iters() {
+        assert_eq!(fit_max_iters_budget(3, 0), 12);
+        assert_eq!(fit_max_iters_budget(8, 0), 32);
+        assert_eq!(fit_max_iters_budget(8, 20), 20);
+        assert_eq!(fit_max_iters_budget(8, 5), 8);
+        assert_eq!(fit_max_iters_budget(0, 0), 0);
+        let base = Config { fit_iters: 3, ..Config::default() };
+        assert_eq!(base.fit_max_iters, 0);
+        assert_eq!(base.fit_max_iters_effective(), 12);
+        let spelled = Config { fit_max_iters: 12, ..base.clone() };
+        assert!(base.search_setting_differences(&spelled).is_empty());
+        let other = Config { fit_max_iters: 13, ..base.clone() };
+        assert_eq!(base.search_setting_differences(&other), vec!["fit_max_iters"]);
     }
 
     /// #968: a routed tail fit's cause is a function of the kernel status
