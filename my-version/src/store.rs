@@ -1496,6 +1496,18 @@ pub fn write_store_with_time(
     group_rows: usize,
     time_col: Option<usize>,
 ) -> Result<(), String> {
+    write_store_with_time_marked(path, table, group_rows, time_col, None)
+}
+
+/// [`write_store_with_time`] whose header carries the `null_store` member (#1321) when
+/// `null_store` is a JSON object; `None` writes the same bytes.
+pub fn write_store_with_time_marked(
+    path: &str,
+    table: &Table,
+    group_rows: usize,
+    time_col: Option<usize>,
+    null_store: Option<&str>,
+) -> Result<(), String> {
     let n_rows = table.len();
     let n_cols = table.n_cols();
     if n_rows == 0 {
@@ -1537,7 +1549,7 @@ pub fn write_store_with_time(
             }
         })
         .collect();
-    write_store_grouped(path, &plans, n_rows, group_rows, |lo, hi, out| {
+    write_store_grouped_marked(path, &plans, n_rows, group_rows, null_store, |lo, hi, out| {
         for (c, plan) in plans.iter().enumerate() {
             let slot = &mut out[c];
             match plan.dtype {

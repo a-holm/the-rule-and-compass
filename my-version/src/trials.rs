@@ -71,7 +71,7 @@ Campaign (--wf):\n\
                          and period grid (pooled.grid.rule, absent for the score grid, and pooled.period_time) and missing-score\n\
                          rule (book.missing_score, absent in a report of a build that carried the position); a report\n\
                          with null_store (priced on a null store) exits 2 naming its label and seed (#1304)\n\
-  --members <mode>      selected (default): one series per report, pooled.period_net; all: one series per\n\
+  --members <mode>       selected (default): one series per report, pooled.period_net; all: one series per\n\
                          members[] row of a walkforward --front --all-members report (members[].series), named\n\
                          <report>#<archive_rank>; a report without members exits 2\n\
   --baseline <file>      rcsr ladder --emit-series report; the best of cash, buy_and_hold, constant_long_flat,\n\
@@ -171,6 +171,7 @@ Both:\n\
                          guard stays. The fitted and the fixed arm are separate trials\n\
   --out <file>           write the JSON report to this file instead of stdout\n\
 \n\
+Annualisation (#1208): every report (and every --cpcv-assemble split report) must have annualization.periods_per_year within 1 % of 31536000 / annualization.period_seconds (when present) and of 31536000 / the median step of pooled.period_time; a report that does not, or has a non-positive value, exits 2 naming the field, the value and the implied value (rerun the walk-forward with a current build; there is no rescaling and no bypass flag). A report with fewer than 3 periods skips the step check and prints a note on stderr.\n\
 Exit 0 ok, 2 usage error or reports that do not match (the message names the field), 3 unreadable input.\n"
 }
 
@@ -267,6 +268,46 @@ fn median_step(time: &[f64]) -> f64 {
     d[d.len() / 2]
 }
 
+/// #1208: relative tolerance between `periods_per_year` and the value its period width implies.
+pub(crate) const ANNUALIZATION_TOLERANCE: f64 = 0.01;
+const SECONDS_PER_YEAR: f64 = 31_536_000.0;
+
+/// #1208: `Err((2, msg))` when `annualization.periods_per_year` contradicts `annualization.period_seconds` or the
+/// median step of `time`; `Ok(Some(note))` when the series is too short to check.
+pub(crate) fn check_annualization(path: &str, j: &Json, time: &[f64], ppy: f64) -> Res<Option<String>> {
+    if !(ppy.is_finite() && ppy > 0.0) {
+        return usage_err(format!("field 'annualization.periods_per_year' is {} in {} (a positive number is required)", jnum(ppy), path));
+    }
+    let off = |implied: f64| ((ppy - implied) / implied).abs() > ANNUALIZATION_TOLERANCE;
+    if let Some(s) = at(j, &["annualization", "period_seconds"]).and_then(Json::as_f64).filter(|s| s.is_finite() && *s > 0.0) {
+        let implied = SECONDS_PER_YEAR / s;
+        if off(implied) {
+            return usage_err(format!(
+                "field 'annualization.periods_per_year' is {} but 'annualization.period_seconds' is {} s ({} periods per year) in {}",
+                jnum(ppy),
+                jnum(s),
+                jnum(implied),
+                path
+            ));
+        }
+    }
+    let step = median_step(time);
+    if step <= 0.0 || time.windows(2).filter(|w| w[1] > w[0]).count() < 2 {
+        return Ok(Some(format!("note: {}: too few periods to check annualization.periods_per_year", path)));
+    }
+    let implied = SECONDS_PER_YEAR / step;
+    if off(implied) {
+        return usage_err(format!(
+            "field 'annualization.periods_per_year' is {} but the median step of 'pooled.period_time' is {} s ({} periods per year) in {}",
+            jnum(ppy),
+            jnum(step),
+            jnum(implied),
+            path
+        ));
+    }
+    Ok(None)
+}
+
 pub(crate) fn read_report(path: &str) -> Res<Json> {
     let text = std::fs::read_to_string(path).or_else(|e| input_err(format!("{}: {}", path, e)))?;
     Json::parse(text.trim()).map_or_else(|| input_err(format!("{}: not a JSON report", path)), Ok)
@@ -326,6 +367,9 @@ pub(crate) fn wf_entry(j: &Json, root: &Json, prefix: &'static str, path: &str, 
     let Some(ppy) = at(j, &["annualization", "periods_per_year"]).and_then(Json::as_f64) else {
         return usage_err(format!("field 'annualization.periods_per_year' is missing in {}", path));
     };
+    if let Some(note) = check_annualization(path, j, &time, ppy)? {
+        eprintln!("{}", note);
+    }
     let guards = GUARDS.iter().map(|g| at(j, g).cloned().unwrap_or(Json::Null)).collect();
     let fit_guards: Vec<Json> = FIT_GUARDS.iter().map(|g| at(j, g).cloned().unwrap_or(Json::Null)).collect();
     let rule = threshold_rule(j);
