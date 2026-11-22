@@ -83,3 +83,24 @@ release() {
   exec {HOLD_FD}<&-
   HOLD_PID=
 }
+
+# fake_blocking_sleep <dir>: <dir>/sleep tells the test that the caller reached its first sleep (a line in the fifo
+# $FAKE_READY), then blocks until a line arrives in the fifo $FAKE_GO. A test uses it to hold one wait-for.sh process
+# at a known point while it starts a second one.
+fake_blocking_sleep() {
+  cat > "$1/sleep" <<'FAKE'
+#!/usr/bin/env bash
+echo ready > "${FAKE_READY:?}"
+read -r _ < "${FAKE_GO:?}"
+FAKE
+  chmod +x "$1/sleep"
+}
+
+# fake_machine <dir> <local dir>: <dir>/taskset records its mask argument (the value after -c) in "<dir>/taskset.mask" and runs the
+# rest; <local dir>/machine.md holds the pin keys rc-run.sh reads (PIN_CORES_BUILD 0,1 and PIN_CORES_BUSY 0).
+fake_machine() {
+  printf '#!/usr/bin/env bash\necho "$2" >> %q\nshift 2\nexec "$@"\n' "$1/taskset.mask" > "$1/taskset"
+  chmod +x "$1/taskset"
+  mkdir -p "$2"
+  printf -- '- PIN_CORES_BUILD: 0,1\n- PIN_CORES_BUSY: 0\n' > "$2/machine.md"
+}
