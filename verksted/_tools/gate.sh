@@ -23,6 +23,7 @@ if [ $# -ne 2 ]; then
 fi
 W=$1
 T=$2
+C=$(crate_dir "$W") || { echo "gate: no single engine crate under $W" >&2; exit 2; }
 D=${RCSR_GATE_DIR:-$GATES}
 if [ ! -d "$D" ]; then
   echo "gate dir $D missing; link it to the log directory or set RCSR_GATES" >&2
@@ -37,7 +38,7 @@ hold() {
 }
 step() {
   local name=$1 cmd=$2
-  hold "cd '$W/$CRATE' && CARGO_BUILD_JOBS=2 $cmd" > "$D/$T-$name.log" 2>&1
+  hold "cd '$C' && CARGO_BUILD_JOBS=2 $cmd" > "$D/$T-$name.log" 2>&1
 }
 
 cpu_env="CARGO_BUILD_JOBS=2"
@@ -78,7 +79,7 @@ suite() {
   n_timeouts=0
   : > "$log"
   : > "$summary"
-  "$B" bash -c "cd '$W/$CRATE' && $env timeout -k $KILL_AFTER 5400 $cargo --no-run --message-format=json" > "$build" 2>&1
+  "$B" bash -c "cd '$C' && $env timeout -k $KILL_AFTER 5400 $cargo --no-run --message-format=json" > "$build" 2>&1
   rc=$?
   if [ "$rc" -ne 0 ]; then
     cat "$build" >> "$log"
@@ -103,7 +104,7 @@ suite() {
     start=$D/$T-$prefix-$name.start
     rm -f "$start"
     t0=$(now)
-    hold "$NOW_CMD > '$start' && cd '$W/$CRATE' && $env timeout -k $KILL_AFTER $hold_cap $cargo --no-fail-fast $args" > "$tlog" 2>&1
+    hold "$NOW_CMD > '$start' && cd '$C' && $env timeout -k $KILL_AFTER $hold_cap $cargo --no-fail-fast $args" > "$tlog" 2>&1
     rc=$?
     t1=$(now)
     ts=$(cat "$start" 2> /dev/null)

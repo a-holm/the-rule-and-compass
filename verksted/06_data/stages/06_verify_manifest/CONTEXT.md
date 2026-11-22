@@ -29,7 +29,7 @@ Do NOT load: re-running earlier stages.
 ## Check
 
 ```sh
-"$RUN/my-version/target/release/rcsr" verify-manifest "$ENRICHED.manifest.json" --data "$ENRICHED"
+"$(verksted/_tools/crate-dir.sh "$RUN")/target/release/rcsr" verify-manifest "$ENRICHED.manifest.json" --data "$ENRICHED"
 ```
 
 Exit 0 writes `pass`. Anything else writes `fail: <what was measured and what was wrong>` to `output/check.md`; `_tools/check.sh` does this. A red result is never rewritten as green.

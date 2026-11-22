@@ -9,13 +9,13 @@ The rules most often broken, each with its source. Sources: `AGENTS.md` and `doc
 3. Never commit to `main`. Never force-push. Never rebase after a push: merge the base branch into yours. (source: `AGENTS.md`; the 2026-10-30 refusal of a `--force-with-lease` brief)
 4. `Refs #<n>`, never `Closes`, `Fixes` or `Resolves`. (source: `AGENTS.md` Style; `docs/issue-workflow.md` rule 7; user, 2026-10-21)
 5. Commits follow the repo style `feat(area): ...`, `fix(area): ...`, `perf(area): ...`, `docs: ...` with a `Refs #<n>` body line. This repo style replaces the global `#<n>: ` subject prefix. Squash subjects are hand-written: `type(area): subject (#<pr>)`. No AI attribution, no co-author trailers. (source: `AGENTS.md` Style; global commit rules)
-6. Each worktree keeps its own `my-version/target/`. Never share a `CARGO_TARGET_DIR`. (source: `docs/issue-workflow.md` sections 2 and 6; stale artefacts seen twice, 2026-10-18)
+6. Each worktree keeps its own `target/` in the crate directory (`verksted/_tools/crate-dir.sh "$W"`). Never share a `CARGO_TARGET_DIR`. (source: `docs/issue-workflow.md` sections 2 and 6; stale artefacts seen twice, 2026-10-18)
 7. Clean up path by path, only the finished ticket's worktree and branches. No `rm -rf`, no bulk clean-up while agents live. (source: global orchestration rules; denied removals, 2026-10-30)
 8. Keep scratch, datasets and build output out of git. (source: `AGENTS.md` Non-negotiables)
 
 ## Language and tools
 
-9. No Python. No `.py` file, no `python3` call, no python shebang. Experiments, reference values, fixtures and helpers are Rust: crate tests, or single-file `rustc -O` programs outside the repo. Quick checks are shell. Scripted edits use the Edit tool, `perl` or `sed`. A Claude Code PreToolUse hook in the user settings blocks any Bash command that invokes `python` or `pip` in this repository. (source: `docs/issue-workflow.md` rule 10; `my-version/tests/no_python.rs`; user, 2026-10-31)
+9. No Python. No `.py` file, no `python3` call, no python shebang. Experiments, reference values, fixtures and helpers are Rust: crate tests, or single-file `rustc -O` programs outside the repo. Quick checks are shell. Scripted edits use the Edit tool, `perl` or `sed`. A Claude Code PreToolUse hook in the user settings blocks any Bash command that invokes `python` or `pip` in this repository. (source: `docs/issue-workflow.md` rule 10; the engine crate's `tests/no_python.rs`; user, 2026-10-31)
 10. Plain technical English, short sentences, no em-dashes. Docs describe the present only: no history, no provenance, no AI references. (source: global writing rules)
 11. Code comments state a constraint the code cannot show. No measured numbers in comments. (source: global commit and ticket rules)
 

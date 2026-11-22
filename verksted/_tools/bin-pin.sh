@@ -25,7 +25,8 @@ wt=$(cd "$wt" && pwd)
 case "$(basename "$wt")" in
   default-ab-run) echo "bin-pin: refusing to pin from $wt" >&2; exit 1 ;;
 esac
-rel=$wt/$CRATE/target/release
+C=$(crate_dir "$wt") || { echo "bin-pin: no single engine crate under $wt" >&2; exit 1; }
+rel=$C/target/release
 
 rev=$(git -C "$wt" rev-parse HEAD) || { echo "bin-pin: $wt is not a git worktree" >&2; exit 1; }
 [ -z "$(git -C "$wt" status --porcelain)" ] || rev=$rev-dirty

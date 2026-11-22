@@ -79,7 +79,7 @@ if want agents; then
     fi
     branch=$(git -C "$w" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")
     if [ -n "$(git -C "$w" status --porcelain 2>/dev/null | head -n 1)" ]; then dirty=y; else dirty=n; fi
-    newest=$(find "$w" -path "$w/$CRATE/target" -prune -o -name .git -prune -o -type f -printf '%T@\n' 2>/dev/null |
+    newest=$(find "$w" -name target -type d -prune -o -name .git -prune -o -type f -printf '%T@\n' 2>/dev/null |
       sort -n | tail -n 1 | cut -d. -f1)
     age=$(((now - ${newest:-0}) / 60))
     flag=""
