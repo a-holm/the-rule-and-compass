@@ -42,6 +42,13 @@
                              fitness, sub-books under --fitness pnl, drawn per
                              generation from the seed. Saved search setting
                              (#1023)
+  --same-book-guard          under --fitness pnl, parent tournaments draw over
+                             distinct long/flat books: one entrant per book,
+                             its simplest holder, so copies of one book are
+                             not selected several times. Needs --fitness pnl;
+                             refuses --selection afp and lexicase, --qd-policy
+                             and --variation postfix. Saved search setting
+                             (#1082)
   --restart-policy archive|island
                              which stall rule restarts an island every
                              restart interval (--restart-interval, default

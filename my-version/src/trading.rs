@@ -1977,6 +1977,32 @@ fn fnv_u64(h: &mut u64, v: u64) {
     }
 }
 
+/// #1082: the identity of a long/flat book in the search, see [`book_signature`].
+pub type BookSig = std::num::NonZeroU64;
+
+/// #1082: FNV-1a over the block count, the whole-book long rows and, per time
+/// block, the gross bits, flips and exits of the totals the regret reads (a row
+/// outside the regime mask is flat in them). The regret is a function of these
+/// numbers, so two candidates with one signature have one error. `long_rows`
+/// is the whole-book count because the device counts long rows for the whole
+/// book only; the per-block `long_rows` of `blocks` are not read.
+pub fn book_signature(long_rows: u64, blocks: &[FitnessTotals]) -> BookSig {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    fnv_u64(&mut h, blocks.len() as u64);
+    fnv_u64(&mut h, long_rows);
+    for t in blocks {
+        fnv_u64(&mut h, t.gross.to_bits());
+        fnv_u64(&mut h, t.flips);
+        fnv_u64(&mut h, t.exits);
+    }
+    BookSig::new(h).unwrap_or(BookSig::MIN)
+}
+
+/// #1082: the [`book_signature`] of the totals of a finite regret.
+fn signature_of(regret: f64, blocks: &[FitnessTotals]) -> Option<BookSig> {
+    regret.is_finite().then(|| book_signature(blocks.iter().map(|t| t.long_rows).sum(), blocks))
+}
+
 impl FitnessBook {
     /// `horizon_seconds` is the label horizon of the target; rows of one group
     /// closer than that are refused (#468). A non-positive horizon skips it.
@@ -2454,12 +2480,32 @@ impl FitnessBook {
     /// #1084: [`FitnessBook::regret`] and the [`BookShape`] of the same
     /// reduction, so the shape follows the position rule the regret prices.
     pub fn regret_and_shape(&self, pred: &[f64]) -> (f64, BookShape) {
+        self.reduce(pred, |regret, t| (regret, BookShape::of(self.len() - self.off_rows, t)))
+    }
+
+    /// #1082: [`FitnessBook::regret`] and the [`book_signature`] of the same
+    /// totals, from one reduction of `pred`. `None` when the regret is not
+    /// finite.
+    pub fn regret_signed(&self, pred: &[f64]) -> (f64, Option<BookSig>) {
+        self.reduce(pred, |regret, t| (regret, signature_of(regret, t)))
+    }
+
+    /// #1082: [`FitnessBook::regret_and_shape`] and [`FitnessBook::regret_signed`]
+    /// from one reduction of `pred`.
+    pub fn regret_shape_signed(&self, pred: &[f64]) -> (f64, BookShape, Option<BookSig>) {
+        self.reduce(pred, |regret, t| (regret, BookShape::of(self.len() - self.off_rows, t), signature_of(regret, t)))
+    }
+
+    /// The totals [`FitnessBook::regret`] prices `pred` by, after the regime
+    /// mask and the position layer: one for a single mean-sd block, else one
+    /// per time block; `f` gets the regret of those totals and the totals.
+    fn reduce<R>(&self, pred: &[f64], f: impl FnOnce(f64, &[FitnessTotals]) -> R) -> R {
         if self.blocks() == 1 && self.stat == BlockStat::MeanSd {
             let t = self.totals(pred);
-            (self.regret_of(&t), BookShape::of(self.len() - self.off_rows, std::slice::from_ref(&t)))
+            f(self.regret_of(&t), std::slice::from_ref(&t))
         } else {
             let t = self.block_totals(pred);
-            (self.fitness_of(&t), BookShape::of(self.len() - self.off_rows, &t))
+            f(self.fitness_of(&t), &t)
         }
     }
 

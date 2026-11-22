@@ -4045,6 +4045,24 @@ fn main() {
         );
         std::process::exit(EXIT_USAGE); // #1070
     }
+    // #1082: the guard replaces the lexicographic tournament of the node path.
+    if cfg.same_book_guard {
+        let clash = if cfg.selection == crate::search::Selection::Afp {
+            Some("--selection afp (parents come from the rank and crowding tournament)")
+        } else if cfg.selection == crate::search::Selection::Lexicase {
+            Some("--selection lexicase (parents come from epsilon-lexicase)")
+        } else if cfg.qd_policy {
+            Some("--qd-policy (parents come from the QD archive)")
+        } else if cfg.variation == crate::search::VariationMode::Postfix {
+            Some("--variation postfix (the guard runs on the node path; use --variation auto or node)")
+        } else {
+            None
+        };
+        if let Some(what) = clash {
+            eprintln!("error: --same-book-guard is not supported with {}", what);
+            std::process::exit(EXIT_USAGE);
+        }
+    }
     // #928: a re-selection is a resume that runs nothing.
     if reselect_path.is_some() || reselect_run_path.is_some() {
         let conflicts = [
@@ -5692,6 +5710,9 @@ fn main() {
             if given {
                 trading_usage(&format!("{} needs --fitness pnl", flag));
             }
+        }
+        if cfg.same_book_guard {
+            trading_usage("--same-book-guard needs --fitness pnl: a book signature exists only for the long/flat fitness");
         }
     }
     // #1179: the fitness benchmark; every reported net stays absolute.
@@ -9401,7 +9422,7 @@ fn main() {
                 outcome.generations,
                 outcome.candidates_evaluated,
                 format!(
-                    "{}{}{}{}",
+                    "{}{}{}{}{}",
                     if cfg.fit_irls_active() {
                         format!(",\"fit_irls\":{}", jstr(cfg.fit_irls.name()))
                     } else {
@@ -9413,7 +9434,9 @@ fn main() {
                         String::new()
                     },
                     fit_accept_json(outcome.fit_accept.as_ref()),
-                    format!(",\"cumulative\":{}", cumulative_json)
+                    format!(",\"cumulative\":{}", cumulative_json),
+                    // #1082: distinct books of the final population under --fitness pnl.
+                    outcome.books.as_ref().map_or_else(String::new, |b| format!(",\"books\":{}", b.json(true)))
                 ),
                 outcome.converged_early,
                 jstr(outcome.stop_reason),

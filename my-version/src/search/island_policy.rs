@@ -1631,7 +1631,7 @@ mod tests {
             let mut rng = Mt::new(3);
             let picks: Vec<(u64, u32)> = (0..200)
                 .map(|_| {
-                    let (tree, age) = pick_parent_aged(&island, &parents, &mut rng, false, &[], &[]);
+                    let (tree, age) = pick_parent_aged(&island, &parents, &mut rng, false, &[], &[], &[]);
                     (expr::structural_hash(&tree), age)
                 })
                 .collect();

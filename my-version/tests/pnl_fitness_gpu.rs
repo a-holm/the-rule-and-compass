@@ -2545,3 +2545,81 @@ fn a_layered_book_is_refused_by_the_device_upload() {
     assert_eq!(ev.set_pnl_book(&layered).unwrap_err(), rcsr::gpu::LONG_PNL_LAYERED);
     ev.set_pnl_book(&book(&f, 1)).expect("a plain book still uploads");
 }
+
+// ---- #1082: book signatures from the kept device totals ----
+
+/// The kept device totals give every candidate the signature the CPU book
+/// gives the device's own predictions; a candidate whose regret is not finite
+/// has none. Returns the signed programs, `None` without a device.
+fn assert_signatures(f: &Fixture, b: &FitnessBook, trees: &[Node], what: &str) -> Option<usize> {
+    let mut ev = evaluator(f, b)?;
+    assert!(ev.keep_pnl_totals(true));
+    let pop = compiled(trees);
+    let (prog, off) = pop.programs();
+    let scored = ev.score_batch(prog, off, ScoreObjective::LongPnl, &vec![0; trees.len()]);
+    assert!(scored.ms >= 0.0 && scored.values.len() == trees.len(), "{what}: the batch runs");
+    let sigs = ev.kept_pnl_signatures(trees.len(), b.blocks()).expect("the batch kept its totals");
+    assert!(ev.kept_pnl_signatures(trees.len() + 1, b.blocks()).is_none(), "{what}: another count is refused");
+    let mut signed = 0usize;
+    for k in 0..trees.len() {
+        let words = &prog[off[k] as usize..off[k + 1] as usize];
+        let pred: Vec<f64> = ev.predict_one_for_tests(words).expect("the device predicts").iter().map(|&p| p as f64).collect();
+        let (regret, want) = b.regret_signed(&pred);
+        assert_eq!(scored.values[k].to_bits(), regret.to_bits(), "{what}: program {k} regret");
+        if regret.is_finite() {
+            assert_eq!(sigs[k], want, "{what}: program {k} signature");
+            signed += 1;
+        }
+    }
+    Some(signed)
+}
+
+/// The memcheck book: 1 and 4 blocks (ids in the flags), 12 blocks (the wide
+/// kernel, plain and cvar), a regime-masked book and a band book.
+#[test]
+fn device_book_signatures_equal_the_cpu_signatures() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    let f = fixture(&STARTS_SMALL, 16_401, 11);
+    let books = [
+        ("1 block", book_blocks(&f, 1, 1, 1.0)),
+        ("4 blocks", book_blocks(&f, 1, 4, 1.0)),
+        ("12 blocks", book_blocks(&f, 1, 12, 1.0)),
+        ("12 blocks cvar", stat_book(&f, 12, 1.0, BlockStat::Cvar(0.25))),
+        ("masked, 9 blocks", masked(&f, &spec(1), 9, &[], &gate_mask(&f))),
+    ];
+    for (what, b) in &books {
+        let Some(signed) = assert_signatures(&f, b, &programs(24, 5), what) else {
+            return;
+        };
+        assert!(signed >= 8, "{what}: {signed} signed programs");
+    }
+    let band = band_book(&f, 0.05, BandUnits::Score, 3, 1);
+    if let Some(signed) = assert_signatures(&f, &band, &band_programs(24, 5), "band") {
+        assert!(signed >= 8, "band: {signed} signed programs");
+    }
+}
+
+/// A fresh device search signs every finite member, on the overlap pipeline
+/// and the synchronous batch, with one block and with a wide-block book.
+#[test]
+fn device_pnl_search_signs_every_finite_member() {
+    let _shared = FAULTS.read().unwrap_or_else(|e| e.into_inner());
+    if !device_present() {
+        return;
+    }
+    for blocks in [1usize, 12] {
+        let (sample, b) = search_fixture_blocks(blocks);
+        let seen: Archived = Arc::default();
+        for (route, cfg) in [
+            ("pipeline", config(&b, &seen)),
+            ("synchronous", Config { fit_strategy: rcsr::fit::FitStrategy::Gpu, pipeline_depth: 0, ..config(&b, &seen) }),
+        ] {
+            let out = search::run(&cfg, &sample, &sample);
+            assert_device_scored(&out);
+            let books = out.books.as_ref().expect("a long/flat search counts books");
+            assert!(books.signed > 0 && books.distinct >= 1 && books.distinct <= books.signed, "{blocks} blocks, {route}: {books:?}");
+            assert_eq!(books.unsigned, 0, "{blocks} blocks, {route}: every finite member carries a book");
+            assert_eq!(books.islands.len(), cfg.islands);
+        }
+    }
+}
