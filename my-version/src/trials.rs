@@ -1,5 +1,4 @@
-//! #926: campaign trial accounting and paired run compari    let period_seconds = at(j, &["annualization", "period_seconds"]).and_then(Json::as_f64).filter(|s| s.is_finite() && *s > 0.0);
-    if let Some(s) = period_seconds {on.
+//! #926: campaign trial accounting and paired run comparison.
 //!
 //! `rcsr trials --wf <report>...` counts the finalists of a campaign from the
 //! pooled out-of-fold net series of their walk-forward reports: distinct books,
@@ -281,7 +280,8 @@ pub(crate) fn check_annualization(path: &str, j: &Json, time: &[f64], ppy: f64) 
         return usage_err(format!("field 'annualization.periods_per_year' is {} in {} (a positive number is required)", jnum(ppy), path));
     }
     let off = |implied: f64| ((ppy - implied) / implied).abs() > ANNUALIZATION_TOLERANCE;
-    if let Some(s) = at(j, &["annualization", "period_seconds"]).and_then(Json::as_f64).filter(|s| s.is_finite() && *s > 0.0) {
+    let period_seconds = at(j, &["annualization", "period_seconds"]).and_then(Json::as_f64).filter(|s| s.is_finite() && *s > 0.0);
+    if let Some(s) = period_seconds {
         let implied = SECONDS_PER_YEAR / s;
         if off(implied) {
             return usage_err(format!(
