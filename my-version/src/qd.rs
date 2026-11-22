@@ -215,7 +215,7 @@ pub struct QdArchive {
     fallbacks: usize,
     /// #1084: what the descriptor axes measure.
     kind: DescriptorKind,
-    /// Threads for the descriptor fallback evaluations; never part of the state.
+    /// Threads for the descriptor fallback evaluations and the final refit; never part of the state.
     workers: usize,
 }
 
@@ -442,7 +442,7 @@ impl QdArchive {
         self
     }
 
-    /// Threads for the descriptor fallback evaluations. The archive does not
+    /// Threads for the descriptor fallback evaluations and the final refit. The archive does not
     /// depend on the count.
     pub fn with_workers(mut self, workers: usize) -> Self {
         self.workers = workers.max(1);
@@ -1073,15 +1073,20 @@ impl QdArchive {
     /// end of a run so every reported cell elite is an all-rows f64 value.
     pub fn refit_all<F>(&mut self, score: F)
     where
-        F: Fn(&Node) -> (f64, f64),
+        F: Fn(&Node) -> (f64, f64) + Sync,
     {
         let mut all: Vec<QdEntry> = Vec::new();
         for cell in &mut self.cells {
             all.append(&mut cell.entries);
         }
         self.visits.iter_mut().for_each(|v| *v = 0);
-        for e in all {
-            let (error, cost) = score(&e.tree);
+        // Scoring is independent per entry; the inserts keep the entry order.
+        let scored = crate::search::par_map(
+            self.workers,
+            all.iter().map(|e| &e.tree).collect::<Vec<&Node>>(),
+            |tree| score(tree),
+        );
+        for (e, (error, cost)) in all.into_iter().zip(scored) {
             let ix = self.cell_index(e.descriptor);
             self.visits[ix] = self.visits[ix].saturating_add(1);
             self.cells[ix].insert(
@@ -1786,6 +1791,85 @@ mod tests {
         let par_s = t.elapsed().as_secs_f64();
         assert_eq!(format!("{:?}", par.state()), format!("{:?}", serial.state()));
         println!("serial {serial_s:.4} s, parallel x4 {par_s:.4} s");
+    }
+    /// #1345: the previous one-at-a-time refit, kept as the oracle for the
+    /// parallel scoring.
+    fn refit_serially(q: &mut QdArchive, score: impl Fn(&Node) -> (f64, f64)) {
+        let mut all: Vec<QdEntry> = Vec::new();
+        for cell in &mut q.cells {
+            all.append(&mut cell.entries);
+        }
+        q.visits.iter_mut().for_each(|v| *v = 0);
+        for e in all {
+            let (error, cost) = score(&e.tree);
+            let ix = q.cell_index(e.descriptor);
+            q.visits[ix] = q.visits[ix].saturating_add(1);
+            q.cells[ix].insert(QdEntry { tree: e.tree, error, cost, descriptor: e.descriptor }, q.cell_cap);
+        }
+    }
+
+    /// #1345: parallel refit scoring inserts in entry order, so cell contents,
+    /// their order and the visit counts equal the serial loop at any worker
+    /// count.
+    #[test]
+    fn parallel_refit_matches_the_serial_loop() {
+        let constant_of = |t: &Node| -> f64 { t.kids[1].val };
+        let score = |t: &Node| {
+            let k = constant_of(t);
+            (1.0 / (1.0 + k), k)
+        };
+        let d = [Descriptor { usage: 0.1, skew: 0.1 }, Descriptor { usage: 0.9, skew: 0.9 }];
+        let mut base = QdArchive::new(2, 4).with_nvars(2);
+        for k in (0..4).rev() {
+            for (j, d) in d.iter().enumerate() {
+                let tree = node(Op::Add, vec![input(0), constant((k + 10 * j) as f64)]);
+                base.insert_descriptor(&tree, 9.0 - k as f64 * 0.5, 100.0 + k as f64, *d);
+            }
+        }
+        let mut serial = base.clone();
+        refit_serially(&mut serial, score);
+        for workers in [1usize, 4] {
+            let mut par = base.clone().with_workers(workers);
+            par.refit_all(score);
+            assert_eq!(format!("{:?}", par.state()), format!("{:?}", serial.state()), "workers {workers}");
+        }
+        let kept: usize = serial.state().cells.iter().map(|c| c.len()).sum();
+        assert_eq!(kept, 8);
+    }
+
+    /// #1345: phase seconds of a 219-entry refit with an all-rows scorer (57,760
+    /// rows, descriptor walk as the scorer), serial loop against 4 workers. Run
+    /// with `cargo test --release --lib parallel_refit_phase -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn parallel_refit_phase_seconds() {
+        let mut s = Sample::default();
+        for i in 0..57_760 {
+            let x = -1.0 + 2.0 * i as f64 / 57_760.0;
+            s.x.push(vec![x, x * x]);
+            s.y.push(x);
+        }
+        let score = |t: &Node| {
+            let d = descriptor(t, &s);
+            (d.skew + 1.0, d.usage)
+        };
+        let mut base = QdArchive::new_cvt(64, 8).with_nvars(2);
+        for k in 0..219 {
+            let c = 0.01 * k as f64;
+            let t = node(Op::Add, vec![node(Op::Sin, vec![node(Op::Mul, vec![constant(c), input(0)])]), node(Op::Mul, vec![input(1), input(1)])]);
+            let d = Descriptor { usage: (k % 7) as f64 / 7.0, skew: (k % 5) as f64 / 5.0 };
+            base.insert_descriptor(&t, 10.0 - c, 5.0 + c, d);
+        }
+        let mut serial = base.clone();
+        let t = std::time::Instant::now();
+        refit_serially(&mut serial, score);
+        let serial_s = t.elapsed().as_secs_f64();
+        let mut par = base.clone().with_workers(4);
+        let t = std::time::Instant::now();
+        par.refit_all(score);
+        let par_s = t.elapsed().as_secs_f64();
+        assert_eq!(format!("{:?}", par.state()), format!("{:?}", serial.state()));
+        println!("entries before {}, serial {serial_s:.4} s, parallel x4 {par_s:.4} s", base.state().cells.iter().map(|c| c.len()).sum::<usize>());
     }
 
     /// #1166: an archive restored from its state continues exactly like the
