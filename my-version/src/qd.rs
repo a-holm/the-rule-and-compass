@@ -1679,7 +1679,7 @@ mod tests {
         for k in (0..4).rev() {
             for (j, d) in d.iter().enumerate() {
                 let tree = node(Op::Add, vec![input(0), constant((k + 10 * j) as f64)]);
-                base.insert_descriptor(&tree, 9.0 - k as f64 * 0.5, 100.0 - k as f64, *d);
+                base.insert_descriptor(&tree, 9.0 - k as f64 * 0.5, 100.0 + k as f64, *d);
             }
         }
         let mut serial = base.clone();
@@ -1714,7 +1714,7 @@ mod tests {
             let c = 0.01 * k as f64;
             let t = node(Op::Add, vec![node(Op::Sin, vec![node(Op::Mul, vec![constant(c), input(0)])]), node(Op::Mul, vec![input(1), input(1)])]);
             let d = Descriptor { usage: (k % 7) as f64 / 7.0, skew: (k % 5) as f64 / 5.0 };
-            base.insert_descriptor(&t, 1.0 + c, 5.0 + (k % 9) as f64, d);
+            base.insert_descriptor(&t, 10.0 - c, 5.0 + c, d);
         }
         let mut serial = base.clone();
         let t = std::time::Instant::now();
@@ -1725,7 +1725,7 @@ mod tests {
         par.refit_all(score);
         let par_s = t.elapsed().as_secs_f64();
         assert_eq!(format!("{:?}", par.state()), format!("{:?}", serial.state()));
-        println!("entries {}, serial {serial_s:.4} s, parallel x4 {par_s:.4} s", par.state().cells.iter().map(|c| c.len()).sum::<usize>());
+        println!("entries before {}, serial {serial_s:.4} s, parallel x4 {par_s:.4} s", base.state().cells.iter().map(|c| c.len()).sum::<usize>());
     }
 
     /// #1166: an archive restored from its state continues exactly like the
