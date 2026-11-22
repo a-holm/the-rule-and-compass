@@ -467,14 +467,19 @@ fn write_hourly_csv(dir: &Path, n: usize, nan_share: f64) -> String {
 }
 
 fn run_hourly(dir: &Path, nan_share: f64, extra: &[&str]) -> (Output, String) {
+    run_hourly_with(dir, nan_share, &["--horizon", "3600"], extra)
+}
+
+fn run_hourly_with(dir: &Path, nan_share: f64, horizon: &[&str], extra: &[&str]) -> (Output, String) {
     let n = 600usize;
     let data = write_hourly_csv(dir, n, nan_share);
     let out_path = dir.join("wf-hourly.json").to_string_lossy().into_owned();
     let w = format!("w,{},{},{},{}", T0 as u64, T0 as u64 + 3600 * 199, T0 as u64 + 3600 * 200, T0 as u64 + 3600 * n as u64);
     let mut args = vec![
-        "walkforward", "--data", &data, "--time", "t", "--group-by", "sym", "--target", "y", "--horizon", "3600",
+        "walkforward", "--data", &data, "--time", "t", "--group-by", "sym", "--target", "y",
         "--expr", "x", "--vars", "x", "--window", &w, "--threshold-quantile", "0.5", "--out", &out_path,
     ];
+    args.extend_from_slice(horizon);
     args.extend_from_slice(extra);
     let out = rcsr(&args);
     (out, out_path)
@@ -512,6 +517,25 @@ fn wf_score_grid_random_nan_scores_trials_accepts() {
     assert_eq!(code(&out), 0, "{}", stderr(&out));
     let j = read_json(&path);
     assert_eq!(num(&j, &["annualization", "period_seconds"]), 3600.0);
+    let o = trials_of(&path);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+}
+
+#[test]
+fn wf_ppy_without_horizon_mismatch_refused() {
+    let scratch = Scratch::new("wf-undeclared-ppy-mismatch");
+    let (out, path) = run_hourly_with(scratch.path(), 0.0, &[], &["--periods-per-year", "365"]);
+    assert_eq!(code(&out), 2, "{}", stderr(&out));
+    let e = stderr(&out);
+    assert!(e.contains("--periods-per-year 365") && e.contains("3600") && e.contains("8760"), "{e}");
+    assert!(!Path::new(&path).exists());
+}
+
+#[test]
+fn wf_ppy_without_horizon_match_trials_accepts() {
+    let scratch = Scratch::new("wf-undeclared-ppy-match");
+    let (out, path) = run_hourly_with(scratch.path(), 0.0, &[], &["--periods-per-year", "8760"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
     let o = trials_of(&path);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
 }
