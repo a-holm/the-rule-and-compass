@@ -20,7 +20,7 @@ Do NOT load: the issue discussion, other worktrees, the code.
 1. If `N`, `SLUG` or `BASE` is missing, or the issue is not open, stop and say which.
 2. Run `verksted/_tools/wt-new.sh "$N" "$SLUG" --base "$BASE"`. It fetches, branches from `origin/$BASE` with `--no-track`, adds the worktree and creates the scratch dir `$GATES/issue$N-scratch/`. Never commit on `main`.
 3. Create `output/` inside the new worktree and write `worktree.md`: path, branch, base tip sha.
-4. Own `my-version/target/`: never set `CARGO_TARGET_DIR`.
+4. Own `<crate>/target/` (`verksted/_tools/crate-dir.sh "$W"`): never set `CARGO_TARGET_DIR`.
 
 ## Outputs
 

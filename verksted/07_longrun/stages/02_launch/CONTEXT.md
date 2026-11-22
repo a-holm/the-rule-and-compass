@@ -10,7 +10,7 @@ One job: launch the run through the tracked launcher.
 
 **Reference (every run):**
 - `../../../_shared/rules.md`
-- `../../../../my-version/src/bin/rcsr_launch.rs`
+- `../../../../<crate>/src/bin/rcsr_launch.rs`
 - `../../CONTEXT.md`
 - `../../../_tools/runlib.sh`
 
