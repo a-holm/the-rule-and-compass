@@ -1,6 +1,6 @@
 # Failure modes seen in the logs, each with its guard
 
-Mined from the Claude Code and opencode sessions of this repo (2026-10-18 to 2026-10-31). The guard is the rule in `rules.md` and the stage check that catches it.
+Mined from the Claude Code and opencode sessions of this repo and the orchestrator briefs (2026-10-18 to 2026-11-22). The guard is the rule in `rules.md` and the stage check that catches it.
 
 | # | Failure | Evidence | Guard |
 |---|---|---|---|
@@ -22,7 +22,7 @@ Mined from the Claude Code and opencode sessions of this repo (2026-10-18 to 202
 | F16 | Run started before required work finished, or idle waiting | opencode 2026-10-20 and 2026-10-21 | rule 29 |
 | F17 | Desktop starved by a terminal in software rendering (345 % CPU) | 2026-10-30 21:41 | `../10_machine/stages/03_measure/CONTEXT.md` |
 | F18 | GPU test could not be traced (`ptrace_scope=1`); no stack | 2026-10-30 20:44 | `RCSR_ATTACHABLE=1`; `../05_diagnose/stages/02_stack/CONTEXT.md` |
-| F19 | Flaky test failed the gate (a timing comparison; a 3.5e-9 relative miss once in 22 runs) | #311, #359 | rule 17 |
+| F19 | Flaky test failed the gate (a timing comparison; a 3.5e-9 relative miss once in 22 runs) | #311, #359 | rule 57 |
 | F20 | Four tickets active against a cap of three | 2026-10-30 | rule 21; `../03_orchestrate/stages/01_wave_plan/CONTEXT.md` |
 | F21 | Dead agent left unreviewed work in its worktree | #295, #301 salvage | `../03_orchestrate/stages/03_dispatch/CONTEXT.md`: a new Sonnet agent treats it as a draft |
 | F22 | Shared `CARGO_TARGET_DIR` linked artefacts from another tree | opencode 2026-10-18, twice, and 2026-11-01 (#470: an A/B base tree built with the branch's target dir) | rule 6 |
@@ -45,3 +45,22 @@ Mined from the Claude Code and opencode sessions of this repo (2026-10-18 to 202
 | F39 | Throw-away editor scripts and interpreter heredoc patches | about 60 `ed*.sh` files; 1,597 heredoc patches in opencode | rule 9 |
 | F40 | `pgrep -f` wait loops written after the rule existed | 2026-11-01T23:44 | rules 26 and 27 |
 | F41 | Placeholder ids passed literally to a message call, twice | opencode | `../03_orchestrate/stages/02_brief/CONTEXT.md` |
+| F42 | A store start was cut by an inherited start date, so the stores began years after the first bar | user, 2026-11-14 | rule 44 |
+| F43 | The Xid total fell when old lines rotated out of the journal and was reported as a fault | 2026-11-20 | rule 31 |
+| F44 | A wide glob read the manifests of sealed stores | broad pilot, 2026-11 | rule 46 |
+| F45 | An empty `--body-file` blanked an issue body (#1207) | 2026-11-22 | rule 50 |
+| F46 | `--edit-last` edited another agent's comment: all agents share one account | `common-rules` brief, 2026-11 | rule 50 |
+| F47 | A CPU build replaced the CUDA `rcsr` binary before CUDA tests ran | 2026-11-22 | rule 54 |
+| F48 | Duplicate waits on one log outlived their agent | 2026-11-21 | rule 52 |
+| F49 | Eight building agents starved a GPU campaign and stopped its first stage | 2026-11-11 and 2026-11-12 | rule 66; `models.md` |
+| F50 | A byte-format change left a golden test red on the tip (#1294) | 2026-11-21 | rule 56 |
+| F51 | A merged PR claimed docs edits that were never committed | 2026-11-15 | rule 55 |
+| F52 | A wall-time A/B on shared cores spread 62 % between two identical runs | broad pilot profile, 2026-11 | rule 38 |
+| F53 | A default cross-section floor blanked the earliest split group | broad pilot, 2026-11 | `../06_data/CONTEXT.md` (columns and views: #1354) |
+| F54 | A hand-made lookback table undercounted the embargo | broad pilot, 2026-11 | `time-rules.md` of `06_data` (#1354) |
+| F55 | A refusal drill expected an exit the engine answers by trimming | broad pilot, 2026-11 | stage `07_audit_lock` of `06_data` (#1354) |
+| F56 | A verifier created its scratch merge worktree in the gates folder and left it after the merge | 2026-11-22 | rule 59 |
+| F57 | Short wait cycles posted a notice to the project lead every few minutes | user, 2026-11-16 and 2026-11-22 | rule 52; `wait-for.sh` |
+| F58 | Two pull requests passed alone and failed together on the tip | #840 with #865; #980 with #765 | rule 68; `verify-merged.sh` (#1375) |
+| F59 | Two `#[ignore]` golden tests were reported as passed: the log said `ok`, 0 passed | final-gate audit, 2026-11-22 | rule 70; `test-summary.sh` (#1375) |
+| F60 | `gh pr merge --delete-branch` removed the author worktree right after the merge on several merges; uncommitted work would be lost | verifier runs, 2026-11 | `verifier-check.sh` worktree row (#1375) |

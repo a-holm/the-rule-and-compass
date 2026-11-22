@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Usage: test-clerk-check.sh
-# Hermetic test of clerk-check.sh against a temp bare origin and clone, with a fake gh.
+# Usage: test-verifier-check.sh
+# Hermetic test of verifier-check.sh against a temp bare origin and clone, with a fake gh.
 # Writes: a temp dir that it removes.
 set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -57,7 +57,7 @@ pr_json() {
     "$1" "$2" "$head" "$3" > "$T/pr.json"
   export FAKE_GH_JSON=$T/pr.json
 }
-run() { bash "$TOOLS/clerk-check.sh" "$@" 2>&1; }
+run() { bash "$TOOLS/verifier-check.sh" "$@" 2>&1; }
 
 printf 'ok line\n' > "$T/log-a.log"
 printf '%s\n' "unit|$T/log-a.log|ok [a-z]+" > "$T/claims-ok"
@@ -126,7 +126,7 @@ check readonly-status "$(git -C "$T/clone" status --porcelain)" ""
 check readonly-no-worktrees "$(git -C "$T/clone" worktree list | wc -l)" 1
 
 if [ "$fails" -ne 0 ]; then
-  echo "test-clerk-check: $fails failed"
+  echo "test-verifier-check: $fails failed"
   exit 1
 fi
-echo "test-clerk-check: ok"
+echo "test-verifier-check: ok"

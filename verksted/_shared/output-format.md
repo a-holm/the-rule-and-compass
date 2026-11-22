@@ -63,7 +63,7 @@ pass | fail: <reason>
 | run card | `../_templates/run.md` | one proof line per acceptance criterion |
 | pull request body | `../_templates/pr.md` | `Refs #N`, never `Closes` |
 | research question, decision | `../_templates/research-question.md`, `../_templates/research-decision.md` | premises, then a binding spec |
-| agent brief | `brief.md` + `../_templates/brief.md`, `brief-research.md`, `brief-clerk.md`; `../_tools/brief.sh` prints the dispatch prompt | starts with the no-resume line |
+| agent brief | `brief.md` + `../_templates/brief.md`, `brief-research.md`, `brief-verifier.md`; `../_tools/brief.sh` prints the dispatch prompt | starts with the no-resume line |
 | verification comment | `../_templates/verification-comment.md` | one row per criterion |
 | status message | `../_templates/status.md` | outcome first |
 

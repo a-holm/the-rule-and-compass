@@ -35,7 +35,8 @@ fn run(extra: &[&str]) -> Json {
     );
     let mut args: Vec<&str> = vec![
         "--data", &data, "--target", "y60", "--vars", INPUTS, "--time", "ts", "--train-select",
-        "ts >= 0 and ts < 1735473600", "--test-select", "ts >= 1735689600 and ts < 1751328000",
+        "ts >= 0 and ts < 1672315200", "--test-select", "ts >= 1672531200 and ts < 1698796800",
+        "--lockbox", "2023-11-15,2026-11-15",
         "--fill", "drop", "--metric", "squared", "--cpu", "--no-dev-log", "--quiet",
         "--target-spec", spec, "--allow-target-structure", "--generations", "1", "--pop", "8",
         "--fit-iters", "0", "--seed", "1", "--json",
@@ -73,12 +74,12 @@ fn expression(m: &Json) -> &str {
     at(m, &["expression"]).as_str().expect("expression")
 }
 
-/// The seeded r5 law: the exponential hyperbola without the macd term.
-fn r5(j: &Json) -> &Json {
+/// The seeded r4 law: the logistic hyperbola.
+fn r4(j: &Json) -> &Json {
     members(j)
         .iter()
-        .find(|m| expression(m).contains("exp(") && !expression(m).contains("macd_hist"))
-        .expect("r5 law in the front")
+        .find(|m| expression(m).contains("logistic("))
+        .expect("r4 law in the front")
 }
 
 /// The seeded r6 law: r5 plus the linear macd term.
@@ -116,12 +117,12 @@ fn print_summary(tag: &str, j: &Json) {
 
 fn rung_checks(j: &Json) {
     let t = |name: &str| num(j, &["baselines", "target_structure", "rungs", name, "test_error"]);
-    assert!((t("zero_param") - 0.104_582_698).abs() <= 1e-8, "{}", t("zero_param"));
-    // Train-only fit. An OLS fit on the test block gives 0.104_553, which is
+    assert!((t("zero_param") - 0.098_568_723).abs() <= 1e-8, "{}", t("zero_param"));
+    // Train-only fit. An OLS fit on the test block is
     // not an out-of-sample number.
-    assert!((t("affine") - 0.104_592_271).abs() <= 1e-6, "{}", t("affine"));
-    assert!((t("binned20") - 0.104_662).abs() <= 1e-5, "{}", t("binned20"));
-    assert!((t("construction_ols") - 0.105_127).abs() <= 2e-6, "{}", t("construction_ols"));
+    assert!((t("affine") - 0.098_623_155).abs() <= 1e-6, "{}", t("affine"));
+    assert!((t("binned20") - 0.099_300).abs() <= 1e-5, "{}", t("binned20"));
+    assert!((t("construction_ols") - 0.101_165).abs() <= 2e-6, "{}", t("construction_ols"));
     for m in members(j) {
         assert_eq!(at(m, &["beats_zero_param_test"]), &Json::Bool(false), "rank {}", num(m, &["rank"]));
     }
@@ -144,7 +145,7 @@ fn e1b_e2_e3_verdict_noise_and_identification_with_a_validation_slice() {
     // The rungs fit on 90 % of the training rows here, so only the
     // zero-parameter rung (no fitted parameter) keeps its E1a value.
     let zero = num(&j, &["baselines", "target_structure", "rungs", "zero_param", "test_error"]);
-    assert!((zero - 0.104_582_698).abs() <= 1e-8, "{zero}");
+    assert!((zero - 0.098_568_723).abs() <= 1e-8, "{zero}");
     for m in members(&j) {
         assert_eq!(at(m, &["beats_zero_param_test"]), &Json::Bool(false));
     }
@@ -154,14 +155,14 @@ fn e1b_e2_e3_verdict_noise_and_identification_with_a_validation_slice() {
     let gates = num(&j, &["timing", "gates_seconds"]);
     println!("timing.gates {gates} vs search {search} ({:.2} %)", 100.0 * gates / search);
 
-    // E2: paired Driscoll-Kraay SE of the printed r5 law on the test block.
-    let r5 = r5(&j);
-    let vs_mean = num(r5, &["comparisons", "test", "mean", "se"]);
-    let vs_zero = num(r5, &["comparisons", "test", "target_structure.zero_param", "se"]);
-    println!("E2 r5 vs mean se {vs_mean} delta {}", num(r5, &["comparisons", "test", "mean", "delta"]));
-    println!("E2 r5 vs zero_param se {vs_zero} delta {}", num(r5, &["comparisons", "test", "target_structure.zero_param", "delta"]));
-    assert!((1.5e-4..=2.3e-4).contains(&vs_mean), "{vs_mean}");
-    assert!((1.6e-5..=2.5e-5).contains(&vs_zero), "{vs_zero}");
+    // E2: paired Driscoll-Kraay SE of the printed r4 law on the test block.
+    let r4 = r4(&j);
+    let vs_mean = num(r4, &["comparisons", "test", "mean", "se"]);
+    let vs_zero = num(r4, &["comparisons", "test", "target_structure.zero_param", "se"]);
+    println!("E2 r4 vs mean se {vs_mean} delta {}", num(r4, &["comparisons", "test", "mean", "delta"]));
+    println!("E2 r4 vs zero_param se {vs_zero} delta {}", num(r4, &["comparisons", "test", "target_structure.zero_param", "delta"]));
+    assert!((3.0e-4..=4.4e-4).contains(&vs_mean), "{vs_mean}");
+    assert!((0.9e-5..=1.4e-5).contains(&vs_zero), "{vs_zero}");
 
     // E3: the printed r6 law is structurally unidentified.
     let r6 = r6(&j);
