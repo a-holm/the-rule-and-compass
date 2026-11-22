@@ -190,8 +190,9 @@ fn a_resumed_run_that_stops_on_patience_reports_the_same_converged_early() {
     ok(rcsr_in(dir, &args(&["--json-out", "full.json"])), "full run");
     let full = std::fs::read_to_string(dir.join("full.json")).unwrap();
     assert!(full.contains("\"stop_reason\":\"patience\""), "the fixture stops on patience: {}", block(&full, "convergence"));
+    assert!(full.contains("\"converged_early\":false"), "the uninterrupted run is not converged");
     let want = readings(dir, "full.json");
-    for cut in [2usize, 5] {
+    for cut in [10usize, 13] {
         ok(rcsr_in(dir, &args(&["--generations", &cut.to_string(), "--save", "cp.rcsr"])), "cut");
         ok(rcsr_in(dir, &args(&["--resume", "cp.rcsr", "--json-out", "res.json"])), "resume");
         let res = std::fs::read_to_string(dir.join("res.json")).unwrap();

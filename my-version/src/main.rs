@@ -4291,6 +4291,9 @@ fn main() {
         if cp.refit_band_unknown {
             eprintln!("# resume: checkpoint has no saved refit band; using --refit-band {}", cfg.refit_band);
         }
+        if cp.progress.is_none() && cp.generations > 0 {
+            eprintln!("# resume: checkpoint has no saved convergence state; the convergence block restarts here (checkpoint.convergence_exact is false)");
+        }
         let mut conflicts: Vec<String> = Vec::new();
         if generations_set && cfg.generations < saved.generations {
             conflicts.push(format!(
@@ -7713,13 +7716,14 @@ fn main() {
             }
         }
         let checkpoint_json = format!(
-            "{{\"resumed_from\":{},\"saved_to\":{},\"generation\":{}}}",
+            "{{\"resumed_from\":{},\"saved_to\":{},\"generation\":{},\"convergence_exact\":{}}}",
             resume_path.as_deref().map(jstr).unwrap_or_else(|| "null".to_string()),
             last_saved
                 .as_ref()
                 .map(|(_, p)| jstr(p))
                 .unwrap_or_else(|| "null".to_string()),
-            outcome.generations
+            outcome.generations,
+            outcome.convergence_exact
         );
         let gpu = gpu_json(
             &outcome.gpu,
@@ -9282,7 +9286,7 @@ fn main() {
             };
             let search_meta_json = format!("{}{}{}", predictor_json, fit_json, prune_json);
             let checkpoint_json = format!(
-                "{{\"resumed_from\":{},\"saved_to\":{},\"generation\":{}}}",
+                "{{\"resumed_from\":{},\"saved_to\":{},\"generation\":{},\"convergence_exact\":{}}}",
                 resume_path
                     .as_deref()
                     .map(jstr)
@@ -9291,7 +9295,8 @@ fn main() {
                     .as_ref()
                     .map(|(_, p)| jstr(p))
                     .unwrap_or_else(|| "null".to_string()),
-                outcome.generations
+                outcome.generations,
+                outcome.convergence_exact
             );
             let best_fit_loss = rows
                 .iter()
