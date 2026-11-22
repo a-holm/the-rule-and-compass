@@ -66,17 +66,17 @@ rl_hold() {
 }
 
 rl_gpu() {
-  local name=$1 to=$2 x0 x1 rc
+  local name=$1 to=$2 xs xn rc
   case "$to" in ''|*[!0-9]*) rl_die "rl_gpu $name: timeout must be whole seconds, got '$to'" ;; esac
   [ "$to" -le "$LOCK_HOLD_MAX" ] || rl_die "refused: rl_gpu $name timeout ${to}s is above LOCK_HOLD_MAX=${LOCK_HOLD_MAX}s"
   rl_hold gpu "$@"
   shift 3
-  x0=$(xid_count)
+  xs=$(xid_start)
   "$L" bash "$RL_LOCK_RUN" "$LOCKFILE" "$RL_TIME" -f "$RL_TIMEF" timeout -k "$KILL_AFTER" "$to" "$@" >> "$RUN/$name.log" 2>&1
   rc=$?
-  x1=$(xid_count)
-  echo "[xid] before=$x0 after=$x1 rc=$rc" >> "$RUN/$name.log"
-  [ "$x1" -le "$x0" ] || rl_die "NVRM Xid count rose $x0 -> $x1 during $name"
+  xn=$(xid_new_since "$xs" 2>> "$RUN/$name.log") || rl_die "Xid check failed during $name (start=${xs:-missing}); failing closed"
+  echo "[xid] new=$xn since=$xs rc=$rc" >> "$RUN/$name.log"
+  [ "$xn" -eq 0 ] || rl_die "$xn new NVRM Xid line(s) since $xs during $name"
   return "$rc"
 }
 

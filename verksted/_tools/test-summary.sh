@@ -7,10 +7,10 @@
 #   errors: <n>
 #   failing: <names, comma-separated> | none
 #   sanitizer: <every ERROR SUMMARY line, joined> | none
-#   xid: <the last "xid before" line> | none
+#   xid: <the last "xid new" line> | none
 #   rc: <n from the last RC_DONE line> | none
 #   verdict: ok | fail
-# Fail when failed > 0, errors > 0, an ERROR SUMMARY has a non-zero count, xid after > before,
+# Fail when failed > 0, errors > 0, an ERROR SUMMARY has a non-zero count, xid new > 0,
 # or rc is present and not 0. A red proof reads failed>0 with errors: 0.
 # Writes: nothing.
 # Exit: 0 when every block says ok; 1 otherwise; 2 usage or a missing log.
@@ -53,10 +53,10 @@ summarize() {
         if (c + 0 > 0) bad = 1
       }
     }
-    /^xid before=[0-9]+ after=[0-9]+/ {
+    /^xid new=[0-9]+ since=/ {
       xid = $0
-      b = $2; a = $3; sub(/before=/, "", b); sub(/after=/, "", a)
-      xbad = (a + 0 > b + 0)
+      n = $2; sub(/new=/, "", n)
+      xbad = (n + 0 > 0)
     }
     /^RC_DONE rc=[0-9]+/ { rc = $2; sub(/rc=/, "", rc) }
     END {

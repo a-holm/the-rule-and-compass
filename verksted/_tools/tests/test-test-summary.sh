@@ -76,12 +76,12 @@ check san3-verdict "$(grep '^verdict:' "$T/san3.out")" 'verdict: fail'
 printf 'ERROR SUMMARY: 0 errors\nERROR SUMMARY: 0 errors\n' > "$T/san2.log"
 check san-joined "$(line sanitizer "$T/san2.log")" 'sanitizer: ERROR SUMMARY: 0 errors; ERROR SUMMARY: 0 errors'
 
-printf 'xid before=2 after=2\nxid before=2 after=3\n' > "$T/xid.log"
+printf 'xid new=0 since=2026-01-01 10:00:00\nxid new=3 since=2026-01-01 10:05:00\n' > "$T/xid.log"
 bash "$S" "$T/xid.log" > "$T/xid.out"; rc=$?
 check xid-rc "$rc" 1
-check xid-line "$(grep '^xid:' "$T/xid.out")" 'xid: xid before=2 after=3'
-printf 'xid before=2 after=2\n' > "$T/xidok.log"
-bash "$S" "$T/xidok.log" > /dev/null; check xid-equal-rc "$?" 0
+check xid-line "$(grep '^xid:' "$T/xid.out")" 'xid: xid new=3 since=2026-01-01 10:05:00'
+printf 'xid new=0 since=2026-01-01 10:00:00\n' > "$T/xidok.log"
+bash "$S" "$T/xidok.log" > /dev/null; check xid-none-rc "$?" 0
 
 printf 'RC_DONE rc=1 at=x\n' > "$T/rc1.log"
 bash "$S" "$T/rc1.log" > "$T/rc1.out"; rc=$?

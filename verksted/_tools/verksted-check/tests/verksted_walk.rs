@@ -1,14 +1,14 @@
 //! The workshop passes the strict walk: fresh index, no orphan tool, root route.
-//! The logic lives in verksted/_tools/verksted-check/src/check.rs.
+//! The logic lives in src/check.rs of this crate.
 
 #[allow(dead_code)]
-#[path = "../../verksted/_tools/verksted-check/src/check.rs"]
+#[path = "../src/check.rs"]
 mod check;
 
 use std::path::{Path, PathBuf};
 
 fn workshop_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../verksted")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
 #[test]

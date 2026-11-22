@@ -110,11 +110,11 @@ rm -f "$T/holds" "$T/run/g.log"
 rb 'rl_gpu g 30 -- echo hi; echo "rc=$?"'; check gpu-rc $? 0
 grep -q '^hi$' "$T/run/g.log"; check gpu-output $? 0
 grep -q '^\[time\] wall=1 s' "$T/run/g.log"; check gpu-time $? 0
-grep -q '^\[xid\] before=0 after=0 rc=0$' "$T/run/g.log"; check gpu-xid $? 0
+grep -q '^\[xid\] new=0 since=[0-9-]* [0-9:]* rc=0$' "$T/run/g.log"; check gpu-xid $? 0
 check gpu-holds "$(wc -l < "$T/holds")" 1
 rb 'rl_gpu g2 30 -- bash -c "exit 4"; echo "rc=$?"'
 grep -q '^rc=4$' "$T/out"; check gpu-passes-rc $? 0
-grep -q '^\[xid\] before=0 after=0 rc=4$' "$T/run/g2.log"; check gpu-xid-rc $? 0
+grep -q '^\[xid\] new=0 since=[0-9-]* [0-9:]* rc=4$' "$T/run/g2.log"; check gpu-xid-rc $? 0
 
 # refusal above LOCK_HOLD_MAX
 rb 'rl_gpu big 900 -- true'; check refuse-rc $? 1
@@ -122,9 +122,35 @@ grep -q 'refused: rl_gpu big timeout 900s is above LOCK_HOLD_MAX=600s' "$T/out";
 [ ! -f "$T/run/big.log" ]; check refuse-nohold $? 0
 
 # rising Xid stops
-rb 'rl_gpu x 30 -- bash -c "echo 5 > '"$T"'/xid"'; check xid-rc $? 1
-grep -q 'Xid count rose 0 -> 5' "$T/out"; check xid-msg $? 0
+rb 'rl_gpu x 30 -- bash -c "echo 1 > '"$T"'/xid"'; check xid-rc $? 1
+grep -q '1 new NVRM Xid line' "$T/out"; check xid-msg $? 0
 echo 0 > "$T/xid"
+
+# stubbed journalctl instead of RCSR_XID_CMD: an old line before the start passes, a new line stops, a failure fails closed
+mkdir -p "$T/jcbin"
+cat > "$T/jcbin/journalctl" <<JC
+#!/bin/sh
+mode=\$(cat "$T/jc.mode")
+[ "\$mode" != fail ] || exit 1
+since=
+[ "\$2" != --since ] || since=\$3
+case "\$mode" in
+  old) [ -n "\$since" ] || echo 'NVRM: Xid (PCI:0000:01:00): 79, old' ;;
+  new) echo 'NVRM: Xid (PCI:0000:01:00): 79, new' ;;
+esac
+exit 0
+JC
+chmod +x "$T/jcbin/journalctl"
+echo old > "$T/jc.mode"
+rb 'rl_gpu jo 30 -- bash -c "exit 4"; echo "rc=$?"' RCSR_XID_CMD= PATH="$T/jcbin:$T/fake:$PATH"
+grep -q '^rc=4$' "$T/out"; check jc-old-passes-rc $? 0
+grep -q '^\[xid\] new=0 since=[0-9-]* [0-9:]* rc=4$' "$T/run/jo.log"; check jc-old-line $? 0
+echo new > "$T/jc.mode"
+rb 'rl_gpu jn 30 -- true' RCSR_XID_CMD= PATH="$T/jcbin:$T/fake:$PATH"; check jc-new-rc $? 1
+grep -q '1 new NVRM Xid line' "$T/out"; check jc-new-msg $? 0
+echo fail > "$T/jc.mode"
+rb 'rl_gpu jf 30 -- true' RCSR_XID_CMD= PATH="$T/jcbin:$T/fake:$PATH"; check jc-fail-rc $? 1
+grep -q 'Xid check failed' "$T/out"; check jc-fail-msg $? 0
 
 # rl_cpu uses the slot, no Xid line
 rm -f "$T/slots"

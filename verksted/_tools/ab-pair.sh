@@ -2,13 +2,13 @@
 # Usage: ab-pair.sh --label <name> --a <bin> --b <bin> [--seeds 1,2,3] [--timeout S] -- <args, {seed} replaced per run>
 # Paired A/B. For each seed, one test-lock hold runs both arms back to back: A first for the 1st, 3rd, ... seed,
 # B first for the 2nd, 4th, ... Each run: /usr/bin/time -f '%e %U %S %M %x' and an outer timeout S (default 280).
-# The Xid count is read before and after each hold; a rise stops the run.
+# New Xid lines since the start of each hold are counted; any new line stops the run.
 # Results in $G/ab-<label>/: runs.tsv (arm seed order wall_s user_s sys_s maxrss_kb rc), <arm>-s<seed>.out and .err,
 # summary.txt (per arm: runs, median user_s, median wall_s, max maxrss_kb; then `ratio_user b/a <x>`).
 # Log $G/ab-<label>.log ends with the RC_DONE line.
 # Compare user CPU time inside these pairs only, never with older runs.
 # Writes: $G/ab-<label>/ and $G/ab-<label>.log only.
-# Exit: 0 every run rc 0; 1 any run failed; 70 Xid rose; 2 usage (2 x timeout must stay under 600 s; --label kebab-case).
+# Exit: 0 every run rc 0; 1 any run failed; 70 a new Xid line appeared or the Xid check failed; 2 usage (2 x timeout must stay under 600 s; --label kebab-case).
 set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
@@ -18,7 +18,7 @@ if [ "${1:-}" = __pair ]; then
   shift 8
   args=()
   for x in "$@"; do args+=("${x//\{seed\}/$seed}"); done
-  before=$(xid_count)
+  xs=$(xid_start)
   for i in 0 1; do
     arm=${order:$i:1}
     if [ "$arm" = A ]; then bin=$bin_a; else bin=$bin_b; fi
@@ -27,9 +27,9 @@ if [ "${1:-}" = __pair ]; then
     read -r wall user sys rss rc < <(tail -n 1 "$base.time")
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$arm" "$seed" "$order" "$wall" "$user" "$sys" "$rss" "$rc" >> "$dir/runs.tsv"
   done
-  after=$(xid_count)
-  if [ "$after" -gt "$before" ]; then
-    echo "ab-pair: Xid count rose from $before to $after in the hold for seed $seed" >&2
+  xn=$(xid_new_since "$xs") || { echo "ab-pair: Xid check failed in the hold for seed $seed; failing closed" >&2; exit 70; }
+  if [ "$xn" -gt 0 ]; then
+    echo "ab-pair: $xn new Xid line(s) since $xs in the hold for seed $seed" >&2
     exit 70
   fi
   exit 0

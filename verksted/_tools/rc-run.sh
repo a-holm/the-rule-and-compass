@@ -8,9 +8,9 @@
 # under an outer `timeout -k $KILL_AFTER` (30 s, override RCSR_KILL_AFTER). Lock modes refuse --timeout above LOCK_HOLD_MAX (600 s).
 # Lock modes run the command through lock-run.sh: its own session; when it owns the flock on $LOCKFILE, every process sharing that flock after the command ended is
 # TERMed, then KILLed, by pid, so a crashed tool cannot leave the lock held.
-# Lock modes add the line `xid before=<a> after=<b>`; the last log line is `RC_DONE rc=<n> at=<UTC>`.
+# Lock modes add the line `xid new=<n> since=<start>` (new NVRM Xid lines since the start of the hold); the last log line is `RC_DONE rc=<n> at=<UTC>`.
 # Writes: the log $(log_path <id> <tag>) (overwritten on rerun).
-# Exit: the command's exit code; 70 when the Xid count rose; 71 when a process still held the lock after the KILL; 75 when the slot or lock gave up; 2 usage or refused input.
+# Exit: the command's exit code; 70 when a new Xid line appeared or the Xid check failed; 71 when a process still held the lock after the KILL; 75 when the slot or lock gave up; 2 usage or refused input.
 set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
@@ -74,15 +74,19 @@ done
 log=$(log_path "$id" "$tag")
 : > "$log"
 echo "$log"
-x0=0
-[ "$lock" -eq 1 ] && x0=$(xid_count)
+xs=
+[ "$lock" -eq 1 ] && xs=$(xid_start)
 "$runner" bash -c "$inner" >> "$log" 2>&1
 rc=$?
 if [ "$lock" -eq 1 ]; then
-  x1=$(xid_count)
-  echo "xid before=$x0 after=$x1" >> "$log"
-  if [ "$x1" -gt "$x0" ]; then
-    echo "STOP: NVRM Xid count rose $x0 -> $x1" >> "$log"
+  if xn=$(xid_new_since "$xs" 2>> "$log"); then
+    echo "xid new=$xn since=$xs" >> "$log"
+    if [ "$xn" -gt 0 ]; then
+      echo "STOP: $xn new NVRM Xid line(s) since $xs" >> "$log"
+      rc=70
+    fi
+  else
+    echo "STOP: Xid check failed (start=${xs:-missing}); failing closed" >> "$log"
     rc=70
   fi
 fi

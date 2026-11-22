@@ -10,7 +10,7 @@
 # Run the whole planned pass with sanitize-all.sh.
 # Search-level tests must set dispatch: DispatchMode::Device (CLI --dispatch device), or every stage runs on the CPU.
 # Writes: the logs <id>-<tag>-build and <id>-<tag> (see rc-run.sh).
-# Exit: 0 when the log holds `ERROR SUMMARY: 0 errors` and the run exits 0; 1 otherwise; 3 when $SANITIZER is missing or not a CUDA 13 path; 70 Xid rose; 2 usage.
+# Exit: 0 when the log holds `ERROR SUMMARY: 0 errors` and the run exits 0; 1 otherwise; 3 when $SANITIZER is missing or not a CUDA 13 path; 70 a new Xid line appeared or the Xid check failed; 2 usage.
 set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 RC_RUN=$(dirname "${BASH_SOURCE[0]}")/rc-run.sh
