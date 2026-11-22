@@ -3556,8 +3556,9 @@ fn hash_with_input_changed(id: &str) -> u64 {
 }
 
 /// Every row of the table changes the hash, so a flag listed there is a real
-/// resume input. The count pins the hashed inputs: a new `fnv_u64` input needs a
-/// `BOOK_INPUTS` row and a case in `hash_with_input_changed`.
+/// resume input. The hash words the book folds (read from the hash function) are
+/// exactly the words the table names: a new fold needs a `BOOK_INPUTS` row and a
+/// case in `hash_with_input_changed`.
 #[test]
 fn every_book_input_changes_the_hash() {
     let s = slice(&[50, 50]);
@@ -3579,11 +3580,62 @@ fn every_book_input_changes_the_hash() {
         assert_ne!(base, hash_with_input_changed(input.id), "{}", input.id);
         assert!(!input.flags.is_empty(), "{}", input.id);
     }
-    let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/trading.rs")).unwrap();
-    // `with_layer` joins the hash of a gate-search book, which has no checkpoint and no --resume.
-    let book_source = &source[..source.find("pub fn with_layer").unwrap()];
-    let hashed = book_source.lines().filter(|l| l.contains("fnv_u64(&mut hash") || l.contains("fnv_u64(&mut self.hash")).count();
-    assert_eq!(hashed, 23, "the hash inputs changed: update BOOK_INPUTS, hash_with_input_changed and this count");
+    let mut folded: Vec<&str> = Vec::new();
+    for book in hash_word_books() {
+        for id in book.hash_inputs() {
+            if !folded.contains(id) {
+                folded.push(id);
+            }
+        }
+    }
+    let covered: Vec<&str> = trading::BOOK_INPUTS.iter().flat_map(|i| i.hashed.iter().copied()).collect();
+    let uncovered: Vec<&&str> = folded.iter().filter(|w| !covered.contains(w)).collect();
+    let unused: Vec<&&str> = covered.iter().filter(|w| !folded.contains(w)).collect();
+    assert!(uncovered.is_empty(), "hash words with no BOOK_INPUTS row: {uncovered:?}");
+    assert!(unused.is_empty(), "BOOK_INPUTS rows name hash words no book folds: {unused:?}");
+}
+
+/// Books that between them take every optional branch of the book hash.
+fn hash_word_books() -> Vec<FitnessBook> {
+    let s = slice(&[200, 200]);
+    let on: Vec<bool> = (0..400).map(|i| i % 7 != 0).collect();
+    let mask = || Some(trading::BookMask { on: &on, identity: "g|0|1" });
+    let mut sd = trading::BandSpec::score(0.5);
+    sd.units = trading::BandUnits::Sd;
+    let banded = TradingSpec { band: trading::BandSpec::score(0.5), min_holding: 2, ..spec() };
+    let sd_spec = TradingSpec { band: sd, ..spec() };
+    let plain = FitnessBook::new(&s, &spec(), 900.0).unwrap();
+    vec![
+        FitnessBook::with_segments(&s, &banded, 900.0, 3, 1.0, &[1.6e9 + 900.0 * 100.0], mask()).unwrap(),
+        FitnessBook::with_segments(&s, &sd_spec, 900.0, 9, 1.0, &[], mask()).unwrap().with_stat(trading::BlockStat::Cvar(0.5)).unwrap(),
+        FitnessBook::new(&s, &TradingSpec { pnl_excess: trading::PnlExcess::XsMean, ..spec() }, 900.0).unwrap(),
+        FitnessBook::new(&s, &TradingSpec { cash_mode: trading::CashMode::TrainMean, ..spec() }, 900.0).unwrap(),
+        plain,
+    ]
+}
+
+/// The words of a book with a position layer that no table row names are the
+/// layer's own: it has no checkpoint and no `--resume`.
+#[test]
+fn layer_hash_words_have_no_resume_row() {
+    #[derive(Debug)]
+    struct Layer;
+    impl trading::PositionLayer for Layer {
+        fn positions(&self, pred: &[f64]) -> Vec<f64> {
+            pred.iter().map(|&p| if p > 0.0 { f64::MAX } else { f64::MIN }).collect()
+        }
+        fn identity(&self) -> String {
+            "layer".to_string()
+        }
+    }
+    let s = slice(&[200, 200]);
+    let plain = FitnessBook::new(&s, &spec(), 900.0).unwrap();
+    let layered = plain.clone().with_layer(std::sync::Arc::new(Layer)).unwrap();
+    let extra: Vec<&&str> = layered.hash_inputs().iter().filter(|w| !plain.hash_inputs().contains(w)).collect();
+    assert_eq!(extra, trading::BOOK_LAYER_INPUTS.iter().collect::<Vec<_>>());
+    for word in trading::BOOK_LAYER_INPUTS {
+        assert!(!trading::BOOK_INPUTS.iter().any(|i| i.hashed.contains(word)), "{word}");
+    }
 }
 
 /// Every flag of the table is a flag of `rcsr --help`.
