@@ -215,7 +215,7 @@ pub struct QdArchive {
     fallbacks: usize,
     /// #1084: what the descriptor axes measure.
     kind: DescriptorKind,
-    /// Threads for the descriptor fallback evaluations; never part of the state.
+    /// Threads for the descriptor fallback evaluations and the final refit; never part of the state.
     workers: usize,
 }
 
@@ -442,7 +442,7 @@ impl QdArchive {
         self
     }
 
-    /// Threads for the descriptor fallback evaluations. The archive does not
+    /// Threads for the descriptor fallback evaluations and the final refit. The archive does not
     /// depend on the count.
     pub fn with_workers(mut self, workers: usize) -> Self {
         self.workers = workers.max(1);
@@ -651,27 +651,70 @@ impl QdArchive {
         &mut self,
         trees: impl IntoIterator<Item = (Node, f64, f64, Option<Descriptor>)>,
         sample: &Sample,
-        fallback: impl Fn(&Node) -> Descriptor,
+        fallback: impl Fn(&Node) -> Descriptor + Sync,
     ) {
         let tag = sample_tag(sample);
         if tag != self.known_tag {
             self.known.clear();
             self.known_tag = tag;
         }
+        // Resolve serially, in item order, which descriptor each item takes.
+        // The cache evolves exactly as in a one-at-a-time loop (a placeholder
+        // stands in for a pending fallback), so the fallback count and the
+        // cache clears match it. Only the evaluations run in parallel.
+        enum Source {
+            Given(Descriptor),
+            Job(usize),
+        }
+        let mut items: Vec<(Node, f64, f64, u64, Source)> = Vec::new();
+        let mut jobs: Vec<usize> = Vec::new();
+        let mut pending: HashMap<u64, usize> = HashMap::new();
         for (tree, error, cost, d) in trees {
             let hash = expr::structural_hash(&tree);
-            let d = match d {
-                Some(d) => d,
-                None => match self.known.get(&hash).copied() {
-                    Some(d) => d,
-                    None => {
-                        self.fallbacks += 1;
-                        fallback(&tree)
-                    }
+            let source = match d {
+                Some(d) => Source::Given(d),
+                None => match pending.get(&hash) {
+                    Some(&job) => Source::Job(job),
+                    None => match self.known.get(&hash).copied() {
+                        Some(d) => Source::Given(d),
+                        None => {
+                            self.fallbacks += 1;
+                            jobs.push(items.len());
+                            Source::Job(jobs.len() - 1)
+                        }
+                    },
                 },
             };
-            self.remember(&tree, d);
-            self.insert_descriptor(&tree, error, cost, d);
+            if self.known.len() >= KNOWN_CACHE_CAP {
+                self.known.clear();
+                pending.clear();
+            }
+            match source {
+                Source::Given(d) => {
+                    pending.remove(&hash);
+                    self.known.insert(hash, d);
+                }
+                Source::Job(job) => {
+                    pending.insert(hash, job);
+                    self.known.insert(hash, Descriptor { usage: 0.0, skew: 0.0 });
+                }
+            }
+            items.push((tree, error, cost, hash, source));
+        }
+        let computed = crate::search::par_map(
+            self.workers,
+            jobs.iter().map(|&i| &items[i].0).collect::<Vec<&Node>>(),
+            |tree| fallback(tree),
+        );
+        for (hash, job) in pending {
+            self.known.insert(hash, computed[job]);
+        }
+        for (tree, error, cost, _, source) in &items {
+            let d = match *source {
+                Source::Given(d) => d,
+                Source::Job(job) => computed[job],
+            };
+            self.insert_descriptor(tree, *error, *cost, d);
         }
         self.maybe_recenter();
     }
@@ -1633,21 +1676,122 @@ mod tests {
     fn record_by_takes_the_callers_fallback() {
         let s = sample();
         let mut archive = QdArchive::new(4, 4).with_kind(DescriptorKind::Book);
-        let calls = std::cell::Cell::new(0usize);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
         let fixed = Descriptor { usage: 0.9, skew: 0.1 };
         let tree = node(Op::Add, vec![input(0), constant(1.0)]);
         let items = vec![(tree.clone(), 1.0, 3.0, None), (tree.clone(), 1.0, 3.0, None)];
         archive.record_with_descriptors_by(items, &s, |_| {
-            calls.set(calls.get() + 1);
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             fixed
         });
-        assert_eq!(calls.get(), 1, "the second offer reuses the known descriptor");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1, "the second offer reuses the known descriptor");
         assert_eq!(archive.report().descriptor_fallbacks, 1);
         let occupied = archive.occupied_cells();
         assert_eq!(occupied.len(), 1);
         assert_eq!(occupied[0].0, archive.cell_index(fixed));
     }
 
+    /// #1343: the previous one-at-a-time loop, kept as the oracle for the
+    /// parallel fallback evaluation.
+    fn record_serially(
+        q: &mut QdArchive,
+        items: Vec<(Node, f64, f64, Option<Descriptor>)>,
+        s: &Sample,
+        fallback: impl Fn(&Node) -> Descriptor,
+    ) {
+        let tag = sample_tag(s);
+        if tag != q.known_tag {
+            q.known.clear();
+            q.known_tag = tag;
+        }
+        for (tree, error, cost, d) in items {
+            let hash = expr::structural_hash(&tree);
+            let d = match d {
+                Some(d) => d,
+                None => match q.known.get(&hash).copied() {
+                    Some(d) => d,
+                    None => {
+                        q.fallbacks += 1;
+                        fallback(&tree)
+                    }
+                },
+            };
+            q.remember(&tree, d);
+            q.insert_descriptor(&tree, error, cost, d);
+        }
+        q.maybe_recenter();
+    }
+
+    /// #1343: parallel fallback evaluation inserts in item order, counts one
+    /// fallback per cache miss (including a re-miss after the cache clears) and
+    /// leaves the same cache as the serial loop, at any worker count.
+    #[test]
+    fn parallel_fallbacks_match_the_serial_loop() {
+        let s = sample();
+        let fallback = |t: &Node| {
+            let h = expr::structural_hash(t);
+            Descriptor { usage: (h % 7) as f64 / 7.0, skew: ((h >> 8) % 5) as f64 / 5.0 }
+        };
+        let n = KNOWN_CACHE_CAP + 700;
+        let items = |round: usize| -> Vec<(Node, f64, f64, Option<Descriptor>)> {
+            (0..n)
+                .map(|i| {
+                    let k = if i % 3 == 0 { i % 500 } else { i + round * n };
+                    let tree = node(Op::Add, vec![input(0), constant(k as f64)]);
+                    let given = (i % 11 == 0).then_some(Descriptor { usage: 0.5, skew: 0.25 });
+                    (tree, ((i * 31) % 97) as f64 + 1.0, 3.0 + (i % 5) as f64, given)
+                })
+                .collect()
+        };
+        for kind in [QdArchive::new(4, 2), QdArchive::new_cvt(16, 2)] {
+            let mut serial = kind.clone().with_nvars(2);
+            record_serially(&mut serial, items(0), &s, fallback);
+            record_serially(&mut serial, items(1), &s, fallback);
+            assert!(serial.report().descriptor_fallbacks > 0);
+            for workers in [1usize, 4] {
+                let mut par = kind.clone().with_nvars(2).with_workers(workers);
+                par.record_with_descriptors_by(items(0), &s, fallback);
+                par.record_with_descriptors_by(items(1), &s, fallback);
+                assert_eq!(par.report().descriptor_fallbacks, serial.report().descriptor_fallbacks, "workers {workers}");
+                assert_eq!(format!("{:?}", par.state()), format!("{:?}", serial.state()), "workers {workers}");
+            }
+        }
+    }
+
+    /// #1343: phase seconds of 300 descriptor fallbacks on 57,760 rows, serial
+    /// loop against the parallel path. Run with
+    /// `cargo test --release --lib parallel_fallback_phase -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn parallel_fallback_phase_seconds() {
+        let mut s = Sample::default();
+        for i in 0..57_760 {
+            let x = -1.0 + 2.0 * i as f64 / 57_760.0;
+            s.x.push(vec![x, x * x]);
+            s.y.push(x);
+        }
+        let items = || -> Vec<(Node, f64, f64, Option<Descriptor>)> {
+            (0..300)
+                .map(|k| {
+                    let c = 0.01 * k as f64;
+                    let inner = node(Op::Mul, vec![constant(c), input(0)]);
+                    let t = node(Op::Add, vec![node(Op::Sin, vec![inner]), node(Op::Mul, vec![input(1), input(1)])]);
+                    (t, 1.0 + c, 5.0, None)
+                })
+                .collect()
+        };
+        let fallback = |t: &Node| descriptor(t, &s);
+        let mut serial = QdArchive::new_cvt(64, 4).with_nvars(2);
+        let t = std::time::Instant::now();
+        record_serially(&mut serial, items(), &s, fallback);
+        let serial_s = t.elapsed().as_secs_f64();
+        let mut par = QdArchive::new_cvt(64, 4).with_nvars(2).with_workers(4);
+        let t = std::time::Instant::now();
+        par.record_with_descriptors_by(items(), &s, fallback);
+        let par_s = t.elapsed().as_secs_f64();
+        assert_eq!(format!("{:?}", par.state()), format!("{:?}", serial.state()));
+        println!("serial {serial_s:.4} s, parallel x4 {par_s:.4} s");
+    }
     /// #1345: the previous one-at-a-time refit, kept as the oracle for the
     /// parallel scoring.
     fn refit_serially(q: &mut QdArchive, score: impl Fn(&Node) -> (f64, f64)) {
