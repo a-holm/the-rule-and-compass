@@ -1,11 +1,12 @@
 //! Check logic of the verksted workshop. Pure std; no `crate::` paths, so the file compiles as a
-//! crate module and through `#[path]` in `my-version/tests/verksted_links.rs`.
+//! crate module and through `#[path]` in the tests of this crate.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const SKIP_DIRS: [&str; 4] = ["node_modules", "_archive", "raw", "target"];
+const SKIP_DIRS: [&str; 5] = ["node_modules", "_archive", "raw", "target", "_local"];
 const CONTRACT: [&str; 4] = ["Inputs", "Process", "Outputs", "Check"];
+const ALTERNATIVES: &str = "Stages with the same number are alternatives";
 
 #[derive(Default)]
 pub struct Report {
@@ -14,7 +15,13 @@ pub struct Report {
     pub broken: Vec<String>,
 }
 
-pub fn collect_markdown(dir: &Path, out: &mut Vec<PathBuf>) {
+/// A directory of test inputs: `tests/fixtures`.
+fn is_fixtures(path: &Path, name: &str) -> bool {
+    name == "fixtures" && path.parent().and_then(|p| p.file_name()).map(|n| n == "tests").unwrap_or(false)
+}
+
+/// Markdown files under `dir`, sorted by path components. `skip` decides per directory.
+fn collect_md(dir: &Path, skip: &dyn Fn(&Path, &str) -> bool, out: &mut Vec<PathBuf>) {
     let mut entries: Vec<PathBuf> = fs::read_dir(dir)
         .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
         .map(|e| e.expect("dir entry").path())
@@ -23,13 +30,21 @@ pub fn collect_markdown(dir: &Path, out: &mut Vec<PathBuf>) {
     for path in entries {
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if path.is_dir() {
-            if !name.starts_with('.') && !SKIP_DIRS.contains(&name) {
-                collect_markdown(&path, out);
+            if !skip(&path, name) {
+                collect_md(&path, skip, out);
             }
         } else if name.ends_with(".md") {
             out.push(path);
         }
     }
+}
+
+pub fn collect_markdown(dir: &Path, out: &mut Vec<PathBuf>) {
+    collect_md(
+        dir,
+        &|path, name| name.starts_with('.') || SKIP_DIRS.contains(&name) || is_fixtures(path, name),
+        out,
+    );
 }
 
 fn has_scheme(s: &str) -> bool {
@@ -132,18 +147,104 @@ fn backtick_spans(line: &str) -> Vec<&str> {
     parts.iter().skip(1).step_by(2).copied().collect()
 }
 
+/// Frontmatter text and body. A file without a closing `---` line has no frontmatter.
+fn split_front(text: &str) -> (&str, &str) {
+    if let Some(rest) = text.strip_prefix("---") {
+        if let Some(end) = rest.find("\n---") {
+            return (&rest[..end], &rest[end + 4..]);
+        }
+    }
+    ("", text)
+}
+
+/// The value of the first `key:` line at or after byte `from`, with the byte where it ends.
+/// Whitespace after the colon may span lines, so a key with an empty value takes the next line.
+fn key_value<'a>(front: &'a str, keys: &[&str], from: usize) -> Option<(&'a str, usize)> {
+    let mut pos = if from == 0 {
+        0
+    } else {
+        from + front[from..].find('\n')? + 1
+    };
+    loop {
+        for key in keys {
+            if let Some(after) = front[pos..].strip_prefix(key).and_then(|r| r.strip_prefix(':')) {
+                let value_at = front.len() - after.trim_start().len();
+                if value_at < front.len() {
+                    let end = front[value_at..].find('\n').map_or(front.len(), |i| value_at + i);
+                    return Some((&front[value_at..end], end));
+                }
+            }
+        }
+        pos += front[pos..].find('\n')? + 1;
+    }
+}
+
+/// `.md` paths in a `consumes:` or `produces:` value: runs without whitespace, brackets, commas
+/// or quotes that end in `.md` at a word boundary.
+fn md_targets(value: &str) -> Vec<String> {
+    let chars: Vec<char> = value.chars().collect();
+    let stop = |c: char| c.is_whitespace() || "[],\"'".contains(c);
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if stop(chars[i]) {
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j < chars.len() && !stop(chars[j]) {
+            j += 1;
+        }
+        let found = (i + 1..=j.saturating_sub(3)).rev().find(|&k| {
+            chars[k..k + 3] == ['.', 'm', 'd'] && (k + 3 == chars.len() || !word(chars[k + 3]))
+        });
+        match found {
+            Some(k) => {
+                out.push(chars[i..k + 3].iter().collect());
+                i = k + 3;
+            }
+            None => i = j,
+        }
+    }
+    out
+}
+
+/// `.md` targets of the `consumes:` and `produces:` keys.
+fn frontmatter_targets(front: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some((value, end)) = key_value(front, &["consumes", "produces"], from) {
+        out.extend(md_targets(value));
+        from = end;
+    }
+    out
+}
+
+/// One link target relative to the file's folder: skips web links, anchors and placeholders.
+fn check_target(dir: &Path, rel: &str, target: &str, report: &mut Report) {
+    if has_scheme(target) || target.starts_with('#') || target.contains('{') {
+        return;
+    }
+    let path_part = target.split('#').next().unwrap_or("");
+    if path_part.is_empty() {
+        return;
+    }
+    report.checked += 1;
+    if !dir.join(percent_decode(path_part)).exists() {
+        report.broken.push(format!("{rel}: link {target}"));
+    }
+}
+
 fn check_file(root: &Path, file: &Path, report: &mut Report) {
     let text = fs::read_to_string(file).unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
-    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
-    let body = match text.strip_prefix("---") {
-        Some(rest) => match rest.find("\n---") {
-            Some(end) => &rest[end + 4..],
-            None => text,
-        },
-        None => text,
-    };
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text).replace("\r\n", "\n");
+    let (front, body) = split_front(&text);
     let rel = file.strip_prefix(root).unwrap_or(file).display().to_string();
     let dir = file.parent().expect("file has a parent");
+    for target in frontmatter_targets(front) {
+        check_target(dir, &rel, &target, report);
+    }
     let mut fence: Option<&str> = None;
     let mut in_inputs = false;
     let mut strict = false;
@@ -189,17 +290,7 @@ fn check_file(root: &Path, file: &Path, report: &mut Report) {
             }
         }
         for target in targets {
-            if has_scheme(&target) || target.starts_with('#') || target.contains('{') {
-                continue;
-            }
-            let path_part = target.split('#').next().unwrap_or("");
-            if path_part.is_empty() {
-                continue;
-            }
-            report.checked += 1;
-            if !dir.join(percent_decode(path_part)).exists() {
-                report.broken.push(format!("{rel}: link {target}"));
-            }
+            check_target(dir, &rel, &target, report);
         }
 
         let is_bullet = trimmed.starts_with("- ") || trimmed.starts_with("* ");
@@ -238,6 +329,575 @@ pub fn check_tree(root: &Path) -> Report {
         check_file(root, file, &mut report);
     }
     report
+}
+
+// ICM rules: the strict link check, the graph and the reference rules.
+
+const ICM_SKIP: [&str; 4] = ["node_modules", "_archive", "_templates", "raw"];
+
+pub struct Node {
+    pub path: String,
+    pub kind: String,
+    pub title: String,
+    pub description: String,
+    pub tags: String,
+}
+
+#[derive(Default)]
+pub struct Graph {
+    pub files: usize,
+    pub checked: usize,
+    pub broken: Vec<String>,
+    pub nodes: Vec<(String, Node)>,
+    pub edges: Vec<(String, String)>,
+}
+
+fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// `path` relative to the absolute folder `base`, with `/` separators.
+fn relative_to(path: &Path, base: &Path) -> String {
+    let p: Vec<_> = path.components().collect();
+    let b: Vec<_> = base.components().collect();
+    let common = p.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    let mut parts: Vec<String> = vec!["..".to_string(); b.len() - common];
+    parts.extend(p[common..].iter().map(|c| c.as_os_str().to_string_lossy().into_owned()));
+    parts.join("/")
+}
+
+fn is_md_name(path: &Path) -> bool {
+    path.file_name().and_then(|n| n.to_str()).map(|n| n.len() > 3 && n.ends_with(".md")).unwrap_or(false)
+}
+
+/// Python-style line split: `\n` and the other Unicode line boundaries.
+fn split_lines(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (i, c) in text.char_indices() {
+        if "\n\x0b\x0c\x1c\x1d\x1e\u{85}\u{2028}\u{2029}".contains(c) {
+            out.push(&text[start..i]);
+            start = i + c.len_utf8();
+        }
+    }
+    if start < text.len() {
+        out.push(&text[start..]);
+    }
+    out
+}
+
+/// A `#` heading line: its level and its text without trailing `#` marks.
+fn heading(line: &str) -> Option<(usize, String)> {
+    let level = line.chars().take_while(|c| *c == '#').count();
+    if !(1..=6).contains(&level) {
+        return None;
+    }
+    let rest = &line[level..];
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let text = rest.trim_start().trim_end().trim_end_matches('#').trim_end();
+    Some((level, text.to_string()))
+}
+
+/// Targets of `[text](target)` and `[text](<target>)` links in one line.
+fn md_links(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    while let Some(o) = line[start..].find('[') {
+        let i = start + o;
+        let Some(c) = line[i + 1..].find(']') else { break };
+        let j = i + 1 + c;
+        let mut next = i + 1;
+        if line[j + 1..].starts_with('(') {
+            let k = j + 2;
+            let rest = &line[k..];
+            let mut hit: Option<(String, usize)> = None;
+            if let Some(inner) = rest.strip_prefix('<') {
+                if let Some(g) = inner.find('>') {
+                    if g >= 1 && inner[g + 1..].starts_with(')') {
+                        hit = Some((inner[..g].to_string(), k + 1 + g + 2));
+                    }
+                }
+            }
+            if hit.is_none() {
+                if let Some(e) = rest.find(|c: char| c == ')' || c.is_whitespace()) {
+                    if e >= 1 && rest[e..].starts_with(')') {
+                        let group = &rest[..e];
+                        let target = if group.starts_with('<') {
+                            let cs: Vec<char> = group.chars().collect();
+                            cs[1..cs.len() - 1].iter().collect()
+                        } else {
+                            group.to_string()
+                        };
+                        hit = Some((target, k + e + 1));
+                    }
+                }
+            }
+            if let Some((target, end)) = hit {
+                out.push(target);
+                next = end;
+            }
+        }
+        start = next;
+    }
+    out
+}
+
+/// Backticked spans without whitespace.
+fn tick_spans(line: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    while let Some(o) = line[start..].find('`') {
+        let i = start + o;
+        let rest = &line[i + 1..];
+        let run = rest.find(|c: char| c == '`' || c.is_whitespace()).unwrap_or(rest.len());
+        if run > 0 && rest[run..].starts_with('`') {
+            out.push(&rest[..run]);
+            start = i + 1 + run + 1;
+        } else {
+            start = i + 1;
+        }
+    }
+    out
+}
+
+fn icm_looks_like_path(s: &str) -> bool {
+    if s.chars().any(|c| "{}<>*?|".contains(c)) || has_scheme(s) {
+        return false;
+    }
+    if s.contains('/') {
+        return true;
+    }
+    match s.rfind('.') {
+        Some(i) => {
+            let ext: Vec<char> = s[i + 1..].chars().collect();
+            (1..=5).contains(&ext.len()) && ext.iter().all(|c| c.is_alphanumeric() || *c == '_')
+        }
+        None => false,
+    }
+}
+
+/// A frontmatter value: comment dropped, quotes removed, JSON escapes of double quotes decoded.
+fn field(front: &str, name: &str) -> String {
+    let Some((raw, _)) = key_value(front, &[name], 0) else { return String::new() };
+    let mut v = raw.trim().to_string();
+    if !v.starts_with(['"', '\'']) && !v.is_empty() {
+        let cs: Vec<char> = v.chars().collect();
+        let cut = (0..cs.len().saturating_sub(1)).find(|&i| {
+            cs[i].is_whitespace() && {
+                let mut k = i;
+                while k < cs.len() && cs[k].is_whitespace() {
+                    k += 1;
+                }
+                k < cs.len() && cs[k] == '#'
+            }
+        });
+        if let Some(i) = cut {
+            v = cs[..i].iter().collect();
+        }
+    }
+    let n = v.chars().count();
+    if n > 1 && v.starts_with('"') && v.ends_with('"') {
+        return json_string(&v).unwrap_or_else(|| v.chars().skip(1).take(n - 2).collect());
+    }
+    if n > 1 && v.starts_with('\'') && v.ends_with('\'') {
+        return v.chars().skip(1).take(n - 2).collect();
+    }
+    v
+}
+
+/// Decodes one complete JSON string literal; `None` when it is not valid JSON.
+fn json_string(v: &str) -> Option<String> {
+    let cs: Vec<char> = v.chars().collect();
+    let mut out = String::new();
+    let mut i = 1;
+    let hex4 = |at: usize| -> Option<u32> {
+        let s: String = cs.get(at..at + 4)?.iter().collect();
+        if s.chars().all(|c| c.is_ascii_hexdigit()) {
+            u32::from_str_radix(&s, 16).ok()
+        } else {
+            None
+        }
+    };
+    loop {
+        let c = *cs.get(i)?;
+        i += 1;
+        match c {
+            '"' => return if i == cs.len() { Some(out) } else { None },
+            '\\' => {
+                let e = *cs.get(i)?;
+                i += 1;
+                match e {
+                    '"' => out.push('"'),
+                    '\\' => out.push('\\'),
+                    '/' => out.push('/'),
+                    'b' => out.push('\u{8}'),
+                    'f' => out.push('\u{c}'),
+                    'n' => out.push('\n'),
+                    'r' => out.push('\r'),
+                    't' => out.push('\t'),
+                    'u' => {
+                        let mut cp = hex4(i)?;
+                        i += 4;
+                        if (0xd800..0xdc00).contains(&cp) && cs.get(i) == Some(&'\\') && cs.get(i + 1) == Some(&'u') {
+                            if let Some(lo) = hex4(i + 2).filter(|l| (0xdc00..0xe000).contains(l)) {
+                                cp = 0x10000 + ((cp - 0xd800) << 10) + (lo - 0xdc00);
+                                i += 6;
+                            }
+                        }
+                        out.push(char::from_u32(cp).unwrap_or('\u{fffd}'));
+                    }
+                    _ => return None,
+                }
+            }
+            c if (c as u32) < 0x20 => return None,
+            c => out.push(c),
+        }
+    }
+}
+
+fn json_str(s: &str, ascii: bool) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 || (ascii && (c as u32) > 0x7e) => {
+                let mut units = [0u16; 2];
+                for u in c.encode_utf16(&mut units) {
+                    out.push_str(&format!("\\u{u:04x}"));
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+struct Scan<'a> {
+    root: &'a Path,
+    graph: Graph,
+}
+
+impl Scan<'_> {
+    fn link(&mut self, file: &Path, file_canon: &Path, rel: &str, target: &str) {
+        if has_scheme(target) || target.starts_with('#') || target.contains('{') {
+            return;
+        }
+        self.graph.checked += 1;
+        let decoded = percent_decode(target.split('#').next().unwrap_or(""));
+        let path = normalize(&file.parent().expect("file has a parent").join(decoded));
+        if !path.exists() {
+            self.graph.broken.push(format!("{rel}: {target}"));
+        } else if is_md_name(&path) {
+            let canon = fs::canonicalize(&path).unwrap_or(path);
+            if canon != file_canon {
+                let to = relative_to(&canon, self.root);
+                let edge = (rel.to_string(), to);
+                if !self.graph.edges.contains(&edge) {
+                    self.graph.edges.push(edge);
+                }
+            }
+        }
+    }
+
+    fn file(&mut self, file: &Path) {
+        let canon = fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
+        let rel = relative_to(file, self.root);
+        let bytes = fs::read(file).unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+        let text = String::from_utf8_lossy(&bytes);
+        let text = text.strip_prefix('\u{feff}').unwrap_or(&text).replace("\r\n", "\n").replace('\r', "\n");
+        let (front, body) = split_front(&text);
+        for target in frontmatter_targets(front) {
+            self.link(file, &canon, &rel, &target);
+        }
+        let mut title = field(front, "title");
+        let mut in_inputs = false;
+        let mut fence: Option<&str> = None;
+        for line in split_lines(body) {
+            let lead = line.trim_start();
+            if lead.starts_with("```") || lead.starts_with("~~~") {
+                let mark = &lead[..3];
+                fence = if fence == Some(mark) { None } else { fence.or(Some(mark)) };
+                continue;
+            }
+            if fence.is_some() {
+                continue;
+            }
+            if let Some((level, text)) = heading(line) {
+                in_inputs = text.trim().to_lowercase() == "inputs";
+                if title.is_empty() && level == 1 {
+                    title = text;
+                }
+                continue;
+            }
+            let stripped = line.trim();
+            if let Some(import) = stripped.strip_prefix('@') {
+                let drive = import.chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false)
+                    && import[1..].starts_with(':');
+                if import.len() > 3
+                    && import.ends_with(".md")
+                    && !import.contains(char::is_whitespace)
+                    && !import.starts_with(['~', '/'])
+                    && !drive
+                {
+                    self.link(file, &canon, &rel, import);
+                }
+            }
+            for target in md_links(line) {
+                self.link(file, &canon, &rel, &target);
+            }
+            let bullet = lead.strip_prefix(['-', '*']).map(|r| r.starts_with(char::is_whitespace)).unwrap_or(false);
+            if in_inputs && bullet {
+                let strict = line.to_lowercase().contains("reference");
+                for span in tick_spans(line) {
+                    if !icm_looks_like_path(span) {
+                        continue;
+                    }
+                    self.graph.checked += 1;
+                    let hits = [
+                        normalize(&file.parent().expect("file has a parent").join(span)),
+                        normalize(&self.root.join(span)),
+                    ];
+                    let ok = hits.iter().any(|h| {
+                        h.exists() || (!strict && h.parent().map(Path::is_dir).unwrap_or(false))
+                    });
+                    if !ok {
+                        self.graph.broken.push(format!("{rel}: input `{span}`"));
+                    }
+                }
+            }
+        }
+        let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+        let node = Node {
+            path: rel.clone(),
+            kind: field(front, "type"),
+            title: if title.is_empty() { stem } else { title },
+            description: field(front, "description"),
+            tags: field(front, "tags"),
+        };
+        self.graph.nodes.push((rel, node));
+    }
+}
+
+/// Walks `root` with the rules of the strict link check. `workshop` additionally skips `_local`
+/// and `tests/fixtures`.
+pub fn scan(root: &Path, workshop: bool) -> Graph {
+    let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let mut files = Vec::new();
+    collect_md(
+        &root,
+        &|path, name| {
+            name.starts_with('.')
+                || ICM_SKIP.contains(&name)
+                || (workshop && (name == "_local" || is_fixtures(path, name)))
+        },
+        &mut files,
+    );
+    let mut scan = Scan { root: &root, graph: Graph::default() };
+    for file in &files {
+        scan.file(file);
+    }
+    scan.graph.files = files.len();
+    scan.graph
+}
+
+/// The report of `links --icm`: broken lines, then the summary line.
+pub fn render_icm_report(g: &Graph) -> String {
+    let mut out = String::new();
+    for b in &g.broken {
+        out.push_str(b);
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "{} files, {} links and inputs checked, {} broken\n",
+        g.files,
+        g.checked,
+        g.broken.len()
+    ));
+    out
+}
+
+/// The graph as JSON lines. `root_ref` is the root folder relative to the output file.
+pub fn render_graph_jsonl(g: &Graph, root_ref: &str) -> String {
+    let mut out = format!("{{\"root\": {}}}\n", json_str(root_ref, true));
+    for (_, n) in &g.nodes {
+        out.push_str(&format!(
+            "{{\"node\": {}, \"type\": {}, \"title\": {}, \"description\": {}, \"tags\": {}}}\n",
+            json_str(&n.path, false),
+            json_str(&n.kind, false),
+            json_str(&n.title, false),
+            json_str(&n.description, false),
+            json_str(&n.tags, false)
+        ));
+    }
+    for (a, b) in &g.edges {
+        out.push_str(&format!("{{\"edge\": [{}, {}]}}\n", json_str(a, false), json_str(b, false)));
+    }
+    out
+}
+
+/// The graph as Graphviz text.
+pub fn render_graph_dot(g: &Graph) -> String {
+    let mut out = String::from("digraph verksted {\n");
+    for (path, _) in &g.nodes {
+        out.push_str(&format!("  {};\n", json_str(path, false)));
+    }
+    for (a, b) in &g.edges {
+        out.push_str(&format!("  {} -> {};\n", json_str(a, false), json_str(b, false)));
+    }
+    out.push_str("}\n");
+    out
+}
+
+/// The root folder relative to the folder that holds the output file (the cwd for stdout).
+pub fn graph_root_ref(root: &Path, out_file: Option<&Path>) -> String {
+    let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let base = match out_file {
+        Some(f) => f.parent().filter(|p| !p.as_os_str().is_empty()).map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from(".")),
+        None => PathBuf::from("."),
+    };
+    let base = fs::canonicalize(&base).unwrap_or(base);
+    relative_to(&root, &base)
+}
+
+/// Each pipeline contract links each of its stages.
+pub fn graph_stage_problems(root: &Path) -> Vec<String> {
+    let graph = scan(root, true);
+    let mut problems = Vec::new();
+    for pipeline in numbered_subdirs(root) {
+        let pname = name_of(&pipeline);
+        let stages_dir = pipeline.join("stages");
+        if !pipeline.join("CONTEXT.md").exists() || !stages_dir.is_dir() {
+            continue;
+        }
+        for stage in numbered_subdirs(&stages_dir) {
+            let sname = name_of(&stage);
+            if !stage.join("CONTEXT.md").exists() {
+                continue;
+            }
+            let edge = (format!("{pname}/CONTEXT.md"), format!("{pname}/stages/{sname}/CONTEXT.md"));
+            if !graph.edges.contains(&edge) {
+                problems.push(format!("{}: no link to stages/{sname}/CONTEXT.md", edge.0));
+            }
+        }
+    }
+    problems
+}
+
+const NOT_NOTES: [&str; 7] = ["_index.md", "index.md", "log.md", "context.md", "agents.md", "claude.md", "gemini.md"];
+
+fn notes_in(dir: &Path, rel: &str, out: &mut Vec<String>) {
+    let Ok(rd) = fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if e.path().is_file() && name.ends_with(".md") && !NOT_NOTES.contains(&name.to_lowercase().as_str()) {
+            out.push(format!("{rel}{name}"));
+        }
+    }
+}
+
+/// Workshop-relative paths of every reference note: `_shared/*.md`, `*/references/*.md` and
+/// `*/stages/*/references/*.md`, sorted by path components.
+pub fn reference_files(root: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    notes_in(&root.join("_shared"), "_shared/", &mut out);
+    for pipeline in numbered_subdirs(root) {
+        let p = name_of(&pipeline);
+        notes_in(&pipeline.join("references"), &format!("{p}/references/"), &mut out);
+        let stages = pipeline.join("stages");
+        if stages.is_dir() {
+            for stage in numbered_subdirs(&stages) {
+                let s = name_of(&stage);
+                notes_in(&stage.join("references"), &format!("{p}/stages/{s}/references/"), &mut out);
+            }
+        }
+    }
+    out.sort_by(|a, b| a.split('/').cmp(b.split('/')));
+    out
+}
+
+fn description_of(root: &Path, rel: &str) -> String {
+    let text = fs::read_to_string(root.join(rel)).unwrap_or_default();
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text).replace("\r\n", "\n");
+    field(split_front(&text).0, "description")
+}
+
+/// A reference note without a frontmatter `description`.
+pub fn reference_description_problems(root: &Path) -> Vec<String> {
+    reference_files(root)
+        .into_iter()
+        .filter(|rel| description_of(root, rel).is_empty())
+        .map(|rel| format!("{rel}: reference has no description in its frontmatter"))
+        .collect()
+}
+
+fn quote_path(path: &str) -> String {
+    let mut out = String::new();
+    for b in path.bytes() {
+        if b.is_ascii_alphanumeric() || b"_.-~/".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+fn render_references(root: &Path) -> String {
+    let mut out = String::new();
+    for rel in reference_files(root) {
+        let name = rel.rsplit('/').next().unwrap_or(&rel);
+        out.push_str(&format!("- [{name}]({})", quote_path(&rel)));
+        let description = description_of(root, &rel);
+        if !description.is_empty() {
+            out.push_str(&format!(": {description}"));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Two stages of one pipeline share a number only when the contract says they are alternatives.
+fn alternative_problems(pname: &str, pipeline_text: &str, stages_dir: &Path) -> Vec<String> {
+    let mut by_number: Vec<(String, Vec<String>)> = Vec::new();
+    for stage in numbered_subdirs(stages_dir) {
+        let sname = name_of(&stage);
+        let number = sname[..2].to_string();
+        match by_number.iter_mut().find(|(n, _)| *n == number) {
+            Some((_, names)) => names.push(sname),
+            None => by_number.push((number, vec![sname])),
+        }
+    }
+    if pipeline_text.contains(ALTERNATIVES) {
+        return Vec::new();
+    }
+    by_number
+        .into_iter()
+        .filter(|(_, names)| names.len() > 1)
+        .map(|(n, names)| {
+            format!("{pname}/CONTEXT.md: stages {} share number {n} without the sentence \"{ALTERNATIVES}\"", names.join(", "))
+        })
+        .collect()
 }
 
 /// The `##` headings of a contract file, fenced blocks excluded.
@@ -327,6 +987,7 @@ pub fn structure_problems(root: &Path) -> Vec<String> {
             problems.push(format!("{pname}: missing stages/"));
             continue;
         }
+        problems.extend(alternative_problems(&pname, &pipeline_text, &stages_dir));
         for stage in numbered_subdirs(&stages_dir) {
             let sname = name_of(&stage);
             let file = stage.join("CONTEXT.md");
@@ -589,6 +1250,8 @@ pub fn render_index(root: &Path) -> String {
         let title = heading_text(&fs::read_to_string(&t).unwrap_or_default());
         out.push_str(&format!("- [{name}](_templates/{name}): {title}\n"));
     }
+    out.push_str("\n## References\n\n");
+    out.push_str(&render_references(root));
     out
 }
 
@@ -659,6 +1322,8 @@ pub fn walk_problems(root: &Path, strict: bool) -> Vec<String> {
         problems.extend(index_problems(root));
         problems.extend(orphan_problems(root));
         problems.extend(root_route_problems(root));
+        problems.extend(reference_description_problems(root));
+        problems.extend(graph_stage_problems(root));
     }
     problems
 }
@@ -843,7 +1508,7 @@ mod tests {
 | Tool | Usage | Writes |\n|---|---|---|\n\
 | [a.sh](_tools/a.sh) | `a.sh <x> \\| y` | out.md |\n\
 | [c](_tools/c/) | A crate | `_index.md` with `index` |\n\
-| [lib.sh](_tools/lib.sh) | sourced | nothing |\n\n## Templates\n\n- [t.md](_templates/t.md): Template title\n";
+| [lib.sh](_tools/lib.sh) | sourced | nothing |\n\n## Templates\n\n- [t.md](_templates/t.md): Template title\n\n## References\n\n";
         assert_eq!(render_index(&root), expected);
         let _ = fs::remove_dir_all(&root);
     }
@@ -892,5 +1557,53 @@ mod tests {
         assert!(root_route_problems(&root).is_empty());
         assert!(walk_problems(&root, true).is_empty(), "{:?}", walk_problems(&root, true));
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn md_targets_follow_the_word_boundary_rule() {
+        assert_eq!(md_targets("[a.md, ../b/c.md, \"d.md\"]"), ["a.md", "../b/c.md", "d.md"]);
+        assert_eq!(md_targets("x.mdx y.md2 z.md"), ["z.md"]);
+        assert_eq!(md_targets(".md a.md.md"), ["a.md.md"]);
+    }
+
+    #[test]
+    fn a_key_with_an_empty_value_takes_the_next_line() {
+        let front = "type: stage\nconsumes:\n  - ../a.md\nproduces: b.md\n";
+        assert_eq!(frontmatter_targets(front), ["../a.md"]);
+        assert_eq!(field("tags:\n  - x\n", "tags"), "- x");
+    }
+
+    #[test]
+    fn field_drops_comments_and_decodes_quotes() {
+        assert_eq!(field("type: stage # note\n", "type"), "stage");
+        assert_eq!(field("t: 'a # b'\n", "t"), "a # b");
+        assert_eq!(field("t: \"a \\u00e5 \\\"q\\\"\"\n", "t"), "a \u{e5} \"q\"");
+        assert_eq!(field("t: \"bad \\x\"\n", "t"), "bad \\x");
+        assert_eq!(field("other: x\n", "t"), "");
+    }
+
+    #[test]
+    fn markdown_links_follow_the_link_pattern() {
+        assert_eq!(md_links("[a](b.md) and [c](<d e.md>) [x](y \"t\") [z]()"), ["b.md", "d e.md"]);
+        assert_eq!(md_links("[a [b](c.md)"), ["c.md"]);
+        assert_eq!(md_links("[a](<b)"), [""]);
+    }
+
+    #[test]
+    fn references_are_listed_with_their_description() {
+        let root = scratch("references");
+        write(&root.join("_shared/a b.md"), "---\ndescription: Shared.\n---\n");
+        write(&root.join("_shared/CLAUDE.md"), "@AGENTS.md\n");
+        write(&root.join("01_p/CONTEXT.md"), "# 01_p: x\n");
+        write(&root.join("01_p/references/r.md"), "# r\n");
+        write(&root.join("01_p/stages/01_s/references/s.md"), "---\ndescription: S.\n---\n");
+        assert_eq!(
+            reference_files(&root),
+            ["01_p/references/r.md", "01_p/stages/01_s/references/s.md", "_shared/a b.md"]
+        );
+        assert_eq!(reference_description_problems(&root), ["01_p/references/r.md: reference has no description in its frontmatter"]);
+        let index = render_index(&root);
+        assert!(index.ends_with("- [a b.md](_shared/a%20b.md): Shared.\n"), "{index}");
+        let _ = fs::remove_dir_all(&root);
     }
 }

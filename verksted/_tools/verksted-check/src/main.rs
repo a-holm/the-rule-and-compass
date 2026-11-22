@@ -3,11 +3,12 @@
 mod check;
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const USAGE: &str = "usage:
-  verksted-check links [DIR]
+  verksted-check links [--icm] [DIR]
+  verksted-check graph [--dot] [--out FILE] [DIR]
   verksted-check walk [--strict] [DIR]
   verksted-check refs [DIR]
   verksted-check index [--check] [DIR]
@@ -38,8 +39,15 @@ fn main() -> ExitCode {
     };
     let mut flags: Vec<&str> = Vec::new();
     let mut dirs: Vec<&str> = Vec::new();
-    for a in rest {
-        if a.starts_with("--") {
+    let mut out_file: Option<&str> = None;
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        if a == "--out" && cmd == "graph" {
+            match it.next() {
+                Some(f) => out_file = Some(f),
+                None => return usage(),
+            }
+        } else if a.starts_with("--") {
             flags.push(a);
         } else {
             dirs.push(a);
@@ -48,7 +56,9 @@ fn main() -> ExitCode {
     let allowed: &[&str] = match cmd.as_str() {
         "walk" => &["--strict"],
         "index" => &["--check"],
-        "links" | "refs" => &[],
+        "links" => &["--icm"],
+        "graph" => &["--dot"],
+        "refs" => &[],
         _ => return usage(),
     };
     if dirs.len() > 1 || flags.iter().any(|f| !allowed.contains(f)) {
@@ -60,10 +70,41 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
     match cmd.as_str() {
+        "links" if flags.contains(&"--icm") => {
+            let graph = check::scan(&dir, false);
+            print!("{}", check::render_icm_report(&graph));
+            if graph.broken.is_empty() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            }
+        }
         "links" => {
             let report = check::check_tree(&dir);
             eprintln!("{} files, {} links and inputs checked", report.files, report.checked);
             finish(&report.broken, "links")
+        }
+        "graph" => {
+            let graph = check::scan(&dir, true);
+            let text = if flags.contains(&"--dot") {
+                check::render_graph_dot(&graph)
+            } else {
+                let root_ref = check::graph_root_ref(&dir, out_file.map(Path::new));
+                check::render_graph_jsonl(&graph, &root_ref)
+            };
+            match out_file {
+                Some(f) => match fs::write(f, text) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("write {f}: {e}");
+                        ExitCode::from(2)
+                    }
+                },
+                None => {
+                    print!("{text}");
+                    ExitCode::SUCCESS
+                }
+            }
         }
         "walk" => finish(&check::walk_problems(&dir, flags.contains(&"--strict")), "walk"),
         "refs" => finish(&check::refs_problems(&dir), "refs"),

@@ -1,0 +1,14 @@
+01_pipe/CONTEXT.md: ../_shared/gone.md
+01_pipe/CONTEXT.md: work/result.md
+01_pipe/CONTEXT.md: input `../_shared/nope.md`
+01_pipe/CONTEXT.md: input `nofolder/run.md`
+01_pipe/CONTEXT.md: input `star-gone.md`
+01_pipe/CONTEXT.md: input `second/inputs-gone.md`
+AGENTS.md: [[note]]
+AGENTS.md: missing.md
+AGENTS.md: 01_pipe/stages/01_a/nothing.sh
+AGENTS.md: missing.md
+AGENTS.md: in-code-gone.md
+AGENTS.md: after-gone.md
+_shared/CLAUDE.md: nothere.md
+22 files, 44 links and inputs checked, 13 broken
