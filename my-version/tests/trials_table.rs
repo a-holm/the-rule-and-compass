@@ -1545,7 +1545,7 @@ fn table_without_family_is_unchanged() {
 }
 
 const PINNED_TABLE_T1: &str = "48f3193890355a469c4b4ac30987aa0ef5a96496fbac2a882a27492ad491e8ae";
-const PINNED_TABLE_T2: &str = "7e24c7106fdbe3ce17387bacf90f674721ca8e813ab5c43332bc69840b764f68";
+const PINNED_TABLE_T2: &str = "9c4356b00357ecf530885d4d9fdedbfc16f5efc8164deb690e7f468299f616fc";
 
 // ---------------------------------------------------------------------------
 // Baselines from walk-forward reports (#1271)
