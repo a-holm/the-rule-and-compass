@@ -863,8 +863,10 @@ impl FitRoute {
     /// #1075: whether a release schedule of `waves` calls runs for `jobs`
     /// device jobs: it can start exact fits early (overlap, at least two calls
     /// of a single-launch LM arm). #1125: under `--fit-fallback-max` it runs
-    /// while the prefix has room; a wave releases only the jobs whose rank
-    /// bound in the rotated order is inside the prefix.
+    /// while the prefix has room. Which jobs are fallbacks is known only after
+    /// their answers, so a binding cap still launches every wave; the waves
+    /// run in rotated key order and release the first fallbacks inside the
+    /// prefix (#1231).
     pub(super) fn releases(&self, arm: DeviceArm, jobs: usize, waves: usize) -> bool {
         let cap = self.settings.fallback_max;
         self.overlap
@@ -874,23 +876,18 @@ impl FitRoute {
             && (cap == 0 || self.fallbacks.len() < cap)
     }
 
-    /// #1125: for each of `jobs`, an upper bound of its rank among the
-    /// fallbacks of the generation: every fallback known now plus the jobs
-    /// that sort before it in the rotated order. A job with a bound below the
-    /// cap is certain to be in the refit prefix. Empty when the cap is 0.
-    fn rank_bounds<K: Copy, S: FitSlots<K> + ?Sized>(&self, jobs: &[(K, GpuFitPlan)], slots: &S) -> Vec<usize> {
-        if self.settings.fallback_max == 0 {
-            return Vec::new();
+    /// #1231: the launch order of `jobs` for a release schedule: job indices
+    /// in the key order of the refit prefix, `(rotated island, slot)`. Job
+    /// order when the cap cannot bind, so the default run keeps its slices.
+    fn launch_order<K: Copy, S: FitSlots<K> + ?Sized>(&self, jobs: &[(K, GpuFitPlan)], slots: &S) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..jobs.len()).collect();
+        if !self.binds(self.fallbacks.len() + jobs.len()) {
+            return order;
         }
         let rotation = self.rotation;
         let place: Vec<(usize, usize)> = jobs.iter().map(|(key, _)| slots.place(*key)).collect();
-        let mut order: Vec<usize> = (0..jobs.len()).collect();
         order.sort_by_key(|&k| (rotation.rank(place[k].0), place[k].1));
-        let mut bounds = vec![0; jobs.len()];
-        for (rank, &k) in order.iter().enumerate() {
-            bounds[k] = self.fallbacks.len() + rank;
-        }
-        bounds
+        order
     }
 
     /// #1075: [`Self::fit_on_device`] with the answers released in `waves`
@@ -922,16 +919,20 @@ impl FitRoute {
             return self.fit_on_device(device, arm, jobs, slots, rows, threads);
         }
         let settings = self.settings;
-        let plans: Vec<&GpuFitPlan> = jobs.iter().map(|(_, p)| p).collect();
+        let order = self.launch_order(jobs, &*slots);
+        let plans: Vec<&GpuFitPlan> = order.iter().map(|&k| &jobs[k].1).collect();
         let mut hints: Vec<Option<Fallback>> = vec![None; jobs.len()];
-        let bounds = self.rank_bounds(jobs, &*slots);
         let cap = self.settings.fallback_max;
+        let mut inside = self.fallbacks.len();
         let early_jobs = &mut self.early_jobs;
         let released = device.fit_released(arm, &plans, &settings, rows, waves, &mut |batch: &[(usize, DeviceAnswer)]| {
+            let mut sorted: Vec<&(usize, DeviceAnswer)> = batch.iter().collect();
+            sorted.sort_by_key(|(p, _)| *p);
             let mut out = Vec::new();
-            for (k, answer) in batch {
-                let Some((key, plan)) = jobs.get(*k) else { continue };
-                if hints[*k].is_some() || (cap != 0 && bounds[*k] >= cap) {
+            for (p, answer) in sorted {
+                let Some(&k) = order.get(*p) else { continue };
+                let (key, plan) = &jobs[k];
+                if hints[k].is_some() {
                     continue;
                 }
                 let finite = answer.c.iter().all(|v| v.is_finite());
@@ -940,21 +941,32 @@ impl FitRoute {
                 }
                 let mut tree = slots.tree(*key).clone();
                 let Triage::Fallback { cause, device: device_tree } = triage(arm, plan, &mut tree, answer) else { continue };
+                if cap != 0 && inside >= cap {
+                    break;
+                }
+                inside += 1;
                 let (island, slot) = slots.place(*key);
                 let early = Some(*early_jobs + out.len());
                 let hint = Fallback { key: (DEVICE, island, slot), cause, tree, device: device_tree, early, tag: slots.tag(*key) };
                 out.push(refit_job(&hint, hint.device.clone(), &settings));
-                hints[*k] = Some(hint);
+                hints[k] = Some(hint);
             }
             *early_jobs += out.len();
             exact.submit(out);
         });
         let ms = if released.answers.is_some() { released.launches.iter().map(|l| l.ms).sum() } else { -1.0 };
+        let answers = released.answers.map(|part| {
+            let mut slots_of: Vec<Option<DeviceAnswer>> = vec![None; jobs.len()];
+            for (p, answer) in part.into_iter().enumerate() {
+                slots_of[order[p]] = Some(answer);
+            }
+            slots_of.into_iter().map(|a| a.expect("one answer per plan")).collect()
+        });
         let run = DeviceRun {
             ms,
             polish_ms: released.launches.iter().map(|l| l.polish_ms).sum(),
             span_start_s: released.launches.first().and_then(|l| l.span_start_s),
-            answers: released.answers,
+            answers,
         };
         let from = self.fallbacks.len();
         let mut step = self.fit_on_device(&mut Collected(Some(run)), arm, jobs, slots, rows, threads);
@@ -2643,13 +2655,13 @@ mod tests {
         (settled, early, launches)
     }
 
-    /// #1125: under a binding cap the waves release exactly the jobs whose
-    /// rank bound is inside the prefix, and the settled trees equal one call.
+    /// #1125/#1231: under a binding cap the waves run in rotated key order and
+    /// release the first `cap` fallbacks, whatever the rotation, and the
+    /// settled trees equal one call.
     #[test]
     fn a_binding_cap_releases_the_jobs_inside_the_prefix() {
         let (islands, slots, cap, waves) = (8usize, 3usize, 5usize, 4usize);
-        // Waves cover islands 0-1, 2-3, 4-5 and 6-7; the last is never released.
-        for (start, early) in [(4usize, 5usize), (0, 5), (2, 5), (6, 0), (7, 2)] {
+        for (start, early) in [(4usize, cap), (0, cap), (2, cap), (6, cap), (7, cap)] {
             let rotation = Rotation::at(start, islands);
             let (one, none, one_launch) = tail_stage(cap, rotation, islands, slots, 0);
             let (waved, got, launches) = tail_stage(cap, rotation, islands, slots, waves);
