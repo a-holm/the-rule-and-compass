@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Usage: bin-pin.sh <worktree> <dest-dir> [<binary-name>...]   (default: rcsr)
-# Copies <worktree>/my-version/target/release/<name> into <dest-dir>, writes <name>.sha256 (sha256sum line) and
+# Copies <worktree>/<crate dir>/target/release/<name> into <dest-dir>, writes <name>.sha256 (sha256sum line) and
 # <name>.rev (git -C <worktree> rev-parse HEAD, with -dirty appended when `git status --porcelain` is not empty),
 # then runs the copy (before it is moved into place) with --version under `env -i PATH=$PATH`: a binary that still needs its build directory fails here.
 # Refuses an ELF binary whose RUNPATH or RPATH points into a build directory or whose NEEDED lists librcsrcuda.
@@ -25,7 +25,7 @@ wt=$(cd "$wt" && pwd)
 case "$(basename "$wt")" in
   default-ab-run) echo "bin-pin: refusing to pin from $wt" >&2; exit 1 ;;
 esac
-rel=$wt/my-version/target/release
+rel=$wt/$CRATE/target/release
 
 rev=$(git -C "$wt" rev-parse HEAD) || { echo "bin-pin: $wt is not a git worktree" >&2; exit 1; }
 [ -z "$(git -C "$wt" status --porcelain)" ] || rev=$rev-dirty

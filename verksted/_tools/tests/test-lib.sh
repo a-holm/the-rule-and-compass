@@ -20,7 +20,7 @@ lib() {
   local snippet=$1
   shift
   env -u RCSR_ROOT -u RCSR_BASE -u RCSR_GATES -u RCSR_MACHINE_DIR -u RCSR_SLOT_SCRIPT \
-    -u RCSR_LOCK_SCRIPT -u RCSR_SANITIZER -u RCSR_XID_CMD "$@" \
+    -u RCSR_LOCK_SCRIPT -u RCSR_SANITIZER -u RCSR_XID_CMD -u RCSR_CRATE -u RCSR_LOCAL "$@" \
     bash -c "set -uo pipefail; source '$LIB'; $snippet"
 }
 git_q() { git -c user.name=t -c user.email=t@t.invalid "$@"; }
@@ -60,6 +60,30 @@ check ROOT-main "$(lib 'echo $ROOT' RCSR_ROOT="$main_top")" "$main_top"
 check ROOT-from-worktree "$(lib 'echo $ROOT' RCSR_ROOT="$side_top")" "$main_top"
 check RCSR_ROOT-from-worktree "$(lib 'echo $RCSR_ROOT' RCSR_ROOT="$side_top")" "$side_top"
 check WT "$(lib 'echo $WT' RCSR_ROOT="$side_top")" "$main_top/worktrees"
+
+# CRATE and VLOCAL
+check CRATE-override "$(lib 'echo $CRATE' RCSR_CRATE=/tmp/y)" "/tmp/y"
+check CRATE-default-found "$([ -f "$want_top/$(lib 'echo $CRATE')/Cargo.toml" ] && echo yes || echo no)" "yes"
+check CRATE-none "$(lib 'echo "[$CRATE]"' RCSR_ROOT="$main_top")" "[]"
+check VLOCAL-default "$(lib 'echo $VLOCAL' RCSR_ROOT="$side_top")" "$main_top/verksted/_local"
+check VLOCAL-override "$(lib 'echo $VLOCAL' RCSR_LOCAL=/tmp/x)" "/tmp/x"
+
+# crate_dir: one match, none, two, a [lib] name alone, subdirectory cwd, override
+fx=$T/fx
+mkdir -p "$fx/pkg/src" "$fx/other" "$fx/sub"
+git -C "$fx" init -q
+printf '[package]\nname = "rule-and-compass"\n\n[[bin]]\nname = "x"\n' > "$fx/pkg/Cargo.toml"
+printf '[package]\nname = "else"\n\n[lib]\nname = "rule-and-compass"\n' > "$fx/other/Cargo.toml"
+check crate_dir-root "$(cd "$fx" && lib 'crate_dir "$PWD"')" "$fx/pkg"
+check crate_dir-subdir "$(cd "$fx/pkg/src" && lib 'crate_dir "$(dirname "$(dirname "$PWD")")"')" "$fx/pkg"
+check crate_dir-default-root "$(cd "$fx/sub" && lib 'crate_dir' RCSR_ROOT="$fx")" "$fx/pkg"
+check crate_dir-lib-name-alone "$(cd "$fx" && lib 'rm -rf pkg; crate_dir "$PWD"; echo rc=$?' 2>&1 | tail -n 1)" "rc=1"
+mkdir -p "$fx/pkg2" "$fx/pkg3"
+for d in pkg2 pkg3; do printf '[package]\nname = "rule-and-compass"\n' > "$fx/$d/Cargo.toml"; done
+out=$(cd "$fx" && lib 'crate_dir "$PWD"; echo rc=$?' 2>&1)
+check crate_dir-two-rc "$(tail -n 1 <<< "$out")" "rc=1"
+check crate_dir-two-msg "$(head -n 1 <<< "$out" | grep -c 'declare package')" "1"
+check crate_dir-override "$(cd "$fx" && lib 'crate_dir "$PWD"' RCSR_CRATE=pkg3)" "$fx/pkg3"
 
 # need_gates
 out=$(lib 'need_gates; echo reached' RCSR_GATES="$T/nogates" 2>&1); rc=$?

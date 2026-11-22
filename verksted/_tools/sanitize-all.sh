@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Usage: sanitize-all.sh <worktree> <id> [--only <binary>]... [--dry-run]
-# The whole memcheck pass from <worktree>/my-version/tests/sanitizer.plan (override: RCSR_SANITIZER_PLAN).
+# The whole memcheck pass from <worktree>/<crate dir>/tests/sanitizer.plan (override: RCSR_SANITIZER_PLAN).
 # Builds once in the build slot (cargo test --release --features cuda --no-run --message-format=json), lists every test
 # executable (lib, bin-<name>, or the --test target name), then runs each one under the CUDA 13.0 memcheck through the
 # test lock, one lock hold per run, rc-run.sh run --cuda --timeout 580:
@@ -43,7 +43,7 @@ while [ $# -gt 0 ]; do
     *) usage >&2; exit 2 ;;
   esac
 done
-plan=${RCSR_SANITIZER_PLAN:-$wt/my-version/tests/sanitizer.plan}
+plan=${RCSR_SANITIZER_PLAN:-$wt/$CRATE/tests/sanitizer.plan}
 [ -f "$plan" ] || { echo "sanitize-all: plan $plan missing" >&2; exit 2; }
 
 san_real=$(realpath "$SANITIZER" 2>/dev/null || true)

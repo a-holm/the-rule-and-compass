@@ -7,6 +7,28 @@
 VERKSTED=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 RCSR_ROOT=${RCSR_ROOT:-$(git -C "$VERKSTED" rev-parse --show-toplevel)}
 ROOT=$(dirname "$(git -C "$RCSR_ROOT" rev-parse --path-format=absolute --git-common-dir)")
+# crate_dir [worktree]: the one first-level directory of the worktree (default $RCSR_ROOT) whose Cargo.toml
+# declares package rule-and-compass; RCSR_CRATE names it instead. Prints the path; exit 1 with a message
+# on stderr when none or several match.
+crate_dir() {
+  local wt=${1:-$RCSR_ROOT} f hits=()
+  if [ -n "${RCSR_CRATE:-}" ]; then
+    printf '%s\n' "$wt/$RCSR_CRATE"
+    return 0
+  fi
+  for f in "$wt"/*/Cargo.toml; do
+    [ -f "$f" ] || continue
+    awk '/^\[/ { s = ($0 == "[package]") } s && /^name *= *"rule-and-compass" *$/ { ok = 1 } END { exit !ok }' "$f" &&
+      hits+=("${f%/Cargo.toml}")
+  done
+  if [ "${#hits[@]}" -ne 1 ]; then
+    echo "engine crate: ${#hits[@]} directories under $wt declare package rule-and-compass; set RCSR_CRATE" >&2
+    return 1
+  fi
+  printf '%s\n' "${hits[0]}"
+}
+CRATE=${RCSR_CRATE:-$(basename "$(crate_dir "$RCSR_ROOT" 2> /dev/null)" 2> /dev/null)}
+VLOCAL=${RCSR_LOCAL:-$ROOT/verksted/_local}
 WT=$ROOT/worktrees
 BASE=${RCSR_BASE:-integration/gpu-hardening}
 GATES=${RCSR_GATES:-/mnt/lager/tmp/rcsr-gates}

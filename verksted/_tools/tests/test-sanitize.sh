@@ -3,6 +3,7 @@
 # Hermetic test of sanitize.sh with a stub slot, lock, cargo, sanitizer and Xid command.
 # Writes: a temp dir that it removes.
 set -uo pipefail
+export RCSR_CRATE=crate-x
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 . "$HERE/lib/fakes.sh"
 SAN=$HERE/../sanitize.sh
@@ -24,8 +25,8 @@ has() {
   fi
 }
 
-mkdir -p "$T/gates" "$T/wt/my-version" "$T/bin" "$T/cuda-13.0/bin" "$T/cuda-12.0/bin"
-touch "$T/wt/my-version/Cargo.toml"
+mkdir -p "$T/gates" "$T/wt/crate-x" "$T/bin" "$T/cuda-13.0/bin" "$T/cuda-12.0/bin"
+touch "$T/wt/crate-x/Cargo.toml"
 echo 4 > "$T/xid"
 for kind in slot lock; do
   bump=; [ "$kind" = lock ] && bump="[ -z \"\${FAKE_XID_BUMP:-}\" ] || echo 5 > $T/xid\n"

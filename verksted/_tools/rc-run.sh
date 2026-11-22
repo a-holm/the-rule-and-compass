@@ -4,7 +4,7 @@
 # test:  through the test lock ($L) with --cuda, else through the build slot (CPU-only tests); default 580 s.
 # run:   through the test lock ($L) for rcsr, rcsr-bench and any GPU run; default 580 s.
 # cpu:   any CPU-only command through the build slot; default 580 s.
-# The command runs in <worktree>/my-version with CARGO_BUILD_JOBS=2 (and RCSR_CUDA_ARCH=sm_86 with --cuda)
+# The command runs in <worktree>/<crate dir> with CARGO_BUILD_JOBS=2 (and RCSR_CUDA_ARCH=sm_86 with --cuda)
 # under an outer `timeout -k $KILL_AFTER` (30 s, override RCSR_KILL_AFTER). Lock modes refuse --timeout above LOCK_HOLD_MAX (600 s).
 # Lock modes run the command through lock-run.sh: its own session; when it owns the flock on $LOCKFILE, every process sharing that flock after the command ended is
 # TERMed, then KILLed, by pid, so a crashed tool cannot leave the lock held.
@@ -48,7 +48,7 @@ case "$mode" in
   cpu) runner=$B; lock=0; default_s=580 ;;
   *) refuse "unknown mode '$mode' (build|test|run|cpu)" ;;
 esac
-[ -f "$wt/my-version/Cargo.toml" ] || refuse "$wt/my-version/Cargo.toml missing"
+[ -f "$wt/$CRATE/Cargo.toml" ] || refuse "$wt/$CRATE/Cargo.toml missing"
 [ -z "${CARGO_TARGET_DIR:-}" ] || refuse "CARGO_TARGET_DIR is set; each worktree uses its own target/"
 timeout_s=${timeout_s:-$default_s}
 case "$timeout_s" in
@@ -66,7 +66,7 @@ reap=
 if [ "$lock" -eq 1 ]; then
   reap=$(printf 'bash %q %q ' "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lock-run.sh" "$LOCKFILE")
 fi
-inner=$(printf 'cd %q && %s %stimeout -k %s %s' "$wt/my-version" "$env_prefix" "$reap" "$KILL_AFTER" "$timeout_s")
+inner=$(printf 'cd %q && %s %stimeout -k %s %s' "$wt/$CRATE" "$env_prefix" "$reap" "$KILL_AFTER" "$timeout_s")
 for arg in "$@"; do
   inner="$inner $(printf '%q' "$arg")"
 done
