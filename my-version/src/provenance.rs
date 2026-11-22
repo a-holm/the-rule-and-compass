@@ -15,10 +15,17 @@ pub const BUILD_COMMIT: &str = match option_env!("RCSR_BUILD_COMMIT") {
     None => "unknown",
 };
 
-/// Whether the work tree had uncommitted files when `build.rs` last ran. It is
-/// not refreshed by source edits alone; the binary SHA-256 is the identity.
+/// Whether the work tree had uncommitted files when `build.rs` last ran. A
+/// change under `src` reruns the script (#1319); the binary SHA-256 is the
+/// identity.
 pub fn build_dirty() -> bool {
     option_env!("RCSR_BUILD_DIRTY") == Some("true")
+}
+
+/// SHA-256 of the sources the binary was built from, recorded by `build.rs`
+/// for a dirty tree or a tree without git (#1319); `None` for a clean build.
+pub fn build_source_sha256() -> Option<&'static str> {
+    option_env!("RCSR_BUILD_SOURCE_SHA256")
 }
 
 /// What a checkpoint records about the process that wrote it.
