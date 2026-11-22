@@ -73,6 +73,8 @@ struct Spec {
     fit: Option<(u32, u32, f64)>,
     /// #1203: `book.missing_score`; `None` writes no `book` object.
     book: Option<&'static str>,
+    /// #1208: `annualization.period_seconds`; `None` writes no member (a report of an older build).
+    period_seconds: Option<f64>,
 }
 
 impl Spec {
@@ -88,6 +90,7 @@ impl Spec {
             policy: "threshold",
             fit: None,
             book: None,
+            period_seconds: None,
         }
     }
 }
@@ -105,7 +108,7 @@ fn write_report(dir: &Path, name: &str, net: &[f64], s: &Spec) -> String {
 \"cost\":{{\"per_side_bps\":{c},\"source\":\"flag\",\"return_units\":\"log\"}},\
 \"policy\":{{\"name\":\"{policy}\",\"band_width\":0,\"min_hold\":1}},\
 \"threshold\":{{\"quantile\":{quantile},\"fixed\":{fixed}{fit}}},\
-\"annualization\":{{\"periods_per_year\":{ppy},\"method\":\"explicit\"}},\
+\"annualization\":{{\"periods_per_year\":{ppy},\"method\":\"explicit\"{period_seconds}}},\
 {book}\
 \"pooled\":{{\"periods\":{n},\"entries\":10,\"active_rows\":100,\"period_net\":[{net_text}],\"period_time\":[{time}]}}}}",
         w = s.window,
@@ -119,6 +122,7 @@ fn write_report(dir: &Path, name: &str, net: &[f64], s: &Spec) -> String {
         c = s.cost_bps,
         rt = s.cost_bps * 2.0,
         ppy = s.ppy,
+        period_seconds = s.period_seconds.map_or(String::new(), |p| format!(",\"period_seconds\":{p}")),
         n = net.len(),
         time = arr(&s.time),
     );
@@ -851,4 +855,114 @@ fn trials_reads_members() {
     let o = run(&["trials", "--compare", &report, &report, "--members", "all", "--draws", "50"]);
     assert_eq!(code(&o), 2, "{}", stderr(&o));
     assert!(stderr(&o).contains("--members does not apply to --compare"), "{}", stderr(&o));
+}
+
+// ---------------------------------------------------------------------------
+// #1208: periods_per_year against the series
+// ---------------------------------------------------------------------------
+
+const DAY: i64 = 86_400;
+
+fn stepped(n: usize, step: i64) -> Vec<f64> {
+    (0..n).map(|i| (T0 + step * i as i64) as f64).collect()
+}
+
+fn daily(ppy: f64, period_seconds: Option<f64>) -> Spec {
+    Spec { ppy, period_seconds, time: stepped(30, DAY), ..Spec::new(30) }
+}
+
+fn trials_one(path: &str) -> Output {
+    run(&["trials", "--wf", path, "--draws", "50", "--block-len", "2"])
+}
+
+#[test]
+fn trials_refuses_ppy_contradicting_period_time() {
+    let (_s, dir) = trials_dir();
+    let p = write_report(&dir, "wf-x", &noise(30, 1, 0.01), &daily(8760.0, None));
+    let o = trials_one(&p);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    let e = stderr(&o);
+    assert!(e.contains("annualization.periods_per_year") && e.contains("8760") && e.contains("365") && e.contains("wf-x.json"), "{e}");
+    let o = run(&["trials", "--wf", &p, "--table", "--draws", "50", "--block-len", "2"]);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).contains("annualization.periods_per_year"), "{}", stderr(&o));
+}
+
+#[test]
+fn trials_accepts_consistent_daily_ppy() {
+    let (_s, dir) = trials_dir();
+    let net = noise(30, 1, 0.01);
+    let p = write_report(&dir, "wf-x", &net, &daily(365.0, None));
+    let j = stdout_json(&trials_one(&p));
+    let got = num(&j, &["best", "sharpe_annual"]);
+    let want = inference::sharpe_per_period(&net) * 365f64.sqrt();
+    assert!((got - want).abs() < 1e-9, "{got} vs {want}");
+}
+
+#[test]
+fn trials_weekly_ppy_checked() {
+    let (_s, dir) = trials_dir();
+    let weekly = |ppy| Spec { ppy, time: stepped(20, 7 * DAY), ..Spec::new(20) };
+    let ok = write_report(&dir, "ok", &noise(20, 1, 0.01), &weekly(365.0 / 7.0));
+    let o = trials_one(&ok);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let bad = write_report(&dir, "bad", &noise(20, 1, 0.01), &weekly(8760.0));
+    let o = trials_one(&bad);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).contains("annualization.periods_per_year"), "{}", stderr(&o));
+}
+
+#[test]
+fn trials_hourly_output_unchanged() {
+    let (_s, dir) = trials_dir();
+    let net = noise(100, 1, 0.01);
+    let p = write_report(&dir, "wf-h", &net, &Spec::new(100));
+    let o = trials_one(&p);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(stderr(&o), "");
+    let j = stdout_json(&o);
+    assert_eq!(num(&j, &["periods_per_year"]), 8760.0);
+    let got = num(&j, &["best", "sharpe_annual"]);
+    assert_eq!(got.to_bits(), (inference::sharpe_per_period(&net) * 8760f64.sqrt()).to_bits());
+}
+
+#[test]
+fn trials_refuses_ppy_contradicting_period_seconds() {
+    let (_s, dir) = trials_dir();
+    let p = write_report(&dir, "wf-x", &noise(30, 1, 0.01), &daily(365.0, Some(3600.0)));
+    let o = trials_one(&p);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    let e = stderr(&o);
+    assert!(e.contains("annualization.period_seconds") && e.contains("365") && e.contains("8760"), "{e}");
+}
+
+#[test]
+fn trials_accepts_report_without_period_seconds() {
+    let (_s, dir) = trials_dir();
+    let p = write_report(&dir, "wf-x", &noise(30, 1, 0.01), &daily(365.0, None));
+    let o = trials_one(&p);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let q = write_report(&dir, "wf-y", &noise(30, 1, 0.01), &daily(365.0, Some(86400.0)));
+    let o = trials_one(&q);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+}
+
+#[test]
+fn trials_short_series_note() {
+    let (_s, dir) = trials_dir();
+    let p = write_report(&dir, "wf-s", &noise(2, 1, 0.01), &Spec { time: stepped(2, DAY), ..Spec::new(2) });
+    let o = trials_one(&p);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stderr(&o).contains("too few periods"), "{}", stderr(&o));
+}
+
+#[test]
+fn trials_refuses_nonpositive_ppy() {
+    let (_s, dir) = trials_dir();
+    for ppy in [0.0, -365.0] {
+        let p = write_report(&dir, "wf-x", &noise(30, 1, 0.01), &daily(ppy, None));
+        let o = trials_one(&p);
+        assert_eq!(code(&o), 2, "{ppy}: {}", stderr(&o));
+        assert!(stderr(&o).contains("annualization.periods_per_year"), "{}", stderr(&o));
+    }
 }

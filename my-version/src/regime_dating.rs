@@ -601,7 +601,7 @@ pub fn usage() -> &'static str {
         (--symbol <name> --symbol-col <col> | --index equal-weight --symbol-col <col>)
         [--rule threshold] [--up 0.30] [--down 0.30] [--min-days 90]
         [--sideways-days 60] [--sideways-band 0.25] [--mode ex-post|causal]
-        [--locked-test <START,END|none>] [--lockbox-embargo <SECONDS>] [--retired <record>]
+        [--locked-test <START,END|none> (alias --lockbox)] [--lockbox-embargo <SECONDS>] [--retired <record>]
         [--purge-seconds <N>]
         [--after-read --ledger <file> --sealed <file> --expect-reads <N>]
 

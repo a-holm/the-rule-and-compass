@@ -3312,14 +3312,15 @@ fn push_scores(
                         dst.push(score);
                     }
                 }
+                if scores.iter().any(|s| !s.is_finite()) {
+                    d.dropped += 1;
+                }
                 for (c, (dst, &score)) in d.train_scores.iter_mut().zip(scores).enumerate() {
                     if score.is_finite() {
                         dst.push(score);
                         if t > d.train_score_max_time[c] {
                             d.train_score_max_time[c] = t;
                         }
-                    } else {
-                        d.dropped += 1;
                     }
                 }
             }
