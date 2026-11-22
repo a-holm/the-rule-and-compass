@@ -909,6 +909,33 @@ fn a_failed_rescore_leaves_no_screening_error() {
     assert_no_device_score_after("rescore", &cfg);
 }
 
+/// #1142: `--fit-accept fitness`, the re-score after the fit fails. The loss
+/// path gates the CPU fit against the pre-fit tree and counts the decisions.
+#[cfg(feature = "cuda")]
+#[test]
+fn a_failed_rescore_gates_the_cpu_fit_against_the_pre_fit_tree() {
+    if !rcsr::backend::probe().available() {
+        rcsr::backend::skip_without_device("skipping: no usable CUDA device");
+        return;
+    }
+    let mut cfg = config(41, true);
+    cfg.generations = 5;
+    cfg.pop = 40;
+    cfg.fit_strategy = rcsr::fit::FitStrategy::Gpu;
+    cfg.fit_accept = search::FitAccept::Fitness;
+    let train = sample(96);
+    let test = sample(96);
+    let faults = Faults::arm("rescore");
+    let out = search::run_resumable(&cfg, &train, &test, None, 1, |_| {})
+        .expect("the run completes on the CPU after the device failure");
+    drop(faults);
+    let reason = out.backend_reason.expect("the run records why the device stopped");
+    assert!(reason.contains(rcsr::gpu::INJECTED_REFUSAL), "{reason}");
+    let report = out.fit_accept.expect("a gated run reports its decisions");
+    let (accepted, rejected) = report.path("lost_batch").expect("the lost_batch path exists");
+    assert!(accepted + rejected >= 1, "no loss-path decision was counted");
+}
+
 /// #1089: the overlap pipeline's device fit fails.
 #[cfg(feature = "cuda")]
 #[test]
