@@ -85,8 +85,8 @@ finite score and a `NaN` target, and keeping them would change exposure, hit
 rate and every pooled return. `position = 1` iff the mask says the row is valid
 and `score > theta`; `score == theta` is flat.
 
-
 `dropped_rows` (per window and in the report total, the total being the sum over windows) counts rows, not candidate scores. A training row outside the validation slice counts once when any candidate scores it non-finite; a test row counts once when its target or any score is non-finite; validation rows are not counted. A row that lies in two windows counts once in each. With one candidate the count is unchanged.
+
 ### Rows with no finite score (`--missing-score`, #1203)
 
 A row with a finite target and no finite score (a NaN feature in a warm-up, a domain error of the formula) is a decision the book has to make. `--missing-score flat|hold` names the rule. The walk-forward test book and `trading::evaluate` (the validation and test books of `rcsr --objective`, which use `flat`) share one implementation, `trading::score_runs` and `trading::hold_positions`. The search fitness book (`trading::FitnessBook`, CPU and device) gives any non-finite prediction the regret `+inf`, so it never prices such a row.
