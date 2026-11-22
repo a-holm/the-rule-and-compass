@@ -13521,8 +13521,7 @@ fn run_walkforward(args: &[String]) -> ! {
                 std::process::exit(EXIT_INPUT);
             }
         };
-        let (commit, dirty) = rcsr::manifest::build_info();
-        (sha, if dirty { format!("{}-dirty", commit) } else { commit })
+        (sha, rcsr::manifest::this_build_id())
     } else {
         (String::new(), String::new())
     };
