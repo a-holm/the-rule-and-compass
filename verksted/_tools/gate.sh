@@ -6,9 +6,9 @@
 # `timeout LOCK_HOLD_MAX-20`, so one target that times out or fails never stops the others and no hold exceeds the cap.
 # A target above the limit is a failure: size it, the limit is never raised.
 # Exit 0 only when every suite passes, no target failed or timed out, and the benchmark recovers 27/27.
-# Exit 70 at once when the Xid count rose during a CUDA target (the remaining targets are not run).
+# Exit 70 at once when a new Xid line appeared (or the Xid check failed) during a CUDA target (the remaining targets are not run).
 # Writes: $D/<tag>-{cpu,cuda,bench}.log, $D/<tag>-{cpu,cuda}-{build,summary}.log, $D/<tag>-{cpu,cuda}-<target>.log
-# The summary has one line per target: <target> rc=<n> [xid=<a>-><b>] wait=<s> run=<s> | <test result line> [| timeout]. The xid field is CUDA only.
+# The summary has one line per target: <target> rc=<n> [xid=new:<n>] wait=<s> run=<s> | <test result line> [| timeout]. The xid field is CUDA only.
 # wait is the time from asking for the lock to the hold start (the hold writes its own start time, RCSR_NOW_CMD, default `date +%s`); run is the time from the hold start to its end.
 # Every hold (each CPU and CUDA target, benchmark) runs through lock-run.sh: a process the command leaves holding the lock is ended by pid.
 # $D/<tag>-{cpu,cuda}.log is the build failure (if any) plus every target log under a `=== <target> ===` header.
@@ -68,7 +68,7 @@ list_targets() {
 }
 
 # suite <prefix> <env> <cargo cmd> <xid: 0|1>: builds once in the build slot, then runs every target in its own hold.
-# Sets s (0, 1 or 70) and n_targets, n_failed, n_timeouts. With xid=1 a rise of the Xid count after a target stops the run (70).
+# Sets s (0, 1 or 70) and n_targets, n_failed, n_timeouts. With xid=1 a new Xid line since the start of a target stops the run (70).
 suite() {
   local prefix=$1 env=$2 cargo=$3 xid=$4
   local log=$D/$T-$prefix.log summary=$D/$T-$prefix-summary.log build=$D/$T-$prefix-build.log
@@ -98,8 +98,8 @@ suite() {
   while IFS=$'\t' read -r name args; do
     n_targets=$((n_targets + 1))
     tlog=$D/$T-$prefix-$name.log
-    xb=0
-    [ "$xid" -eq 0 ] || xb=$(xid_count)
+    xs=
+    [ "$xid" -eq 0 ] || xs=$(xid_start)
     start=$D/$T-$prefix-$name.start
     rm -f "$start"
     t0=$(now)
@@ -108,11 +108,11 @@ suite() {
     t1=$(now)
     ts=$(cat "$start" 2> /dev/null)
     rm -f "$start"
-    xa=0
-    [ "$xid" -eq 0 ] || xa=$(xid_count)
+    xn=0
+    if [ "$xid" -eq 1 ]; then xn=$(xid_new_since "$xs") || xn=check-failed; fi
     res=$(grep -a '^test result:' "$tlog" | tail -n 1)
     if [ "$xid" -eq 1 ]; then
-      line="$name rc=$rc xid=$xb->$xa $(hold_times "$t0" "$ts" "$t1") | ${res:-no test result line}"
+      line="$name rc=$rc xid=new:$xn $(hold_times "$t0" "$ts" "$t1") | ${res:-no test result line}"
     else
       line="$name rc=$rc $(hold_times "$t0" "$ts" "$t1") | ${res:-no test result line}"
     fi
@@ -123,8 +123,8 @@ suite() {
     [ "$rc" -eq 0 ] || n_failed=$((n_failed + 1))
     echo "$line" >> "$summary"
     { echo "=== $name ==="; cat "$tlog"; } >> "$log"
-    if [ "$xa" -gt "$xb" ]; then
-      echo "Xid count rose during $name; remaining CUDA targets not run" | tee -a "$summary" >> "$log"
+    if [ "$xn" != 0 ]; then
+      echo "New Xid line(s) or failed Xid check ($xn) during $name; remaining CUDA targets not run" | tee -a "$summary" >> "$log"
       s=70
       return
     fi

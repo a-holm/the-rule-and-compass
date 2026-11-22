@@ -27,7 +27,7 @@ i=0
 while [ $i -lt 20000 ]; do i=$((i + 1)); done
 EOF
 printf '#!/bin/sh\necho "args: $*"\nexit 3\n' > "$T/bin/bad"
-printf '#!/bin/sh\necho 5 > "%s/xid"\n' "$T" > "$T/bin/bump"
+printf '#!/bin/sh\necho 1 > "%s/xid"\n' "$T" > "$T/bin/bump"
 printf '#!/bin/sh\necho "hang ran" >&2\nexit 99\n' > "$T/bin/hang"
 chmod +x "$T"/lock.sh "$T"/bin/*
 

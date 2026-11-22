@@ -40,9 +40,9 @@ gpu_parity      *            skip           device fault under memcheck
 gpu_big         slow_case    skip           too slow under memcheck
 gpu_memory_plan refused_alloc api-errors-no  provokes an out-of-memory on purpose
 PLAN
-echo 4 > "$T/xid"
+echo 0 > "$T/xid"
 for kind in slot lock; do
-  bump=; [ "$kind" = lock ] && bump="case \"\$*\" in *\"\${FAKE_XID_BUMP_ON:-@none@}\"*) echo 5 > $T/xid ;; esac\n"
+  bump=; [ "$kind" = lock ] && bump="case \"\$*\" in *\"\${FAKE_XID_BUMP_ON:-@none@}\"*) echo 1 > $T/xid ;; esac\n"
   printf '#!/usr/bin/env bash\necho "%s $*" >> "%s/calls"\n%bexec "$@"\n' "$kind" "$T" "$bump" > "$T/$kind.sh"
   chmod +x "$T/$kind.sh"
 done
@@ -124,8 +124,8 @@ check full-require-device "$(sort -u "$T/san-req" | tr "\n" " ")" "req=1 "
 has full-lib "$T/san-calls" 'error-exitcode 99 /fake/deps/rcsr-aaa$'
 has full-bin "$T/san-calls" 'error-exitcode 99 /fake/deps/rcsr_bin-bbb$'
 has full-lock "$T/calls" '^lock .*timeout -k 30 580 '
-has full-line "$sum" '^gpu_fit rc=0 xid=4->4 secs=[0-9]+ \| test result: ok\. 1 passed.* \| =+ ERROR SUMMARY: 0 errors$'
-has full-api-line "$sum" '^gpu_memory_plan:refused_alloc rc=0 xid=4->4 secs='
+has full-line "$sum" '^gpu_fit rc=0 xid=0 secs=[0-9]+ \| test result: ok\. 1 passed.* \| =+ ERROR SUMMARY: 0 errors$'
+has full-api-line "$sum" '^gpu_memory_plan:refused_alloc rc=0 xid=0 secs='
 check full-run-lines "$(grep -c ' rc=' "$sum")" "6"
 check full-limits "$(grep -c "^580 .*compute-sanitizer" "$T/timeouts")" "$(wc -l < "$T/san-calls" | tr -d " ")"
 check full-limits-all "$(grep -c compute-sanitizer "$T/timeouts")" "$(wc -l < "$T/san-calls" | tr -d " ")"
@@ -208,7 +208,7 @@ PLAN=$T/plan-nc FAKE_NC_RC=99 FAKE_NC_ON=gpu_fit-fff run "$T/wt" 9 > /dev/null 2
 check nc-rc99-rc "$r" "1"
 PLAN=$T/plan-nc FAKE_NC_RC=139 FAKE_NC_ON=gpu_fit-fff run "$T/wt" 9 > /dev/null 2>&1; r=$?
 check nc-rc139-rc "$r" "1"
-has nc-rc139-line "$sum" '^gpu_fit tool crash rc=139 xid=4->4 secs=[0-9]+ \| compute-sanitizer died with SIGSEGV; not retried'
+has nc-rc139-line "$sum" '^gpu_fit tool crash rc=139 xid=0 secs=[0-9]+ \| compute-sanitizer died with SIGSEGV; not retried'
 PLAN=$T/plan-nc FAKE_NC_RC=124 FAKE_NC_ON=gpu_fit-fff run "$T/wt" 9 > /dev/null 2>&1; r=$?
 check nc-budget-rc "$r" "1"
 has nc-budget-line "$sum" '^gpu_fit rc=124 .* \| budget$'
@@ -239,7 +239,7 @@ cp "$T/plan" "$T/plan-ao"
 echo 'gpu_fit * app-only the test process calls CUDA; its children are not traced' >> "$T/plan-ao"
 PLAN=$T/plan-ao run "$T/wt" 9 > /dev/null 2>&1; r=$?
 check ao-rc "$r" "0"
-has ao-line "$sum" '^gpu_fit rc=0 xid=4->4 secs=[0-9]+ \| test result: ok\. [0-9]+ passed.*ERROR SUMMARY: 0 errors$'
+has ao-line "$sum" '^gpu_fit rc=0 xid=0 secs=[0-9]+ \| test result: ok\. [0-9]+ passed.*ERROR SUMMARY: 0 errors$'
 hasnt ao-not-listed "$sum" 'listed no-cuda but called CUDA$'
 has ao-flag "$T/san-calls" 'memcheck --target-processes application-only --leak-check no --error-exitcode 99 /fake/deps/gpu_fit-fff$'
 hasnt ao-flag-other-bins "$T/san-calls" 'target-processes.*(gpu_big|rcsr-aaa|gpu_memory_plan)'
@@ -261,7 +261,7 @@ cp "$T/plan" "$T/plan-dev"
 echo 'gpu_fit * device the binary calls CUDA by design' >> "$T/plan-dev"
 PLAN=$T/plan-dev run "$T/wt" 9 > /dev/null 2>&1; r=$?
 check dev-rc "$r" "0"
-has dev-line "$sum" '^gpu_fit rc=0 xid=4->4 secs=[0-9]+ \| test result: ok\. [0-9]+ passed.*ERROR SUMMARY: 0 errors$'
+has dev-line "$sum" '^gpu_fit rc=0 xid=0 secs=[0-9]+ \| test result: ok\. [0-9]+ passed.*ERROR SUMMARY: 0 errors$'
 hasnt dev-not-listed "$sum" 'listed no-cuda but called CUDA$'
 has dev-flag "$T/san-calls" 'memcheck --leak-check no --error-exitcode 99 /fake/deps/gpu_fit-fff$'
 hasnt dev-no-target-processes "$T/san-calls" 'gpu_fit.*target-processes|target-processes.*gpu_fit'
@@ -294,12 +294,12 @@ check noattach-unlisted-rc "$r" "1"
 has noattach-unlisted-line "$sum" '^gpu_fit rc=255 '
 
 # a rising Xid count stops at once with 70
-echo 4 > "$T/xid"
+echo 0 > "$T/xid"
 FAKE_XID_BUMP_ON=gpu_big-ddd run "$T/wt" 9 > /dev/null 2>&1; r=$?
 check xid-rc "$r" "70"
-has xid-line "$sum" '^gpu_big rc=70 xid=4->5 '
+has xid-line "$sum" '^gpu_big rc=70 xid=1 '
 hasnt xid-stopped "$sum" '^gpu_memory_plan rc='
-echo 4 > "$T/xid"
+echo 0 > "$T/xid"
 
 # --dry-run builds and runs nothing and lists skips and commands
 run "$T/wt" 9 --dry-run > "$T/out" 2>&1; r=$?
@@ -337,7 +337,7 @@ check runbin-san-calls "$(wc -l < "$T/san-calls" | tr -d ' ')" "1"
 has runbin-san-args "$T/san-calls" 'san under=memcheck --tool memcheck --target-processes application-only --leak-check no --error-exitcode 99 /fake/release/rcsr-gpu-bench --batch 64 --reps 1 --depth 3$'
 hasnt runbin-not-unit "$T/san-calls" 'rcsr_gpu_bench-unit'
 has runbin-lock "$T/calls" '^lock .*timeout -k 30 580 '
-has runbin-line "$sum" '^rcsr-gpu-bench rc=0 xid=4->4 secs=[0-9]+ \| .*ERROR SUMMARY: 0 errors$'
+has runbin-line "$sum" '^rcsr-gpu-bench rc=0 xid=0 secs=[0-9]+ \| .*ERROR SUMMARY: 0 errors$'
 # a full pass runs the unit-test binaries and the run-bin line; the unit binary of the bench is skipped by plan
 FAKE_BENCH_UNIT=1 PLAN=$T/plan-bin run "$T/wt" 9 > "$T/out" 2>&1; r=$?
 check runbin-full-rc "$r" "0"
