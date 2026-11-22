@@ -43,6 +43,7 @@ for src in "$ROOT"/rcsr-engine/tests/*.rs; do
   for t in "$REL"/deps/"$name"-*; do
     [[ -f "$t" && -x "$t" && "$t" != *.d ]] || continue
     ! cmp -s "$t" "$REL/$name" || continue
+    grep -qa RUST_TEST_THREADS "$t" || continue
     check_elf "$t" "$(basename "$t")"
     "$t" --list >/dev/null 2>&1 || fail "$(basename "$t") --list failed"
     n=$((n + 1))

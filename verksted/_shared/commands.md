@@ -32,7 +32,7 @@ verksted/_tools/wt-new.sh --research "$SLUG"               # research run: detac
 git worktree list
 ```
 
-New tickets branch from the integration branch, not from `main`. Do not set `CARGO_TARGET_DIR`: each worktree keeps its own `my-version/target/`.
+New tickets branch from the integration branch, not from `main`. Do not set `CARGO_TARGET_DIR`: each worktree keeps its own `<crate>/target/`.
 
 ## Build, test, run
 
@@ -154,7 +154,7 @@ verksted/_tools/sanitize.sh "$W" "$N" memcheck --test <file> -- <filter>    # bu
 # search-level tests: the config helper must set dispatch: DispatchMode::Device (CLI: --dispatch device), else the sanitized run stays on the CPU
 journalctl -k --since "<start>" | grep -i xid   # must print nothing
 verksted/_tools/sanitize.sh "$W" "$N" memcheck --test <file> --api-errors no -- <test> --exact   # one test with driver API error reporting off
-verksted/_tools/sanitize-all.sh "$W" "$N" [--only <binary>]... [--dry-run]   # the planned memcheck pass (my-version/tests/sanitizer.plan), one lock hold per run, summary log <id>-san-summary; a run-bin line runs a release binary with stated arguments; gate.sh has no sanitizer stage
+verksted/_tools/sanitize-all.sh "$W" "$N" [--only <binary>]... [--dry-run]   # the planned memcheck pass (<crate>/tests/sanitizer.plan), one lock hold per run, summary log <id>-san-summary; a run-bin line runs a release binary with stated arguments; gate.sh has no sanitizer stage
 ```
 
 ## Pinned binaries and paired runs
@@ -178,7 +178,7 @@ rcsr dev-report "runs/$LABEL.dev.ndjson"
 rcsr schema
 ```
 
-`rcsr` and `rcsr-launch` are in `my-version/target/release/` of the worktree.
+`rcsr` and `rcsr-launch` are in `"$(verksted/_tools/crate-dir.sh "$W")/target/release/"` of the worktree.
 
 ## Dispatch an agent
 
