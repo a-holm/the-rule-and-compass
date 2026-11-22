@@ -277,6 +277,90 @@ pub fn hold_positions<K: PartialEq>(books: &[K], scored: &[bool], positions: &mu
     }
 }
 
+/// #1207: the book key of every row of `groups` in book order. Run 0 of a group
+/// keeps the group id; every later run gets a key that no group, no other run
+/// and no id of `used` carries.
+pub fn run_book_keys(groups: &[u64], runs: &[u32], used: impl IntoIterator<Item = u64>) -> Vec<u64> {
+    if runs.iter().all(|&r| r == 0) {
+        return groups.to_vec();
+    }
+    let mix = |mut x: u64| {
+        x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        x ^ (x >> 31)
+    };
+    let mut used: std::collections::HashSet<u64> = used.into_iter().chain(groups.iter().copied()).collect();
+    let mut out = Vec::with_capacity(groups.len());
+    let mut last: Option<(u64, u32, u64)> = None;
+    for (&g, &r) in groups.iter().zip(runs) {
+        if r == 0 {
+            out.push(g);
+            continue;
+        }
+        let key = match last {
+            Some((lg, lr, key)) if lg == g && lr == r => key,
+            _ => {
+                let mut key = mix(g ^ mix(r as u64));
+                while !used.insert(key) {
+                    key = mix(key);
+                }
+                last = Some((g, r, key));
+                key
+            }
+        };
+        out.push(key);
+    }
+    out
+}
+
+/// #1207: the rows a long/flat book prices under a [`MissingScore`] rule, in
+/// canonical `(group, time, row)` order.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BookRows {
+    /// Input row of every priced row.
+    pub rows: Vec<usize>,
+    /// Book key of every priced row: the group id, or a run key after a gap.
+    pub keys: Vec<u64>,
+    /// Score of every priced row. Under `Hold` a row without a score repeats the
+    /// score before it in its group, and a leading one stays `NaN`.
+    pub scores: Vec<f64>,
+}
+
+/// #1207: the one place that turns rows with a finite target and a score that
+/// may be missing into the book of a rule. Under `Flat` the rows without a
+/// score are not priced and every run is its own book; under `Hold` every row
+/// with a finite target is priced and carries the score before it.
+pub fn book_rows(groups: &[u64], times: &[f64], targets: &[f64], scores: &[f64], rule: MissingScore) -> BookRows {
+    let n = groups.len().min(times.len()).min(targets.len()).min(scores.len());
+    let mut rows: Vec<usize> = (0..n).filter(|&i| targets[i].is_finite() && scores[i].is_finite()).collect();
+    rows.sort_by(|&a, &b| groups[a].cmp(&groups[b]).then_with(|| times[a].total_cmp(&times[b])).then_with(|| a.cmp(&b)));
+    let _ = rule;
+    return BookRows { keys: rows.iter().map(|&i| groups[i]).collect(), scores: rows.iter().map(|&i| scores[i]).collect(), rows };
+    let n = groups.len().min(times.len()).min(targets.len()).min(scores.len());
+    let mut labelled: Vec<usize> = (0..n).filter(|&i| targets[i].is_finite()).collect();
+    labelled.sort_by(|&a, &b| groups[a].cmp(&groups[b]).then_with(|| times[a].total_cmp(&times[b])).then_with(|| a.cmp(&b)));
+    let lab_groups: Vec<u64> = labelled.iter().map(|&i| groups[i]).collect();
+    let lab_scored: Vec<bool> = labelled.iter().map(|&i| scores[i].is_finite()).collect();
+    let runs = score_runs(&lab_groups, &lab_scored, rule);
+    let mut rows = Vec::with_capacity(labelled.len());
+    let mut run_ids = Vec::with_capacity(labelled.len());
+    for (k, &i) in labelled.iter().enumerate() {
+        if let Some(run) = runs.run[k] {
+            rows.push(i);
+            run_ids.push(run);
+        }
+    }
+    let row_groups: Vec<u64> = rows.iter().map(|&i| groups[i]).collect();
+    let keys = run_book_keys(&row_groups, &run_ids, groups[..n].iter().copied());
+    let mut out_scores: Vec<f64> = rows.iter().map(|&i| scores[i]).collect();
+    if rule == MissingScore::Hold {
+        let scored: Vec<bool> = out_scores.iter().map(|s| s.is_finite()).collect();
+        hold_positions(&row_groups, &scored, &mut out_scores, |_| f64::NAN);
+    }
+    BookRows { rows, keys, scores: out_scores }
+}
+
 /// #925: how `--band B` is read.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BandUnits {

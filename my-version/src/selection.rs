@@ -6,7 +6,8 @@
 //! purpose — to demonstrate, in a test, the optimism of ranking by the block
 //! you are about to report.
 
-use crate::trading_gpu::{self, ValidMask};
+use crate::trading::MissingScore;
+use crate::trading_gpu;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SelectBy {
@@ -179,6 +180,8 @@ pub struct BandOptions {
     pub segment_rows: usize,
     /// Cash return passed to the exact reduction.
     pub cash_return: f64,
+    /// #1207: what the book does on a row with a finite target and no finite score.
+    pub missing_score: MissingScore,
     /// Compute the exhaustive exact ranking as an audit. This is the only way
     /// to report `recall_band` honestly; the strict default fails the run when
     /// the band misses the exhaustive winner.
@@ -198,6 +201,7 @@ impl Default for BandOptions {
             cost_bps: trading_gpu::DEFAULT_COST_BPS,
             segment_rows: trading_gpu::DEFAULT_SEGMENT_ROWS,
             cash_return: 0.0,
+            missing_score: MissingScore::Flat,
             verify_exhaustive: true,
             fail_on_miss: true,
         }
@@ -447,10 +451,10 @@ fn band_flip_rows(rows: &BandRows<'_>, scores: &[f64], threshold: f64) -> u64 {
 
 /// Exact CPU `f64` long-only rescore over the full rows.
 ///
-/// The rows are first filtered with the shared [`ValidMask`] (score **and**
-/// target finite) and sorted to the canonical `(group, time, row)` order. The
-/// reduction is [`trading_gpu::reduce`], which is the same CPU `f64` arithmetic
-/// the report uses, including one final-exit charge per group.
+/// The rows with a finite target are priced under `options.missing_score` by
+/// [`crate::trading::book_rows`] and sorted to the canonical `(group, time, row)`
+/// order. The reduction is [`trading_gpu::reduce`], which is the same CPU `f64`
+/// arithmetic the report uses, including one final-exit charge per book.
 fn canonical_rows(
     rows: &BandRows<'_>,
     scores: &[f64],
@@ -468,23 +472,10 @@ fn canonical_rows(
         return Err("segment_rows must be at least 1".to_string());
     }
 
-    let mask = ValidMask::from_finites(scores, rows.targets);
-    let mut order: Vec<usize> = mask.indices().collect();
-    order.sort_by(|&a, &b| {
-        rows.groups[a]
-            .cmp(&rows.groups[b])
-            .then_with(|| rows.times[a].total_cmp(&rows.times[b]))
-            .then_with(|| a.cmp(&b))
-    });
-
-    let mut ord_scores = Vec::with_capacity(order.len());
-    let mut ord_returns = Vec::with_capacity(order.len());
-    let mut ord_groups = Vec::with_capacity(order.len());
-    for &i in &order {
-        ord_scores.push(scores[i]);
-        ord_returns.push(rows.targets[i]);
-        ord_groups.push(rows.groups[i]);
-    }
+    let book = crate::trading::book_rows(rows.groups, rows.times, rows.targets, scores, options.missing_score);
+    let ord_scores = book.scores;
+    let ord_returns: Vec<f64> = book.rows.iter().map(|&i| rows.targets[i]).collect();
+    let ord_groups = book.keys;
     let params = trading_gpu::PnlParams {
         threshold: 0.0,
         per_side_bps: options.cost_bps,
@@ -1106,5 +1097,98 @@ mod tests {
             },
         ];
         assert_eq!(select(&candidates, SelectBy::Validation), Some(1));
+    }
+
+    /// #1207: two symbols, hourly rows 0..299, return +0.001 and -0.005 on rows
+    /// 120..159 (the stretch).
+    struct Stretch {
+        targets: Vec<f64>,
+        groups: Vec<u64>,
+        times: Vec<f64>,
+    }
+
+    fn stretch() -> Stretch {
+        let mut s = Stretch { targets: Vec::new(), groups: Vec::new(), times: Vec::new() };
+        for g in 0..2u64 {
+            for t in 0..300usize {
+                s.targets.push(if (120..160).contains(&t) { -0.005 } else { 0.001 });
+                s.groups.push(g);
+                s.times.push(t as f64 * 3600.0);
+            }
+        }
+        s
+    }
+
+    fn options() -> BandOptions {
+        BandOptions { cost_bps: 10.0, ..BandOptions::default() }
+    }
+
+    #[test]
+    fn select_band_rescore_follows_the_missing_score_rule() {
+        let s = stretch();
+        let rows = BandRows { targets: &s.targets, groups: &s.groups, times: &s.times };
+        let z: Vec<f64> = (0..600).map(|i| if (120..160).contains(&(i % 300)) { f64::NAN } else { 1.0 }).collect();
+        let o = vec![1.0; 600];
+
+        // `Flat`: the same book as `o` on the slice split at the stretch.
+        let keep: Vec<usize> = (0..600).filter(|i| !(120..160).contains(&(i % 300))).collect();
+        let split_groups: Vec<u64> = keep.iter().map(|&i| s.groups[i] * 10 + (i % 300 >= 160) as u64).collect();
+        let split_targets: Vec<f64> = keep.iter().map(|&i| s.targets[i]).collect();
+        let split_times: Vec<f64> = keep.iter().map(|&i| s.times[i]).collect();
+        let split = BandRows { targets: &split_targets, groups: &split_groups, times: &split_times };
+        let flat = rescore_exact(&rows, &z, 0.5, &options()).unwrap();
+        let reference = rescore_exact(&split, &o[..keep.len()], 0.5, &options()).unwrap();
+        assert_eq!(flat.net.to_bits(), reference.net.to_bits());
+        assert_eq!(flat.turnover.to_bits(), reference.turnover.to_bits());
+        // 4 entries and 4 exits at 10 bp: 520 priced rows of +0.001, cost 0.008.
+        assert!((flat.net - (0.52 - 0.008)).abs() < 1e-12, "net {}", flat.net);
+        assert!((flat.turnover - 4.0).abs() < 1e-12, "turnover {}", flat.turnover);
+
+        // `Hold`: the book of `o` on the whole slice.
+        let hold_options = BandOptions { missing_score: MissingScore::Hold, ..options() };
+        let hold = rescore_exact(&rows, &z, 0.5, &hold_options).unwrap();
+        let whole = rescore_exact(&rows, &o, 0.5, &options()).unwrap();
+        assert_eq!(hold.net.to_bits(), whole.net.to_bits());
+        assert_eq!(hold.turnover.to_bits(), whole.turnover.to_bits());
+    }
+
+    #[test]
+    fn full_coverage_rescore_is_unchanged_by_the_rule() {
+        let s = stretch();
+        let rows = BandRows { targets: &s.targets, groups: &s.groups, times: &s.times };
+        let scores: Vec<f64> = (0..600).map(|i| ((i as f64) * 0.754_877_666_246_692_7).fract() - 0.5).collect();
+        let flat = rescore_exact(&rows, &scores, 0.0, &options()).unwrap();
+        let hold = rescore_exact(&rows, &scores, 0.0, &BandOptions { missing_score: MissingScore::Hold, ..options() }).unwrap();
+        assert_eq!(flat.net.to_bits(), hold.net.to_bits());
+        assert_eq!(flat.turnover.to_bits(), hold.turnover.to_bits());
+    }
+
+    #[test]
+    fn select_band_ranks_candidates_on_the_reported_book() {
+        let s = stretch();
+        let rows = BandRows { targets: &s.targets, groups: &s.groups, times: &s.times };
+        // `p` has no score on row 0 and on the stretch; `q` is flat on the stretch.
+        let p: Vec<f64> = (0..600).map(|i| if i % 300 == 0 || (120..160).contains(&(i % 300)) { f64::NAN } else { 1.0 }).collect();
+        let q: Vec<f64> = (0..600).map(|i| if (120..160).contains(&(i % 300)) { 0.0 } else { 1.0 }).collect();
+        let spec = crate::trading::TradingSpec { cost_bps: 10.0, threshold: 0.5, ..crate::trading::TradingSpec::default() };
+        let trading_rows = crate::trading::TradingRows { time: s.times.clone(), group: s.groups.clone(), funding: Vec::new() };
+        for (rule, expect) in [(MissingScore::Flat, 1usize), (MissingScore::Hold, 0usize)] {
+            let options = BandOptions { missing_score: rule, ..options() };
+            let candidates: Vec<BandCandidate<'_>> = [(&p, 0usize), (&q, 1usize)]
+                .iter()
+                .map(|(scores, index)| BandCandidate {
+                    index: *index,
+                    surrogate: screening_net(&rows, scores, 0.5, &options).unwrap(),
+                    complexity: 1,
+                    scores,
+                    threshold: 0.5,
+                })
+                .collect();
+            let selection = select_band(&rows, &candidates, &options).unwrap();
+            assert_eq!(selection.selected_index, expect, "{}", rule.name());
+            let book = crate::trading::evaluate(&p, &s.targets, &trading_rows, &crate::trading::TradingSpec { missing_score: rule, ..spec.clone() }).unwrap();
+            let exact = rescore_exact(&rows, &p, 0.5, &options).unwrap();
+            assert!((exact.net - book.net_pnl).abs() < 1e-12, "{}: {} vs {}", rule.name(), exact.net, book.net_pnl);
+        }
     }
 }

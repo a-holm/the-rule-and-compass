@@ -1369,12 +1369,16 @@ CHECKPOINTS:
                              and writes run.json and the report. Pass the data
                              and flags of the original run. Exit 2: no final
                              archive, --generations above the saved value,
-                             other data, target spec or backend. Another
+                             other data, target spec or backend, or a checkpoint
+                             whose `book missing_score` line is absent or not
+                             this build's rule (#1207). Another
                              build is accepted and recorded
   --reselect-run <run.json>  the same from a run.json front (expression_exact);
                              with --select-rule occam it reads pareto[].occam_tree
                              (exit 2 if absent);
-                             split and train rows must match the data. A run.json
+                             split and train rows must match the data. Exit 2:
+                             book.missing_score absent or not this build's rule
+                             (#1207). A run.json
                              with a compose block (rcsr compose) reruns compose's
                              choice over its composites on these rows (pass the
                              compose flags without --gates and the pools; see
@@ -7436,6 +7440,11 @@ fn main() {
     let mut reselect_outcome: Option<search::Outcome> = None;
     if let Some(path) = &reselect_path {
         let cp = resume_checkpoint.take().expect("--reselect loads its checkpoint with the resume path");
+        let saved_text = std::fs::read_to_string(path).unwrap_or_default();
+        if let Err(e) = rcsr::reselect::check_book_rule(&format!("--reselect '{}'", path), rcsr::checkpoint::book_missing_score(&saved_text).as_deref()) {
+            eprintln!("error: {}", e);
+            std::process::exit(EXIT_USAGE);
+        }
         let sha = rcsr::manifest::sha256_file(path).unwrap_or_else(|e| {
             eprintln!("error: {}", e);
             std::process::exit(EXIT_INPUT);
@@ -7450,6 +7459,7 @@ fn main() {
             std::process::exit(EXIT_USAGE);
         };
         let run = rcsr::reselect::RunFront::load(path).unwrap_or_else(|e| usage(e));
+        rcsr::reselect::check_book_rule(&format!("--reselect-run '{}'", path), run.missing_score.as_deref()).unwrap_or_else(|e| usage(e));
         if run.variables != vars {
             usage(format!("--reselect-run '{}': its variables differ from this run's --vars", path));
         }
@@ -9449,7 +9459,7 @@ fn main() {
                 None => backend_json,
             };
             let result_json = format!(
-                "{{{}{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"lockbox\":{},\"target_spec\":{},\"preparation\":{},\"generations_run\":{},\"search\":{{\"candidates_evaluated\":{}{}}},\"converged_early\":{},\"stop_reason\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"gpu\":{},\"dispatch\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"validation_hv\":{}{},\"qd\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
+                "{{{}{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"lockbox\":{},\"target_spec\":{},\"book\":{{\"missing_score\":{}}},\"preparation\":{},\"generations_run\":{},\"search\":{{\"candidates_evaluated\":{}{}}},\"converged_early\":{},\"stop_reason\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"gpu\":{},\"dispatch\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"validation_hv\":{}{},\"qd\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
                 search_meta_json, // #85 #86
                 backend_json,     // #141
                 jstr(VERSION),
@@ -9468,6 +9478,7 @@ fn main() {
                 split_json,
                 lockbox_json,
                 target_spec_json,
+                jstr(rcsr::trading::MissingScore::default().name()), // #1207
                 prepared.prep.json(),
                 outcome.generations,
                 outcome.candidates_evaluated,
@@ -12129,7 +12140,11 @@ OPTIONS:
                              position before it and earns its return, with no
                              cost; the band and cooldown state carries across
                              it. A row with a finite score and no finite target
-                             is never priced. The report adds book
+                             is never priced. The rule prices every
+                             walk-forward book: --select-band screening and
+                             rescore, the --threshold-fit cut book and the test
+                             book (#1207); the ladder rungs always price flat.
+                             The report adds book
                              (missing_score, missing_score_exits,
                              unpriced_target_rows); rcsr trials and
                              --cpcv-assemble guard book.missing_score

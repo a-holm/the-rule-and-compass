@@ -664,6 +664,8 @@ impl Checkpoint {
         if let Some(fp) = split_intervals {
             writeln!(out, "split_intervals {}", fp).unwrap();
         }
+        // #1207: the rule of the books that selection and re-selection price.
+        writeln!(out, "book missing_score {}", crate::trading::MissingScore::default().name()).unwrap();
         writeln!(out, "candidates_evaluated {}", self.candidates_evaluated).unwrap();
         writeln!(out, "archive_hash {:016x}", self.archive.hash()).unwrap();
         writeln!(out, "archive {} {}", self.archive.items.len(), self.archive.cap).unwrap();
@@ -967,6 +969,13 @@ impl Checkpoint {
                         .get(1)
                         .ok_or_else(|| format!("line {}: target_spec has no value", lineno))?;
                     set_once(&mut target_spec, v.to_string(), "target_spec", lineno)?;
+                }
+                "book" => {
+                    if parts.get(1) != Some(&"missing_score") {
+                        return Err(format!("line {}: unknown book record", lineno));
+                    }
+                    let v = parts.get(2).ok_or_else(|| format!("line {}: book missing_score has no value", lineno))?;
+                    crate::trading::MissingScore::parse(v).map_err(|e| format!("line {}: book missing_score: {}", lineno, e))?;
                 }
                 "split_intervals" => {
                     let v = parts
@@ -2365,6 +2374,12 @@ impl QdReader {
             known: self.known,
         }))
     }
+}
+
+/// #1207: the `book missing_score` rule recorded in checkpoint text, or `None`
+/// for a file written before the line existed.
+pub fn book_missing_score(text: &str) -> Option<String> {
+    text.lines().find_map(|l| l.strip_prefix("book missing_score ").map(|v| v.trim().to_string()))
 }
 
 #[cfg(test)]

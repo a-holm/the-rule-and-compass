@@ -1529,7 +1529,7 @@ pub fn compose(req: &Request, book: &FitnessBook, slices: &Slices, ctx: &Context
     let train_rows = Json::parse(ctx.split_json).and_then(|s| s.get("train_rows").and_then(Json::as_usize)).unwrap_or(0);
     let test_rows = Json::parse(ctx.split_json).and_then(|s| s.get("test_rows").and_then(Json::as_usize)).unwrap_or(0);
     let run_json = format!(
-        "{{\"tool\":\"rcsr\",\"version\":{},\"command\":{},\"target\":{},\"variables\":[{}],\"train_rows\":{},\"test_rows\":{},\"split\":{},\"target_spec\":{},\
+        "{{\"tool\":\"rcsr\",\"version\":{},\"command\":{},\"target\":{},\"variables\":[{}],\"train_rows\":{},\"test_rows\":{},\"split\":{},\"target_spec\":{},\"book\":{{\"missing_score\":{}}},\
          \"generations_run\":{},\"search\":{{\"candidates_evaluated\":{}}},\"objective\":{},\"compose\":{}{},\"pareto\":[{}]}}",
         text(env!("CARGO_PKG_VERSION")),
         text(ctx.command),
@@ -1539,6 +1539,7 @@ pub fn compose(req: &Request, book: &FitnessBook, slices: &Slices, ctx: &Context
         test_rows,
         ctx.split_json,
         ctx.target_spec_json,
+        text(crate::trading::MissingScore::default().name()),
         req.searched.as_ref().map_or(0, |s| s.generations),
         trials,
         finalist_with_switch(report.json("cpu", None), switch_of(req, c).as_ref()),
