@@ -4843,7 +4843,10 @@ fn window_period(spec: &EvalSpec, opts: &ProtocolOptions, rows: &[RowBase]) -> (
         };
     }
     match spec.periods_per_year {
-        Some(v) => (v, None, 0.0, PeriodSource::Explicit),
+        Some(v) => {
+            let step = opts.check_undeclared_ppy.then(|| infer_frequency(rows).1).flatten();
+            (v, step, 0.0, PeriodSource::Explicit)
+        }
         None => {
             let (ppy, dt) = infer_frequency(rows);
             (ppy, dt, 0.0, PeriodSource::InferredLabelledRows)
