@@ -801,7 +801,7 @@ average 9 to 12):
 #### Constants behind `sign` and `step`
 
 `sign` and `step` are piecewise constant: their derivative is zero almost
-everywhere, and so is the adjoint that [`fit.rs`](../my-version/src/fit.rs)
+everywhere, and so is the adjoint that [`fit.rs`](../rcsr-engine/src/fit.rs)
 uses to move constants. A constant that reaches the output only through one of
 them therefore never changes during fitting; whatever threshold the search
 happened to create is printed, but it is not an optimum. When the fitted Pareto
@@ -1308,7 +1308,7 @@ are worth trying on the machine that will run the search.
 
 ```sh
 # Native code generation (may produce a binary that only runs on this CPU).
-cd my-version
+cd rcsr-engine
 RUSTFLAGS="-C target-cpu=native" cargo build --release --bin cpu_bench
 ./target/release/cpu_bench
 ```
@@ -1326,7 +1326,7 @@ Instrument with a representative workload, merge the profiles, then rebuild
 with the merged profile; combine with `target-cpu=native` if desired:
 
 ```sh
-cd my-version
+cd rcsr-engine
 PROFDATA=$(find "$(rustc --print sysroot)" -name llvm-profdata | head -1)
 PGO=/mnt/lager/tmp/opencode/pgo
 rm -rf "$PGO" && mkdir -p "$PGO"

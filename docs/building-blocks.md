@@ -139,7 +139,7 @@ inputs happens to the arguments; the body itself is never rewritten.
 
 ## Tests
 
-`my-version/tests/blocks.rs` covers definition parsing and parameter inference,
+`rcsr-engine/tests/blocks.rs` covers definition parsing and parameter inference,
 evaluation, round-tripping, arity/recursion/duplicate rejection, per-block
 complexity, shared-constant fitting (including `count_constants`), an
 end-to-end recovery of `sin(x1)*cos(x2)` through a supplied block, and the

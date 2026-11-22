@@ -6,7 +6,7 @@ Instructions for automated agents (and humans) working in this repository.
 
 `the-rule-and-compass` is a symbolic-regression engine written in Rust: it
 searches for interpretable formulas `y = f(x)` that fit data, ranked on an
-error/complexity Pareto front. The crate is in [`my-version/`](my-version/),
+error/complexity Pareto front. The crate is in [`rcsr-engine/`](rcsr-engine/),
 the specification is [`SPEC.md`](SPEC.md), and the overview is
 [`README.md`](README.md).
 
@@ -61,13 +61,13 @@ Recurring agent workflows are numbered pipelines with a checked contract per sta
 * Every non-trivial change starts from a GitHub issue. No issue, no work.
 * Work happens **only** inside your own `worktrees/issue-<n>-<slug>/` checkout on
   branch `issue/<n>-<slug>`. Never commit directly to `main`.
-* `main` must always build and pass `cargo test --release` in `my-version/`.
+* `main` must always build and pass `cargo test --release` in `rcsr-engine/`.
 * Update `--help`, the `schema` output, `README.md` and the relevant file in
   `docs/` whenever behaviour, flags or output change.
 * Keep build output, datasets and local scratch out of git. `.gitignore` and the
   local exclude file handle the usual directories — do not add them to a commit.
 * Measure performance claims and record the before/after numbers in the issue.
-* Rust only. No Python files, no `python3` calls in tests, scripts, docs or workflows. Experiments, reference computations, fixtures and measurement tools are written in Rust; Python's runtime and library behaviour do not show what the Rust code does. The guard is `my-version/tests/no_python.rs`.
+* Rust only. No Python files, no `python3` calls in tests, scripts, docs or workflows. Experiments, reference computations, fixtures and measurement tools are written in Rust; Python's runtime and library behaviour do not show what the Rust code does. The guard is `rcsr-engine/tests/no_python.rs`.
 
 ## Style
 
@@ -82,12 +82,12 @@ Recurring agent workflows are numbered pipelines with a checked contract per sta
 
 ```sh
 # build and test the engine
-cd my-version && cargo build --release && cargo test --release
+cd rcsr-engine && cargo build --release && cargo test --release
 
 # the CLI
-cd my-version && ./target/release/rcsr --help
-cd my-version && ./target/release/rcsr schema
+cd rcsr-engine && ./target/release/rcsr --help
+cd rcsr-engine && ./target/release/rcsr schema
 
 # start an issue (see docs/issue-workflow.md for the full flow)
-git worktree add -b issue/12-metrics-expansion worktrees/issue-12-metrics-expansion main
+verksted/_tools/wt-new.sh 12 metrics-expansion
 ```

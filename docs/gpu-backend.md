@@ -28,7 +28,7 @@ default.
 ## Build and run
 
 ```sh
-cd my-version
+cd rcsr-engine
 
 # default: CPU only, no CUDA needed
 cargo build --release
@@ -89,7 +89,7 @@ Toolkit selection, first match wins:
 2. The newest `/usr/local/cuda-13.<minor>/bin/nvcc` that runs `--version` and can target `RCSR_CUDA_ARCH`, source `cuda-13`. Only directories named `cuda-13.<digits>` count; the symlinks `cuda` and `cuda-13` are skipped. CUDA 13.0 removed offline compilation for `sm_50` to `sm_72`, so those targets skip rule 2.
 3. `nvcc` on `PATH`, source `PATH`.
 
-The major is pinned to 13 (`PREFERRED_CUDA_MAJOR` in `src/cuda/arch.rs`). `NVCC`, `CUDA_HOME` and `CUDA_PATH` are not read. Installing a toolkit does not rerun `build.rs`: run `touch my-version/build.rs` after the install. A target that the chosen CUDA 13 `nvcc` cannot build, for example `sm_70` with only CUDA 13 on `PATH`, fails with a message that names `RCSR_NVCC=/usr/bin/nvcc`.
+The major is pinned to 13 (`PREFERRED_CUDA_MAJOR` in `src/cuda/arch.rs`). `NVCC`, `CUDA_HOME` and `CUDA_PATH` are not read. Installing a toolkit does not rerun `build.rs`: run `touch rcsr-engine/build.rs` after the install. A target that the chosen CUDA 13 `nvcc` cannot build, for example `sm_70` with only CUDA 13 on `PATH`, fails with a message that names `RCSR_NVCC=/usr/bin/nvcc`.
 
 The chosen toolkit is compiled into the binary. `rcsr --version` prints a second line in a CUDA build:
 
@@ -124,7 +124,7 @@ GB10 attached.
 
 ### `sm_121` compile-only validation (#28)
 
-[`tests/sm121_compile.rs`](../my-version/tests/sm121_compile.rs) compiles the
+[`tests/sm121_compile.rs`](../rcsr-engine/tests/sm121_compile.rs) compiles the
 real `src/cuda/eval.cu` for `sm_121` and inspects the cubin. It needs CUDA ≥
 12.9 and `cuobjdump`, but no GPU; when no such toolkit is found it prints a skip
 note and the rest of the suite is unaffected. Run it explicitly:
@@ -585,9 +585,9 @@ exact CPU statistic (and can still use the device fit-only arm); that case
 reports `cpu` with `backend_reason = "order/rank scoring: the sample is below
 the 4096-row device floor"`, and `GpuSearch::native_metric`/`native_stat` are
 inactive. The sort-based arms need at least
-[`MEDIAN_GPU_MIN_ROWS`](../my-version/src/fit.rs) = 4 096 training rows
+[`MEDIAN_GPU_MIN_ROWS`](../rcsr-engine/src/fit.rs) = 4 096 training rows
 (median, interquartile, rank, AUC) and the maximum fit arm
-[`MAXIMUM_GPU_MIN_ROWS`](../my-version/src/fit.rs) = 512, a floor below which the CPU statistic is cheaper. The maximum fit arm also needs the cost model of the maximum polish to prefer the device, which for one constant starts near 3 300 rows (see "Maximum absolute error fitting").
+[`MAXIMUM_GPU_MIN_ROWS`](../rcsr-engine/src/fit.rs) = 512, a floor below which the CPU statistic is cheaper. The maximum fit arm also needs the cost model of the maximum polish to prefer the device, which for one constant starts near 3 300 rows (see "Maximum absolute error fitting").
 
 Fallback and the flags:
 
@@ -606,7 +606,7 @@ Fallback and the flags:
   hatch: it is silent and yields the byte-identical CPU trajectory.
 * `RCSR_GPU=0` makes a CUDA build behave as if no device were present, which is
   how the fallback test runs on a machine that has one.
-  Tests build their `rcsr` and `rcsr-bench` children through `my-version/tests/common/rcsr.rs`: `rcsr()` sets `RCSR_GPU=0`, so the child makes no CUDA call, and `rcsr_on_device()` keeps the environment for a test whose purpose is the device (`rcsr_for(args)` picks by the device flags `--gpu`, `--dispatch`, `--batch-pnl`, `--device-pnl`, `--gpu-memory`). `tests/rcsr_command_lint.rs` fails on any other use of `CARGO_BIN_EXE_rcsr` or `CARGO_BIN_EXE_rcsr-bench` in `tests/`.
+  Tests build their `rcsr` and `rcsr-bench` children through `rcsr-engine/tests/common/rcsr.rs`: `rcsr()` sets `RCSR_GPU=0`, so the child makes no CUDA call, and `rcsr_on_device()` keeps the environment for a test whose purpose is the device (`rcsr_for(args)` picks by the device flags `--gpu`, `--dispatch`, `--batch-pnl`, `--device-pnl`, `--gpu-memory`). `tests/rcsr_command_lint.rs` fails on any other use of `CARGO_BIN_EXE_rcsr` or `CARGO_BIN_EXE_rcsr-bench` in `tests/`.
 * Any CUDA error during a batch prints the same `# gpu: unavailable (...)`
   note and disables the GPU for the rest of the run. There is no panic and no
   stale result: every candidate that was still pending when the failing stage
@@ -627,9 +627,9 @@ The fit arms of #226/#227/#230/#232 already computed an exact device statistic;
 the dispatch gate that admits those metrics to the search.
 
 **Entry point.** `GpuEvaluator::score_stat_batch(plans, constants, stat)` takes one
-[`GpuFitPlan`](../my-version/src/fit.rs) and one constant vector per candidate,
+[`GpuFitPlan`](../rcsr-engine/src/fit.rs) and one constant vector per candidate,
 runs the exact `f64` forward pass from the resident rows, and returns one
-`Option<f64>` per candidate for a [`ScoreStat`](../my-version/src/gpu.rs):
+`Option<f64>` per candidate for a [`ScoreStat`](../rcsr-engine/src/gpu.rs):
 
 | `ScoreStat` | device work | exactness contract |
 |---|---|---|
@@ -3532,7 +3532,7 @@ kernels of the native run. `--dispatch device` stays the explicit override, and
 GPU test helpers that must force the device set `DispatchMode::Device`. When `auto` keeps every stage on the CPU, the run
 reports `backend_reason` `dispatch: cost model kept every stage on the cpu`.
 
-The memcheck pass uses the CUDA 13.0 sanitizer `/usr/local/cuda-13.0/bin/compute-sanitizer`. It is defined by `my-version/tests/sanitizer.plan` and run by `verksted/_tools/sanitize-all.sh`. Each line names a binary and a test (or `*`), a mode and a reason. `skip` runs nothing. `run-bin` (only with `*`) names a cargo bin instead of a test target: the release binary itself runs under memcheck with the rest of the line as its arguments, in its own lock hold (`rcsr-gpu-bench * run-bin --batch 64 --reps 1 --depth 3`; `--only rcsr-gpu-bench` runs just that line). The bin's unit-test executable keeps a `skip` line. `app-only` (only with `*`) runs the test process under memcheck with `--target-processes application-only` and gives the normal verdict: for a binary whose test process makes CUDA calls and whose children are not traced (the reason names what stays unsanitized). An `app-only` line may be combined with named `skip` lines of the same binary. `no-cuda-app-only` (only with `*`) is `no-cuda` run with `--target-processes application-only`, for a binary whose child processes also make no CUDA call and on which the default `all` crashes the sanitizer; the launch-timeout message `No attachable process found` also counts as no CUDA call there. `no-cuda` (only with `*`) lists a binary that makes no CUDA call by design: it still runs, and rc 255 with `terminated before first instrumented API call` and passing tests is a pass only for a listed binary; an unlisted binary with that outcome fails the pass, and a listed binary that does call CUDA gets the normal verdict with a `listed no-cuda but called CUDA` mark. `device` (only with `*`) lists a binary that calls CUDA by design; the runner treats it exactly like an unlisted binary (default `--target-processes all`, normal verdict) and it may be combined with named `skip` and `api-errors-no` lines. `tests/sanitizer_plan.rs` requires exactly one `*` line per test executable (every `tests/<name>.rs`, `lib` and each `bin-<name>`), so a new test file needs a `device`, `no-cuda`, `no-cuda-app-only`, `app-only` or `skip` line in the same change. A `no-cuda` or `no-cuda-app-only` binary whose sources name a device entry point (`DEVICE_TOKENS` in that test, for example `"--gpu"`, `gpu: true`, `DispatchMode::Device`) needs `ok-token: <token>` in its reason for each such token; the marker records that the use does not reach the device from the test process and is not evidence that the binary is CPU-only, the memcheck verdicts decide. `api-errors-no` runs that one test alone with `--report-api-errors no`, because it provokes a `cudaMalloc` out-of-memory on purpose and the default reports that call as an error. The runner exports `RCSR_UNDER_SANITIZER=memcheck`; a test reads it through `tests/common/sanitizer.rs` (`active()`, `pick(native, sanitized)`) to pick a smaller fixture that still crosses every chunk, tile and gap boundary. Every run is capped at 580 s; a run that hits the cap fails as `budget`. `tests/sanitizer_plan.rs` fails when the plan names a binary or test that does not exist.
+The memcheck pass uses the CUDA 13.0 sanitizer `/usr/local/cuda-13.0/bin/compute-sanitizer`. It is defined by `rcsr-engine/tests/sanitizer.plan` and run by `verksted/_tools/sanitize-all.sh`. Each line names a binary and a test (or `*`), a mode and a reason. `skip` runs nothing. `run-bin` (only with `*`) names a cargo bin instead of a test target: the release binary itself runs under memcheck with the rest of the line as its arguments, in its own lock hold (`rcsr-gpu-bench * run-bin --batch 64 --reps 1 --depth 3`; `--only rcsr-gpu-bench` runs just that line). The bin's unit-test executable keeps a `skip` line. `app-only` (only with `*`) runs the test process under memcheck with `--target-processes application-only` and gives the normal verdict: for a binary whose test process makes CUDA calls and whose children are not traced (the reason names what stays unsanitized). An `app-only` line may be combined with named `skip` lines of the same binary. `no-cuda-app-only` (only with `*`) is `no-cuda` run with `--target-processes application-only`, for a binary whose child processes also make no CUDA call and on which the default `all` crashes the sanitizer; the launch-timeout message `No attachable process found` also counts as no CUDA call there. `no-cuda` (only with `*`) lists a binary that makes no CUDA call by design: it still runs, and rc 255 with `terminated before first instrumented API call` and passing tests is a pass only for a listed binary; an unlisted binary with that outcome fails the pass, and a listed binary that does call CUDA gets the normal verdict with a `listed no-cuda but called CUDA` mark. `device` (only with `*`) lists a binary that calls CUDA by design; the runner treats it exactly like an unlisted binary (default `--target-processes all`, normal verdict) and it may be combined with named `skip` and `api-errors-no` lines. `tests/sanitizer_plan.rs` requires exactly one `*` line per test executable (every `tests/<name>.rs`, `lib` and each `bin-<name>`), so a new test file needs a `device`, `no-cuda`, `no-cuda-app-only`, `app-only` or `skip` line in the same change. A `no-cuda` or `no-cuda-app-only` binary whose sources name a device entry point (`DEVICE_TOKENS` in that test, for example `"--gpu"`, `gpu: true`, `DispatchMode::Device`) needs `ok-token: <token>` in its reason for each such token; the marker records that the use does not reach the device from the test process and is not evidence that the binary is CPU-only, the memcheck verdicts decide. `api-errors-no` runs that one test alone with `--report-api-errors no`, because it provokes a `cudaMalloc` out-of-memory on purpose and the default reports that call as an error. The runner exports `RCSR_UNDER_SANITIZER=memcheck`; a test reads it through `tests/common/sanitizer.rs` (`active()`, `pick(native, sanitized)`) to pick a smaller fixture that still crosses every chunk, tile and gap boundary. Every run is capped at 580 s; a run that hits the cap fails as `budget`. `tests/sanitizer_plan.rs` fails when the plan names a binary or test that does not exist.
 A test binary that spawns a process (a `Command::new`, an `rcsr_cmd::` child helper, or `.spawn()`, `.output()`, `.status()` on a `Command`) never runs under the default `--target-processes all`: compute-sanitizer 2025.3.1.0 crashes (use-after-free in the front-end, rc 139) while it tracks a process tree, on the same commit at random. `tests/sanitizer_plan.rs` fails when such a binary has no `skip`, `no-cuda-app-only` or `app-only` star line. In application-only mode the target still carries the injection environment, and a CUDA-using child can block in `libsanitizer-collection.so`. `tests/common/rcsr.rs` therefore removes `NV_SANITIZER_INJECTION_*`, `NVIDIA_PROCESS_INJECTION_*`, `NVTX_INJECTION64_PATH`, `CUDA_INJECTION64_PATH` and `LD_PRELOAD` from every rcsr child of a sanitized test (`RCSR_UNDER_SANITIZER` set) and drops the compute-sanitizer directory from its `LD_LIBRARY_PATH`. Device work of children is memchecked as one process per run on the `rcsr * run-bin` lines, which also run with `--target-processes application-only` and must start no CUDA-using child (`calibrate --no-enrich`). `sanitize-all.sh` labels rc 139 as `tool crash`, fails the pass and never retries it. Several `run-bin` lines may share one binary; the first logs as `<binary>`, later ones as `<binary>-<n>`.
 
 A device test that finds no usable device calls `rcsr::backend::skip_without_device(reason)` and returns. The call prints `reason` and lets the test skip, or panics when `RCSR_REQUIRE_DEVICE=1`, so a gate on a machine whose device went missing fails instead of passing. `verksted/_tools/gate.sh`, `sanitize.sh` and `sanitize-all.sh` set it for every CUDA suite and memcheck run. `RCSR_GPU=0` in the environment of a test process hides the device and fails a required test with that message. Children that tests start with `RCSR_GPU=0` do not call the helper, so the two switches do not meet. `tests/device_skip_lint.rs` refuses a bare `eprintln!("skip...device")` in `tests/` and `src/`, and `tests/require_device.rs` runs the helper in a child process of the test binary to prove the panic without touching the environment of parallel tests.
@@ -3561,7 +3561,7 @@ Resident scoring of 400 candidates over 4,775,757 x 20 f32 rows takes 0.139 s (m
 
 ## Kernel arguments are device memory
 
-A kernel never receives host memory. Under HMM addressing a host pointer in a launch works natively and memcheck does not reliably flag it, so `my-version/tests/cuda_kernel_args.rs` checks the `src/cuda/*.cu` and `*.h` text on every `cargo test` (no GPU, no CUDA build). Rules:
+A kernel never receives host memory. Under HMM addressing a host pointer in a launch works natively and memcheck does not reliably flag it, so `rcsr-engine/tests/cuda_kernel_args.rs` checks the `src/cuda/*.cu` and `*.h` text on every `cargo test` (no GPU, no CUDA build). Rules:
 
 | Rule | Rejects |
 |---|---|
@@ -3575,7 +3575,7 @@ L2 has an allowlist (`ALLOW_L2` in the test) for entry points whose caller passe
 
 ### Checked launches
 
-Every kernel launch in `src/cuda/*.cu` goes through `rc_launch` (`my-version/src/cuda/launch_guard.h`). `rc_launch` calls `cudaPointerGetAttributes` on each pointer argument before the launch and refuses it unless the pointer is NULL, device memory (`type` 2) or managed memory (`type` 3). The test uses `type`, not `devicePointer`: under HMM `devicePointer` is non-NULL for `malloc`, `calloc` and stack memory (`type` 0). Pinned host memory (`type` 1) is refused; a kernel that needs it must add a reviewed `RcArgCheck` specialisation. A by-value struct that carries pointers needs one too (`RwArena`, `RcFeatDev`, `RcPrepDev`); the build fails with a static assertion for a struct without one.
+Every kernel launch in `src/cuda/*.cu` goes through `rc_launch` (`rcsr-engine/src/cuda/launch_guard.h`). `rc_launch` calls `cudaPointerGetAttributes` on each pointer argument before the launch and refuses it unless the pointer is NULL, device memory (`type` 2) or managed memory (`type` 3). The test uses `type`, not `devicePointer`: under HMM `devicePointer` is non-NULL for `malloc`, `calloc` and stack memory (`type` 0). Pinned host memory (`type` 1) is refused; a kernel that needs it must add a reviewed `RcArgCheck` specialisation. A by-value struct that carries pointers needs one too (`RwArena`, `RcFeatDev`, `RcPrepDev`); the build fails with a static assertion for a struct without one.
 
 A refused launch runs nothing: `rc_launch` launches the same kernel with zero blocks, which executes no code and leaves `cudaErrorInvalidValue` in the last-error slot. Every call site already reads that slot, so the batch fails like any failed launch. Under an explicit `--gpu` the run exits 6 with `--gpu was requested but the device search failed: CUDA batch evaluation failed` and writes no result file. Under the default Auto dispatch the search reruns on the CPU: the result records `backend` `cpu` with `backend_reason` `CUDA batch evaluation failed`, and its archive hash equals a plain `--cpu` run of the same seed. `tests/gpu_refusal_cli.rs` proves both. The first refusal of each kernel prints `rcsr: refused launch of <kernel>: argument <i> is not device or managed memory` on stderr. Under `compute-sanitizer` a refusal shows as a `cudaErrorInvalidValue` API error, never as an `Invalid __global__` access.
 
