@@ -930,3 +930,119 @@ fn adaptive_mix_learns_on_the_device() {
     assert_eq!(archive, again, "the archive differs between two runs");
     assert_eq!(mixes, again_mixes, "the learned windows differ between two runs");
 }
+
+/// #1078, #1117: a `--fitness pnl --fit-accept fitness` search on the device
+/// refuses some fits and counts them on the device path.
+#[cfg(feature = "cuda")]
+struct AcceptRun {
+    archive: Vec<(u64, usize, u64)>,
+    hash: u64,
+    fit_accept: Option<rcsr::search::FitAcceptReport>,
+    /// Per generation `(accepted, rejected)` from the dev log.
+    log: Vec<Option<(u64, u64)>>,
+    wall_s: f64,
+}
+
+#[cfg(feature = "cuda")]
+fn pnl_panel() -> (Sample, std::sync::Arc<rcsr::trading::FitnessBook>) {
+    let mut state = 17u64;
+    let mut unit = move || {
+        state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        (state >> 11) as f64 / (1u64 << 53) as f64
+    };
+    let mut rows = rcsr::trading::TradingRows::default();
+    let mut x = Vec::new();
+    let mut ret = Vec::new();
+    for i in 0..2_400usize {
+        let g = i / 600;
+        rows.group.push(g as u64);
+        rows.time.push(1.6e9 + 900.0 * (i - 600 * g) as f64);
+        let signal = unit() - 0.5;
+        x.push(vec![signal, unit() * 4.0 - 2.0]);
+        ret.push(0.004 * signal + 0.003 * (unit() - 0.5));
+    }
+    let slice = rcsr::data::TradingSlice { rows, ret: ret.clone() };
+    let spec = rcsr::trading::TradingSpec { cost_bps: 2.0, min_trades: 0, ..Default::default() };
+    let book = rcsr::trading::FitnessBook::new(&slice, &spec, 900.0).expect("a profitable book");
+    (Sample { x, y: ret, w: Vec::new(), ys: Vec::new(), pairs: None }, std::sync::Arc::new(book))
+}
+
+#[cfg(feature = "cuda")]
+fn accept_run(accept: rcsr::search::FitAccept, seed: u32) -> AcceptRun {
+    let (sample, book) = pnl_panel();
+    let records = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = records.clone();
+    let cfg = Config {
+        generations: 12,
+        islands: 2,
+        pop: 64,
+        max_complexity: 14,
+        fit_iters: 6,
+        patience: 0,
+        seed,
+        metric: Metric::Squared,
+        ops: vec![Op::Add, Op::Sub, Op::Mul, Op::Div],
+        fitness: rcsr::search::Fitness::LongPnl(book),
+        fit_strategy: rcsr::fit::FitStrategy::Gpu,
+        fit_accept: accept,
+        gpu: true,
+        gpu_required: true,
+        gpu_notes: false,
+        dispatch: rcsr::dispatch::DispatchMode::Device,
+        dev_log: Some(std::sync::Arc::new(move |r: &rcsr::devlog::GenRecord| {
+            sink.lock().unwrap().push((r.fit.accept, r.wall_s));
+        })),
+        ..Default::default()
+    };
+    let out = search::run(&cfg, &sample, &sample);
+    let records = records.lock().unwrap().clone();
+    AcceptRun {
+        archive: describe(&out),
+        hash: out.archive.hash(),
+        fit_accept: out.fit_accept,
+        log: records.iter().map(|r| r.0).collect(),
+        wall_s: records.iter().map(|r| r.1).sum(),
+    }
+}
+
+/// #1078, #1117: on the device, `fit.rejected` is above 0 in the dev log,
+/// `by_path.device` is non-zero, the totals equal the sums over the paths, and
+/// two runs with the same seed give the same archive, counts and log. The
+/// default `always` arm counts nothing. The wall ratio is printed, not asserted.
+#[cfg(feature = "cuda")]
+#[test]
+fn fit_accept_fitness_runs_on_the_device_and_is_repeatable() {
+    if !rcsr::backend::probe().available() {
+        rcsr::backend::skip_without_device("skipping: no usable CUDA device");
+        return;
+    }
+    let first = accept_run(rcsr::search::FitAccept::Fitness, 7);
+    let again = accept_run(rcsr::search::FitAccept::Fitness, 7);
+    let report = first.fit_accept.as_ref().expect("counts under fitness");
+    let rejected_in_log: u64 = first.log.iter().map(|c| c.expect("every record carries the counts under fitness").1).sum();
+    let (kept, refused) = report.path("device").expect("a device path");
+    eprintln!(
+        "fit_accept: dev log rejected {rejected_in_log}, device path (accepted {kept}, rejected {refused}), totals {:?}",
+        report.totals()
+    );
+    assert!(rejected_in_log > 0, "the gate refused no fit in the dev log");
+    assert!(kept + refused > 0, "no device decision was counted");
+    let sum = rcsr::search::FitPath::ALL.iter().fold((0, 0), |s, p| {
+        let (a, r) = report.path(p.name()).unwrap();
+        (s.0 + a, s.1 + r)
+    });
+    assert_eq!(report.totals(), sum, "the totals differ from the sums over the paths");
+    assert_eq!(first.archive, again.archive, "the front differs between two runs");
+    assert_eq!(first.hash, again.hash, "the archive hash differs between two runs");
+    assert_eq!(first.fit_accept, again.fit_accept, "the counts differ between two runs");
+    assert_eq!(first.log, again.log, "the dev log counts differ between two runs");
+    let always = accept_run(rcsr::search::FitAccept::Always, 7);
+    assert!(always.fit_accept.is_none() && always.log.iter().all(|c| c.is_none()), "the always arm counts decisions");
+    eprintln!(
+        "fit_accept wall: fitness {:.3} s, again {:.3} s, always {:.3} s, fitness/always {:.3}",
+        first.wall_s,
+        again.wall_s,
+        always.wall_s,
+        first.wall_s / always.wall_s
+    );
+}
