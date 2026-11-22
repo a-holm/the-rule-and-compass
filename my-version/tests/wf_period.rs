@@ -539,3 +539,15 @@ fn wf_ppy_without_horizon_match_trials_accepts() {
     let o = trials_of(&path);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
 }
+
+#[test]
+fn wf_ppy_without_horizon_records_period_seconds_and_survives_nan_scores() {
+    let scratch = Scratch::new("wf-undeclared-ppy-nan");
+    let (out, path) = run_hourly_with(scratch.path(), 0.75, &[], &["--periods-per-year", "8760"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let j = read_json(&path);
+    assert_eq!(num(&j, &["annualization", "period_seconds"]), 3600.0);
+    assert_eq!(at(&j, &["annualization", "source"]).as_str(), Some("explicit"));
+    let o = trials_of(&path);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+}
