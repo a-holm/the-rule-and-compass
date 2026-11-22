@@ -2709,6 +2709,46 @@ fn missing_score_device_pnl_reduction_reads_the_same_book() {
     }
 }
 
+fn top_dropped(r: &walkforward::Report) -> u64 {
+    let j = rcsr::devlog::Json::parse(&r.json()).unwrap();
+    j.get("dropped_rows").and_then(|v| v.as_f64()).unwrap() as u64
+}
+
+#[test]
+fn dropped_rows_counts_a_training_row_once_across_candidates() {
+    // Training rows 0..8 (validation is the later half), test rows 8..10. A
+    // negative x makes sqrt(x + k) NaN for the candidates with k below -x.
+    let xs = [1.0, -5.0, -1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 1.0, 2.0, 3.0, 4.0];
+    let rows: Vec<(f64, f64, f64)> = xs.iter().enumerate().map(|(i, &x)| (i as f64, x, 0.01)).collect();
+    let t = single(&rows);
+    let run = |candidates: &[&str], windows: Vec<Window>| {
+        let mut s = spec("x", windows);
+        s.validation_frac = 0.5;
+        s.threshold_quantile = 0.5;
+        s.candidates = candidates.iter().map(|c| c.to_string()).collect();
+        walkforward::run_table(&t, &s, "test").unwrap()
+    };
+    let one = vec![window("w", 0.0, 8.0, 8.0, 10.0)];
+
+    // Every candidate is NaN on row 1 only.
+    let all_nan = run(&["sqrt(x + 1)", "sqrt(x + 1.5)", "sqrt(x + 2)"], one.clone());
+    assert_eq!(all_nan.windows[0].dropped_rows, 1);
+    assert_eq!(top_dropped(&all_nan), 1);
+
+    // A is NaN on row 1, B on rows 1 and 2, C never: rows 1 and 2.
+    let mixed = run(&["sqrt(x + 2)", "sqrt(x + 0.5)", "x"], one.clone());
+    assert_eq!(mixed.windows[0].dropped_rows, 2);
+
+    // One candidate: the same rows, counted the same way.
+    let single_run = run(&["sqrt(x + 0.5)"], one.clone());
+    assert_eq!(single_run.windows[0].dropped_rows, 2);
+
+    // Windows count independently and the top level is their sum.
+    let two = run(&["sqrt(x + 2)", "sqrt(x + 0.5)", "x"], vec![window("w1", 0.0, 8.0, 8.0, 10.0), window("w2", 0.0, 8.0, 10.0, 12.0)]);
+    assert_eq!(two.windows.iter().map(|w| w.dropped_rows).collect::<Vec<_>>(), vec![2, 2]);
+    assert_eq!(top_dropped(&two), 4);
+}
+
 /// #1176: `--all-members` and `--emit-series` on a 3-symbol panel and a front of 3 members.
 mod members {
     use rcsr::devlog::Json;
