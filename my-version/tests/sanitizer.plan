@@ -69,6 +69,7 @@ synth_panel            *  no-cuda  CPU-only tests; no CUDA call
 target_golden          *  no-cuda-app-only  its tests are ignored (measurement or external data): 0 tests run; the rcsr child runs with RCSR_GPU=0; memcheck runs with --target-processes application-only because the binary spawns processes and the default all crashes the sanitizer on a process tree (#910)
 test_attributes        *  no-cuda  CPU-only tests; no CUDA call
 test_hygiene           *  no-cuda  CPU-only tests; no CUDA call
+threshold_fit_golden   *  no-cuda  CPU-only tests; no CUDA call
 time_parsing           *  no-cuda  CPU-only tests; no CUDA call
 trading                *  no-cuda  CPU-only tests; no CUDA call
 ts_hazards             *  no-cuda  CPU-only tests; no CUDA call
