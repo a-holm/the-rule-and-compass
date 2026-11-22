@@ -464,7 +464,7 @@ and leakage rules, and a worked recovery example.
 A long search can be checkpointed and continued later. The checkpoint carries
 the complete search state — configuration, backend (`cpu`/`gpu`), canonical
 config hash, populations, per-island RNG states, stagnation and patience
-counters, archive and a data fingerprint — so a resumed run follows the
+counters, archive, convergence tracker and a data fingerprint — so a resumed run follows the
 identical trajectory:
 
 ```sh

@@ -170,6 +170,11 @@ Every record:
 | `qd_observed <usage> <skew>` | #1166: one descriptor of the bounded Lloyd sample (at most 4096), in sample order. |
 | `qd_entry <cell> <usage> <skew> <error> <cost> <tree>` | #1166: one member of a cell's local front with its descriptor, in cell order and then in the cell's own order. |
 | `qd_known <hash> <usage> <skew>` | #1166: one entry of the archive's descriptor cache (structural hash in hex), in ascending hash order. The cache decides which trees need an evaluating descriptor fallback, so it is saved for `qd.descriptor_fallbacks` to continue exactly. At most 65 536 entries. |
+| `progress 1 <window> <jaccard_sum> <confidence> <stability> <maturity> <percent> <best> <fronts> <jaccards> <seen>` | #1348: header of the convergence tracker (docs/convergence.md) after the last observed generation, format version 1. The comparison window, the running Jaccard sum, the current four readings and the record counts that follow. Every float is 16 hex digits of its IEEE-754 bit pattern, never decimal text. |
+| `progress_best <generation> <error>` | #1348: one remembered `(generation, best error)` pair, oldest first (at most `window + 1`). |
+| `progress_front <form>...` | #1348: the structural-form hashes (hex, ascending) of one remembered front, oldest first (at most `window + 1`). A generation with an empty front writes the bare record. |
+| `progress_jaccard <value>` | #1348: one remembered Jaccard overlap, oldest first (at most `window`). |
+| `progress_seen <form> <generation>` | #1348: the first generation of the current continuous run of one form on the front, in ascending form order. |
 
 Floating-point values are written with Rust's shortest round-trip `Debug` form
 (`1.9968344769643271`, `-0.0`), with `inf`, `-inf` and `NaN` for non-finite
@@ -381,11 +386,15 @@ In `--ndjson` mode the same actions are machine-readable events:
 and `--json` includes:
 
 ```json
-"checkpoint": {"resumed_from": "run.rcsr", "saved_to": "run.rcsr", "generation": 40}
+"checkpoint": {"resumed_from": "run.rcsr", "saved_to": "run.rcsr", "generation": 40, "convergence_exact": true}
 ```
 
 The text-mode `# checkpoint: ...` line goes to stderr, like the rest of the
 human-readable log.
+
+### Convergence state (#1348)
+
+Every checkpoint carries the convergence tracker, so a resumed run continues the `convergence` readings (`confidence`, `stability`, `maturity`, `percent_converged`) of the run it continues. A run cut at any generation, a chain of resumes and a chain of `--interim-chunk` chunks report the same `convergence` block, byte for byte, as the uninterrupted run. The `checkpoint` block of `run.json` adds `"convergence_exact"`: `true` when every reading came from the continued tracker, `false` when the run resumed (after at least one generation) from a checkpoint written before the tracker was saved. Then the tracker starts empty at the resume, the block describes only the generations after it, and `converged_early` can differ from the uninterrupted run; the resume prints a `# resume:` line on stderr. An unsupported `progress` version, a record before the header, a duplicate header or record counts that do not match are refused as a corrupt checkpoint.
 
 ## Book rule line (#1207)
 

@@ -40,6 +40,8 @@
 //! | `books <i> <sig|->...` | #1082: book signature of each member of island i (16 hex digits), written only under `--same-book-guard` |
 //! | `qd_archive 1 <mode> <cells> <records> <fallbacks> <known_tag> <observed> <entries> <known>` | #1166: QD archive header, written only under `--qd-policy` |
 //! | `qd_visits` / `qd_centroid` / `qd_observed` / `qd_entry` / `qd_known` | #1166: the archive's visit counts, centroids, Lloyd sample, cell fronts and descriptor cache |
+//! | `progress 1 <window> <jaccard_sum> <confidence> <stability> <maturity> <percent> <best> <fronts> <jaccards> <seen>` | #1348: convergence tracker header, floats as 16 hex digits of their bit pattern |
+//! | `progress_best` / `progress_front` / `progress_jaccard` / `progress_seen` | #1348: the tracker history (best errors, form sets, Jaccard values, first-seen generation of each form) |
 //!
 //! Trees are encoded recursively as `op_index val arity child...`, where
 //! `op_index` is [`Op::index`] and `val` is the exact floating-point value
@@ -55,6 +57,7 @@ use crate::data::Sample;
 use crate::expr::{AggKind, Node, Op};
 use crate::metrics::Metric;
 use crate::pareto::{Archive, Sol};
+use crate::progress_stats::{Convergence, ProgressSnapshot};
 use crate::provenance::BuildIdentity;
 use crate::qd::{Descriptor, QdEntry, QdMode, QdState};
 use crate::rng::Mt;
@@ -74,6 +77,9 @@ const STATE_WORDS: usize = 624;
 
 /// #1166: the version field of the `qd_archive` header this build reads and writes.
 const QD_ARCHIVE_VERSION: u32 = 1;
+
+/// #1348: the version field of the `progress` header this build reads and writes.
+const PROGRESS_VERSION: u32 = 1;
 
 /// #1166: why a `--qd-policy` checkpoint without the archive records does not resume.
 pub const QD_ARCHIVE_MISSING: &str =
@@ -291,6 +297,10 @@ pub struct Checkpoint {
     /// a `--qd-policy` file written before the archive was saved (a resume
     /// refuses that file).
     pub qd: Option<QdState>,
+    /// #1348: the convergence tracker after the last observed generation, so a
+    /// resume continues the readings of the run it continues. `None` for a file
+    /// written before the tracker was saved (its readings restart at the resume).
+    pub progress: Option<ProgressSnapshot>,
 }
 
 /// The operators in [`Op::index`] order. The array index is exactly
@@ -763,6 +773,9 @@ impl Checkpoint {
         if let Some(q) = &self.qd {
             write_qd(q, &mut out); // #1166
         }
+        if let Some(p) = &self.progress {
+            write_progress(p, &mut out); // #1348
+        }
         out
     }
 
@@ -815,6 +828,7 @@ impl Checkpoint {
         let mut final_header: Option<(usize, usize, u64)> = None;
         let mut final_sols: Vec<Sol> = Vec::new();
         let mut qd = QdReader::default(); // #1166
+        let mut progress = ProgressReader::default(); // #1348
 
         for (lineno, line) in lines.enumerate() {
             let lineno = lineno + 2; // first line is line 1
@@ -1176,6 +1190,7 @@ impl Checkpoint {
                     }
                 }
                 other if other.starts_with("qd_") => qd.record(&parts, lineno)?, // #1166
+                other if other == "progress" || other.starts_with("progress_") => progress.record(&parts, lineno)?, // #1348
                 other => {
                     return Err(format!(
                         "line {}: unknown checkpoint record '{}'",
@@ -1187,6 +1202,7 @@ impl Checkpoint {
 
         let config = build_config(&config_fields)?;
         let qd = qd.finish(config.qd_policy)?; // #1166
+        let progress = progress.finish()?; // #1348
         let refit_band_unknown = !config_fields.contains_key("refit_band");
         let calibration_record = config_fields.get("calibration_source").map(|s| CalibrationRecord {
             source: s.clone(),
@@ -1419,6 +1435,7 @@ impl Checkpoint {
             final_archive,
             identity,
             qd,
+            progress,
         })
     }
 
@@ -2380,6 +2397,146 @@ impl QdReader {
 /// for a file written before the line existed.
 pub fn book_missing_score(text: &str) -> Option<String> {
     text.lines().find_map(|l| l.strip_prefix("book missing_score ").map(|v| v.trim().to_string()))
+}
+
+/// #1348: the `progress_*` records. Floats are written as 16 hex digits of
+/// their bit pattern, never as decimal text.
+fn write_progress(p: &ProgressSnapshot, out: &mut String) {
+    let c = &p.current;
+    writeln!(
+        out,
+        "progress {} {} {:016x} {:016x} {:016x} {:016x} {:016x} {} {} {} {}",
+        PROGRESS_VERSION,
+        p.window,
+        p.jaccard_sum.to_bits(),
+        c.confidence.to_bits(),
+        c.stability.to_bits(),
+        c.maturity.to_bits(),
+        c.percent_converged.to_bits(),
+        p.best.len(),
+        p.fronts.len(),
+        p.jaccards.len(),
+        p.seen.len()
+    )
+    .unwrap();
+    for (generation, error) in &p.best {
+        writeln!(out, "progress_best {} {:016x}", generation, error.to_bits()).unwrap();
+    }
+    for forms in &p.fronts {
+        let list: Vec<String> = forms.iter().map(|f| format!("{:016x}", f)).collect();
+        writeln!(out, "progress_front {}", list.join(" ")).unwrap();
+    }
+    for j in &p.jaccards {
+        writeln!(out, "progress_jaccard {:016x}", j.to_bits()).unwrap();
+    }
+    for (form, generation) in &p.seen {
+        writeln!(out, "progress_seen {:016x} {}", form, generation).unwrap();
+    }
+}
+
+/// #1348: collects the `progress_*` records of one checkpoint, header first.
+#[derive(Default)]
+struct ProgressReader {
+    header: Option<ProgressHeader>,
+    best: Vec<(usize, f64)>,
+    fronts: Vec<Vec<u64>>,
+    jaccards: Vec<f64>,
+    seen: Vec<(u64, usize)>,
+}
+
+struct ProgressHeader {
+    window: usize,
+    jaccard_sum: f64,
+    current: Convergence,
+    best: usize,
+    fronts: usize,
+    jaccards: usize,
+    seen: usize,
+}
+
+fn parse_bits_at(parts: &[&str], at: usize, lineno: usize, what: &str) -> Result<f64, String> {
+    parse_hex_at(parts, at, lineno, what).map(f64::from_bits)
+}
+
+impl ProgressReader {
+    fn record(&mut self, parts: &[&str], lineno: usize) -> Result<(), String> {
+        let kind = parts[0];
+        if kind == "progress" {
+            let version = parse_num::<u32>(parts, 1, lineno, "progress version")?;
+            if version != PROGRESS_VERSION {
+                return Err(format!(
+                    "line {}: progress version {} is not supported; this build reads version {}",
+                    lineno, version, PROGRESS_VERSION
+                ));
+            }
+            let header = ProgressHeader {
+                window: parse_num(parts, 2, lineno, "progress window")?,
+                jaccard_sum: parse_bits_at(parts, 3, lineno, "progress jaccard_sum")?,
+                current: Convergence {
+                    confidence: parse_bits_at(parts, 4, lineno, "progress confidence")?,
+                    stability: parse_bits_at(parts, 5, lineno, "progress stability")?,
+                    maturity: parse_bits_at(parts, 6, lineno, "progress maturity")?,
+                    percent_converged: parse_bits_at(parts, 7, lineno, "progress percent_converged")?,
+                },
+                best: parse_num(parts, 8, lineno, "progress best count")?,
+                fronts: parse_num(parts, 9, lineno, "progress front count")?,
+                jaccards: parse_num(parts, 10, lineno, "progress jaccard count")?,
+                seen: parse_num(parts, 11, lineno, "progress seen count")?,
+            };
+            return set_once(&mut self.header, header, "progress", lineno);
+        }
+        if self.header.is_none() {
+            return Err(format!("line {}: {} record before the progress header", lineno, kind));
+        }
+        match kind {
+            "progress_best" => self.best.push((
+                parse_num(parts, 1, lineno, "progress_best generation")?,
+                parse_bits_at(parts, 2, lineno, "progress_best error")?,
+            )),
+            "progress_front" => {
+                let mut forms = Vec::with_capacity(parts.len() - 1);
+                for at in 1..parts.len() {
+                    forms.push(parse_hex_at(parts, at, lineno, "progress_front form")?);
+                }
+                self.fronts.push(forms);
+            }
+            "progress_jaccard" => self.jaccards.push(parse_bits_at(parts, 1, lineno, "progress_jaccard")?),
+            "progress_seen" => self.seen.push((
+                parse_hex_at(parts, 1, lineno, "progress_seen form")?,
+                parse_num(parts, 2, lineno, "progress_seen generation")?,
+            )),
+            other => return Err(format!("line {}: unknown checkpoint record '{}'", lineno, other)),
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<Option<ProgressSnapshot>, String> {
+        let Some(h) = self.header else {
+            return Ok(None);
+        };
+        for (what, said, found) in [
+            ("progress_best", h.best, self.best.len()),
+            ("progress_front", h.fronts, self.fronts.len()),
+            ("progress_jaccard", h.jaccards, self.jaccards.len()),
+            ("progress_seen", h.seen, self.seen.len()),
+        ] {
+            if said != found {
+                return Err(format!(
+                    "checkpoint is truncated or inconsistent: progress says {} {} record(s), found {}",
+                    said, what, found
+                ));
+            }
+        }
+        Ok(Some(ProgressSnapshot {
+            window: h.window,
+            best: self.best,
+            fronts: self.fronts,
+            jaccards: self.jaccards,
+            jaccard_sum: h.jaccard_sum,
+            seen: self.seen,
+            current: h.current,
+        }))
+    }
 }
 
 #[cfg(test)]

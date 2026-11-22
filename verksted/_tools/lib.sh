@@ -27,7 +27,6 @@ crate_dir() {
   fi
   printf '%s\n' "${hits[0]}"
 }
-CRATE=${RCSR_CRATE:-$(basename "$(crate_dir "$RCSR_ROOT" 2> /dev/null)" 2> /dev/null)}
 VLOCAL=${RCSR_LOCAL:-$ROOT/verksted/_local}
 WT=$ROOT/worktrees
 BASE=${RCSR_BASE:-integration/gpu-hardening}

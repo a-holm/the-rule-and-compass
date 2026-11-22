@@ -144,6 +144,7 @@ pub fn outcome(
         candidates_evaluated,
         fixed_position_fallback: false,
         interim: false,
+        convergence_exact: true,
         fit_accept: None,
         books: None,
     }

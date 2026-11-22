@@ -149,6 +149,10 @@ The result JSON carries `stop_reason` (`solved`, `patience`, `time_budget`,
 terminating generation of a `time_budget` stop still emits its progress and
 development-log events.
 
+## Resume (#1348)
+
+The tracker state is part of every checkpoint (docs/checkpoint.md, `progress` records), so a resumed run reports the `convergence` block and `converged_early` of the uninterrupted run, byte for byte. `converged_early` is a report field only: the loop stops on `solved`, `patience` or `time_budget` from the checkpointed patience counters, never from these readings. `run.json` `checkpoint.convergence_exact` is `false` when the run resumed from a checkpoint without the saved tracker; the block then covers only the generations after the resume.
+
 ## Reading the numbers
 
 | reading | interpretation |
