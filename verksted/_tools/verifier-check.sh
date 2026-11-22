@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Usage: clerk-check.sh <pr> [--base <branch>] [--claims <file>] [--scope <glob>]...
-# Read-only evidence check for the merge clerk. git fetch origin, then prints:
+# Usage: verifier-check.sh <pr> [--base <branch>] [--claims <file>] [--scope <glob>]...
+# Read-only evidence check for the verifier. git fetch origin, then prints:
 #   state: <OPEN|MERGED|CLOSED>  base: <name>  mergeable: <MERGEABLE|CONFLICTING|UNKNOWN>  head: <sha>
 #   files: one changed path per line, `out of scope` after a path that matches no --scope glob
 #   stat:  git diff --stat origin/<base>...<head>

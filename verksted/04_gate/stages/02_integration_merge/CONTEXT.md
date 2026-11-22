@@ -19,7 +19,7 @@ Do NOT load: gate runs, unmerged branches.
 ## Process
 
 1. If an input is missing or empty, stop and say which.
-2. Merges go through the merge clerk (`../../../03_orchestrate/CONTEXT.md`, stages `05_receive_and_verify` and `06_merge_cleanup`), one at a time, without a gate per merge. After each merge, comment on the issue with the merge sha. When `main` moved, merge `origin/main` into `BASE` instead of rebasing.
+2. Merges go through the verifier (`../../../03_orchestrate/CONTEXT.md`, stages `05_receive_and_verify` and `06_merge_cleanup`), one at a time, without a gate per merge. After each merge, comment on the issue with the merge sha. When `main` moved, merge `origin/main` into `BASE` instead of rebasing.
 3. New tickets branch from the tip of `BASE`, not from `main`.
 4. Write `merged.md`: the output of `git log --oneline main..BASE`.
 
