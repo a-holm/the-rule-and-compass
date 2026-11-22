@@ -8790,9 +8790,13 @@ fn run_search(
     crate::gpu::note_search_start();
     let nvars = train.x.first().map(|r| r.len()).unwrap_or(0);
     // #26: a checkpoint written during a GPU run stores the f32 proxy fitness,
-    // so a resumed run must rebuild the reported front on the CPU even when it
-    // is resumed with `--no-gpu`.
+    // so a run resumed from it must rebuild the reported front on the CPU even
+    // when it is resumed with `--no-gpu`. #1171: an exact (f64) checkpoint needs
+    // no rebuild; the reported front then does not depend on where the run was cut.
     let resumed = resume.is_some();
+    let resumed_inexact = resume
+        .as_ref()
+        .map_or(false, |cp| cp.error_kind != crate::checkpoint::ErrorKind::F64);
     // The aggregates are a property of the training rows, computed once. They
     // are deliberately **not** rebuilt for a generation's row subset and never
     // read the test sample: a subset changes which rows score a candidate, not
@@ -10305,7 +10309,7 @@ fn run_search(
         && (subsampling_active(cfg, train)
             || gpu_used
             || fit_only_device
-            || resumed
+            || resumed_inexact
             || fit_screened
             || cfg.fit_irls_active())
     {

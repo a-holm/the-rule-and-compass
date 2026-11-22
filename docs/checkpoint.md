@@ -33,6 +33,13 @@ search archive at the last completed generation. Saving only reads the state; it
 never consumes a random number or mutates a population, so `--save` alone cannot
 change the result.
 
+A CPU run that resumes a checkpoint with `error_kind f64` reports the search
+archive, as an uninterrupted CPU run does, so the reported trees do not depend
+on where the run was cut. A resume of an `f32_proxy` or `unknown` checkpoint, a
+run that scores on the device, and a run on row subsets rebuild the front from
+the surviving trees on every training row. Among trees that tie on error and
+cost the rebuild reports the lowest structural hash.
+
 Each save is **atomic**: the new text is written to `<file>.tmp`, flushed with
 `fsync`, and renamed over `<file>`. The previous good generation is retained as
 `<file>.prev` (hard link where possible, copy otherwise). A process killed

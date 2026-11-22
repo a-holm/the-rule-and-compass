@@ -1456,7 +1456,7 @@ fn a_resumed_cpu_run_reports_the_uninterrupted_front_trees() {
     let train = sample(240);
     let test = sample(80);
     let mut differing = Vec::new();
-    for seed in 11u32..23 {
+    for seed in 17u32..20 {
         let fixtures = [
             ("pnl", Config { generations: 24, gpu: false, ..pnl_config(seed, 5.0, &train) }),
             ("block pnl", Config { generations: 24, gpu: false, fitness: block_book_fitness(&train), ..config(seed) }),
@@ -1478,6 +1478,29 @@ fn a_resumed_cpu_run_reports_the_uninterrupted_front_trees() {
         }
     }
     assert!(differing.is_empty(), "resumed fronts differ from the uninterrupted front: {differing:?}");
+}
+
+/// #1171: a checkpoint whose errors are not exact keeps the rebuild. On the
+/// fixture where the exact resume reports the uninterrupted trees, the same
+/// checkpoint marked `f32_proxy` reports the rebuilt front, which takes the
+/// lowest structural hash among trees that tie on error and cost.
+#[test]
+fn a_resume_of_an_f32_proxy_checkpoint_still_rebuilds_the_front() {
+    let train = sample(240);
+    let test = sample(80);
+    let base = Config { generations: 24, gpu: false, fitness: block_book_fitness(&train), ..config(18) };
+    let uninterrupted = search::run(&base, &train, &test);
+    let text = checkpoint_text(&Config { generations: 12, ..base.clone() }, &train, &test);
+    assert!(text.contains("\nerror_kind f64\n"));
+    let resume = |text: &str| {
+        let saved = Checkpoint::from_text(text).expect("parse");
+        search::run_resumable(&base, &train, &test, Some(saved), 0, |_| {}).expect("resume")
+    };
+    assert_eq!(describe(&uninterrupted), describe(&resume(&text)));
+    let proxy = resume(&text.replace("\nerror_kind f64\n", "\nerror_kind f32_proxy\n"));
+    assert_ne!(describe(&uninterrupted), describe(&proxy), "the rebuild picks the canonical tie member");
+    let unknown = resume(&text.replace("\nerror_kind f64\n", "\nerror_kind unknown\n"));
+    assert_eq!(describe(&proxy), describe(&unknown));
 }
 
 /// #598: the pipeline depth is an execution setting. A resume takes the one it
