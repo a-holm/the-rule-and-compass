@@ -13184,6 +13184,7 @@ fn run_walkforward(args: &[String]) -> ! {
         popts.row_rule = walkforward::RowRule::of_search(Some(fit_spec), s.return_column.as_deref().unwrap_or(&s.column), top_tercile, front_run.as_ref(), book_column);
         popts.delay = agree("--delay", delay_flag, s.delay_seconds);
     } else {
+        popts.check_undeclared_ppy = true;
         if let (Some(h), Some(v)) = (horizon, periods_per_year) {
             if let Some(msg) = walkforward::horizon_ppy_conflict(h, v) {
                 usage_fail(&msg);

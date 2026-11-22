@@ -157,6 +157,8 @@ pub struct ProtocolOptions {
     /// #1175: emit exposure, entries, gross and buy-and-hold per period with the strata.
     pub period_series: bool,
     /// #1199: the periods of the pooled series (`--period-grid`).
+    /// #1328: the CLI refuses an explicit `--periods-per-year` far from the inferred step when no period is declared.
+    pub check_undeclared_ppy: bool,
     pub period_grid: PeriodGrid,
     /// #1214: per candidate, the switch that defines its book (`--from-run` or
     /// `--front` of a composed run); empty when no candidate is a switch.
@@ -568,6 +570,7 @@ impl Default for ProtocolOptions {
             regime_exprs: Vec::new(),
             period_series: false,
             period_grid: PeriodGrid::Score,
+            check_undeclared_ppy: false,
             switches: Vec::new(),
             missing_score: MissingScore::Flat,
             emit_series: false,
@@ -2576,7 +2579,9 @@ impl Accum {
         let mut strata_in = StrataIn::new(opts.regime_exprs.len());
         let mut entry_times = 0usize;
         let validated_windows = self.windows.iter().filter(|d| d.validation_start.is_some()).count();
-        check_undeclared_ppy(spec, opts, &self.windows)?;
+        if opts.check_undeclared_ppy {
+            check_undeclared_ppy(spec, opts, &self.windows)?;
+        }
         let window_count = self.windows.len();
         for (window_index, mut d) in self.windows.into_iter().enumerate() {
             // #1199: the target grid, its period width and the rows that define it come from the rows before the gate.
