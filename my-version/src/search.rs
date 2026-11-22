@@ -3704,7 +3704,7 @@ fn finish_on_cpu(
             if ind.error.is_nan() {
                 if cfg.fit_accept == FitAccept::Fitness {
                     // #1142: a slot whose fit ran before the failure is gated against its pre-fit tree.
-                    let baseline = &ind.tree;
+                    let baseline = prefit.iter().find(|(slot, _)| *slot == (i, j)).map_or(&ind.tree, |(_, pre)| &pre.tree);
                     unfitted.push((i, j, Ind::evaluated(baseline.clone(), rows, cfg)));
                 }
                 crate::fit::fit_weighted_metric_thresholds(
