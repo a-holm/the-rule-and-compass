@@ -1119,6 +1119,10 @@ pub fn assemble_cli(args: &[String]) -> Result<(), Fail> {
     let mut by_split: Vec<Option<SplitReport>> = (0..count).map(|_| None).collect();
     for path in &a.reports {
         let r = load_report(path)?;
+        let ppy = at(&r.json, &["annualization", "periods_per_year"]).and_then(Json::as_f64).unwrap_or(f64::NAN);
+        if let Some(note) = crate::trials::check_annualization(path, &r.json, &r.time, ppy)? {
+            eprintln!("{}", note);
+        }
         let mut tests: Vec<(i64, i64)> = r.windows.iter().map(|w| w.test).collect();
         tests.sort_unstable();
         let Some(s) = scheme.tests.iter().position(|t| *t == tests) else {
