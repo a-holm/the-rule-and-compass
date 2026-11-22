@@ -4778,12 +4778,17 @@ pub(crate) fn declared_period(spec: &EvalSpec, opts: &ProtocolOptions) -> Option
 
 /// Refuse an explicit `--periods-per-year` that contradicts the declared period.
 fn check_explicit_ppy(spec: &EvalSpec, opts: &ProtocolOptions) -> Result<(), String> {
-    if let (Some(given), Some((s, PeriodSource::TargetSpec))) = (spec.periods_per_year, declared_period(spec, opts)) {
+    if let (Some(given), Some((s, source))) = (spec.periods_per_year, declared_period(spec, opts)) {
         let derived = SECONDS_PER_YEAR / s;
-        if ((given - derived) / derived).abs() > 1e-9 {
+        let tolerance = if source == PeriodSource::TargetSpec { 1e-9 } else { crate::trials::ANNUALIZATION_TOLERANCE };
+        if ((given - derived) / derived).abs() > tolerance {
+            let from = match source {
+                PeriodSource::TargetSpec => "the target spec period width (the larger of horizon_seconds and stride_seconds)",
+                _ => "--horizon",
+            };
             return Err(format!(
-                "--periods-per-year {} conflicts with {} derived from the target spec period width ({} s, the larger of horizon_seconds and stride_seconds); remove the flag or edit the spec",
-                given, derived, s
+                "--periods-per-year {} conflicts with {} periods per year derived from {} ({} s); remove the flag or change the width",
+                given, derived, from, s
             ));
         }
     }

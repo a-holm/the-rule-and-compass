@@ -12094,7 +12094,8 @@ OPTIONS:
                              the bucket floor(t / S); without a declared
                              horizon a period is one timestamp. With a target
                              spec a different value exits 2; with --horizon
-                             alone it overrides
+                             alone a value more than 1 % off exits 2, else it
+                             overrides
   --device-pnl               recompute each test block through the fused
                              long-only reduction (f64 canonical segments; the
                              CUDA kernel when built with --features cuda) and

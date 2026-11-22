@@ -1,4 +1,5 @@
-//! #926: campaign trial accounting and paired run comparison.
+//! #926: campaign trial accounting and paired run compari    let period_seconds = at(j, &["annualization", "period_seconds"]).and_then(Json::as_f64).filter(|s| s.is_finite() && *s > 0.0);
+    if let Some(s) = period_seconds {on.
 //!
 //! `rcsr trials --wf <report>...` counts the finalists of a campaign from the
 //! pooled out-of-fold net series of their walk-forward reports: distinct books,
@@ -171,7 +172,7 @@ Both:\n\
                          guard stays. The fitted and the fixed arm are separate trials\n\
   --out <file>           write the JSON report to this file instead of stdout\n\
 \n\
-Annualisation (#1208): every report (and every --cpcv-assemble split report) must have annualization.periods_per_year within 1 % of 31536000 / annualization.period_seconds (when present) and of 31536000 / the median step of pooled.period_time; a report that does not, or has a non-positive value, exits 2 naming the field, the value and the implied value (rerun the walk-forward with a current build; there is no rescaling and no bypass flag). A report with fewer than 3 periods skips the step check and prints a note on stderr.\n\
+Annualisation (#1208): every report (and every --cpcv-assemble split report) must have annualization.periods_per_year within 1 % of 31536000 / annualization.period_seconds (when present) and, for a report with a period grid (pooled.grid.rule) or without period_seconds, of 31536000 / the median step of pooled.period_time (a score-grid report with period_seconds skips the step check, #1328); a report that does not, or has a non-positive value, exits 2 naming the field, the value and the implied value (rerun the walk-forward with a current build; there is no rescaling and no bypass flag). A report with fewer than 3 periods skips the step check and prints a note on stderr.\n\
 Exit 0 ok, 2 usage error or reports that do not match (the message names the field), 3 unreadable input.\n"
 }
 
@@ -272,8 +273,9 @@ fn median_step(time: &[f64]) -> f64 {
 pub(crate) const ANNUALIZATION_TOLERANCE: f64 = 0.01;
 const SECONDS_PER_YEAR: f64 = 31_536_000.0;
 
-/// #1208: `Err((2, msg))` when `annualization.periods_per_year` contradicts `annualization.period_seconds` or the
-/// median step of `time`; `Ok(Some(note))` when the series is too short to check.
+/// #1208, #1328: `Err((2, msg))` when `annualization.periods_per_year` contradicts `annualization.period_seconds` or the
+/// median step of `time`; the median step is skipped for a score-grid report that has `period_seconds`, because
+/// its `period_time` holds the scored rows only and NaN scores thin it; `Ok(Some(note))` when the series is too short to check.
 pub(crate) fn check_annualization(path: &str, j: &Json, time: &[f64], ppy: f64) -> Res<Option<String>> {
     if !(ppy.is_finite() && ppy > 0.0) {
         return usage_err(format!("field 'annualization.periods_per_year' is {} in {} (a positive number is required)", jnum(ppy), path));
@@ -290,6 +292,10 @@ pub(crate) fn check_annualization(path: &str, j: &Json, time: &[f64], ppy: f64) 
                 path
             ));
         }
+    }
+    let period_grid = at(j, GRID_RULE).is_some_and(|r| !matches!(r, Json::Null));
+    if period_seconds.is_some() && !period_grid {
+        return Ok(None);
     }
     let step = median_step(time);
     if step <= 0.0 || time.windows(2).filter(|w| w[1] > w[0]).count() < 2 {
