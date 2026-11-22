@@ -400,3 +400,47 @@ fn wf_stride_wider_than_step_refused() {
     let msg = stderr(&out);
     assert!(msg.contains("stride_seconds 86400") && msg.contains("3600"), "{msg}");
 }
+
+fn trials_ok(path: &str) {
+    let o = rcsr(&["trials", "--wf", path, "--draws", "50", "--block-len", "2"]);
+    assert_eq!(code(&o), 0, "{path}: {}", stderr(&o));
+    assert!(!stderr(&o).contains("annualization"), "{path}: {}", stderr(&o));
+}
+
+/// #1208: `rcsr trials` accepts every annualisation the walk-forward writes: the declared width of a spec
+/// (anchored and strided), the score and the target grid, a horizon flag, an explicit value and the
+/// inferred step.
+#[test]
+fn trials_reads_every_period_kind() {
+    let scratch = Scratch::new("wf-period-trials");
+    let dir = scratch.path().to_path_buf();
+    for step in [86_400u64, 259_200, 604_800, 1_209_600] {
+        for grid in [&[][..], &["--period-grid", "target"][..]] {
+            let (out, path) = run_cli(&dir, step, grid);
+            assert_eq!(code(&out), 0, "{}", stderr(&out));
+            trials_ok(&path);
+        }
+    }
+    for grid in [&[][..], &["--period-grid", "target"][..]] {
+        let (out, path) = run_cli_spec(&dir, 86_400, 3600, Some(86_400), grid);
+        assert_eq!(code(&out), 0, "{}", stderr(&out));
+        trials_ok(&path);
+    }
+    let data = write_csv(&dir, 86_400, 60);
+    let w = format!("w,{},{},{},{}", T0 as u64, T0 as u64 + 86_400 * 19, T0 as u64 + 86_400 * 20, T0 as u64 + 86_400 * 60);
+    for (name, extra) in [
+        ("horizon", vec!["--horizon", "86400"]),
+        ("explicit", vec!["--periods-per-year", "365"]),
+        ("inferred", vec![]),
+    ] {
+        let out_path = dir.join(format!("flag-{name}.json")).to_string_lossy().into_owned();
+        let mut args = vec![
+            "walkforward", "--data", &data, "--time", "t", "--group-by", "sym", "--target", "y", "--expr", "x", "--vars", "x",
+            "--window", &w, "--threshold-quantile", "0.5", "--out", &out_path,
+        ];
+        args.extend(extra);
+        let out = rcsr(&args);
+        assert_eq!(code(&out), 0, "{name}: {}", stderr(&out));
+        trials_ok(&out_path);
+    }
+}
