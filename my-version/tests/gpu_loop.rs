@@ -803,6 +803,30 @@ impl Drop for Faults {
     }
 }
 
+/// #1331: the gaps between the errors a run kept and the exact CPU scores of
+/// their trees. A finite error on a tree whose exact score is not finite is a
+/// stale score; its gap is NaN, which `f64::max` would drop.
+#[derive(Default)]
+struct GapTally {
+    worst: f64,
+    stale_finite: usize,
+    wrong_inf: usize,
+}
+
+impl GapTally {
+    fn record(&mut self, error: f64, exact: f64) {
+        if error.is_finite() {
+            if exact.is_finite() {
+                self.worst = self.worst.max((error - exact).abs() / exact.max(1e-300));
+            } else {
+                self.stale_finite += 1;
+            }
+        } else {
+            self.wrong_inf += usize::from(exact.is_finite());
+        }
+    }
+}
+
 /// #1089: run `cfg` with the fault `site` armed. The fault fires in the
 /// generation that the checkpoints with `generations <= 2` precede. In every
 /// checkpoint with `generations >= 3`, a member not carried unchanged from an
@@ -821,8 +845,7 @@ fn assert_no_device_score_after(site: &str, cfg: &search::Config) {
     let test = sample(96);
     let faults = Faults::arm(site);
     let mut seen = std::collections::HashSet::new();
-    let mut worst = 0.0f64;
-    let mut wrong_inf = 0usize;
+    let mut gaps = GapTally::default();
     // (generations, members, carried, finite, non-finite)
     let mut rows: Vec<(usize, usize, usize, usize, usize)> = Vec::new();
     let out = search::run_resumable(cfg, &train, &test, None, 1, |cp| {
@@ -848,11 +871,10 @@ fn assert_no_device_score_after(site: &str, cfg: &search::Config) {
                     / train.y.len() as f64;
                 if ind.error.is_finite() {
                     row.3 += 1;
-                    worst = worst.max((ind.error - exact).abs() / exact.max(1e-300));
                 } else {
                     row.4 += 1;
-                    wrong_inf += usize::from(exact.is_finite());
                 }
+                gaps.record(ind.error, exact);
             }
         }
         rows.push(row);
@@ -865,10 +887,14 @@ fn assert_no_device_score_after(site: &str, cfg: &search::Config) {
     let checked = at_three.3 + at_three.4;
     let need = cfg.pop * cfg.islands - cfg.islands;
     assert!(
-        checked >= need && wrong_inf == 0 && worst < 1e-9,
-        "{checked} members checked at generation 3 (need {need}); {wrong_inf} non-finite errors on a tree with a \
-         finite CPU score (need 0); worst relative gap to the CPU score {worst} (need < 1e-9); \
-         (generations, members, carried, finite, non-finite): {rows:?}"
+        checked >= need && gaps.wrong_inf == 0 && gaps.stale_finite == 0 && gaps.worst < 1e-9,
+        "{checked} members checked at generation 3 (need {need}); {} non-finite errors on a tree with a \
+         finite CPU score (need 0); {} finite errors on a tree with a non-finite CPU score (need 0); worst relative gap \
+         to the CPU score {} (need < 1e-9); \
+         (generations, members, carried, finite, non-finite): {rows:?}",
+        gaps.wrong_inf,
+        gaps.stale_finite,
+        gaps.worst
     );
 }
 
@@ -929,4 +955,25 @@ fn adaptive_mix_learns_on_the_device() {
     let (again, again_mixes) = run();
     assert_eq!(archive, again, "the archive differs between two runs");
     assert_eq!(mixes, again_mixes, "the learned windows differ between two runs");
+}
+
+/// #1331: a finite error against a non-finite exact score is counted, not
+/// dropped as a NaN gap.
+#[test]
+fn a_finite_error_on_a_non_finite_exact_score_is_counted() {
+    for exact in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let mut t = GapTally::default();
+        t.record(1.0, exact);
+        assert_eq!((t.stale_finite, t.wrong_inf), (1, 0), "exact {exact}");
+        assert_eq!(t.worst, 0.0, "exact {exact}: the gap is not a number and is not a gap");
+    }
+    let mut t = GapTally::default();
+    t.record(1.0, 1.0 + 1e-12);
+    assert_eq!(t.stale_finite, 0);
+    assert!(t.worst > 0.0 && t.worst < 1e-9, "{}", t.worst);
+    t.record(f64::INFINITY, 2.0);
+    assert_eq!(t.wrong_inf, 1);
+    t.record(f64::INFINITY, f64::INFINITY);
+    t.record(f64::INFINITY, f64::NAN);
+    assert_eq!((t.stale_finite, t.wrong_inf), (0, 1));
 }
