@@ -58,6 +58,7 @@ const COUNT_FLAGS: &[&str] = &[
     "--generations", "--islands", "--pop", "--max-complexity", "--seed", "--folds", "--lags",
     "--view", "--null-runs", "--null-block", "--baseline-samples", "--bootstrap-error",
     "--stability", "--cv-k", "--fit-iters", "--fit-fallback-max", "--patience", "--top",
+    "--fit-max-iters",
 ];
 
 const FLOAT_FLAGS: &[&str] = &[
@@ -87,7 +88,7 @@ fn zero_stays_valid_where_it_means_off_or_all() {
     for flag in [
         "--lags", "--view", "--null-runs", "--bootstrap-error", "--stability", "--fit-iters",
         "--fit-fallback-max", "--baseline-samples", "--top", "--time-budget", "--validation-frac",
-        "--history-frac", "--gap-break",
+        "--history-frac", "--gap-break", "--fit-max-iters",
     ] {
         let out = search(flag, "0");
         assert_eq!(out.status.code(), Some(0), "{flag} 0: {}", String::from_utf8_lossy(&out.stderr));

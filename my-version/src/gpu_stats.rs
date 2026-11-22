@@ -243,6 +243,8 @@ pub struct RunLedger {
     fallback_by_cause: std::collections::BTreeMap<String, usize>,
     /// Fallbacks whose exact CPU refit lowered the exact error, by cause.
     fallback_improved_by_cause: std::collections::BTreeMap<String, usize>,
+    /// #1042: routed fallbacks whose device answer beat the CPU refit, by cause.
+    fallback_device_kept_by_cause: std::collections::BTreeMap<String, usize>,
     /// Candidates scored by the evaluator's CPU fallback pool.
     eval_fallback_programs: u64,
     /// Wall seconds the evaluator's CPU fallback pool spent.
@@ -468,6 +470,13 @@ impl RunLedger {
         }
     }
 
+    /// #1042: add the routed fallbacks that kept their device answer.
+    pub fn record_fit_device_kept(&mut self, by_cause: std::collections::BTreeMap<String, usize>) {
+        for (name, count) in by_cause {
+            *self.fallback_device_kept_by_cause.entry(name).or_default() += count;
+        }
+    }
+
     /// #334: store the fit/score allocator counters of one device context. The
     /// counters are totals, so this replaces rather than adds.
     pub fn set_fit_alloc(&mut self, alloc: FitAlloc) {
@@ -552,6 +561,9 @@ impl RunLedger {
                 .fallback_improved_by_cause
                 .entry(name.clone())
                 .or_default() += *count;
+        }
+        for (name, count) in &other.fallback_device_kept_by_cause {
+            *self.fallback_device_kept_by_cause.entry(name.clone()).or_default() += *count;
         }
     }
 
@@ -686,6 +698,9 @@ impl RunLedger {
     }
     pub fn fallback_improved(&self) -> u64 {
         self.fallback_improved_by_cause.values().map(|n| *n as u64).sum()
+    }
+    pub fn fallback_device_kept_by_cause(&self) -> &std::collections::BTreeMap<String, usize> {
+        &self.fallback_device_kept_by_cause
     }
 
     pub fn eval_fallback_programs(&self) -> u64 {

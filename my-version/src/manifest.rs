@@ -147,10 +147,11 @@ impl Manifest {
         }
         if let Some((source, reason)) = &self.fit_resolution {
             out.push_str(&format!(
-                "  \"fit_resolution\":{{\"strategy\":{},\"source\":{},\"reason\":{}}},\n",
+                "  \"fit_resolution\":{{\"strategy\":{},\"source\":{},\"reason\":{},\"fit_max_iters\":{}}},\n",
                 jstr(self.config.fit_strategy.name()),
                 jstr(source),
-                jstr(reason)
+                jstr(reason),
+                self.config.fit_max_iters_effective()
             ));
         }
         if let Some((rows, hash, fixed)) = self.fit_subsample {

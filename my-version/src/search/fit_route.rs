@@ -36,6 +36,8 @@ use std::collections::{BTreeMap, HashMap};
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct FitSettings {
     pub(super) iters: usize,
+    /// #1042: the damped trial budget of the device LM arm, at least `iters`.
+    pub(super) max_iters: usize,
     pub(super) metric: Metric,
     pub(super) polish: FitPolish,
     /// #1024: run the threshold step after the LM.
@@ -50,6 +52,7 @@ impl FitSettings {
     pub(super) fn of(cfg: &Config) -> Self {
         FitSettings {
             iters: cfg.fit_iters,
+            max_iters: cfg.fit_max_iters_effective(),
             metric: cfg.metric,
             polish: cfg.fit_polish,
             thresholds: cfg.fit_thresholds,
@@ -260,8 +263,8 @@ impl DeviceFit for crate::gpu::GpuEvaluator {
             DeviceArm::Maximum => self.max_fit_batch(plans, iters),
             DeviceArm::OrderStat(want) => self.order_stat_fit_batch(plans, iters, want),
             DeviceArm::Rank { signed } => self.rank_fit_batch(plans, iters, &rows.y, signed),
-            DeviceArm::Lm(DeviceLoss::Slope) => self.slope_fit_batch(plans, iters),
-            DeviceArm::Lm(loss) => self.fit_batch(plans, iters, loss),
+            DeviceArm::Lm(DeviceLoss::Slope) => self.slope_fit_batch_capped(plans, iters, settings.max_iters),
+            DeviceArm::Lm(loss) => self.fit_batch_capped(plans, iters, settings.max_iters, loss),
         };
         let (polish_ms, span_start_s) = if ms > 0.0 {
             let polish = self.take_polish_ms(ms);
@@ -296,10 +299,21 @@ impl ReplayDevice {
         Self::new(recording.calls.into_iter().map(|(_, call)| call))
     }
 
-    /// Whether `call` launched exactly `plans` with `iters` on `arm`.
-    fn launched(call: &crate::fit_record::RecCall, arm: DeviceArm, plans: &[&GpuFitPlan], iters: usize) -> bool {
+    /// Whether `call` launched exactly `plans` with `settings` on `arm`. #1042:
+    /// the LM arms launch with the damped budget, the squared start of the
+    /// polish arms with `iters`.
+    fn launched(call: &crate::fit_record::RecCall, arm: DeviceArm, plans: &[&GpuFitPlan], settings: &FitSettings) -> bool {
         let kmax = plans.iter().map(|p| p.nconst).max().unwrap_or(0);
-        if call.nprog as usize != plans.len() || call.kmax as usize != kmax || call.iters as usize != iters {
+        let iters = settings.iters;
+        let max_iters = match arm {
+            DeviceArm::Lm(_) => settings.max_iters.max(iters),
+            _ => iters,
+        };
+        if call.nprog as usize != plans.len()
+            || call.kmax as usize != kmax
+            || call.iters as usize != iters
+            || call.max_iters as usize != max_iters
+        {
             return false;
         }
         if let DeviceArm::Lm(loss) = arm {
@@ -338,7 +352,7 @@ impl DeviceFit for ReplayDevice {
         let Some(call) = self.calls.pop_front() else {
             return DeviceRun::failed();
         };
-        if !Self::launched(&call, arm, plans, settings.iters) || call.ms < 0.0 {
+        if !Self::launched(&call, arm, plans, settings) || call.ms < 0.0 {
             return DeviceRun::failed();
         }
         let kmax = call.kmax as usize;
@@ -554,6 +568,8 @@ pub(super) struct RouteCounts {
     pub(super) fallback: BTreeMap<FitFallbackCause, usize>,
     /// #265: refits that lowered the exact error.
     pub(super) improved: BTreeMap<FitFallbackCause, usize>,
+    /// #1042: routed tail refits that kept the device answer.
+    pub(super) device_kept: BTreeMap<FitFallbackCause, usize>,
     /// #988: refits skipped because they cannot win.
     pub(super) skipped: BTreeMap<FitFallbackCause, usize>,
     /// Device fits kept.
@@ -1045,6 +1061,9 @@ impl FitRoute {
             if job.improved {
                 *self.counts.improved.entry(f.cause).or_default() += 1;
             }
+            if job.device_kept {
+                *self.counts.device_kept.entry(f.cause).or_default() += 1;
+            }
             if job.skipped {
                 *self.counts.skipped.entry(f.cause).or_default() += 1;
             }
@@ -1168,6 +1187,7 @@ mod tests {
             data: 0,
             flags: 0,
             iters: ITERS as u32,
+            max_iters: ITERS as u32,
             loss,
             polish: 0,
             nprog: plans.len() as u32,
@@ -1207,7 +1227,7 @@ mod tests {
     }
 
     fn settings(metric: Metric, cap: usize, thresholds: bool) -> FitSettings {
-        FitSettings { iters: ITERS, metric, polish: FitPolish::default(), thresholds, fallback_max: cap, accept: FitAccept::Always }
+        FitSettings { iters: ITERS, max_iters: ITERS, metric, polish: FitPolish::default(), thresholds, fallback_max: cap, accept: FitAccept::Always }
     }
 
     /// A dispatcher that sends every batch to the device (0), refuses every
@@ -1387,6 +1407,9 @@ mod tests {
         for (&(_, _, cause), job) in fallbacks[..refit].iter().zip(&jobs) {
             if job.improved {
                 add(&mut counts.improved, cause);
+            }
+            if job.device_kept {
+                add(&mut counts.device_kept, cause);
             }
             if job.skipped {
                 add(&mut counts.skipped, cause);
@@ -1568,6 +1591,9 @@ mod tests {
                     if job.improved {
                         add(&mut counts.improved, f.cause);
                     }
+                    if job.device_kept {
+                        add(&mut counts.device_kept, f.cause);
+                    }
                     if job.skipped {
                         add(&mut counts.skipped, f.cause);
                     }
@@ -1591,6 +1617,9 @@ mod tests {
             for (&n, job) in rest.iter().zip(jobs) {
                 if job.improved {
                     add(&mut counts.improved, fallbacks[n].cause);
+                }
+                if job.device_kept {
+                    add(&mut counts.device_kept, fallbacks[n].cause);
                 }
                 if job.skipped {
                     add(&mut counts.skipped, fallbacks[n].cause);
@@ -2038,9 +2067,13 @@ mod tests {
         assert!(words.fit(arm, &refs[1..], &settings, &sample).answers.is_none(), "other programs");
         let mut loss = ReplayDevice::new([call.clone()]);
         assert!(loss.fit(DeviceArm::Lm(DeviceLoss::Absolute), &refs, &settings, &sample).answers.is_none());
-        let mut iters = ReplayDevice::new([call]);
+        let mut iters = ReplayDevice::new([call.clone()]);
         let more = FitSettings { iters: ITERS + 1, ..settings };
         assert!(iters.fit(arm, &refs, &more, &sample).answers.is_none());
+        // #1042: a call recorded at budget `iters` is another launch at `4 * iters`.
+        let mut budget = ReplayDevice::new([call]);
+        let wider = FitSettings { max_iters: 4 * ITERS, ..settings };
+        assert!(budget.fit(arm, &refs, &wider, &sample).answers.is_none());
     }
 
     /// #1075: device calls recorded on demand for exactly the plans each call

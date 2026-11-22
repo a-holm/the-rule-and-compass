@@ -1659,6 +1659,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "fit_strategy",  // #116: missing means `exact`
         "fit_admission", // #223: missing means `screened`
         "fit_polish",    // #496: missing means `f64`
+        "fit_max_iters", // #1042: missing means `4 * fit_iters`
         "fit_irls",      // #611: missing means `nested`
         "fitness",       // #480: missing means `metric`
         "fit_rows",      // #116: missing means 0 (off)
@@ -1887,6 +1888,13 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
             format!("config 'fit_polish' must be f64, f32 or off, got '{}'", raw)
         })?,
     };
+    // #1042: `0` (also when missing) means `4 * fit_iters`.
+    let fit_max_iters = match fields.get("fit_max_iters") {
+        None => 0,
+        Some(raw) => raw
+            .parse::<usize>()
+            .map_err(|_| format!("bad config value for 'fit_max_iters': '{}'", raw))?,
+    };
     let fit_irls = match fields.get("fit_irls").map(|s| s.as_str()) {
         None => crate::fit::FitIrls::Nested,
         Some(raw) => crate::fit::FitIrls::parse(raw).ok_or_else(|| {
@@ -1981,6 +1989,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         ops,
         init_depth: num_usize("init_depth")?,
         fit_iters: num_usize("fit_iters")?,
+        fit_max_iters, // #1042
         fit_strategy, // #116
         fit_admission, // #223
         fit_polish, // #496
@@ -2072,6 +2081,10 @@ fn write_config(cfg: &Config, out: &mut String) {
     }
     if cfg.fit_polish != crate::fit::FitPolish::F64 {
         writeln!(out, "config fit_polish {}", cfg.fit_polish.name()).unwrap();
+    }
+    // #1042: only a budget other than the default `4 * fit_iters`.
+    if cfg.fit_max_iters_effective() != 4 * cfg.fit_iters {
+        writeln!(out, "config fit_max_iters {}", cfg.fit_max_iters_effective()).unwrap();
     }
     if cfg.fit_irls != crate::fit::FitIrls::Nested {
         writeln!(out, "config fit_irls {}", cfg.fit_irls.name()).unwrap(); // #611

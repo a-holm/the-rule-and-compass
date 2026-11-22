@@ -580,6 +580,57 @@ fn candidates_are_selected_on_validation_never_on_test() {
 }
 
 #[test]
+fn all_members_mixed_validation_slices_state_the_mix() {
+    use rcsr::walkforward::{FrontSource, ProtocolOptions};
+    // Validation rows of w1 reward `x`, those of w2 reward `0 - x`; w3 has no slice.
+    let rows: Vec<(f64, f64, f64)> = (0..90)
+        .map(|i| {
+            let x = ((i * 7) % 11) as f64 - 5.0;
+            let sign = if (30..60).contains(&i) { -1.0 } else { 1.0 };
+            (i as f64, x, sign * x * 0.001)
+        })
+        .collect();
+    let t = single(&rows);
+    let mut s = spec(
+        "x",
+        vec![window("w1", 0.0, 20.0, 20.0, 30.0), window("w2", 30.0, 50.0, 50.0, 60.0), window("w3", 60.0, 80.0, 80.0, 90.0)],
+    );
+    s.candidates = vec!["x".to_string(), "0 - x".to_string()];
+    s.threshold_fixed = Some(0.0);
+    let front = FrontSource {
+        run: "run.json".to_string(),
+        run_sha256: String::new(),
+        labels: vec!["front_rank_1".to_string(), "front_rank_2".to_string()],
+        ranks: vec![1, 2],
+    };
+    let mixed = ProtocolOptions {
+        all_members: true,
+        front: Some(front.clone()),
+        validation_starts: vec![("w1".to_string(), 10.0), ("w2".to_string(), 40.0)],
+        ..ProtocolOptions::default()
+    };
+    let r = walkforward::run_table_with(&t, &s, "t", &mixed).unwrap();
+    let label = "validation (2 of 3 windows); first front member where no validation slice";
+    assert_eq!(r.selected_on, label);
+    let picked: Vec<usize> = r.windows.iter().map(|w| w.candidate).collect();
+    assert_eq!(picked, vec![0, 1, 0], "w1 picks x, w2 picks 0 - x on validation, w3 keeps the first member");
+    assert!(r.windows[0].validation_error.is_some() && r.windows[2].validation_error.is_none());
+    assert!(!r.test_used_for_selection);
+    assert!(r.json().contains(&format!("\"selected_on\":\"{label}\"")), "{}", r.json());
+    assert!(r.markdown().contains(&format!("- Selection: {label}")));
+
+    let none = ProtocolOptions { validation_starts: Vec::new(), ..mixed.clone() };
+    let r = walkforward::run_table_with(&t, &s, "t", &none).unwrap();
+    assert!(r.selected_on.starts_with("none (--all-members without a validation slice"));
+    let all = ProtocolOptions {
+        validation_starts: vec![("w1".to_string(), 10.0), ("w2".to_string(), 40.0), ("w3".to_string(), 70.0)],
+        ..mixed
+    };
+    let r = walkforward::run_table_with(&t, &s, "t", &all).unwrap();
+    assert_eq!(r.selected_on, "validation");
+}
+
+#[test]
 fn final_exit_is_charged_per_group_when_rows_are_dropped() {
     // Group 1 has a NaN-target row first, group 2 is the single last row.
     // Both groups end held, so both pay an entry and a final exit.
