@@ -11,6 +11,8 @@ use std::process::Output;
 
 const INPUTS: &str = "r16,r96,r672,ma96,ma672,ma_slope672,macd_hist,natr14,vol16,vol96,vol_ts,vol_ratio,vol_z2880,parkinson96,rv_ratio,rsi14,bb96,bb_width96,adx14,di_diff14,cmf20,mfi14,vwap_dev96,vol_z96,taker_ratio96,taker_imb16,trade_intensity96,clv1,clv4,body1,batr,wasym1,lower_wick,rng1,volrat,gapatr,ou_hl96,acf1,vr4,rskew96,jump_share,semivar_asym,cusum_abs_z,btc_r96,btc_vol96,rel_btc96,beta384,tod_sin,tod_cos,dow_sin,dow_cos,don96";
 
+const R4_LAW: &str = "(-0.0188 / (-0.175 + logistic((268.4249 * (-0.0054 + vol96)))))";
+
 fn cell() -> String {
     std::env::var("RCSR_COMPACT_CELL")
         .expect("set RCSR_COMPACT_CELL to the path of panel_hourly_compact.rcsb")
@@ -29,7 +31,8 @@ fn run(target: &str, expr: &str, extra: &[&str]) -> Output {
     let spec = spec();
     let mut args = vec![
         "--data", &data, "--target", target, "--vars", INPUTS, "--time", "ts", "--train-select",
-        "ts >= 0 and ts < 1735473600", "--test-select", "ts >= 1735689600 and ts < 1751328000",
+        "ts >= 0 and ts < 1672315200", "--test-select", "ts >= 1672531200 and ts < 1698796800",
+        "--lockbox", "2023-11-15,2026-11-15",
         "--fill", "drop", "--metric", "squared", "--cpu", "--no-dev-log", "--quiet",
         "--target-spec", &spec, "--eval-expr", expr, "--json",
     ];
@@ -67,16 +70,20 @@ fn compact_cell_zero_parameter_rung_beats_the_searched_front() {
     let out = run("y60", "(0-0.002)/(6*vol96)", &["--allow-target-structure"]);
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
     let j = json(&out);
-    assert_eq!(num(&j, &["train_rows"]), 2_456_306.0);
-    assert_eq!(num(&j, &["test_rows"]), 411_316.0);
+    assert_eq!(num(&j, &["train_rows"]), 800_126.0);
+    assert_eq!(num(&j, &["test_rows"]), 666_071.0);
     let rung_test = num(&j, &["target_structure", "test_error"]);
-    assert!((rung_test - 0.104_582_698).abs() <= 5e-10, "{rung_test}");
-    assert!(rung_test < 0.104_616_110 && rung_test < 0.104_658_228);
+    assert!((rung_test - 0.098_568_722_64).abs() <= 5e-10, "{rung_test}");
+    // The printed r4 law, evaluated on the same split with its printed constants.
+    let law = run("y60", R4_LAW, &["--allow-target-structure"]);
+    assert_eq!(law.status.code(), Some(0), "{}", String::from_utf8_lossy(&law.stderr));
+    let law = json(&law);
+    assert!(rung_test < num(&law, &["eval", "test_error"]));
     let rung_train = num(&j, &["target_structure", "train_error"]);
-    assert!((rung_train - 0.103_513_258_9).abs() <= 5e-10, "{rung_train}");
-    assert!(rung_train < 0.104_616_110);
-    assert!((num(&j, &["eval", "test_error"]) - 0.104_582_697_76).abs() <= 5e-10);
-    assert!((num(&j, &["eval", "train_error"]) - 0.103_513_550_90).abs() <= 5e-10);
+    assert!((rung_train - 0.107_539_910_9).abs() <= 5e-10, "{rung_train}");
+    assert!(rung_train < num(&law, &["eval", "train_error"]));
+    assert!((num(&j, &["eval", "test_error"]) - 0.098_569_617_11).abs() <= 5e-10);
+    assert!((num(&j, &["eval", "train_error"]) - 0.107_540_062_86).abs() <= 5e-10);
     assert_eq!(num(&j, &["target_spec", "horizon_seconds"]), 3600.0);
     assert_eq!(
         at(&j, &["target_spec", "window_seconds"]),
@@ -102,5 +109,5 @@ fn compact_cell_raw_target_has_no_structure() {
     let j = json(&out);
     assert_eq!(at(&j, &["target_spec", "structural_term"]), &Json::Bool(false));
     let mse = num(&j, &["target_structure", "test_error"]);
-    assert!((mse - 1.322_536_784e-4).abs() <= 1e-12, "{mse}");
+    assert!((mse - 9.460_949_007e-5).abs() <= 1e-12, "{mse}");
 }

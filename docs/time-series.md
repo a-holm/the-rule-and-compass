@@ -244,7 +244,7 @@ zero offset has no structure: the reference is the mean. Per-member flags
 beats the zero-parameter rung beyond noise.
 
 **Verify.** `cargo test --release target::`, `tests/target_spec.rs`; the golden
-cell test `tests/target_golden.rs` (ignored; needs `RCSR_COMPACT_CELL`).
+cell test `tests/target_golden.rs` (ignored; needs `RCSR_COMPACT_CELL`). Both cell tests split before the 2023-11-15 new-work lock and pass `--lockbox 2023-11-15,2026-11-15`.
 
 ---
 
