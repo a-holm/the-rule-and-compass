@@ -2251,6 +2251,7 @@ mod tests {
                 _ => calls,
             };
             assert_eq!(step.launches.len(), launches, "seed {seed}: launches of {schedule:?}");
+            assert!(step.launches.len() <= waves.max(1), "seed {seed}: more launches than waves");
             if !failed {
                 assert_eq!(step.launches.iter().map(|l| l.candidates).sum::<usize>(), jobs.len(), "seed {seed}");
             }
@@ -2659,6 +2660,124 @@ mod tests {
             for (a, b) in one.iter().zip(&waved) {
                 assert_eq!((a.0, a.1), (b.0, b.1));
                 assert_same_tree(&a.2, &b.2, &format!("start {start}: slot ({}, {})", a.0, a.1));
+            }
+        }
+    }
+
+    /// #1231: a device that answers the tail status for the marked jobs and a
+    /// finite fit for the rest, and records the constant tag of every plan of
+    /// each call. A job `(island, slot)` carries tag `island * slots + slot + 1`.
+    struct Marked<'a> {
+        tails: &'a [f64],
+        calls: Vec<Vec<f64>>,
+    }
+
+    impl DeviceFit for Marked<'_> {
+        fn fit(&mut self, _: DeviceArm, plans: &[&GpuFitPlan], _: &FitSettings, _: &Sample) -> DeviceRun {
+            self.calls.push(plans.iter().map(|p| p.c0[0]).collect());
+            let answers = plans
+                .iter()
+                .map(|p| DeviceAnswer { status: if self.tails.contains(&p.c0[0]) { 9 } else { 0 }, c: p.c0.clone() })
+                .collect();
+            DeviceRun { answers: Some(answers), ms: 1.0, polish_ms: 0.0, span_start_s: None }
+        }
+    }
+
+    struct MarkedStage {
+        early: usize,
+        launches: usize,
+        calls: Vec<Vec<f64>>,
+        refit: Vec<(usize, usize)>,
+    }
+
+    /// One synchronous stage of `islands` x `slots` candidates whose device
+    /// answers are fallbacks for the `tails` jobs only.
+    fn marked_stage(cap: usize, rotation: Rotation, islands: usize, slots: usize, waves: usize, tails: &[(usize, usize)]) -> MarkedStage {
+        let sample = rows(Metric::Squared, 160);
+        let settings = settings(Metric::Squared, cap, false);
+        let mut route = FitRoute::new(settings, true).with_rotation(rotation);
+        let mut exact = ScopedFits::new(&sample, &settings, 2);
+        let cfg = Config::default();
+        let tag = |(i, j): (usize, usize)| (i * slots + j + 1) as f64;
+        let tree = |k: (usize, usize)| node(Op::Mul, vec![constant(tag(k)), input(0)]);
+        let mut grid: Vec<Vec<Ind>> = (0..islands).map(|i| (0..slots).map(|j| Ind::pending(tree((i, j)), &cfg)).collect()).collect();
+        let jobs: Vec<((usize, usize), GpuFitPlan)> = (0..islands)
+            .flat_map(|i| (0..slots).map(move |j| (i, j)))
+            .map(|k| (k, crate::fit::gpu_fit_plan_reason(&tree(k), false).expect("a plan")))
+            .collect();
+        let marked: Vec<f64> = tails.iter().map(|&k| tag(k)).collect();
+        let mut device = Marked { tails: &marked, calls: Vec::new() };
+        let step = route.fit_on_device_released(&mut device, DeviceArm::Lm(DeviceLoss::Squared), &jobs, &mut grid[..], &sample, 2, &mut exact, waves);
+        let (early, launches) = (step.early, step.launches.len());
+        route.submit_early(&mut exact);
+        let done = route.finish(&mut exact);
+        let mut refit: Vec<(usize, usize)> = done
+            .settled
+            .iter()
+            .filter(|s| !crate::expr::same(&s.tree, &tree((s.island, s.slot))))
+            .map(|s| (s.island, s.slot))
+            .collect();
+        refit.sort_unstable();
+        MarkedStage { early, launches, calls: device.calls, refit }
+    }
+
+    /// #1231: waves release the fallbacks that are inside the prefix, not the
+    /// jobs ranked before them: three fallbacks far down the rotated order,
+    /// cap 2, so the first two in key order start early and the third stays
+    /// outside the prefix.
+    #[test]
+    fn waves_release_fallbacks_not_ranked_jobs() {
+        let (islands, slots) = (8usize, 8usize);
+        let rotation = Rotation::at(3, islands);
+        // Rotated island order 3, 4, 5, 6, 7, 0, 1, 2; waves of 16 jobs hold
+        // islands 3-4, 5-6, 7-0 and 1-2.
+        let tails = [(4usize, 2usize), (6, 6), (0, 3)];
+        let waved = marked_stage(2, rotation, islands, slots, 4, &tails);
+        let one = marked_stage(2, rotation, islands, slots, 0, &tails);
+        assert_eq!(waved.launches, 4);
+        assert_eq!((one.early, one.launches), (0, 1));
+        assert_eq!(waved.early, 2, "the first two fallbacks in key order start early");
+        assert_eq!(waved.refit, vec![(4, 2), (6, 6)], "the prefix is the first two in key order");
+        assert_eq!(waved.refit, one.refit);
+    }
+
+    /// #1231: the waves are contiguous slices of the jobs in key order
+    /// `(rotation.rank(island), slot)`.
+    #[test]
+    fn waves_run_in_rotated_key_order() {
+        let (islands, slots) = (5usize, 4usize);
+        for start in 0..islands {
+            let rotation = Rotation::at(start, islands);
+            let mut expected: Vec<(usize, usize)> = (0..islands).flat_map(|i| (0..slots).map(move |j| (i, j))).collect();
+            expected.sort_by_key(|&(i, j)| (rotation.rank(i), j));
+            let expected: Vec<f64> = expected.iter().map(|&(i, j)| (i * slots + j + 1) as f64).collect();
+            for waves in [2usize, 3, 7] {
+                let stage = marked_stage(3, rotation, islands, slots, waves, &[(0, 0), (2, 1)]);
+                let calls: Vec<usize> = stage.calls.iter().map(Vec::len).collect();
+                assert_eq!(calls, wave_bounds(islands * slots, waves).iter().map(|r| r.len()).collect::<Vec<_>>(), "start {start}, {waves} waves");
+                let flat: Vec<f64> = stage.calls.concat();
+                assert_eq!(flat, expected, "start {start}, {waves} waves");
+            }
+        }
+    }
+
+    /// #1231: with no cap, and with a cap that cannot bind, the waves are the
+    /// slices of the jobs in job order.
+    #[test]
+    fn waves_keep_job_order_when_the_cap_cannot_bind() {
+        for seed in 0..2000u32 {
+            let mut rng = Mt::new(40_000 + seed);
+            let islands = 1 + rng.usize_below(6);
+            let slots = 1 + rng.usize_below(5);
+            let n = islands * slots;
+            let cap = *rng.pick(&[0, n, n + 3]);
+            let waves = *rng.pick(&[2usize, 3, 7]);
+            let rotation = Rotation::at(rng.usize_below(islands), islands);
+            let tails: Vec<(usize, usize)> = (0..islands).flat_map(|i| (0..slots).map(move |j| (i, j))).filter(|_| rng.bool(0.3)).collect();
+            let stage = marked_stage(cap, rotation, islands, slots, waves, &tails);
+            let job_order: Vec<f64> = (1..=n).map(|k| k as f64).collect();
+            if n >= 2 {
+                assert_eq!(stage.calls.concat(), job_order, "seed {seed}: cap {cap}, {waves} waves");
             }
         }
     }
