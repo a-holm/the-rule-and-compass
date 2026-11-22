@@ -11,7 +11,7 @@
 # A run that hits the 580 s timeout is a failure labelled `budget`. The timeout is never raised: size the fixture or add a plan line.
 # A run that ends with rc 139 (compute-sanitizer itself died with SIGSEGV) is a failure labelled `tool crash`, written without a test verdict and never retried.
 # Writes: one log per run (<id>-san-<binary>[-<test>]), the build log <id>-san-build, and the summary <id>-san-summary
-# with one line per run: <binary>[:<test>] rc=<n> xid=<a>-><b> secs=<s> | <test result line> | <ERROR SUMMARY line>,
+# with one line per run: <binary>[:<test>] rc=<n> xid=<new lines> secs=<s> | <test result line> | <ERROR SUMMARY line>,
 # plus `<binary>[:<test>] skip | <reason>` lines.
 # Plan mode `<cargo bin name> * run-bin <arguments>` (for example `rcsr-gpu-bench * run-bin --batch 64 --reps 1 --depth 3`) runs the release binary itself under memcheck, not its unit tests: it builds `cargo build --release --features cuda --bin <name>` and runs that executable with the arguments in a lock hold of its own, label `<name>`. `--only <name>` runs just that line and skips the test-binary build. The unit-test executable of the same binary (`bin-<name>`) has its own `skip` line. A run-bin run uses `--target-processes application-only` and must start no CUDA-using child. A name may have several run-bin lines: the first logs as `<name>`, later ones as `<name>-<n>`.
 # Plan mode `<binary> * no-cuda <reason>` lists a binary that makes no CUDA call by design. It still runs under memcheck.
@@ -23,7 +23,7 @@
 # A listed binary whose run printed an ERROR SUMMARY called CUDA: it gets the normal verdict and the line ends `listed no-cuda but called CUDA`.
 # The summary ends with the counts `no-cuda binaries`, `unexpected no-cuda` and `listed no-cuda but called CUDA`.
 # A run with rc 255, `running 0 tests`, a non-zero filtered-out count and the sanitizer message `terminated before first instrumented API call` (the plan filtered out every test) is written as `<binary> skipped by plan | ...` and is not a failure.
-# Exit: 0 when every run has rc 0 and `ERROR SUMMARY: 0 errors`; 70 at once when the Xid count rose; 1 otherwise; 3 when $SANITIZER is missing or not CUDA 13; 2 usage.
+# Exit: 0 when every run has rc 0 and `ERROR SUMMARY: 0 errors`; 70 at once when a new Xid line appeared or the Xid check failed; 1 otherwise; 3 when $SANITIZER is missing or not CUDA 13; 2 usage.
 set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 RC_RUN=$(dirname "${BASH_SOURCE[0]}")/rc-run.sh
@@ -120,7 +120,7 @@ run_one() { # label tag api bin args...
   t1=$(date +%s)
   log=$(log_path "$id" "$tag")
   local xid res err extra= by_plan=0 no_cuda=0
-  xid=$(sed -n 's/^xid before=\([0-9]*\) after=\([0-9]*\)$/\1->\2/p' "$log" | tail -1)
+  xid=$(sed -n 's/^xid new=\([0-9]*\) since=.*$/\1/p' "$log" | tail -1)
   res=$(grep -a '^test result:' "$log" | tail -1)
   err=$(grep -a 'ERROR SUMMARY:' "$log" | tail -1)
   if [ "$rc" -eq 124 ]; then
@@ -154,7 +154,7 @@ run_one() { # label tag api bin args...
     fi
     emit "$label rc=$rc xid=${xid:-?} secs=$((t1 - t0)) | $res | $err$extra"
   fi
-  [ "$rc" -ne 70 ] || { echo "sanitize-all: Xid count rose during $label; stopped" >&2; exit 70; }
+  [ "$rc" -ne 70 ] || { echo "sanitize-all: new Xid line during $label (or Xid check failed); stopped" >&2; exit 70; }
   [ "$by_plan" -eq 0 ] || return 0
   if [ "$no_cuda" -eq 1 ]; then
     [ "$listed" -eq 1 ] && return 0

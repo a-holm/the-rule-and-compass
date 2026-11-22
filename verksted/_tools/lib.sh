@@ -69,6 +69,27 @@ xid_count() {
   echo "${n:-0}"
 }
 
+# xid_start: prints the local start time of a hold, for xid_new_since.
+xid_start() {
+  date '+%Y-%m-%d %H:%M:%S'
+}
+
+# xid_new_since <time>: prints the number of `NVRM: Xid` kernel lines since <time>, never a journal total.
+# Fails closed (returns 1, prints nothing) when <time> is empty or journalctl fails.
+# RCSR_XID_CMD, when set, replaces journalctl and prints the new-line count itself.
+xid_new_since() {
+  local since=${1:-} out n
+  [ -n "$since" ] || { echo "xid: start time missing" >&2; return 1; }
+  if [ -n "${RCSR_XID_CMD:-}" ]; then
+    n=$(bash -c "$RCSR_XID_CMD") || { echo "xid: check command failed" >&2; return 1; }
+  else
+    out=$(journalctl -k --since "$since" 2>/dev/null) || { echo "xid: journalctl failed" >&2; return 1; }
+    n=$(printf '%s\n' "$out" | grep -c 'NVRM: Xid')
+  fi
+  case "$n" in ''|*[!0-9]*) echo "xid: unreadable count '$n'" >&2; return 1 ;; esac
+  echo "$n"
+}
+
 rc_done() {
   printf 'RC_DONE rc=%s at=%s\n' "$1" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }

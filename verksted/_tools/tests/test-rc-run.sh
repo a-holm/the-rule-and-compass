@@ -35,12 +35,12 @@ has() {
 mkdir -p "$T/gates" "$T/wt/crate-x" "$T/bin" "$T/oc"
 fake_timeout "$T/bin"
 touch "$T/wt/crate-x/Cargo.toml"
-echo 4 > "$T/xid"
+echo 0 > "$T/xid"
 for kind in slot lock; do
   cat > "$T/$kind.sh" <<STUB
 #!/usr/bin/env bash
 echo "$kind \$*" >> "$T/calls"
-[ -z "\${FAKE_XID_BUMP:-}" ] || echo 5 > "$T/xid"
+[ -z "\${FAKE_XID_BUMP:-}" ] || echo 1 > "$T/xid"
 exec "\$@"
 STUB
   chmod +x "$T/$kind.sh"
@@ -80,7 +80,7 @@ for m in "test" "run"; do
   rc bash "$RC" $m "$T/wt" 9 t --cuda -- show-args a > /dev/null; r=$?
   check "lock-$m-rc" "$r" "0"
   check "lock-$m-calls" "$(cut -d' ' -f1 "$T/calls")" "lock"
-  has "lock-$m-xid" "$log" '^xid before=4 after=4$'
+  has "lock-$m-xid" "$log" '^xid new=0 since=[0-9-]+ [0-9:]+$'
   has "lock-$m-timeout" "$T/calls" 'timeout -k 30 580 '
 done
 has test-cuda-arch "$log" 'arch=sm_86'
@@ -117,18 +117,50 @@ check giveup-last "$(tail -n 1 "$log" | cut -d' ' -f1-2)" "RC_DONE rc=75"
 cat > "$T/lock.sh" <<STUB
 #!/usr/bin/env bash
 echo "lock \$*" >> "$T/calls"
-[ -z "\${FAKE_XID_BUMP:-}" ] || echo 5 > "$T/xid"
+[ -z "\${FAKE_XID_BUMP:-}" ] || echo 1 > "$T/xid"
 exec "\$@"
 STUB
 
 # a rising Xid count gives 70
-echo 4 > "$T/xid"
+echo 0 > "$T/xid"
 FAKE_XID_BUMP=1 rc bash "$RC" run "$T/wt" 9 t -- show-args > /dev/null; r=$?
 check xid-rc "$r" "70"
-has xid-line "$log" '^xid before=4 after=5$'
-has xid-stop "$log" '^STOP: NVRM Xid count rose 4 -> 5$'
+has xid-line "$log" '^xid new=1 since=[0-9-]+ [0-9:]+$'
+has xid-stop "$log" '^STOP: 1 new NVRM Xid line\(s\) since '
 check xid-last "$(tail -n 1 "$log" | cut -d' ' -f1-2)" "RC_DONE rc=70"
-echo 4 > "$T/xid"
+
+# Stubbed journalctl (no RCSR_XID_CMD). Mode "old": an old Xid line exists in the journal total (a call without --since
+# prints it) and nothing is newer than the hold. Mode "new": a line is newer than the start. Mode "fail": journalctl fails.
+mkdir -p "$T/jcbin"
+cat > "$T/jcbin/journalctl" <<JC
+#!/bin/sh
+mode=\$(cat "$T/jc.mode")
+[ "\$mode" != fail ] || exit 1
+since=
+[ "\$2" != --since ] || since=\$3
+case "\$mode" in
+  old) [ -n "\$since" ] || echo 'NVRM: Xid (PCI:0000:01:00): 79, old' ;;
+  new) echo 'NVRM: Xid (PCI:0000:01:00): 79, new' ;;
+esac
+exit 0
+JC
+chmod +x "$T/jcbin/journalctl"
+jc() { echo "$1" > "$T/jc.mode"; shift; rc RCSR_XID_CMD= PATH="$T/jcbin:$T/bin:$PATH" "$@"; }
+
+# an old Xid line before the start and none after: the job's rc passes through (a total-count check would see a line)
+FAKE_RC=3 jc old bash "$RC" run "$T/wt" 9 t -- show-args > /dev/null; r=$?
+check jc-old-rc "$r" "3"
+has jc-old-line "$log" '^xid new=0 since=[0-9-]+ [0-9:]+$'
+check jc-old-total-would-fail "$(PATH="$T/jcbin:$PATH" bash -c "echo old > '$T/jc.mode'; journalctl -k | grep -c 'NVRM: Xid'")" "1"
+# a new line after the start stops the step
+jc new bash "$RC" run "$T/wt" 9 t -- show-args > /dev/null; r=$?
+check jc-new-rc "$r" "70"
+has jc-new-line "$log" '^xid new=1 since='
+# journalctl failing fails closed
+jc fail bash "$RC" run "$T/wt" 9 t -- show-args > /dev/null; r=$?
+check jc-fail-rc "$r" "70"
+has jc-fail-line "$log" '^STOP: Xid check failed'
+echo 0 > "$T/xid"
 
 # arguments with a space and a quote arrive unchanged
 rc bash "$RC" cpu "$T/wt" 9 t -- show-args "a b" "it's \"x\"" '$HOME' > /dev/null

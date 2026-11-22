@@ -27,9 +27,9 @@ has() {
 
 mkdir -p "$T/gates" "$T/wt/crate-x" "$T/bin" "$T/cuda-13.0/bin" "$T/cuda-12.0/bin"
 touch "$T/wt/crate-x/Cargo.toml"
-echo 4 > "$T/xid"
+echo 0 > "$T/xid"
 for kind in slot lock; do
-  bump=; [ "$kind" = lock ] && bump="[ -z \"\${FAKE_XID_BUMP:-}\" ] || echo 5 > $T/xid\n"
+  bump=; [ "$kind" = lock ] && bump="[ -z \"\${FAKE_XID_BUMP:-}\" ] || echo 1 > $T/xid\n"
   printf '#!/usr/bin/env bash\necho "%s $*" >> "%s/calls"\n%bexec "$@"\n' "$kind" "$T" "$bump" > "$T/$kind.sh"
   chmod +x "$T/$kind.sh"
 done
@@ -85,7 +85,7 @@ has clean-san-args "$T/san-calls" 'san under=memcheck --tool memcheck --leak-che
 check clean-require-device "$(sort -u "$T/san-req" | tr "\n" " ")" "req=1 "
 has clean-cargo-args "$T/cargo-calls" 'cargo test --release --features cuda --no-run --message-format=json --test gpu_fit'
 has clean-summary "$rlog" '^ERROR SUMMARY: 0 errors$'
-has clean-xid "$rlog" '^xid before=4 after=4$'
+has clean-xid "$rlog" '^xid new=0 since=[0-9-]+ [0-9:]+$'
 has clean-done "$rlog" '^RC_DONE rc=0 '
 check clean-limits "$(grep -c "^580 .*compute-sanitizer" "$T/timeouts")" "$(wc -l < "$T/san-calls" | tr -d " ")"
 has clean-build-done "$blog" '^RC_DONE rc=0 '
@@ -113,7 +113,7 @@ has bin-cargo "$T/cargo-calls" '^cargo build --release --features cuda --message
 has bin-san-args "$T/san-calls" 'san under=memcheck --tool memcheck --leak-check no --error-exitcode 99 /fake/release/rcsr-gpu-bench --batch 64 --reps 1 --depth 3$'
 has bin-slot "$T/calls" '^slot .*cargo build'
 has bin-lock "$T/calls" '^lock .*compute-sanitizer'
-has bin-xid "$rlog" '^xid before=4 after=4$'
+has bin-xid "$rlog" '^xid new=0 since=[0-9-]+ [0-9:]+$'
 FAKE_SUMMARY='ERROR SUMMARY: 3 errors' run "$T/wt" 7 s --bin rcsr-gpu-bench > /dev/null 2>&1; r=$?
 check bin-errors-rc "$r" "1"
 FAKE_NO_BIN=1 run "$T/wt" 7 s --bin rcsr-gpu-bench > /dev/null 2>&1; r=$?
@@ -139,10 +139,10 @@ check zero-tests-rc "$r" "0"
 case "$out" in *'tests run: 0'*) ;; *) echo "FAIL zero-tests-warning: '$out'"; fails=$((fails + 1)) ;; esac
 
 # a rising Xid count gives 70
-echo 4 > "$T/xid"
+echo 0 > "$T/xid"
 FAKE_XID_BUMP=1 run "$T/wt" 7 s --test gpu_fit > /dev/null 2>&1; r=$?
 check xid-rc "$r" "70"
-echo 4 > "$T/xid"
+echo 0 > "$T/xid"
 
 # sanitizer path without /cuda-13, or missing, gives 3 and never builds
 : > "$T/cargo-calls"

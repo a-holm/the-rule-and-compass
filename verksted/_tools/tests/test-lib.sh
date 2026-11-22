@@ -114,6 +114,28 @@ check xid-journal "$(lib 'xid_count' PATH="$T/bin:$PATH")" "2"
 printf '#!/bin/sh\necho quiet\n' > "$T/bin/journalctl"
 check xid-journal-none "$(lib 'xid_count' PATH="$T/bin:$PATH")" "0"
 
+# xid_new_since: counts new lines since the start, fails closed
+check xid-new-cmd "$(lib 'xid_new_since "2026-01-01 00:00:00"' RCSR_XID_CMD='echo 3')" "3"
+check xid-new-missing-start "$(lib 'xid_new_since ""' RCSR_XID_CMD='echo 0' 2>/dev/null; echo "rc=$?")" "rc=1"
+check xid-new-cmd-fails "$(lib 'xid_new_since "t"' RCSR_XID_CMD='exit 3' 2>/dev/null; echo "rc=$?")" "rc=1"
+check xid-new-cmd-garbage "$(lib 'xid_new_since "t"' RCSR_XID_CMD='echo x' 2>/dev/null; echo "rc=$?")" "rc=1"
+# the stub selects its output by the --since argument: quiet after 12:00, one new line after 11:00
+cat > "$T/bin/journalctl" <<'JC'
+#!/bin/sh
+[ "$1" = -k ] || exit 2
+[ "$2" = --since ] || exit 2
+case "$3" in
+  "2026-01-01 12:00:00") printf 'quiet\n' ;;
+  "2026-01-01 11:00:00") printf 'quiet\nNVRM: Xid (PCI:0000:01:00): 79, GPU has fallen off the bus\n' ;;
+  *) exit 1 ;;
+esac
+JC
+chmod +x "$T/bin/journalctl"
+check xid-new-old-line-ignored "$(lib 'xid_new_since "2026-01-01 12:00:00"' PATH="$T/bin:$PATH")" "0"
+check xid-new-after-start "$(lib 'xid_new_since "2026-01-01 11:00:00"' PATH="$T/bin:$PATH")" "1"
+check xid-new-journalctl-fails "$(lib 'xid_new_since "2030-01-01 00:00:00"' PATH="$T/bin:$PATH" 2>/dev/null; echo "rc=$?")" "rc=1"
+check xid-start-format "$(lib 'xid_start' | grep -cE '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$')" "1"
+
 # usage prints the calling script's header without the comment prefix
 cat > "$T/hdr.sh" <<HDR
 #!/usr/bin/env bash
