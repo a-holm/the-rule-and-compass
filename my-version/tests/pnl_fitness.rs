@@ -3646,16 +3646,28 @@ fn write_two_label_csv(dir: &std::path::Path) -> (String, String) {
 
 /// A saved `--fitness pnl` search resumed with `resumed` instead of `saved`
 /// exits 2, and the conflict names `flag` among the flags given now.
-fn assert_row_flag_conflict(data: &str, spec: &str, dir: &std::path::Path, saved: &[&str], resumed: &[&str], flag: &str) {
+fn row_flag_conflict(data: &str, spec: &str, dir: &std::path::Path, saved: &[&str], resumed: &[&str], flag: &str) -> Result<(), String> {
     let cp = dir.join(format!("row{}.rcsr", flag.trim_start_matches('-'))).to_string_lossy().into_owned();
     let first = run(data, spec, &[&["--fitness", "pnl"][..], saved, &["--generations", "10", "--save", &cp]].concat());
-    assert_eq!(code(&first), 0, "{flag}: {}", stderr(&first));
+    if code(&first) != 0 {
+        return Err(format!("{flag}: the first run failed: {}", stderr(&first)));
+    }
     let other = run(data, spec, &[&["--fitness", "pnl"][..], resumed, &["--generations", "20", "--resume", &cp]].concat());
-    assert_eq!(code(&other), 2, "{flag}: {}", stderr(&other));
     let err = stderr(&other);
-    assert!(err.contains("--resume conflicts with the saved search settings"), "{flag}: {err}");
-    let given = err.split("flags given now: ").nth(1).unwrap_or_else(|| panic!("{flag}: no given flags in: {err}"));
-    assert!(given.contains(flag), "{flag} missing from the flags given now: {given}");
+    if code(&other) != 2 || !err.contains("--resume conflicts with the saved search settings") {
+        return Err(format!("{flag}: want a resume conflict (exit 2), got exit {}: {err}", code(&other)));
+    }
+    let given = err.split("flags given now: ").nth(1).unwrap_or_default().trim_end().trim_end_matches(')').to_string();
+    if !given.split(", ").any(|g| g == flag) {
+        return Err(format!("{flag}: missing from the flags given now: {given}"));
+    }
+    Ok(())
+}
+
+/// Every case runs; the failures are reported together.
+fn assert_row_flag_conflicts(data: &str, spec: &str, dir: &std::path::Path, cases: &[(&[&str], &[&str], &str)]) {
+    let failures: Vec<String> = cases.iter().filter_map(|(saved, resumed, flag)| row_flag_conflict(data, spec, dir, saved, resumed, flag).err()).collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 #[test]
@@ -3663,17 +3675,21 @@ fn resume_conflict_names_the_row_selection_flags() {
     let (_scratch, dir) = scratch();
     let data = write_csv(&dir, 900);
     let spec = write_spec(&dir);
-    assert_row_flag_conflict(&data, &spec, &dir, &[], &["--filter", "x1 > -0.4"], "--filter");
-    assert_row_flag_conflict(&data, &spec, &dir, &[], &["--exclude", "x1 > 0.4"], "--exclude");
-    assert_row_flag_conflict(
+    assert_row_flag_conflicts(
         &data,
         &spec,
         &dir,
-        &["--train-select", "x1 < 0.3", "--test-select", "x1 >= 0.3"],
-        &["--train-select", "x1 < 0.2", "--test-select", "x1 >= 0.2"],
-        "--train-select",
+        &[
+            (&[], &["--filter", "x1 > -0.4"], "--filter"),
+            (&[], &["--exclude", "x1 > 0.4"], "--exclude"),
+            (
+                &["--train-select", "x1 < 0.3", "--test-select", "x1 >= 0.3"],
+                &["--train-select", "x1 < 0.2", "--test-select", "x1 >= 0.2"],
+                "--train-select",
+            ),
+            (&[], &["--gap", "40"], "--gap"),
+        ],
     );
-    assert_row_flag_conflict(&data, &spec, &dir, &[], &["--gap", "40"], "--gap");
 }
 
 #[test]
@@ -3684,15 +3700,19 @@ fn resume_conflict_names_the_sample_rows_flag() {
     let table = rcsr::data::parse_table(&std::fs::read_to_string(&csv).unwrap()).unwrap();
     let store = dir.join("d.rcsb").to_string_lossy().into_owned();
     rcsr::store::write_store(&store, &table, 251).unwrap();
-    assert_row_flag_conflict(&store, &spec, &dir, &[], &["--sample-rows", "400"], "--sample-rows");
+    assert_row_flag_conflicts(&store, &spec, &dir, &[(&[], &["--sample-rows", "400"], "--sample-rows")]);
 }
 
 #[test]
 fn resume_conflict_names_the_label_flags() {
     let (_scratch, dir) = scratch();
     let (data, spec) = write_two_label_csv(&dir);
-    assert_row_flag_conflict(&data, &spec, &dir, &["--target", "y"], &["--target", "z"], "--target");
-    assert_row_flag_conflict(&data, &spec, &dir, &["--book-target", "y"], &["--book-target", "z"], "--book-target");
+    assert_row_flag_conflicts(
+        &data,
+        &spec,
+        &dir,
+        &[(&["--target", "y"], &["--target", "z"], "--target"), (&["--book-target", "y"], &["--book-target", "z"], "--book-target")],
+    );
 }
 
 /// A resume with a changed `--lockbox` or `--skip-malformed` on clean rows keeps the book hash:
