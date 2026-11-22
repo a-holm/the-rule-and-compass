@@ -21,6 +21,7 @@
 //! minimum supported version instead of the raw nvcc diagnostics.
 
 include!("src/cuda/arch.rs");
+include!("src/sha256_core.rs");
 
 use std::process::Command;
 
@@ -113,9 +114,53 @@ fn git(args: &[&str]) -> Option<String> {
     }
 }
 
+/// Every file that enters the binary: `src/**` (recursively), `build.rs`,
+/// `Cargo.toml` and `Cargo.lock`, as paths relative to the crate directory.
+fn source_files(dir: &std::path::Path) -> Vec<String> {
+    fn walk(dir: &std::path::Path, rel: &str, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir.join(rel)) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let path = format!("{}/{}", rel, e.file_name().to_string_lossy());
+            match e.file_type() {
+                Ok(t) if t.is_dir() => walk(dir, &path, out),
+                Ok(t) if t.is_file() => out.push(path),
+                _ => {}
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(dir, "src", &mut files);
+    for name in ["build.rs", "Cargo.toml", "Cargo.lock"] {
+        if dir.join(name).is_file() {
+            files.push(name.to_string());
+        }
+    }
+    files.sort();
+    files
+}
+
+/// #1319: SHA-256 over the sorted paths, lengths and bytes of [`source_files`].
+fn source_digest(dir: &std::path::Path) -> String {
+    let mut state = Sha256::new();
+    for rel in source_files(dir) {
+        let Ok(bytes) = std::fs::read(dir.join(&rel)) else {
+            continue;
+        };
+        state.update(rel.as_bytes());
+        state.update(&[0]);
+        state.update(&(bytes.len() as u64).to_le_bytes());
+        state.update(&bytes);
+    }
+    state.finalize()
+}
+
 /// #256: record the commit this binary is built from, at build time. A runtime
 /// `git rev-parse` names whatever tree the process happens to run in.
 /// `RCSR_BUILD_COMMIT` overrides it for builds from an exported source tree.
+/// #1319: a dirty tree also records the digest of its sources, and a source
+/// edit reruns the script, so the dirty flag and the digest follow the binary.
 fn record_build_commit() {
     println!("cargo:rerun-if-env-changed=RCSR_BUILD_COMMIT");
     let commit = std::env::var("RCSR_BUILD_COMMIT")
@@ -123,10 +168,19 @@ fn record_build_commit() {
         .filter(|c| !c.trim().is_empty())
         .or_else(|| git(&["rev-parse", "HEAD"]))
         .unwrap_or_else(|| "unknown".to_string());
-    let dirty = git(&["status", "--porcelain"]).is_some();
+    let in_work_tree = git(&["rev-parse", "--is-inside-work-tree"]).is_some();
+    let dirty = in_work_tree && git(&["status", "--porcelain"]).is_some();
     println!("cargo:rustc-env=RCSR_BUILD_COMMIT={}", commit);
     println!("cargo:rustc-env=RCSR_BUILD_DIRTY={}", dirty);
     let dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
+    if dirty || !in_work_tree {
+        println!("cargo:rustc-env=RCSR_BUILD_SOURCE_SHA256={}", source_digest(std::path::Path::new(&dir)));
+    }
+    for name in ["src", "build.rs", "Cargo.toml", "Cargo.lock"] {
+        if std::path::Path::new(&dir).join(name).exists() {
+            println!("cargo:rerun-if-changed={}", name);
+        }
+    }
     let git_path = |name: &str| {
         git(&["rev-parse", "--git-path", name]).map(|p| std::path::Path::new(&dir).join(p))
     };

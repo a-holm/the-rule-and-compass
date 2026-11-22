@@ -1,4 +1,4 @@
-//! #981: the build script reruns only when this checkout's commit can change,
+//! #981, #1319: the build script reruns only when this checkout's commit can change,
 //! never for another worktree's ref changes, and always records the commit of
 //! the checkout being built. Each case builds a probe crate that carries the
 //! real `build.rs`, inside a temporary repository with a linked worktree.
@@ -32,6 +32,9 @@ struct Build {
     fresh: bool,
     compiled: bool,
     commit: String,
+    dirty: bool,
+    source_sha: String,
+    stdout: String,
     log: String,
 }
 
@@ -51,6 +54,7 @@ impl Fixture {
         let here = Path::new(env!("CARGO_MANIFEST_DIR"));
         std::fs::copy(here.join("build.rs"), probe.join("build.rs")).unwrap();
         std::fs::copy(here.join("src/cuda/arch.rs"), probe.join("src/cuda/arch.rs")).unwrap();
+        std::fs::copy(here.join("src/sha256_core.rs"), probe.join("src/sha256_core.rs")).unwrap();
         std::fs::write(probe.join("src/cuda/eval.cu"), "// kernel\n").unwrap();
         std::fs::write(
             probe.join("Cargo.toml"),
@@ -59,9 +63,10 @@ impl Fixture {
         .unwrap();
         std::fs::write(
             probe.join("src/main.rs"),
-            "fn main() { println!(\"{}\", env!(\"RCSR_BUILD_COMMIT\")); }\n",
+            "fn main() { println!(\"{} {} {}\", env!(\"RCSR_BUILD_COMMIT\"), env!(\"RCSR_BUILD_DIRTY\"), option_env!(\"RCSR_BUILD_SOURCE_SHA256\").unwrap_or(\"-\")); }\n",
         )
         .unwrap();
+        std::fs::write(probe.join(".gitignore"), "/Cargo.lock\n").unwrap();
         git(&main, &["init", "-q"]);
         if !reflog {
             git(&main, &["config", "core.logAllRefUpdates", "false"]);
@@ -87,16 +92,25 @@ impl Fixture {
             .current_dir(self.probe())
             .env("CARGO_TARGET_DIR", &self.target)
             .env_remove("RCSR_BUILD_COMMIT")
+            .env_remove("RCSR_BUILD_DIRTY")
+            .env_remove("RCSR_BUILD_SOURCE_SHA256")
             .env_remove("RUSTC_WRAPPER")
             .output()
             .expect("run cargo");
         let log = String::from_utf8_lossy(&out.stderr).into_owned();
         assert!(out.status.success(), "{}", log);
         let ran = Command::new(self.target.join("debug/probe")).output().expect("run probe");
+        let stdout = String::from_utf8_lossy(&ran.stdout).into_owned();
+        let mut fields = stdout.split_whitespace();
+        let mut next = || fields.next().unwrap_or_default().to_string();
+        let (commit, dirty, source_sha) = (next(), next(), next());
         Build {
             fresh: log.contains("Fresh probe"),
             compiled: log.contains("Compiling probe"),
-            commit: String::from_utf8_lossy(&ran.stdout).trim().to_string(),
+            commit,
+            dirty: dirty == "true",
+            source_sha,
+            stdout,
             log,
         }
     }
@@ -177,4 +191,43 @@ fn other_worktree_ref_changes_do_not_rebuild_and_own_commits_do() {
 #[test]
 fn without_a_reflog_own_commits_still_rebuild_and_other_refs_do_not() {
     scenario(false);
+}
+
+fn edit_main(f: &Fixture, text: &str) {
+    let path = f.probe().join("src/main.rs");
+    let mut source = std::fs::read_to_string(&path).unwrap();
+    source.push_str(text);
+    std::fs::write(path, source).unwrap();
+}
+
+#[test]
+fn an_uncommitted_source_edit_marks_the_build_dirty_with_a_digest_of_that_source() {
+    let f = Fixture::new("dirty-source", true);
+    let clean = f.build();
+    assert!(!clean.dirty && clean.source_sha == "-", "a clean build records no digest: dirty={} sha={} stdout={:?}\n{}", clean.dirty, clean.source_sha, clean.stdout, clean.log);
+    f.assert_fresh("second clean build");
+
+    edit_main(&f, "// edit a\n");
+    let a = f.build();
+    assert!(a.compiled && a.dirty, "an edit under src must rerun the script\n{}", a.log);
+    assert_eq!(a.commit, clean.commit, "the commit stays the clean commit");
+    assert_eq!(a.source_sha.len(), 64, "{}", a.source_sha);
+    f.assert_fresh("build after the edit");
+
+    edit_main(&f, "// edit b\n");
+    let b = f.build();
+    assert!(b.dirty && b.source_sha.len() == 64 && b.source_sha != a.source_sha, "a different edit gives a different digest");
+
+    git(&f.wt, &["checkout", "--", "probe/src/main.rs"]);
+    let reverted = f.build();
+    assert!(reverted.compiled && !reverted.dirty && reverted.source_sha == "-", "a reverted edit gives the clean build again\n{}", reverted.log);
+}
+
+#[test]
+fn an_untracked_new_source_file_makes_the_build_dirty() {
+    let f = Fixture::new("dirty-untracked", true);
+    assert!(!f.build().dirty);
+    std::fs::write(f.probe().join("src/extra.rs"), "// new\n").unwrap();
+    let b = f.build();
+    assert!(b.compiled && b.dirty && b.source_sha.len() == 64, "{}", b.log);
 }
