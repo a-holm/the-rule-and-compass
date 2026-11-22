@@ -721,7 +721,7 @@ fn batch_workers(workers: usize, n: usize, rows: usize) -> usize {
 /// results in input order. Work is handed out one item at a time, so uneven
 /// fit costs balance. `f` must not touch shared mutable state that changes
 /// the result, so the output is independent of `workers`.
-fn par_map<T: Send, R: Send>(workers: usize, items: Vec<T>, f: impl Fn(T) -> R + Sync) -> Vec<R> {
+pub(crate) fn par_map<T: Send, R: Send>(workers: usize, items: Vec<T>, f: impl Fn(T) -> R + Sync) -> Vec<R> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     let n = items.len();
@@ -9558,7 +9558,7 @@ fn run_search(
         } else {
             QdArchive::new(cfg.qd_bins, cfg.qd_cell_cap)
         };
-        let mut archive = archive.with_nvars(nvars).with_kind(cfg.qd_descriptor); // #1084
+        let mut archive = archive.with_nvars(nvars).with_kind(cfg.qd_descriptor).with_workers(cfg.threads); // #1084
         if let Some(state) = saved_qd.take() {
             archive.restore(state).map_err(|e| format!("cannot resume: {e}"))?; // #1166
         }
