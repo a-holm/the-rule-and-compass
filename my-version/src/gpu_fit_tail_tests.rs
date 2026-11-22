@@ -382,8 +382,8 @@ fn tail_fit_overlap_equals_serial_routing() {
 
 /// #1075: the device fit released in waves gives the one-call trees, errors
 /// and per-cause counts bit for bit, carries the same candidates in more
-/// launches, and starts released exact fits early. #1125: a cap with room in
-/// the refit prefix releases in waves too, and starts at most the cap of exact
+/// launches, and starts released exact fits early. #1125/#1231: a cap with room in
+/// the refit prefix releases in waves too, runs them in rotated key order, and starts at least one and at most the cap of exact
 /// fits per device step.
 #[test]
 fn release_waves_equal_one_shot() {
@@ -455,6 +455,7 @@ fn release_waves_equal_one_shot() {
             } else {
                 assert!(r.fit_calls > o.fit_calls && r.fit_calls <= waves * o.fit_calls, "{label}: a cap with room releases in waves");
                 assert!(r.fit_tail_early <= cfg.fit_fallback_max * o.fit_calls, "{label}: a released exact fit past the cap");
+                assert!(r.fit_tail_early >= 1, "{label}: a binding cap released no exact fit early");
             }
             assert!(r.ledger.closure_residual().value.abs() < 1e-9, "{label}: the ledger does not close");
         }
