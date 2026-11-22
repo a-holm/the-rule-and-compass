@@ -264,3 +264,39 @@ fn graph_usage_errors_exit_2() {
     assert_eq!(code(&run(&["graph", "--icm"])), 2);
     assert_eq!(code(&run(&["links", "--dot"])), 2);
 }
+
+#[test]
+fn links_external_checks_outside_references_strictly() {
+    let root = workshop("external");
+    let base = root.parent().expect("base").to_path_buf();
+    write(&base.join("pkg/Cargo.toml"), "[package]\nname = \"rule-and-compass\"\n");
+    write(
+        &root.join("01_p/CONTEXT.md"),
+        "# 01_p: job\n\nOne job: x.\n\nDo NOT load: y.\n\n## Inputs\n\n**Reference:**\n- `../../<crate>/src/gone.rs`\n\n## Process\n## Outputs\n## Check\n\n`stages/01_s/` and `_tools/a.sh`\n\n[s](stages/01_s/CONTEXT.md)\n",
+    );
+    assert_eq!(code(&run(&["links", s(&root)])), 0);
+    let o = run(&["links", "--external", s(&root)]);
+    assert_eq!(code(&o), 1);
+    assert!(stdout(&o).contains("<crate>/src/gone.rs"), "{}", stdout(&o));
+    write(&base.join("pkg/src/gone.rs"), "");
+    assert_eq!(code(&run(&["links", "--external", s(&root)])), 0);
+    fs::remove_file(base.join("pkg/Cargo.toml")).expect("remove manifest");
+    let o = run(&["links", "--external", s(&root)]);
+    assert_eq!(code(&o), 1);
+    assert!(String::from_utf8_lossy(&o.stderr).contains("no engine crate directory"));
+    assert_eq!(code(&run(&["links", "--icm", "--external", s(&root)])), 2);
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn walk_flags_the_crate_directory_name() {
+    let root = workshop("crate_name");
+    let base = root.parent().expect("base").to_path_buf();
+    write(&base.join("pkg/Cargo.toml"), "[package]\nname = \"rule-and-compass\"\n");
+    assert_eq!(code(&run(&["walk", s(&root)])), 0);
+    write(&root.join("_templates/t.md"), "# T\n\nSee `pkg/src/x.rs`.\n");
+    let o = run(&["walk", s(&root)]);
+    assert_eq!(code(&o), 1);
+    assert!(stdout(&o).contains("_templates/t.md:3"), "{}", stdout(&o));
+    let _ = fs::remove_dir_all(&base);
+}

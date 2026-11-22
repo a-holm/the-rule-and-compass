@@ -331,6 +331,23 @@ pub fn check_tree(root: &Path) -> Report {
     report
 }
 
+// Engine crate guard: the crate directory is resolved at run time by package name.
+
+/// The one first-level directory of `repo` whose `Cargo.toml` declares package `rule-and-compass`.
+pub fn crate_dir(_repo: &Path) -> Option<PathBuf> {
+    None
+}
+
+/// Like `check_tree`; `external` checks references outside the workshop strictly.
+pub fn check_tree_with(root: &Path, _external: bool) -> Report {
+    check_tree(root)
+}
+
+/// Tracked workshop text that names the engine crate directory as a path.
+pub fn crate_name_problems(_root: &Path) -> Vec<String> {
+    Vec::new()
+}
+
 // ICM rules: the strict link check, the graph and the reference rules.
 
 const ICM_SKIP: [&str; 4] = ["node_modules", "_archive", "_templates", "raw"];
@@ -1605,5 +1622,132 @@ mod tests {
         let index = render_index(&root);
         assert!(index.ends_with("- [a b.md](_shared/a%20b.md): Shared.\n"), "{index}");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    fn pkg(dir: &Path) {
+        write(&dir.join("Cargo.toml"), "[package]\nname = \"rule-and-compass\"\nversion = \"0.1.0\"\n");
+    }
+
+    #[test]
+    fn crate_dir_finds_one_none_and_two() {
+        let one = scratch("crate_one");
+        pkg(&one.join("pkg"));
+        write(&one.join("other/Cargo.toml"), "[package]\nname = \"other\"\n");
+        write(&one.join("lib/Cargo.toml"), "[package]\nname = \"other\"\n[lib]\nname = \"rule-and-compass\"\n");
+        assert_eq!(crate_dir(&one), Some(one.join("pkg")));
+
+        let none = scratch("crate_none");
+        write(&none.join("a/Cargo.toml"), "[package]\nname = \"other\"\n");
+        assert_eq!(crate_dir(&none), None);
+
+        let two = scratch("crate_two");
+        pkg(&two.join("a"));
+        pkg(&two.join("b"));
+        assert_eq!(crate_dir(&two), None);
+        for d in [one, none, two] {
+            let _ = fs::remove_dir_all(&d);
+        }
+    }
+
+    #[test]
+    fn crate_name_red_a_path_that_names_the_crate_directory_is_reported() {
+        let base = scratch("name_red");
+        let root = base.join("verksted");
+        pkg(&base.join("pkg"));
+        write(&root.join("x.md"), "# x\n\nRead `pkg/src/x.rs`.\n");
+        write(&root.join("_tools/a.sh"), "#!/usr/bin/env bash\ncd \"${W}/pkg\" && ls\n");
+        write(&root.join("y.md"), "[l](../pkg/Cargo.toml)\n");
+        let problems = crate_name_problems(&root);
+        assert_eq!(problems.len(), 3, "{problems:?}");
+        assert!(problems.iter().any(|p| p.starts_with("x.md:3")), "{problems:?}");
+        assert!(problems.iter().any(|p| p.starts_with("_tools/a.sh:2")), "{problems:?}");
+        assert!(problems.iter().any(|p| p.starts_with("y.md:1")), "{problems:?}");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn crate_name_green_prose_longer_words_and_a_missing_crate_pass() {
+        let base = scratch("name_green");
+        let root = base.join("verksted");
+        pkg(&base.join("pkg"));
+        write(&root.join("x.md"), "# x\n\nThe pkg crate. Run `cd pkg`. A xpkg/a path and pkg2/b and a-pkg/c.\n");
+        write(&root.join("_local/z.md"), "pkg/x.rs\n");
+        assert!(crate_name_problems(&root).is_empty(), "{:?}", crate_name_problems(&root));
+        write(&root.join("w.md"), "`pkg/x.rs`\n");
+        fs::remove_file(base.join("pkg/Cargo.toml")).expect("remove manifest");
+        assert!(crate_name_problems(&root).is_empty());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn crate_name_red_a_file_or_directory_named_like_the_crate_is_reported() {
+        let base = scratch("name_file");
+        let root = base.join("verksted");
+        pkg(&base.join("pkg"));
+        write(&root.join("pkg/n.md"), "# n\n");
+        let problems = crate_name_problems(&root);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].starts_with("pkg:"), "{problems:?}");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    fn external_tree(name: &str) -> PathBuf {
+        let base = scratch(name);
+        let root = base.join("verksted");
+        pkg(&base.join("pkg"));
+        write(&base.join("pkg/src/there.rs"), "");
+        write(&base.join("docs/there.md"), "");
+        write(
+            &root.join("s/CONTEXT.md"),
+            "# s\n\n## Inputs\n\n**Reference (every run):**\n- `../../<crate>/src/there.rs`\n- `../../<crate>/src/missing.rs`\n- `../../docs/there.md`\n- `../../docs/gone.md`\n- `../../nodir/gone.md`\n\n[a](../../docs/gone.md)\n",
+        );
+        root
+    }
+
+    #[test]
+    fn external_red_outside_references_are_strict_and_crate_placeholders_resolve() {
+        let root = external_tree("external_red");
+        let report = check_tree_with(&root, true);
+        assert_eq!(
+            report.broken,
+            [
+                "s/CONTEXT.md: link ../../docs/gone.md",
+                "s/CONTEXT.md: input `../../<crate>/src/missing.rs`",
+                "s/CONTEXT.md: input `../../docs/gone.md`",
+                "s/CONTEXT.md: input `../../nodir/gone.md`",
+            ]
+        );
+        let _ = fs::remove_dir_all(root.parent().expect("base"));
+    }
+
+    #[test]
+    fn external_green_default_mode_passes_outside_references_with_an_existing_parent() {
+        let root = external_tree("external_green");
+        let report = check_tree_with(&root, false);
+        assert_eq!(report.broken, ["s/CONTEXT.md: input `../../nodir/gone.md`"], "{:?}", report.broken);
+        assert_eq!(check_tree(&root).broken, report.broken);
+        let _ = fs::remove_dir_all(root.parent().expect("base"));
+    }
+
+    #[test]
+    fn default_mode_keeps_references_inside_the_workshop_strict() {
+        let base = scratch("inside_strict");
+        let root = base.join("verksted");
+        write(&root.join("s/CONTEXT.md"), "# s\n\n## Inputs\n\n**Reference:**\n- `../gone.md`\n\n[a](../gone.md)\n");
+        let report = check_tree_with(&root, false);
+        assert_eq!(report.broken.len(), 2, "{:?}", report.broken);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn external_without_a_crate_reports_the_placeholder_input() {
+        let base = scratch("external_nocrate");
+        let root = base.join("verksted");
+        write(&root.join("s/CONTEXT.md"), "# s\n\n## Inputs\n\n**Reference:**\n- `../../<crate>/src/x.rs`\n");
+        assert!(check_tree_with(&root, false).broken.is_empty());
+        let report = check_tree_with(&root, true);
+        assert_eq!(report.broken.len(), 1, "{:?}", report.broken);
+        assert!(report.broken[0].contains("no engine crate directory"), "{:?}", report.broken);
+        let _ = fs::remove_dir_all(&base);
     }
 }
