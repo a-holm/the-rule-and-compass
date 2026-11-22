@@ -63,7 +63,8 @@ fn num(j: &Json, path: &[&str]) -> f64 {
 
 #[test]
 #[ignore = "needs RCSR_COMPACT_CELL (1.9 GB, not in git)"]
-fn compact_cell_zero_parameter_rung_beats_the_searched_front() {
+// The rung does not beat the whole front on this split: the rank-5 law is marginally lower on test.
+fn compact_cell_zero_parameter_rung_beats_the_printed_r4_law() {
     let refused = run("y60", "(0-0.002)/(6*vol96)", &[]);
     assert_eq!(refused.status.code(), Some(5), "{}", String::from_utf8_lossy(&refused.stderr));
 
