@@ -3619,6 +3619,98 @@ fn resume_conflict_names_every_book_flag() {
     assert!(given.contains("--threshold") && !given.contains("--pnl-mask"), "{given}");
 }
 
+
+// ---- #1336: the resume conflict names the flags that change the training rows or the return column ----
+
+/// Two labels on one frame: `y` prices on return column `r`, `z` on `r2`.
+fn write_two_label_csv(dir: &std::path::Path) -> (String, String) {
+    let mut text = String::from("t,x1,x2,r,r2,y,z\n");
+    for i in 0..N {
+        let f = i as f64;
+        let x1 = frac(f * 0.618_033_988_749_894_9) - 0.5;
+        let x2 = frac(f * 0.754_877_666_246_692_7) - 0.5;
+        let noise = frac(f * 0.324_717_957_244_746) - 0.5;
+        let r = 0.01 * x1 + 0.0005 * noise;
+        let r2 = 0.01 * x2 + 0.0005 * noise;
+        text.push_str(&format!("{},{},{},{},{},{},{}\n", T0 + 900 * i as i64, x1, x2, r, r2, r + 0.05 * x2, r2 + 0.05 * x1));
+    }
+    let data = dir.join("two.csv");
+    std::fs::write(&data, text).unwrap();
+    let one = std::fs::read_to_string(write_spec(dir)).unwrap();
+    let entry = &one[one.find("{\"column\"").unwrap()..one.rfind("]}").unwrap()];
+    let second = entry.replace("\"column\":\"y\"", "\"column\":\"z\"").replace("\"return_column\":\"r\"", "\"return_column\":\"r2\"").replace("raw_target", "raw_target_z");
+    let spec = dir.join("two.json");
+    std::fs::write(&spec, one.replace(entry, &format!("{entry},{second}"))).unwrap();
+    (data.to_string_lossy().into_owned(), spec.to_string_lossy().into_owned())
+}
+
+/// A saved `--fitness pnl` search resumed with `resumed` instead of `saved`
+/// exits 2, and the conflict names `flag` among the flags given now.
+fn assert_row_flag_conflict(data: &str, spec: &str, dir: &std::path::Path, saved: &[&str], resumed: &[&str], flag: &str) {
+    let cp = dir.join(format!("row{}.rcsr", flag.trim_start_matches('-'))).to_string_lossy().into_owned();
+    let first = run(data, spec, &[&["--fitness", "pnl"][..], saved, &["--generations", "10", "--save", &cp]].concat());
+    assert_eq!(code(&first), 0, "{flag}: {}", stderr(&first));
+    let other = run(data, spec, &[&["--fitness", "pnl"][..], resumed, &["--generations", "20", "--resume", &cp]].concat());
+    assert_eq!(code(&other), 2, "{flag}: {}", stderr(&other));
+    let err = stderr(&other);
+    assert!(err.contains("--resume conflicts with the saved search settings"), "{flag}: {err}");
+    let given = err.split("flags given now: ").nth(1).unwrap_or_else(|| panic!("{flag}: no given flags in: {err}"));
+    assert!(given.contains(flag), "{flag} missing from the flags given now: {given}");
+}
+
+#[test]
+fn resume_conflict_names_the_row_selection_flags() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, 900);
+    let spec = write_spec(&dir);
+    assert_row_flag_conflict(&data, &spec, &dir, &[], &["--filter", "x1 > -0.4"], "--filter");
+    assert_row_flag_conflict(&data, &spec, &dir, &[], &["--exclude", "x1 > 0.4"], "--exclude");
+    assert_row_flag_conflict(
+        &data,
+        &spec,
+        &dir,
+        &["--train-select", "x1 < 0.3", "--test-select", "x1 >= 0.3"],
+        &["--train-select", "x1 < 0.2", "--test-select", "x1 >= 0.2"],
+        "--train-select",
+    );
+    assert_row_flag_conflict(&data, &spec, &dir, &[], &["--gap", "40"], "--gap");
+}
+
+#[test]
+fn resume_conflict_names_the_sample_rows_flag() {
+    let (_scratch, dir) = scratch();
+    let csv = write_csv(&dir, 900);
+    let spec = write_spec(&dir);
+    let table = rcsr::data::parse_table(&std::fs::read_to_string(&csv).unwrap()).unwrap();
+    let store = dir.join("d.rcsb").to_string_lossy().into_owned();
+    rcsr::store::write_store(&store, &table, 251).unwrap();
+    assert_row_flag_conflict(&store, &spec, &dir, &[], &["--sample-rows", "400"], "--sample-rows");
+}
+
+#[test]
+fn resume_conflict_names_the_label_flags() {
+    let (_scratch, dir) = scratch();
+    let (data, spec) = write_two_label_csv(&dir);
+    assert_row_flag_conflict(&data, &spec, &dir, &["--target", "y"], &["--target", "z"], "--target");
+    assert_row_flag_conflict(&data, &spec, &dir, &["--book-target", "y"], &["--book-target", "z"], "--book-target");
+}
+
+/// A resume with a changed `--lockbox` or `--skip-malformed` on clean rows keeps the book hash:
+/// neither changes which rows are read (rows in a lockbox and malformed rows are refused, not
+/// dropped), so neither is in the table.
+#[test]
+fn lockbox_and_skip_malformed_keep_the_book_hash() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, 900);
+    let spec = write_spec(&dir);
+    let cp = dir.join("keep.rcsr").to_string_lossy().into_owned();
+    let first = run(&data, &spec, &["--fitness", "pnl", "--generations", "10", "--save", &cp, "--lockbox", "2040-01-01,2041-01-01"]);
+    assert_eq!(code(&first), 0, "{}", stderr(&first));
+    for extra in [&["--lockbox", "2042-01-01,2043-01-01"][..], &["--lockbox", "2040-01-01,2041-01-01", "--skip-malformed"]] {
+        let resumed = run(&data, &spec, &[&["--fitness", "pnl", "--generations", "20", "--resume", &cp][..], extra].concat());
+        assert_eq!(code(&resumed), 0, "{extra:?}: {}", stderr(&resumed));
+    }
+}
 #[test]
 fn resume_names_the_block_lambda_and_the_split_table() {
     let (_scratch, dir) = scratch();
