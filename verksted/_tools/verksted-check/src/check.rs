@@ -1569,7 +1569,7 @@ mod tests {
     #[test]
     fn a_key_with_an_empty_value_takes_the_next_line() {
         let front = "type: stage\nconsumes:\n  - ../a.md\nproduces: b.md\n";
-        assert_eq!(frontmatter_targets(front), ["../a.md"]);
+        assert_eq!(frontmatter_targets(front), ["../a.md", "b.md"]);
         assert_eq!(field("tags:\n  - x\n", "tags"), "- x");
     }
 

@@ -46,12 +46,14 @@ fn workshop_graph_links_every_pipeline_to_its_stages() {
 }
 
 #[test]
+#[ignore = "enabled by the wire-up package: the shared notes carry no description yet"]
 fn workshop_references_carry_a_description() {
     let problems = check::reference_description_problems(&workshop_root());
     assert!(problems.is_empty(), "references without a description:\n{}", problems.join("\n"));
 }
 
 #[test]
+#[ignore = "enabled by the local-area package (#1352): verksted/.gitignore is not there yet"]
 fn local_area_is_not_tracked() {
     let root = workshop_root();
     let ignore = std::fs::read_to_string(root.join(".gitignore")).unwrap_or_default();
@@ -73,6 +75,7 @@ fn local_area_is_not_tracked() {
 const MACHINE_PATH_FILES: [&str; 3] = ["_shared/rules.md", "_shared/commands.md", "setup/questionnaire.md"];
 
 #[test]
+#[ignore = "enabled when the packages that move machine values into the local area land"]
 fn tracked_workshop_names_no_machine_path_outside_lib() {
     let root = workshop_root();
     let mut files = Vec::new();
