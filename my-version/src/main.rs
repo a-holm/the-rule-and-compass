@@ -12144,7 +12144,10 @@ OPTIONS:
                              the bucket floor(t / S); without a declared
                              horizon a period is one timestamp. With a target
                              spec a different value exits 2; with --horizon
-                             alone it overrides
+                             alone a value more than 1 % off exits 2, else it
+                             overrides;
+                             with neither, a value more than 1 % off the
+                             inferred one exits 2
   --device-pnl               recompute each test block through the fused
                              long-only reduction (f64 canonical segments; the
                              CUDA kernel when built with --features cuda) and
@@ -13181,6 +13184,12 @@ fn run_walkforward(args: &[String]) -> ! {
         popts.row_rule = walkforward::RowRule::of_search(Some(fit_spec), s.return_column.as_deref().unwrap_or(&s.column), top_tercile, front_run.as_ref(), book_column);
         popts.delay = agree("--delay", delay_flag, s.delay_seconds);
     } else {
+        popts.check_undeclared_ppy = true;
+        if let (Some(h), Some(v)) = (horizon, periods_per_year) {
+            if let Some(msg) = walkforward::horizon_ppy_conflict(h, v) {
+                usage_fail(&msg);
+            }
+        }
         popts.entry_offset = entry_offset_flag.unwrap_or(0.0);
         popts.delay = delay_flag.unwrap_or(0.0);
         popts.row_rule = walkforward::RowRule::of_search(None, target.as_deref().unwrap_or(""), policy == walkforward::Policy::TopTercile, front_run.as_ref(), None);

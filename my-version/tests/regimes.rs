@@ -562,7 +562,7 @@ fn read_store(dir: &Path) -> (String, String, String, i64, i64) {
     let (l, sealed) = (s(&dir.join("ledger.jsonl")), s(&dir.join("sealed.json")));
     let wfa = |extra: &[&str]| {
         let mut a = vec![
-            "walkforward", "--data", data.as_str(), "--target", "y", "--time", "ts", "--horizon", "5", "--cost-bps", "5", "--periods-per-year", "365",
+            "walkforward", "--data", data.as_str(), "--target", "y", "--time", "ts", "--horizon", "5", "--cost-bps", "5", "--periods-per-year", "6307200",
             "--json", "--ledger", l.as_str(), "--expr", "x",
         ];
         a.extend_from_slice(extra);
@@ -603,7 +603,7 @@ fn regime_dating_after_read_needs_the_final_reads() {
     // the one read
     let read = format!("locked,{},{},{},{}", lock_start - 100 * H, lock_start - 10 * H, lock_start, lock_end);
     let o = run(&[
-        "walkforward", "--data", &data, "--target", "y", "--time", "ts", "--horizon", "5", "--cost-bps", "5", "--periods-per-year", "365", "--json",
+        "walkforward", "--data", &data, "--target", "y", "--time", "ts", "--horizon", "5", "--cost-bps", "5", "--periods-per-year", "6307200", "--json",
         "--ledger", &l, "--expr", "x", "--locked-test", "--sealed", &sealed, "--window", &read,
     ]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));

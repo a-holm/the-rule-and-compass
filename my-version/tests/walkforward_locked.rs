@@ -146,7 +146,7 @@ fn variants(dir: &Path) -> Vec<(&'static str, Vec<String>)> {
 fn wf(data: &str, window: &str, extra: &[String]) -> (i32, String, String) {
     let mut a: Vec<&str> = vec![
         "walkforward", "--data", data, "--target", "y", "--time", "ts", "--group-by", "sym", "--horizon", "3600",
-        "--cost-bps", "5", "--periods-per-year", "365", "--json", "--window", window,
+        "--cost-bps", "5", "--periods-per-year", "8760", "--json", "--window", window,
     ];
     a.extend(extra.iter().map(String::as_str));
     rcsr(&a)
@@ -297,7 +297,7 @@ fn front_read_verifies_with_another_path_spelling() {
     let front = |spelling: &str, extra: &[&str]| {
         let mut a: Vec<&str> = vec![
             "walkforward", "--data", &data, "--target", "y", "--time", "ts", "--group-by", "sym", "--horizon", "3600",
-            "--cost-bps", "5", "--periods-per-year", "365", "--json", "--window", &w, "--front", spelling,
+            "--cost-bps", "5", "--periods-per-year", "8760", "--json", "--window", &w, "--front", spelling,
             "--validation-frac", "0.2",
         ];
         a.extend_from_slice(extra);

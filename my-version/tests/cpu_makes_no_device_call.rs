@@ -132,7 +132,7 @@ fn explicit_cpu_commands_open_no_device() {
     let window = format!("dev,{},{},{},{}", T0, T0 + 150 * H, T0 + 160 * H, T0 + 250 * H);
     let wf = [
         "walkforward", "--data", p.as_str(), "--target", "y", "--expr", "f1", "--time", "ts", "--group-by", "sym", "--horizon", "5",
-        "--cost-bps", "5", "--periods-per-year", "365", "--json", "--window", window.as_str(),
+        "--cost-bps", "5", "--periods-per-year", "6307200", "--json", "--window", window.as_str(),
     ];
     assert_eq!(rcsr_opens(&trace, &wf), 0, "walkforward without device flags opened /dev/nvidia*");
     let lout = s(&dir.join("l.json"));

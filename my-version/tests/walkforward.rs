@@ -685,10 +685,11 @@ fn the_cli_exits_2_on_overlapping_returns() {
     }
     std::fs::write(&data, csv).unwrap();
     let run = |horizon: &str| {
+        let ppy = (31_536_000.0 / horizon.parse::<f64>().unwrap()).to_string();
         rcsr_cmd::rcsr()
             .args([
                 "walkforward", "--data", data.to_str().unwrap(), "--target", "target", "--expr", "x",
-                "--time", "ts", "--horizon", horizon, "--cost-bps", "5", "--periods-per-year", "365",
+                "--time", "ts", "--horizon", horizon, "--cost-bps", "5", "--periods-per-year", &ppy,
                 "--window", "w,0,7200,14400,28800", "--json",
             ])
             .output()
@@ -715,7 +716,7 @@ fn device_pnl_is_refused_with_policy_band() {
         rcsr_cmd::rcsr()
             .args([
                 "walkforward", "--data", data.to_str().unwrap(), "--target", "target", "--expr", "x",
-                "--time", "ts", "--horizon", "3600", "--cost-bps", "5", "--periods-per-year", "365",
+                "--time", "ts", "--horizon", "3600", "--cost-bps", "5", "--periods-per-year", "8760",
                 "--window", "w,0,7200,14400,28800", "--json", "--policy", "band",
             ])
             .args(extra)
@@ -790,7 +791,7 @@ mod front {
 
     fn wf(data: &str, source: &[&str], window: &str, extra: &[&str]) -> (i32, String, String) {
         let mut a = vec![
-            "walkforward", "--data", data, "--time", "ts", "--horizon", "1", "--periods-per-year", "365",
+            "walkforward", "--data", data, "--time", "ts", "--horizon", "1", "--periods-per-year", "31536000",
             "--validation-frac", "0.3", "--window", window, "--json",
         ];
         a.extend_from_slice(source);
@@ -1524,7 +1525,7 @@ fn vote_refusals_exit_before_data_work() {
         rcsr_cmd::rcsr()
             .args([
                 "walkforward", "--data", data.to_str().unwrap(), "--target", "target", "--expr", "x", "--expr", "x - 1",
-                "--time", "ts", "--horizon", "3600", "--cost-bps", "5", "--periods-per-year", "365",
+                "--time", "ts", "--horizon", "3600", "--cost-bps", "5", "--periods-per-year", "8760",
                 "--window", "w,0,7200,14400,28800", "--json", "--threshold-fixed", "1.5",
             ])
             .args(extra)
@@ -1837,7 +1838,7 @@ fn the_cli_prints_the_same_controls_for_a_numeric_group_as_csv_and_store() {
         let out = rcsr_cmd::rcsr()
             .args([
                 "walkforward", "--data", data.to_str().unwrap(), "--target", "target", "--expr", "x", "--time", "ts",
-                "--group-by", "gid", "--horizon", "3600", "--cost-bps", "5", "--periods-per-year", "365",
+                "--group-by", "gid", "--horizon", "3600", "--cost-bps", "5", "--periods-per-year", "8760",
                 "--window", "w,0,18000,25200,43200", "--control-seed", "7", "--json",
             ])
             .output()
@@ -3287,7 +3288,7 @@ fn walkforward_vote_quorum_warning_stderr() {
         rcsr_cmd::rcsr()
             .args([
                 "walkforward", "--data", data.to_str().unwrap(), "--target", "target", "--expr", "x", "--expr", "x - 1", "--expr", "x - 2",
-                "--time", "ts", "--horizon", "3600", "--cost-bps", "5", "--periods-per-year", "365",
+                "--time", "ts", "--horizon", "3600", "--cost-bps", "5", "--periods-per-year", "8760",
                 "--window", "w,0,7200,14400,28800", "--json", "--threshold-fixed", "1.5", "--policy", "vote", "--quorum", quorum,
             ])
             .output()

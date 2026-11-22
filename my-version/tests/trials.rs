@@ -75,6 +75,8 @@ struct Spec {
     book: Option<&'static str>,
     /// #1208: `annualization.period_seconds`; `None` writes no member (a report of an older build).
     period_seconds: Option<f64>,
+    /// #1328: `pooled.grid.rule`; `None` writes no `grid` object (the score grid).
+    grid_rule: Option<&'static str>,
 }
 
 impl Spec {
@@ -91,6 +93,7 @@ impl Spec {
             fit: None,
             book: None,
             period_seconds: None,
+            grid_rule: None,
         }
     }
 }
@@ -110,7 +113,7 @@ fn write_report(dir: &Path, name: &str, net: &[f64], s: &Spec) -> String {
 \"threshold\":{{\"quantile\":{quantile},\"fixed\":{fixed}{fit}}},\
 \"annualization\":{{\"periods_per_year\":{ppy},\"method\":\"explicit\"{period_seconds}}},\
 {book}\
-\"pooled\":{{\"periods\":{n},\"entries\":10,\"active_rows\":100,\"period_net\":[{net_text}],\"period_time\":[{time}]}}}}",
+\"pooled\":{{\"periods\":{n},\"entries\":10,\"active_rows\":100,\"period_net\":[{net_text}],\"period_time\":[{time}]{grid}}}}}",
         w = s.window,
         policy = s.policy,
         quantile = s.quantile.map_or("null".to_string(), |q| q.to_string()),
@@ -125,6 +128,7 @@ fn write_report(dir: &Path, name: &str, net: &[f64], s: &Spec) -> String {
         period_seconds = s.period_seconds.map_or(String::new(), |p| format!(",\"period_seconds\":{p}")),
         n = net.len(),
         time = arr(&s.time),
+        grid = s.grid_rule.map_or(String::new(), |r| format!(",\"grid\":{{\"rule\":\"{r}\"}}")),
     );
     let path = dir.join(format!("{name}.json"));
     std::fs::write(&path, text).unwrap();
@@ -965,4 +969,53 @@ fn trials_refuses_nonpositive_ppy() {
         assert_eq!(code(&o), 2, "{ppy}: {}", stderr(&o));
         assert!(stderr(&o).contains("annualization.periods_per_year"), "{}", stderr(&o));
     }
+}
+
+// #1328: a score-grid series thinned at random keeps its native period_seconds
+
+fn thinned(n: usize, step: i64) -> Vec<f64> {
+    let mut t = Vec::new();
+    let mut i = 0usize;
+    while t.len() < n {
+        let u = (i as f64 * 0.682_327_803_828_019_3 + 0.123).fract();
+        if u < 0.3 {
+            t.push((T0 + step * i as i64) as f64);
+        }
+        i += 1;
+    }
+    t
+}
+
+fn sparse(ppy: f64, grid_rule: Option<&'static str>) -> Spec {
+    Spec { ppy, period_seconds: Some(3600.0), time: thinned(60, STEP), grid_rule, ..Spec::new(60) }
+}
+
+#[test]
+fn trials_score_grid_sparse_time_accepted() {
+    let (_s, dir) = trials_dir();
+    let t = sparse(8760.0, None).time;
+    let mut d: Vec<f64> = t.windows(2).map(|w| w[1] - w[0]).collect();
+    d.sort_by(|a, b| a.total_cmp(b));
+    assert!(d[d.len() / 2] > 1.5 * STEP as f64, "median step {}", d[d.len() / 2]);
+    let p = write_report(&dir, "wf-x", &noise(60, 1, 0.01), &sparse(8760.0, None));
+    let o = trials_one(&p);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+}
+
+#[test]
+fn trials_score_grid_sparse_time_wrong_period_seconds_refused() {
+    let (_s, dir) = trials_dir();
+    let p = write_report(&dir, "wf-x", &noise(60, 1, 0.01), &sparse(365.0, None));
+    let o = trials_one(&p);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).contains("annualization.period_seconds"), "{}", stderr(&o));
+}
+
+#[test]
+fn trials_period_grid_step_still_checked() {
+    let (_s, dir) = trials_dir();
+    let p = write_report(&dir, "wf-x", &noise(60, 1, 0.01), &sparse(8760.0, Some("target")));
+    let o = trials_one(&p);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).contains("pooled.period_time"), "{}", stderr(&o));
 }

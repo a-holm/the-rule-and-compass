@@ -444,3 +444,110 @@ fn trials_reads_every_period_kind() {
         trials_ok(&out_path);
     }
 }
+
+// ---------------------------------------------------------------------------
+// #1328: walk-forward never writes a report that `rcsr trials` refuses
+// ---------------------------------------------------------------------------
+
+/// Hourly rows, two groups, every row labelled; `x` is NaN on a share of the rows chosen by a
+/// scrambled index (random, not in blocks).
+fn write_hourly_csv(dir: &Path, n: usize, nan_share: f64) -> String {
+    let mut text = String::from("t,sym,x,y\n");
+    for h in 0..n {
+        for g in 0..2usize {
+            let t = T0 as u64 + 3600 * h as u64;
+            let u = frac((h * 2 + g) as f64 * 0.682_327_803_828_019_3 + 0.123);
+            let x = if u < nan_share { "nan".to_string() } else { format!("{}", feature(h, g)) };
+            text.push_str(&format!("{t},s{g},{x},{}\n", ret(h, g)));
+        }
+    }
+    let path = dir.join("hourly.csv");
+    std::fs::write(&path, text).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+fn run_hourly(dir: &Path, nan_share: f64, extra: &[&str]) -> (Output, String) {
+    run_hourly_with(dir, nan_share, &["--horizon", "3600"], extra)
+}
+
+fn run_hourly_with(dir: &Path, nan_share: f64, horizon: &[&str], extra: &[&str]) -> (Output, String) {
+    let n = 600usize;
+    let data = write_hourly_csv(dir, n, nan_share);
+    let out_path = dir.join("wf-hourly.json").to_string_lossy().into_owned();
+    let w = format!("w,{},{},{},{}", T0 as u64, T0 as u64 + 3600 * 199, T0 as u64 + 3600 * 200, T0 as u64 + 3600 * n as u64);
+    let mut args = vec![
+        "walkforward", "--data", &data, "--time", "t", "--group-by", "sym", "--target", "y",
+        "--expr", "x", "--vars", "x", "--window", &w, "--threshold-quantile", "0.5", "--out", &out_path,
+    ];
+    args.extend_from_slice(horizon);
+    args.extend_from_slice(extra);
+    let out = rcsr(&args);
+    (out, out_path)
+}
+
+fn trials_of(path: &str) -> Output {
+    rcsr(&["trials", "--wf", path, "--draws", "50", "--block-len", "2"])
+}
+
+#[test]
+fn wf_horizon_flag_ppy_mismatch_refused() {
+    let scratch = Scratch::new("wf-horizon-ppy-mismatch");
+    let (out, path) = run_hourly(scratch.path(), 0.0, &["--periods-per-year", "365"]);
+    assert_eq!(code(&out), 2, "{}", stderr(&out));
+    let e = stderr(&out);
+    assert!(e.contains("--horizon") && e.contains("3600") && e.contains("365") && e.contains("8760"), "{e}");
+    assert!(!Path::new(&path).exists());
+}
+
+#[test]
+fn wf_horizon_flag_ppy_within_tolerance_trials_accepts() {
+    let scratch = Scratch::new("wf-horizon-ppy-tolerance");
+    for v in ["8760", "8700"] {
+        let (out, path) = run_hourly(scratch.path(), 0.0, &["--periods-per-year", v]);
+        assert_eq!(code(&out), 0, "{v}: {}", stderr(&out));
+        let o = trials_of(&path);
+        assert_eq!(code(&o), 0, "{v}: {}", stderr(&o));
+    }
+}
+
+#[test]
+fn wf_score_grid_random_nan_scores_trials_accepts() {
+    let scratch = Scratch::new("wf-random-nan-scores");
+    let (out, path) = run_hourly(scratch.path(), 0.75, &[]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let j = read_json(&path);
+    assert_eq!(num(&j, &["annualization", "period_seconds"]), 3600.0);
+    let o = trials_of(&path);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+}
+
+#[test]
+fn wf_ppy_without_horizon_mismatch_refused() {
+    let scratch = Scratch::new("wf-undeclared-ppy-mismatch");
+    let (out, path) = run_hourly_with(scratch.path(), 0.0, &[], &["--periods-per-year", "365"]);
+    assert_eq!(code(&out), 2, "{}", stderr(&out));
+    let e = stderr(&out);
+    assert!(e.contains("--periods-per-year 365") && e.contains("3600") && e.contains("8760"), "{e}");
+    assert!(!Path::new(&path).exists());
+}
+
+#[test]
+fn wf_ppy_without_horizon_match_trials_accepts() {
+    let scratch = Scratch::new("wf-undeclared-ppy-match");
+    let (out, path) = run_hourly_with(scratch.path(), 0.0, &[], &["--periods-per-year", "8760"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let o = trials_of(&path);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+}
+
+#[test]
+fn wf_ppy_without_horizon_records_period_seconds_and_survives_nan_scores() {
+    let scratch = Scratch::new("wf-undeclared-ppy-nan");
+    let (out, path) = run_hourly_with(scratch.path(), 0.75, &[], &["--periods-per-year", "8760"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let j = read_json(&path);
+    assert_eq!(num(&j, &["annualization", "period_seconds"]), 3600.0);
+    assert_eq!(at(&j, &["annualization", "source"]).as_str(), Some("explicit"));
+    let o = trials_of(&path);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+}

@@ -157,6 +157,8 @@ pub struct ProtocolOptions {
     /// #1175: emit exposure, entries, gross and buy-and-hold per period with the strata.
     pub period_series: bool,
     /// #1199: the periods of the pooled series (`--period-grid`).
+    /// #1328: the CLI refuses an explicit `--periods-per-year` far from the inferred step when no period is declared.
+    pub check_undeclared_ppy: bool,
     pub period_grid: PeriodGrid,
     /// #1214: per candidate, the switch that defines its book (`--from-run` or
     /// `--front` of a composed run); empty when no candidate is a switch.
@@ -568,6 +570,7 @@ impl Default for ProtocolOptions {
             regime_exprs: Vec::new(),
             period_series: false,
             period_grid: PeriodGrid::Score,
+            check_undeclared_ppy: false,
             switches: Vec::new(),
             missing_score: MissingScore::Flat,
             emit_series: false,
@@ -2576,6 +2579,9 @@ impl Accum {
         let mut strata_in = StrataIn::new(opts.regime_exprs.len());
         let mut entry_times = 0usize;
         let validated_windows = self.windows.iter().filter(|d| d.validation_start.is_some()).count();
+        if opts.check_undeclared_ppy {
+            check_undeclared_ppy(spec, opts, &self.windows)?;
+        }
         let window_count = self.windows.len();
         for (window_index, mut d) in self.windows.into_iter().enumerate() {
             // #1199: the target grid, its period width and the rows that define it come from the rows before the gate.
@@ -4779,6 +4785,18 @@ pub(crate) fn declared_period(spec: &EvalSpec, opts: &ProtocolOptions) -> Option
     }
 }
 
+/// #1328: `--horizon S` with `--periods-per-year V` where V is more than the `rcsr trials` tolerance off
+/// `31536000 / S`: the report would be refused by `rcsr trials`.
+pub fn horizon_ppy_conflict(horizon: f64, ppy: f64) -> Option<String> {
+    if !(horizon.is_finite() && horizon >= 1.0 && horizon <= SECONDS_PER_YEAR) {
+        return None;
+    }
+    let implied = SECONDS_PER_YEAR / horizon;
+    (((ppy - implied) / implied).abs() > crate::trials::ANNUALIZATION_TOLERANCE).then(|| {
+        format!("--periods-per-year {} conflicts with --horizon {} s, which implies {} periods per year (tolerance 1 %); remove the flag or change the width", ppy, horizon, implied)
+    })
+}
+
 /// Refuse an explicit `--periods-per-year` that contradicts the declared period.
 fn check_explicit_ppy(spec: &EvalSpec, opts: &ProtocolOptions) -> Result<(), String> {
     if let (Some(given), Some((s, PeriodSource::TargetSpec))) = (spec.periods_per_year, declared_period(spec, opts)) {
@@ -4789,6 +4807,27 @@ fn check_explicit_ppy(spec: &EvalSpec, opts: &ProtocolOptions) -> Result<(), Str
                 given, derived, s
             ));
         }
+    }
+    Ok(())
+}
+
+/// #1328: an explicit `--periods-per-year` with no declared period width is used as given, but `rcsr trials`
+/// compares it with the median step of `pooled.period_time`. Refuse a value more than the `trials` tolerance off
+/// the value the inferred branch of `window_period` would write.
+fn check_undeclared_ppy(spec: &EvalSpec, opts: &ProtocolOptions, windows: &[WindowData]) -> Result<(), String> {
+    let (Some(given), None) = (spec.periods_per_year, declared_period(spec, opts)) else {
+        return Ok(());
+    };
+    let mut steps: Vec<f64> = windows.iter().filter_map(|d| infer_frequency(&d.test_rows).1).collect();
+    let Some(step) = median(&mut steps) else {
+        return Ok(());
+    };
+    let implied = SECONDS_PER_YEAR / step;
+    if ((given - implied) / implied).abs() > crate::trials::ANNUALIZATION_TOLERANCE {
+        return Err(format!(
+            "--periods-per-year {} conflicts with the median step of the labelled rows ({} s, {} periods per year; tolerance 1 %); set --horizon or a target spec, or remove the flag",
+            given, step, implied
+        ));
     }
     Ok(())
 }
@@ -4804,7 +4843,10 @@ fn window_period(spec: &EvalSpec, opts: &ProtocolOptions, rows: &[RowBase]) -> (
         };
     }
     match spec.periods_per_year {
-        Some(v) => (v, None, 0.0, PeriodSource::Explicit),
+        Some(v) => {
+            let step = opts.check_undeclared_ppy.then(|| infer_frequency(rows).1).flatten();
+            (v, step, 0.0, PeriodSource::Explicit)
+        }
         None => {
             let (ppy, dt) = infer_frequency(rows);
             (ppy, dt, 0.0, PeriodSource::InferredLabelledRows)
