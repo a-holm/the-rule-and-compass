@@ -190,14 +190,17 @@ fn worktree_paths_scan_shell_files_line_by_line() {
     assert_eq!(worktree_path_problems(dir.path()).len(), 1, "script tests are not scanned");
 }
 
-/// Files whose text holds no machine value: the general rules, briefs, templates and the two edited stage contracts.
-const MACHINE_FREE_FILES: [&str; 6] = [
+/// Files whose text holds no machine value: the general rules, briefs, templates, the two edited stage contracts,
+/// the shared script library and the machine.md template.
+const MACHINE_FREE_FILES: [&str; 8] = [
     "_shared/rules.md",
     "_shared/brief.md",
     "_templates/brief.md",
     "_templates/brief-research.md",
     "01_issue/stages/01_worktree/CONTEXT.md",
     "10_machine/stages/01_lock/CONTEXT.md",
+    "_tools/lib.sh",
+    "_templates/local/machine.md",
 ];
 
 const VOLUME_PREFIXES: [&str; 7] = ["/mnt/", "/media/", "/home/", "/usr/local/", "/opt/", "/srv/", "/Volumes/"];
@@ -320,4 +323,51 @@ fn no_machine_values_pass_keys_and_plain_numbers() {
 fn no_machine_values_report_a_missing_file() {
     let dir = Scratch::new("mv-missing");
     assert_eq!(machine_value_problems(dir.path(), &["_shared/brief.md"]), ["_shared/brief.md: file missing"]);
+}
+
+/// `file:line: text` for every absolute volume path in the tracked markdown and shell sources under `root`.
+fn volume_path_problems(root: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    for file in tracked_sources(root) {
+        let rel = file.strip_prefix(root).unwrap_or(&file).to_string_lossy().into_owned();
+        let text = fs::read_to_string(&file).unwrap_or_default();
+        for (n, line) in text.lines().enumerate() {
+            if VOLUME_PREFIXES.iter().any(|p| line.contains(p)) && !line.trim_start().starts_with("#!") {
+                out.push(format!("{rel}:{}: {}", n + 1, line.trim()));
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn tracked_workshop_sources_name_no_absolute_volume_path() {
+    let problems = volume_path_problems(&workshop_root());
+    assert!(
+        problems.is_empty(),
+        "absolute volume paths belong in machine.md; tracked text uses the keys or variables of lib.sh:\n{}",
+        problems.join("\n")
+    );
+}
+
+#[test]
+fn volume_path_guard_flags_a_script_and_a_note_and_spares_a_shebang() {
+    let dir = Scratch::new("vp");
+    write(dir.path(), "_tools/a.sh", "#!/usr/bin/env bash\nDIR=/mnt/lager/tmp/x\n");
+    write(dir.path(), "_shared/n.md", "Run /home/someone/tool\n");
+    write(dir.path(), "_tools/tests/t.sh", "X=/mnt/fixture\n");
+    write(dir.path(), "_shared/ok.md", "Use `$GATES`.\n");
+    let problems = volume_path_problems(dir.path());
+    assert_eq!(problems, ["_shared/n.md:1: Run /home/someone/tool", "_tools/a.sh:2: DIR=/mnt/lager/tmp/x"]);
+}
+
+#[test]
+fn machine_value_guard_flags_a_lib_default() {
+    let dir = Scratch::new("mv-lib");
+    write(dir.path(), "_tools/lib.sh", "GATES=${RCSR_GATES:-/mnt/vol/gates}\nCUDA_ARCH=sm_80\nSANITIZER=${RCSR_SANITIZER:-/usr/local/cuda/bin/compute-sanitizer}\n");
+    let problems = machine_value_problems(dir.path(), &["_tools/lib.sh"]);
+    assert_eq!(problems.len(), 3, "{problems:?}");
+    assert!(problems[0].contains("absolute volume path"));
+    assert!(problems[1].contains("architecture token"));
+    assert!(problems[2].contains("absolute volume path"));
 }

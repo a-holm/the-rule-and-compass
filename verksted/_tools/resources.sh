@@ -19,17 +19,9 @@ case ${1:-} in
   *) usage >&2; exit 2 ;;
 esac
 
-profile=$VLOCAL/machine.md
-[ -f "$profile" ] || { echo "resources.sh: $profile missing; key DISK_MIN_FREE is not set (run local-init.sh, then seed machine.md)" >&2; exit 2; }
-key() {
-  local v
-  v=$(sed -n "s/^- *$1: *//p" "$profile" | head -n 1 | sed 's/[[:space:]]*$//')
-  [ -n "$v" ] || { echo "resources.sh: key $1 missing in $profile" >&2; exit 2; }
-  printf '%s\n' "$v"
-}
-min=$(key DISK_MIN_FREE) || exit 2
-vol=$(key BUILD_VOLUME) || exit 2
-slots=$(key BUILD_SLOTS) || exit 2
+min=$(machine_key DISK_MIN_FREE) || exit 2
+vol=$(machine_key BUILD_VOLUME) || exit 2
+slots=$(machine_key BUILD_SLOTS) || exit 2
 case $slots in '' | *[!0-9]*) echo "resources.sh: key BUILD_SLOTS is not a number: $slots" >&2; exit 2 ;; esac
 min_bytes=$(printf '%s\n' "$min" | awk '
   match($0, /^[0-9]+(\.[0-9]+)?/) {

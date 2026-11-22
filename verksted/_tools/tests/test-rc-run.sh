@@ -9,6 +9,8 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 RC=$HERE/../rc-run.sh
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
+mkdir -p "$T/local"
+printf -- '- GATES: /x/gates\n- MACHINE_SCRIPTS: /x/scripts\n- SANITIZER: /x/san\n- CUDA_ARCH: sm_rc\n' > "$T/local/machine.md"
 fails=0
 check() {
   local name=$1 got=$2 want=$3
@@ -54,7 +56,7 @@ STUB
 chmod +x "$T/bin/show-args"
 
 rc() {
-  env -u CARGO_TARGET_DIR RCSR_GATES="$T/gates" RCSR_SLOT_SCRIPT="$T/slot.sh" RCSR_LOCK_SCRIPT="$T/lock.sh" \
+  env -u CARGO_TARGET_DIR RCSR_LOCAL="$T/local" RCSR_GATES="$T/gates" RCSR_SLOT_SCRIPT="$T/slot.sh" RCSR_LOCK_SCRIPT="$T/lock.sh" \
     RCSR_XID_CMD="cat '$T/xid'" RCSR_MACHINE_DIR="$T/oc" RCSR_REAP_TERM_WAITS=2 RCSR_REAP_KILL_WAITS=50 PATH="$T/bin:$PATH" FAKE_TIMEOUT_LOG="$T/timeouts" "$@"
 }
 log=$T/gates/issue9-t.log
@@ -83,7 +85,7 @@ for m in "test" "run"; do
   has "lock-$m-xid" "$log" '^xid new=0 since=[0-9-]+ [0-9:]+$'
   has "lock-$m-timeout" "$T/calls" 'timeout -k 30 580 '
 done
-has test-cuda-arch "$log" 'arch=sm_86'
+has test-cuda-arch "$log" 'arch=sm_rc'
 : > "$T/calls"
 rc bash "$RC" test "$T/wt" 9 t -- show-args > /dev/null
 check test-cpu-slot "$(cut -d' ' -f1 "$T/calls")" "slot"
@@ -403,7 +405,7 @@ chmod +x "$T/bin/ignore-term"
 mkdir -p "$T/real-bin"
 ln -sf "$T/bin/ignore-term" "$T/real-bin/ignore-term"
 flock_stub
-RCSR_KILL_AFTER=0.5 env -u CARGO_TARGET_DIR RCSR_GATES="$T/gates" RCSR_SLOT_SCRIPT="$T/slot.sh" RCSR_LOCK_SCRIPT="$T/lock.sh" \
+RCSR_KILL_AFTER=0.5 env -u CARGO_TARGET_DIR RCSR_LOCAL="$T/local" RCSR_GATES="$T/gates" RCSR_SLOT_SCRIPT="$T/slot.sh" RCSR_LOCK_SCRIPT="$T/lock.sh" \
   RCSR_XID_CMD="cat '$T/xid'" RCSR_MACHINE_DIR="$T/oc" RCSR_REAP_TERM_WAITS=2 PATH="$T/real-bin:$PATH" \
   bash "$RC" run "$T/wt" 9 t --cuda --timeout 1 -- ignore-term > /dev/null 2>&1; r=$?
 check real-timeout-kill-rc "$r" "137"

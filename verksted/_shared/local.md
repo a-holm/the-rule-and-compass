@@ -25,10 +25,12 @@ A run card holds: id, kind, start and end (UTC), the exact command or the path o
 
 ## Machine profile keys
 
-Tracked text names these keys and never their values. `machine.md` holds one line per key, `- KEY: value`; the scripts that read a key (`resources.sh`) fail with exit 2 and name it when it is missing. `TOOLS_WT` lives in `rules-local.md`, the other keys in `machine.md`.
+Tracked text names these keys and never their values. `machine.md` holds one line per key, `- KEY: value`; `local-init.sh` creates it from the template with `<set me>` as the value of every key. `lib.sh` reads `GATES`, `MACHINE_SCRIPTS`, `SANITIZER` and `CUDA_ARCH` through `machine_key`, `resources.sh` reads three more; a missing key, an empty value or `<set me>` makes the script exit 2 and name the key. No tracked script holds a default for any of them. `TOOLS_WT` lives in `rules-local.md`, the other keys in `machine.md`.
 
 | Key | Meaning |
 |---|---|
+| `GATES` | directory of the gate and issue logs (`$GATES`, `lib.sh`) |
+| `MACHINE_SCRIPTS` | directory that holds `build-slot.sh`, `one-full-suite.sh`, `desktop-busy.sh` and the `PAUSE`, `STREAMING` and lock files |
 | `BUILD_VOLUME` | volume that holds the worktrees and their build targets |
 | `DISK_MIN_FREE` | minimum free space on `BUILD_VOLUME` before a new worktree or build |
 | `BUILD_SLOT` | the build-slot script |

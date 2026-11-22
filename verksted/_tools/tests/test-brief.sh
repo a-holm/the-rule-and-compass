@@ -10,6 +10,7 @@ export RCSR_GATES=/nonexistent-gates
 LOCAL=$(mktemp -d)
 trap 'rm -rf "$LOCAL"' EXIT
 export RCSR_LOCAL=$LOCAL
+printf -- '- GATES: /x/gates\n- MACHINE_SCRIPTS: /x/scripts\n- SANITIZER: /x/san\n- CUDA_ARCH: sm_x\n' > "$LOCAL/machine.md"
 LINE1="You are not resumed automatically; block in your own turn until everything is done."
 fails=0
 check() {
@@ -66,8 +67,11 @@ bash "$S" impl --issue 7 --slug ok --model x >/dev/null 2>&1; check bad-model-x 
 bash "$S" impl --issue 7 --slug ok --model >/dev/null 2>&1; check model-no-value $? 2
 old_role=$(printf "cler%s" k)
 bash "$S" "$old_role" --issue 7 --pr 9 >/dev/null 2>&1; check old-role-refused $? 2
-ROOT=$(dirname "$(git -C "$V" rev-parse --path-format=absolute --git-common-dir)")
-out=$(env -u RCSR_LOCAL bash "$S" impl --issue 7 --slug demo-slug --epic 3)
+ROOT=$LOCAL/repo
+git init -q "$ROOT"
+mkdir -p "$ROOT/verksted/_local"
+cp "$LOCAL/machine.md" "$ROOT/verksted/_local/machine.md"
+out=$(env -u RCSR_LOCAL RCSR_ROOT="$ROOT" bash "$S" impl --issue 7 --slug demo-slug --epic 3)
 check default-local-line "$(printf '%s\n' "$out" | tail -1)" "Read $ROOT/verksted/_local/rules-local.md when it exists."
 bash "$S" impl --issue 7 --slug ok --bogus >/dev/null 2>&1; check bad-flag $? 2
 bash "$S" -h >/dev/null 2>&1; check help $? 0

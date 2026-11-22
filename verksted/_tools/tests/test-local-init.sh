@@ -71,6 +71,19 @@ init > /dev/null
 check pre-machine "$(cat "$L/machine.md")" "keep"
 check pre-others "$([ -f "$L/rules-local.md" ] && echo yes || echo no)" "yes"
 
+# machine.md: every profile key of _shared/local.md except TOOLS_WT starts as <set me>, and lib.sh refuses it
+L="$T/keys"
+init > /dev/null
+keys=$(sed -n 's/^| `\([A-Z_]*\)` | .*/\1/p' "$HERE/../../_shared/local.md" | grep -vx TOOLS_WT | LC_ALL=C sort)
+have=$(sed -n 's/^- \([A-Z_]*\): <set me>$/\1/p' "$L/machine.md" | LC_ALL=C sort)
+check keys-in-template "$have" "$keys"
+check keys-count "$(wc -l <<< "$have")" "17"
+out=$(RCSR_LOCAL=$L bash -c "source '$HERE/../lib.sh'; echo reached" 2>&1); rc=$?
+check seed-rc "$rc" "2"
+check seed-names-first-key "$(grep -c 'key GATES missing' <<< "$out")" "1"
+sed -i 's/^- \(GATES\|MACHINE_SCRIPTS\|SANITIZER\|CUDA_ARCH\): <set me>$/- \1: x/' "$L/machine.md"
+check seeded-lib-rc "$(RCSR_LOCAL=$L bash -c "source '$HERE/../lib.sh'; echo \$CUDA_ARCH" 2>&1)" "x"
+
 if [ "$fails" -ne 0 ]; then
   echo "test-local-init: $fails failed"
   exit 1

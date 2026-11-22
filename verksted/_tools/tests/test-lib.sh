@@ -8,6 +8,10 @@ LIB=$HERE/../lib.sh
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
 fails=0
+# synthetic machine.md every lib() call reads unless the call passes its own RCSR_LOCAL
+DEFLOCAL=$T/mdef
+mkdir -p "$DEFLOCAL"
+printf -- '- GATES: /def/gates\n- MACHINE_SCRIPTS: /def/scripts\n- SANITIZER: /def/sanitizer\n- CUDA_ARCH: sm_def\n' > "$DEFLOCAL/machine.md"
 check() {
   local name=$1 got=$2 want=$3
   if [ "$got" != "$want" ]; then
@@ -20,7 +24,7 @@ lib() {
   local snippet=$1
   shift
   env -u RCSR_ROOT -u RCSR_BASE -u RCSR_GATES -u RCSR_MACHINE_DIR -u RCSR_SLOT_SCRIPT \
-    -u RCSR_LOCK_SCRIPT -u RCSR_SANITIZER -u RCSR_XID_CMD -u RCSR_CRATE -u RCSR_LOCAL "$@" \
+    -u RCSR_LOCK_SCRIPT -u RCSR_SANITIZER -u RCSR_XID_CMD -u RCSR_CRATE -u RCSR_LOCAL RCSR_LOCAL="$DEFLOCAL" "$@" \
     bash -c "set -uo pipefail; source '$LIB'; $snippet"
 }
 git_q() { git -c user.name=t -c user.email=t@t.invalid "$@"; }
@@ -29,16 +33,54 @@ git_q() { git -c user.name=t -c user.email=t@t.invalid "$@"; }
 want_top=$(git -C "$HERE" rev-parse --show-toplevel)
 check default-RCSR_ROOT "$(lib 'echo $RCSR_ROOT')" "$want_top"
 check default-BASE "$(lib 'echo $BASE')" "integration/gpu-hardening"
-check default-GATES "$(lib 'echo $GATES')" "/mnt/lager/tmp/rcsr-gates"
-check default-G "$(lib 'echo $G')" "/mnt/lager/tmp/rcsr-gates"
-check default-OC "$(lib 'echo $OC')" "/mnt/lager/tmp/opencode"
-check default-B "$(lib 'echo $B')" "/mnt/lager/tmp/opencode/build-slot.sh"
-check default-L "$(lib 'echo $L')" "/mnt/lager/tmp/opencode/one-full-suite.sh"
-check default-SANITIZER "$(lib 'echo $SANITIZER')" "/usr/local/cuda-13.0/bin/compute-sanitizer"
-check default-CUDA_ARCH "$(lib 'echo $CUDA_ARCH')" "sm_86"
 check default-LOCK_HOLD_MAX "$(lib 'echo $LOCK_HOLD_MAX')" "600"
 check default-VERKSTED "$(lib 'echo $VERKSTED')" "$(cd "$HERE/../.." && pwd)"
 
+
+# machine.md keys: present, missing, placeholder, overrides
+mach() { mkdir -p "$T/m$1"; printf '%s' "$2" > "$T/m$1/machine.md"; echo "$T/m$1"; }
+all_keys='# Profile
+- GATES: /fx/gates
+- MACHINE_SCRIPTS: /fx/scripts
+- SANITIZER: /fx/cuda/compute-sanitizer
+- CUDA_ARCH: sm_fx
+'
+d=$(mach 1 "$all_keys")
+check key-GATES "$(lib 'echo "$GATES $G"' RCSR_LOCAL="$d")" "/fx/gates /fx/gates"
+check key-SANITIZER "$(lib 'echo $SANITIZER' RCSR_LOCAL="$d")" "/fx/cuda/compute-sanitizer"
+check key-CUDA_ARCH "$(lib 'echo $CUDA_ARCH' RCSR_LOCAL="$d")" "sm_fx"
+check key-MACHINE_SCRIPTS "$(lib 'echo "$OC $PAUSE $STREAMING $LOCKFILE $SLOTDIR $B $L"' RCSR_LOCAL="$d")" \
+  "/fx/scripts /fx/scripts/PAUSE /fx/scripts/STREAMING /fx/scripts/full-suite.lock /fx/scripts/build-slots /fx/scripts/build-slot.sh /fx/scripts/one-full-suite.sh"
+check machine_key-direct "$(lib 'machine_key CUDA_ARCH' RCSR_LOCAL="$d")" "sm_fx"
+d=$(mach 2 '- GATES:   /a b/c  
+- GATES: /second
+- MACHINE_SCRIPTS: /s
+- SANITIZER: /z
+- CUDA_ARCH: sm_1
+')
+check key-trim-first-wins "$(lib 'echo "[$GATES]"' RCSR_LOCAL="$d")" "[/a b/c]"
+for k in GATES MACHINE_SCRIPTS SANITIZER CUDA_ARCH; do
+  d=$(mach "miss$k" "$(grep -v "^- $k:" <<< "$all_keys")")
+  out=$(lib 'echo reached' RCSR_LOCAL="$d" 2>&1); rc=$?
+  check "missing-$k-rc" "$rc" "2"
+  check "missing-$k-names" "$(grep -c "key $k missing in $d/machine.md" <<< "$out")" "1"
+  check "missing-$k-no-run" "$(grep -c reached <<< "$out")" "0"
+  d=$(mach "ph$k" "$(sed "s/^- $k: .*/- $k: <set me>/" <<< "$all_keys")")
+  out=$(lib 'echo reached' RCSR_LOCAL="$d" 2>&1); rc=$?
+  check "placeholder-$k-rc" "$rc" "2"
+  check "placeholder-$k-names" "$(grep -c "key $k missing in $d/machine.md" <<< "$out")" "1"
+done
+out=$(lib 'echo reached' RCSR_LOCAL="$T/none" 2>&1); rc=$?
+check no-machine-md-rc "$rc" "2"
+check no-machine-md-names "$(grep -c "key GATES missing in $T/none/machine.md" <<< "$out")" "1"
+d=$(mach empty "- GATES:
+$(grep -v '^- GATES:' <<< "$all_keys")")
+check empty-value-rc "$(lib 'echo reached' RCSR_LOCAL="$d" >/dev/null 2>&1; echo $?)" "2"
+# an override replaces its key, the other keys still come from machine.md
+d=$(mach ov "- CUDA_ARCH: sm_fx
+")
+check override-all "$(lib 'echo "$GATES $OC $SANITIZER $CUDA_ARCH"' RCSR_LOCAL="$d" RCSR_GATES=/g RCSR_MACHINE_DIR=/m RCSR_SANITIZER=/s)" "/g /m /s sm_fx"
+check override-gates-only-rc "$(lib 'echo reached' RCSR_LOCAL="$d" RCSR_GATES=/g >/dev/null 2>&1; echo $?)" "2"
 # overrides
 check RCSR_BASE "$(lib 'echo $BASE' RCSR_BASE=b/x)" "b/x"
 check RCSR_GATES "$(lib 'echo "$GATES $G"' RCSR_GATES=/g/h)" "/g/h /g/h"
@@ -62,8 +104,10 @@ check RCSR_ROOT-from-worktree "$(lib 'echo $RCSR_ROOT' RCSR_ROOT="$side_top")" "
 check WT "$(lib 'echo $WT' RCSR_ROOT="$side_top")" "$main_top/worktrees"
 
 # VLOCAL
-check VLOCAL-default "$(lib 'echo $VLOCAL' RCSR_ROOT="$side_top")" "$main_top/verksted/_local"
-check VLOCAL-override "$(lib 'echo $VLOCAL' RCSR_LOCAL=/tmp/x)" "/tmp/x"
+mkdir -p "$main_top/verksted/_local"
+cp "$DEFLOCAL/machine.md" "$main_top/verksted/_local/machine.md"
+check VLOCAL-default "$(lib 'echo $VLOCAL' RCSR_ROOT="$side_top" RCSR_LOCAL=)" "$main_top/verksted/_local"
+check VLOCAL-override "$(lib 'echo $VLOCAL' RCSR_LOCAL="$DEFLOCAL")" "$DEFLOCAL"
 
 # crate_dir: one match, none, two, a [lib] name alone, subdirectory cwd, override
 fx=$T/fx

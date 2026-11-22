@@ -18,7 +18,7 @@ Do NOT load: killing running jobs.
 ## Process
 
 1. If an input is missing or empty, stop and say which.
-2. `touch /mnt/lager/tmp/opencode/PAUSE`. The lock script waits while the file exists. Running jobs finish; nothing new starts.
+2. `source verksted/_tools/lib.sh; touch "$PAUSE"`. The lock script waits while the file exists. Running jobs finish; nothing new starts.
 3. Write `pause.md`: the time and the running lock holder.
 
 ## Outputs
@@ -29,7 +29,7 @@ Do NOT load: killing running jobs.
 ## Check
 
 ```sh
-test -e /mnt/lager/tmp/opencode/PAUSE
+source verksted/_tools/lib.sh; test -e "$PAUSE"
 ```
 
 Exit 0 writes `pass`. Anything else writes `fail: <what was measured and what was wrong>` to `output/check.md`; `_tools/check.sh` does this. A red result is never rewritten as green.

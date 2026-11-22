@@ -31,7 +31,7 @@ Each value is defined, with its `RCSR_*` override, in [`../_tools/lib.sh`](../_t
 | Lock script | `L` (`RCSR_LOCK_SCRIPT`) |
 | Build slot script | `B` (`RCSR_SLOT_SCRIPT`), `SLOTDIR` |
 | Pause file | `PAUSE` |
-| Gate logs | `$GATES`, the neutral path `/mnt/lager/tmp/rcsr-gates` (a symlink) |
+| Gate logs | `$GATES` (`GATES` of `machine.md`) |
 | CUDA architecture | `CUDA_ARCH` |
 | CUDA 13.0 sanitizer | `SANITIZER` (`RCSR_SANITIZER`) |
 | Integration branch | `BASE` (`RCSR_BASE`) |

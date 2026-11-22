@@ -71,5 +71,5 @@ pass | fail: <reason>
 
 - Stage folders: `NN_snake_case`. Pipeline folders: `NN_noun`.
 - Worktree `worktrees/issue-<n>-<slug>`, branch `issue/<n>-<slug>`, slug kebab-case from the issue title.
-- Logs: `$GATES/issue<n>-<what>.log` (`$GATES` defaults to `/mnt/lager/tmp/rcsr-gates`), gate logs `<tag>-{cpu,cuda,bench}.log`.
+- Logs: `$GATES/issue<n>-<what>.log` (`$GATES` is the `GATES` key of `machine.md`), gate logs `<tag>-{cpu,cuda,bench}.log`.
 - Dates `YYYY-MM-DD`, never "today".

@@ -53,22 +53,32 @@ sync --check > /dev/null
 check recheck-rc "$?" 0
 
 # build-slot.sh: a held slot is refused once, then the job runs once.
-if [ ! -x /mnt/lager/tmp/opencode/desktop-busy.sh ]; then
-  echo "SKIP build-slot serialisation: live desktop-busy.sh missing"
-else
-  mkdir -p "$T/fake" "$T/slots"
-  fake_slot_sleep "$T/fake" "$T/polls"
-  printf '#!/bin/sh\necho "0, 0"\n' > "$T/fake/nvidia-smi"; chmod +x "$T/fake/nvidia-smi"
-  exec 9> "$T/slots/slot1.lock"; flock 9
-  PATH="$T/fake:$PATH" RCSR_BUILD_SLOT_DIR=$T/slots RCSR_TEST_PAUSE=$T/nopause RCSR_BUILD_SLOTS=1 \
-    RCSR_BUILD_SLOTS_DISCORD=1 RCSR_BUILD_MIN_AVAIL_KB=0 RCSR_CPUS=0 RCSR_CPUS_DISCORD=0 \
-    bash "$TOOLS/machine/build-slot.sh" bash -c 'echo ran' > "$T/slot.out" 2> "$T/slot.err"; rc=$?
-  exec 9>&-
-  check slot-rc "$rc" 0
-  check slot-polls "$(cat "$T/polls")" 1
-  check slot-ran "$(cat "$T/slot.out")" ran
-  check slot-held "$(grep -c '^\[build-slot\] slot 1/1 held: bash -c echo ran$' "$T/slot.err")" 1
-fi
+mkdir -p "$T/fake" "$T/slots"
+fake_slot_sleep "$T/fake" "$T/polls"
+printf '#!/bin/sh\necho "0, 0"\n' > "$T/fake/nvidia-smi"; chmod +x "$T/fake/nvidia-smi"
+exec 9> "$T/slots/slot1.lock"; flock 9
+PATH="$T/fake:$PATH" RCSR_BUILD_SLOT_DIR=$T/slots RCSR_TEST_PAUSE=$T/nopause RCSR_BUILD_SLOTS=1 \
+  RCSR_BUILD_SLOTS_DISCORD=1 RCSR_BUILD_MIN_AVAIL_KB=0 RCSR_CPUS=0 RCSR_CPUS_DISCORD=0 \
+  bash "$TOOLS/machine/build-slot.sh" bash -c 'echo ran' > "$T/slot.out" 2> "$T/slot.err"; rc=$?
+exec 9>&-
+check slot-rc "$rc" 0
+check slot-polls "$(cat "$T/polls")" 1
+check slot-ran "$(cat "$T/slot.out")" ran
+check slot-held "$(grep -c '^\[build-slot\] slot 1/1 held: bash -c echo ran$' "$T/slot.err")" 1
+
+# the machine scripts find PAUSE, STREAMING, the lock and the slot directory next to themselves
+I=$T/inst
+mkdir -p "$I"
+cp "$TOOLS/machine/"*.sh "$I/"
+check self-no-path "$(cat "$I"/*.sh | grep -cE '/mnt/|/home/|/opt/')" 0
+env -u RCSR_TEST_LOCK -u RCSR_TEST_PAUSE bash "$I/desktop-busy.sh" > /dev/null 2>&1; check busy-free "$?" 1
+touch "$I/STREAMING"
+bash "$I/desktop-busy.sh"; check busy-flag "$?" 0
+rm "$I/STREAMING"
+env -u RCSR_TEST_LOCK -u RCSR_TEST_PAUSE bash "$I/one-full-suite.sh" true > /dev/null 2>&1; check suite-rc "$?" 0
+check suite-lock-next-to-script "$([ -f "$I/full-suite.lock" ] && echo yes || echo no)" "yes"
+env -u RCSR_BUILD_SLOT_DIR -u RCSR_TEST_PAUSE RCSR_BUILD_MIN_AVAIL_KB=0 RCSR_CPUS=0 PATH="$T/fake:$PATH" bash "$I/build-slot.sh" true > /dev/null 2>&1; check slot-rc-self "$?" 0
+check slot-dir-next-to-script "$([ -f "$I/build-slots/slot1.lock" ] && echo yes || echo no)" "yes"
 
 if [ "$fails" -ne 0 ]; then
   echo "$fails failure(s)"

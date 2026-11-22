@@ -16,6 +16,8 @@ check() {
   fi
 }
 L=$T/local
+mkdir -p "$L"
+printf -- '- GATES: /x/gates\n- MACHINE_SCRIPTS: /x/scripts\n- SANITIZER: /x/san\n- CUDA_ARCH: sm_x\n' > "$L/machine.md"
 rr() { RCSR_LOCAL=$L bash "$RR" "$@" 2>&1; echo "rc=$?"; }
 rc_of() { tail -n 1 <<< "$1"; }
 key() { sed -n "s/^$2: *//p" "$1" | head -n 1; }
@@ -211,6 +213,6 @@ check help "$(RCSR_LOCAL=$L bash "$RR" --help | head -n 1 | cut -c1-20)" "Usage:
 # nothing outside the local area changed; nothing stray inside runs/
 check outside-unchanged "$(cd "$T" && find . \( -path ./local -o -path ./cases \) -prune -o -type f -exec cksum {} + | sort)" "$before"
 check no-temp-files "$(find "$L" -name '.card.*' -o -name '.index.*' | wc -l)" "0"
-check only-runs "$(ls "$L")" "runs"
+check only-runs "$(ls "$L" | grep -vx machine.md)" "runs"
 
 [ "$fails" -eq 0 ] && echo "test-run-record: ok" || { echo "test-run-record: $fails failure(s)"; exit 1; }
