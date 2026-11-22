@@ -62,7 +62,6 @@ fn usage_errors_exit_2() {
 #[test]
 fn links_exit_1_with_the_broken_link_on_stdout() {
     let root = workshop("links");
-    write(&base.join("pkg/src/other.rs"), "");
     assert_eq!(code(&run(&["links", s(&root)])), 0);
     write(&root.join("x.md"), "[b](missing.md)\n");
     let o = run(&["links", s(&root)]);
@@ -275,6 +274,7 @@ fn links_external_checks_outside_references_strictly() {
         &root.join("01_p/CONTEXT.md"),
         "# 01_p: job\n\nOne job: x.\n\nDo NOT load: y.\n\n## Inputs\n\n**Reference:**\n- `../../<crate>/src/gone.rs`\n\n## Process\n## Outputs\n## Check\n\n`stages/01_s/` and `_tools/a.sh`\n\n[s](stages/01_s/CONTEXT.md)\n",
     );
+    write(&base.join("pkg/src/other.rs"), "");
     assert_eq!(code(&run(&["links", s(&root)])), 0);
     let o = run(&["links", "--external", s(&root)]);
     assert_eq!(code(&o), 1);
