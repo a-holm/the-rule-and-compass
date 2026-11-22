@@ -519,7 +519,7 @@ fn compose_none_output_is_unchanged() {
     assert_eq!(got, (PINNED_COMPOSE_JSON.to_string(), PINNED_COMPOSE_TEXT.to_string()), "the default compose output (run.json, summary) changed");
 }
 
-const PINNED_COMPOSE_JSON: &str = "246fd7729f55a5c2fa1f1c877c9eaf502f8d30f0a68b9492fe64c49c685bc550";
+const PINNED_COMPOSE_JSON: &str = "28985d556dc03745b16d4f3fc343394b2caedfeae4fd922b65733609a090b52e";
 const PINNED_COMPOSE_TEXT: &str = "25d6add1c7bfa1316484cc48bd3db1c2db6bba1cca8bf8a0e911a44411046357";
 
 #[test]

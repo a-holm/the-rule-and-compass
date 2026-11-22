@@ -3556,8 +3556,9 @@ fn hash_with_input_changed(id: &str) -> u64 {
 }
 
 /// Every row of the table changes the hash, so a flag listed there is a real
-/// resume input. The count pins the hashed inputs: a new `fnv_u64` input needs a
-/// `BOOK_INPUTS` row and a case in `hash_with_input_changed`.
+/// resume input. The hash words the book folds (read from the hash function) are
+/// exactly the words the table names: a new fold needs a `BOOK_INPUTS` row and a
+/// case in `hash_with_input_changed`.
 #[test]
 fn every_book_input_changes_the_hash() {
     let s = slice(&[50, 50]);
@@ -3579,11 +3580,62 @@ fn every_book_input_changes_the_hash() {
         assert_ne!(base, hash_with_input_changed(input.id), "{}", input.id);
         assert!(!input.flags.is_empty(), "{}", input.id);
     }
-    let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/trading.rs")).unwrap();
-    // `with_layer` joins the hash of a gate-search book, which has no checkpoint and no --resume.
-    let book_source = &source[..source.find("pub fn with_layer").unwrap()];
-    let hashed = book_source.lines().filter(|l| l.contains("fnv_u64(&mut hash") || l.contains("fnv_u64(&mut self.hash")).count();
-    assert_eq!(hashed, 23, "the hash inputs changed: update BOOK_INPUTS, hash_with_input_changed and this count");
+    let mut folded: Vec<&str> = Vec::new();
+    for book in hash_word_books() {
+        for id in book.hash_inputs() {
+            if !folded.contains(id) {
+                folded.push(id);
+            }
+        }
+    }
+    let covered: Vec<&str> = trading::BOOK_INPUTS.iter().flat_map(|i| i.hashed.iter().copied()).collect();
+    let uncovered: Vec<&&str> = folded.iter().filter(|w| !covered.contains(w)).collect();
+    let unused: Vec<&&str> = covered.iter().filter(|w| !folded.contains(w)).collect();
+    assert!(uncovered.is_empty(), "hash words with no BOOK_INPUTS row: {uncovered:?}");
+    assert!(unused.is_empty(), "BOOK_INPUTS rows name hash words no book folds: {unused:?}");
+}
+
+/// Books that between them take every optional branch of the book hash.
+fn hash_word_books() -> Vec<FitnessBook> {
+    let s = slice(&[200, 200]);
+    let on: Vec<bool> = (0..400).map(|i| i % 7 != 0).collect();
+    let mask = || Some(trading::BookMask { on: &on, identity: "g|0|1" });
+    let mut sd = trading::BandSpec::score(0.5);
+    sd.units = trading::BandUnits::Sd;
+    let banded = TradingSpec { band: trading::BandSpec::score(0.5), min_holding: 2, ..spec() };
+    let sd_spec = TradingSpec { band: sd, ..spec() };
+    let plain = FitnessBook::new(&s, &spec(), 900.0).unwrap();
+    vec![
+        FitnessBook::with_segments(&s, &banded, 900.0, 3, 1.0, &[1.6e9 + 900.0 * 100.0], mask()).unwrap(),
+        FitnessBook::with_segments(&s, &sd_spec, 900.0, 9, 1.0, &[], mask()).unwrap().with_stat(trading::BlockStat::Cvar(0.5)).unwrap(),
+        FitnessBook::new(&s, &TradingSpec { pnl_excess: trading::PnlExcess::XsMean, ..spec() }, 900.0).unwrap(),
+        FitnessBook::new(&s, &TradingSpec { cash_mode: trading::CashMode::TrainMean, ..spec() }, 900.0).unwrap(),
+        plain,
+    ]
+}
+
+/// The words of a book with a position layer that no table row names are the
+/// layer's own: it has no checkpoint and no `--resume`.
+#[test]
+fn layer_hash_words_have_no_resume_row() {
+    #[derive(Debug)]
+    struct Layer;
+    impl trading::PositionLayer for Layer {
+        fn positions(&self, pred: &[f64]) -> Vec<f64> {
+            pred.iter().map(|&p| if p > 0.0 { f64::MAX } else { f64::MIN }).collect()
+        }
+        fn identity(&self) -> String {
+            "layer".to_string()
+        }
+    }
+    let s = slice(&[200, 200]);
+    let plain = FitnessBook::new(&s, &spec(), 900.0).unwrap();
+    let layered = plain.clone().with_layer(std::sync::Arc::new(Layer)).unwrap();
+    let extra: Vec<&&str> = layered.hash_inputs().iter().filter(|w| !plain.hash_inputs().contains(w)).collect();
+    assert_eq!(extra, trading::BOOK_LAYER_INPUTS.iter().collect::<Vec<_>>());
+    for word in trading::BOOK_LAYER_INPUTS {
+        assert!(!trading::BOOK_INPUTS.iter().any(|i| i.hashed.contains(word)), "{word}");
+    }
 }
 
 /// Every flag of the table is a flag of `rcsr --help`.
@@ -3619,6 +3671,118 @@ fn resume_conflict_names_every_book_flag() {
     assert!(given.contains("--threshold") && !given.contains("--pnl-mask"), "{given}");
 }
 
+
+// ---- #1336: the resume conflict names the flags that change the training rows or the return column ----
+
+/// Two labels on one frame: `y` prices on return column `r`, `z` on `r2`.
+fn write_two_label_csv(dir: &std::path::Path) -> (String, String) {
+    let mut text = String::from("t,x1,x2,r,r2,y,z\n");
+    for i in 0..N {
+        let f = i as f64;
+        let x1 = frac(f * 0.618_033_988_749_894_9) - 0.5;
+        let x2 = frac(f * 0.754_877_666_246_692_7) - 0.5;
+        let noise = frac(f * 0.324_717_957_244_746) - 0.5;
+        let r = 0.01 * x1 + 0.0005 * noise;
+        let r2 = 0.01 * x2 + 0.0005 * noise;
+        text.push_str(&format!("{},{},{},{},{},{},{}\n", T0 + 900 * i as i64, x1, x2, r, r2, r + 0.05 * x2, r2 + 0.05 * x1));
+    }
+    let data = dir.join("two.csv");
+    std::fs::write(&data, text).unwrap();
+    let one = std::fs::read_to_string(write_spec(dir)).unwrap();
+    let entry = &one[one.find("{\"column\"").unwrap()..one.rfind("]}").unwrap()];
+    let second = entry.replace("\"column\":\"y\"", "\"column\":\"z\"").replace("\"return_column\":\"r\"", "\"return_column\":\"r2\"").replace("raw_target", "raw_target_z");
+    let spec = dir.join("two.json");
+    std::fs::write(&spec, one.replace(entry, &format!("{entry},{second}"))).unwrap();
+    (data.to_string_lossy().into_owned(), spec.to_string_lossy().into_owned())
+}
+
+/// A saved `--fitness pnl` search resumed with `resumed` instead of `saved`
+/// exits 2, and the conflict names `flag` among the flags given now.
+fn row_flag_conflict(data: &str, spec: &str, dir: &std::path::Path, saved: &[&str], resumed: &[&str], flag: &str) -> Result<(), String> {
+    let cp = dir.join(format!("row{}.rcsr", flag.trim_start_matches('-'))).to_string_lossy().into_owned();
+    let first = run(data, spec, &[&["--fitness", "pnl"][..], saved, &["--generations", "10", "--save", &cp]].concat());
+    if code(&first) != 0 {
+        return Err(format!("{flag}: the first run failed: {}", stderr(&first)));
+    }
+    let other = run(data, spec, &[&["--fitness", "pnl"][..], resumed, &["--generations", "20", "--resume", &cp]].concat());
+    let err = stderr(&other);
+    if code(&other) != 2 || !err.contains("--resume conflicts with the saved search settings") {
+        return Err(format!("{flag}: want a resume conflict (exit 2), got exit {}: {err}", code(&other)));
+    }
+    let given = err.split("flags given now: ").nth(1).unwrap_or_default().trim_end().trim_end_matches(')').to_string();
+    if !given.split(", ").any(|g| g == flag) {
+        return Err(format!("{flag}: missing from the flags given now: {given}"));
+    }
+    Ok(())
+}
+
+/// Every case runs; the failures are reported together.
+fn assert_row_flag_conflicts(data: &str, spec: &str, dir: &std::path::Path, cases: &[(&[&str], &[&str], &str)]) {
+    let failures: Vec<String> = cases.iter().filter_map(|(saved, resumed, flag)| row_flag_conflict(data, spec, dir, saved, resumed, flag).err()).collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn resume_conflict_names_the_row_selection_flags() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, 900);
+    let spec = write_spec(&dir);
+    assert_row_flag_conflicts(
+        &data,
+        &spec,
+        &dir,
+        &[
+            (&[], &["--filter", "x1 > -0.4"], "--filter"),
+            (&[], &["--exclude", "x1 > 0.4"], "--exclude"),
+            (
+                &["--train-select", "x1 < 0.3", "--test-select", "x1 >= 0.3"],
+                &["--train-select", "x1 < 0.2", "--test-select", "x1 >= 0.2"],
+                "--train-select",
+            ),
+            (&[], &["--gap", "40"], "--gap"),
+        ],
+    );
+}
+
+#[test]
+fn resume_conflict_names_the_sample_rows_flag() {
+    let (_scratch, dir) = scratch();
+    let csv = write_csv(&dir, 900);
+    let spec = write_spec(&dir);
+    let table = rcsr::data::parse_table(&std::fs::read_to_string(&csv).unwrap()).unwrap();
+    let store = dir.join("d.rcsb").to_string_lossy().into_owned();
+    rcsr::store::write_store(&store, &table, 251).unwrap();
+    assert_row_flag_conflicts(&store, &spec, &dir, &[(&[], &["--sample-rows", "400"], "--sample-rows")]);
+}
+
+#[test]
+fn resume_conflict_names_the_label_flags() {
+    let (_scratch, dir) = scratch();
+    let (data, spec) = write_two_label_csv(&dir);
+    assert_row_flag_conflicts(
+        &data,
+        &spec,
+        &dir,
+        &[(&["--target", "y"], &["--target", "z"], "--target"), (&["--book-target", "y"], &["--book-target", "z"], "--book-target")],
+    );
+}
+
+/// A resume with a changed `--lockbox` or `--skip-malformed` on clean rows keeps the book hash:
+/// neither changes which rows are read (rows in a lockbox and malformed rows are refused, not
+/// dropped), so neither is in the table.
+#[test]
+fn lockbox_and_skip_malformed_keep_the_book_hash() {
+    let (_scratch, dir) = scratch();
+    let data = write_csv(&dir, 900);
+    let spec = write_spec(&dir);
+    let cp = dir.join("keep.rcsr").to_string_lossy().into_owned();
+    let first = run(&data, &spec, &["--fitness", "pnl", "--generations", "10", "--save", &cp, "--lockbox", "2040-01-01,2041-01-01"]);
+    assert_eq!(code(&first), 0, "{}", stderr(&first));
+    for extra in [&["--lockbox", "2042-01-01,2043-01-01"][..], &["--lockbox", "2040-01-01,2041-01-01", "--skip-malformed"]] {
+        let resumed = run(&data, &spec, &[&["--fitness", "pnl", "--generations", "20", "--resume", &cp][..], extra].concat());
+        assert_eq!(code(&resumed), 0, "{extra:?}: {}", stderr(&resumed));
+    }
+}
 #[test]
 fn resume_names_the_block_lambda_and_the_split_table() {
     let (_scratch, dir) = scratch();

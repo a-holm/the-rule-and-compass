@@ -164,6 +164,7 @@ typedef struct RcPrep {
     int n_unique;
     int n_out;
     int n_conflict;
+    int ran;
 
     RcPrepStats last;
     double batch_start_ms;
@@ -406,14 +407,30 @@ static void rc_free(void *p)
     if (p) cudaFree(p);
 }
 
-static void rc_upload(void *dst, const void *src, size_t bytes)
+static cudaError_t rc_upload(void *dst, const void *src, size_t bytes)
 {
-    if (bytes) cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice);
+    return bytes ? cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice) : cudaSuccess;
 }
 
-static void rc_download(void *dst, const void *src, size_t bytes)
+static thread_local int g_force_download_fail = 0;
+
+extern "C" void rc_prep_test_force_download_fail(int on)
 {
-    if (bytes) cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost);
+    g_force_download_fail = on;
+}
+
+static cudaError_t rc_download(void *dst, const void *src, size_t bytes)
+{
+    if (g_force_download_fail) return cudaErrorUnknown;
+    return bytes ? cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost) : cudaSuccess;
+}
+
+/* Two ints read back from the device; both copies are checked. */
+static cudaError_t rc_download_pair(int *dst, const int *src0, const int *src1)
+{
+    cudaError_t e = rc_download(&dst[0], src0, sizeof(int));
+    if (e != cudaSuccess) return e;
+    return rc_download(&dst[1], src1, sizeof(int));
 }
 
 static void stats_begin(RcPrep *c)
@@ -899,29 +916,41 @@ RcPrep *rc_prep_create(const long long *times, const double *open,
             rc_prep_destroy(c);
             return NULL;
         }
-        rc_upload(c->d_seg_start, starts, nr * sizeof(int));
-        rc_upload(c->d_seg_len, lens, nr * sizeof(int));
-        rc_upload(c->d_seg_end, ends, nr * sizeof(int));
-        rc_upload(c->d_seg_id, ids, rows * sizeof(int));
+        int up_bad = 0;
+        up_bad |= rc_upload(c->d_seg_start, starts, nr * sizeof(int)) != cudaSuccess;
+        up_bad |= rc_upload(c->d_seg_len, lens, nr * sizeof(int)) != cudaSuccess;
+        up_bad |= rc_upload(c->d_seg_end, ends, nr * sizeof(int)) != cudaSuccess;
+        up_bad |= rc_upload(c->d_seg_id, ids, rows * sizeof(int)) != cudaSuccess;
         free(starts);
         free(lens);
         free(ends);
         free(ids);
+        if (up_bad) {
+            cudaGetLastError();
+            rc_prep_destroy(c);
+            return NULL;
+        }
     }
 
-    rc_upload(c->d_time, times, rows * sizeof(long long));
-    rc_upload(c->d_open, open, rows * sizeof(double));
-    rc_upload(c->d_high, high, rows * sizeof(double));
-    rc_upload(c->d_low, low, rows * sizeof(double));
-    rc_upload(c->d_close, close, rows * sizeof(double));
-    rc_upload(c->d_volume, volume, rows * sizeof(double));
-    rc_upload(c->d_quote_volume, quote_volume, rows * sizeof(double));
-    rc_upload(c->d_trades, trades, rows * sizeof(double));
-    rc_upload(c->d_taker_buy_base, taker_buy_base, rows * sizeof(double));
-    rc_upload(c->d_taker_buy_quote, taker_buy_quote, rows * sizeof(double));
-    rc_upload(c->d_complete, complete, rows * sizeof(unsigned char));
-    rc_upload(c->d_traded, traded, rows * sizeof(unsigned char));
-    rc_upload(c->d_chain, chain, rows * sizeof(long long));
+    int up_bad = 0;
+    up_bad |= rc_upload(c->d_time, times, rows * sizeof(long long)) != cudaSuccess;
+    up_bad |= rc_upload(c->d_open, open, rows * sizeof(double)) != cudaSuccess;
+    up_bad |= rc_upload(c->d_high, high, rows * sizeof(double)) != cudaSuccess;
+    up_bad |= rc_upload(c->d_low, low, rows * sizeof(double)) != cudaSuccess;
+    up_bad |= rc_upload(c->d_close, close, rows * sizeof(double)) != cudaSuccess;
+    up_bad |= rc_upload(c->d_volume, volume, rows * sizeof(double)) != cudaSuccess;
+    up_bad |= rc_upload(c->d_quote_volume, quote_volume, rows * sizeof(double)) != cudaSuccess;
+    up_bad |= rc_upload(c->d_trades, trades, rows * sizeof(double)) != cudaSuccess;
+    up_bad |= rc_upload(c->d_taker_buy_base, taker_buy_base, rows * sizeof(double)) != cudaSuccess;
+    up_bad |= rc_upload(c->d_taker_buy_quote, taker_buy_quote, rows * sizeof(double)) != cudaSuccess;
+    up_bad |= rc_upload(c->d_complete, complete, rows * sizeof(unsigned char)) != cudaSuccess;
+    up_bad |= rc_upload(c->d_traded, traded, rows * sizeof(unsigned char)) != cudaSuccess;
+    up_bad |= rc_upload(c->d_chain, chain, rows * sizeof(long long)) != cudaSuccess;
+    if (up_bad) {
+        cudaGetLastError();
+        rc_prep_destroy(c);
+        return NULL;
+    }
 
     /* CUB workspaces: one stable segmented sort and one int scan buffer. */
     c->sort_tmp_bytes = 0;
@@ -1060,9 +1089,10 @@ void rc_prep_last_stats(RcPrep *c, RcPrepStats *out)
 void rc_prep_counts(RcPrep *c, int *n_out, int *n_conflict, int *n_unique)
 {
     if (!c) return;
-    if (n_out) *n_out = c->n_out;
-    if (n_conflict) *n_conflict = c->n_conflict;
-    if (n_unique) *n_unique = c->n_unique;
+    const int live = c->ran;
+    if (n_out) *n_out = live ? c->n_out : -1;
+    if (n_conflict) *n_conflict = live ? c->n_conflict : -1;
+    if (n_unique) *n_unique = live ? c->n_unique : -1;
 }
 
 static thread_local int g_force_cub_fail = 0;
@@ -1075,7 +1105,9 @@ extern "C" void rc_prep_test_force_cub_fail(int on)
 int rc_prep_run(RcPrep *c, long long in_step, long long out_step,
                 int keep_partial, int threads)
 {
-    if (!c || in_step <= 0 || out_step <= 0 || out_step % in_step != 0) return 1;
+    if (!c) return 1;
+    c->ran = 0;
+    if (in_step <= 0 || out_step <= 0 || out_step % in_step != 0) return 1;
     if (out_step != 4 * in_step) return 1;
     if (threads < 32 || threads > 1024 || threads % 32 != 0) return 2;
     stats_begin(c);
@@ -1113,8 +1145,12 @@ int rc_prep_run(RcPrep *c, long long in_step, long long out_step,
         return 4;
     }
     int run_tail[2] = {0, 0};
-    rc_download(&run_tail[0], c->d_run_of + (n - 1), sizeof(int));
-    rc_download(&run_tail[1], c->d_run_flags + (n - 1), sizeof(int));
+    if (rc_download_pair(run_tail, c->d_run_of + (n - 1), c->d_run_flags + (n - 1)) != cudaSuccess) {
+        cudaGetLastError();
+        c->last.failed = 1;
+        stats_end(c);
+        return 13;
+    }
     c->n_unique = run_tail[0] + run_tail[1];
     c->last.d2h_bytes += 2ULL * sizeof(int);
     if (c->n_unique <= 0 || c->n_unique > n) {
@@ -1137,8 +1173,12 @@ int rc_prep_run(RcPrep *c, long long in_step, long long out_step,
         return 10;
     }
     int conf_tail[2] = {0, 0};
-    rc_download(&conf_tail[0], c->d_conf_off + (c->n_unique - 1), sizeof(int));
-    rc_download(&conf_tail[1], c->d_u_conflict + (c->n_unique - 1), sizeof(int));
+    if (rc_download_pair(conf_tail, c->d_conf_off + (c->n_unique - 1), c->d_u_conflict + (c->n_unique - 1)) != cudaSuccess) {
+        cudaGetLastError();
+        c->last.failed = 1;
+        stats_end(c);
+        return 13;
+    }
     c->n_conflict = conf_tail[0] + conf_tail[1];
     c->last.d2h_bytes += 2ULL * sizeof(int);
     if (c->n_conflict > 0) {
@@ -1159,8 +1199,12 @@ int rc_prep_run(RcPrep *c, long long in_step, long long out_step,
         return 11;
     }
     int bucket_tail[2] = {0, 0};
-    rc_download(&bucket_tail[0], c->d_bucket_of + (c->n_unique - 1), sizeof(int));
-    rc_download(&bucket_tail[1], c->d_bucket_flags + (c->n_unique - 1), sizeof(int));
+    if (rc_download_pair(bucket_tail, c->d_bucket_of + (c->n_unique - 1), c->d_bucket_flags + (c->n_unique - 1)) != cudaSuccess) {
+        cudaGetLastError();
+        c->last.failed = 1;
+        stats_end(c);
+        return 13;
+    }
     int n_buckets = bucket_tail[0] + bucket_tail[1];
     c->last.d2h_bytes += 2ULL * sizeof(int);
     if (n_buckets <= 0 || n_buckets > n) {
@@ -1183,8 +1227,12 @@ int rc_prep_run(RcPrep *c, long long in_step, long long out_step,
         return 12;
     }
     int emit_tail[2] = {0, 0};
-    rc_download(&emit_tail[0], c->d_out_at + (n_buckets - 1), sizeof(int));
-    rc_download(&emit_tail[1], c->d_emit + (n_buckets - 1), sizeof(int));
+    if (rc_download_pair(emit_tail, c->d_out_at + (n_buckets - 1), c->d_emit + (n_buckets - 1)) != cudaSuccess) {
+        cudaGetLastError();
+        c->last.failed = 1;
+        stats_end(c);
+        return 13;
+    }
     c->n_out = emit_tail[0] + emit_tail[1];
     c->last.d2h_bytes += 2ULL * sizeof(int);
     if (c->n_out < 0 || c->n_out > n_buckets) {
@@ -1213,17 +1261,19 @@ int rc_prep_run(RcPrep *c, long long in_step, long long out_step,
         stats_end(c);
         return 9;
     }
+    c->ran = 1;
     stats_end(c);
     return 0;
 }
 
 int rc_prep_download(RcPrep *c, RcPrepHostOut *out)
 {
-    if (!c || !out) return 1;
+    if (!c || !out || !c->ran) return 1;
     if (out->n_out != c->n_out || out->n_conflict != c->n_conflict) return 2;
     stats_begin(c);
     int n = c->n_out;
     int m = c->n_conflict;
+    int err = 0;
     if (n > 0) {
         if (!out->time || !out->open || !out->high || !out->low || !out->close ||
             !out->volume || !out->quote_volume || !out->trades ||
@@ -1233,22 +1283,22 @@ int rc_prep_download(RcPrep *c, RcPrepHostOut *out)
             stats_end_phase(c, 2);
             return 3;
         }
-        rc_download(out->time, c->d_o_time, (size_t)n * sizeof(long long));
-        rc_download(out->open, c->d_o_open, (size_t)n * sizeof(double));
-        rc_download(out->high, c->d_o_high, (size_t)n * sizeof(double));
-        rc_download(out->low, c->d_o_low, (size_t)n * sizeof(double));
-        rc_download(out->close, c->d_o_close, (size_t)n * sizeof(double));
-        rc_download(out->volume, c->d_o_volume, (size_t)n * sizeof(double));
-        rc_download(out->quote_volume, c->d_o_quote_volume, (size_t)n * sizeof(double));
-        rc_download(out->trades, c->d_o_trades, (size_t)n * sizeof(double));
-        rc_download(out->taker_buy_base, c->d_o_taker_buy_base, (size_t)n * sizeof(double));
-        rc_download(out->taker_buy_quote, c->d_o_taker_buy_quote, (size_t)n * sizeof(double));
-        rc_download(out->cov15m, c->d_o_cov, (size_t)n * sizeof(unsigned int));
-        rc_download(out->dup_rows, c->d_o_dup_rows, (size_t)n * sizeof(unsigned int));
-        rc_download(out->gap, c->d_o_gap, (size_t)n * sizeof(unsigned int));
-        rc_download(out->flags, c->d_o_flags, (size_t)n * sizeof(unsigned int));
-        rc_download(out->chain, c->d_o_chain, (size_t)n * sizeof(long long));
-        rc_download(out->segment, c->d_o_seg, (size_t)n * sizeof(int));
+        err |= rc_download(out->time, c->d_o_time, (size_t)n * sizeof(long long)) != cudaSuccess;
+        err |= rc_download(out->open, c->d_o_open, (size_t)n * sizeof(double)) != cudaSuccess;
+        err |= rc_download(out->high, c->d_o_high, (size_t)n * sizeof(double)) != cudaSuccess;
+        err |= rc_download(out->low, c->d_o_low, (size_t)n * sizeof(double)) != cudaSuccess;
+        err |= rc_download(out->close, c->d_o_close, (size_t)n * sizeof(double)) != cudaSuccess;
+        err |= rc_download(out->volume, c->d_o_volume, (size_t)n * sizeof(double)) != cudaSuccess;
+        err |= rc_download(out->quote_volume, c->d_o_quote_volume, (size_t)n * sizeof(double)) != cudaSuccess;
+        err |= rc_download(out->trades, c->d_o_trades, (size_t)n * sizeof(double)) != cudaSuccess;
+        err |= rc_download(out->taker_buy_base, c->d_o_taker_buy_base, (size_t)n * sizeof(double)) != cudaSuccess;
+        err |= rc_download(out->taker_buy_quote, c->d_o_taker_buy_quote, (size_t)n * sizeof(double)) != cudaSuccess;
+        err |= rc_download(out->cov15m, c->d_o_cov, (size_t)n * sizeof(unsigned int)) != cudaSuccess;
+        err |= rc_download(out->dup_rows, c->d_o_dup_rows, (size_t)n * sizeof(unsigned int)) != cudaSuccess;
+        err |= rc_download(out->gap, c->d_o_gap, (size_t)n * sizeof(unsigned int)) != cudaSuccess;
+        err |= rc_download(out->flags, c->d_o_flags, (size_t)n * sizeof(unsigned int)) != cudaSuccess;
+        err |= rc_download(out->chain, c->d_o_chain, (size_t)n * sizeof(long long)) != cudaSuccess;
+        err |= rc_download(out->segment, c->d_o_seg, (size_t)n * sizeof(int)) != cudaSuccess;
     }
     if (m > 0) {
         if (!out->conf_time || !out->conf_segment || !out->conf_chain ||
@@ -1256,12 +1306,18 @@ int rc_prep_download(RcPrep *c, RcPrepHostOut *out)
             stats_end_phase(c, 2);
             return 4;
         }
-        rc_download(out->conf_time, c->d_conf_time, (size_t)m * sizeof(long long));
-        rc_download(out->conf_segment, c->d_conf_seg, (size_t)m * sizeof(int));
-        rc_download(out->conf_chain, c->d_conf_chain, (size_t)m * sizeof(long long));
-        rc_download(out->conf_dup_rows, c->d_conf_dup_rows, (size_t)m * sizeof(int));
-        rc_download(out->conf_first_row, c->d_conf_first_row, (size_t)m * sizeof(int));
-        rc_download(out->conf_len, c->d_conf_len, (size_t)m * sizeof(int));
+        err |= rc_download(out->conf_time, c->d_conf_time, (size_t)m * sizeof(long long)) != cudaSuccess;
+        err |= rc_download(out->conf_segment, c->d_conf_seg, (size_t)m * sizeof(int)) != cudaSuccess;
+        err |= rc_download(out->conf_chain, c->d_conf_chain, (size_t)m * sizeof(long long)) != cudaSuccess;
+        err |= rc_download(out->conf_dup_rows, c->d_conf_dup_rows, (size_t)m * sizeof(int)) != cudaSuccess;
+        err |= rc_download(out->conf_first_row, c->d_conf_first_row, (size_t)m * sizeof(int)) != cudaSuccess;
+        err |= rc_download(out->conf_len, c->d_conf_len, (size_t)m * sizeof(int)) != cudaSuccess;
+    }
+    if (err) {
+        cudaGetLastError();
+        c->last.failed = 1;
+        stats_end_phase(c, 2);
+        return 5;
     }
     c->last.d2h_bytes += (unsigned long long)n *
                          (sizeof(long long) + 9ULL * sizeof(double) +

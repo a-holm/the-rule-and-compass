@@ -30,6 +30,8 @@ pub struct RunFront {
     pub train_rows: Option<usize>,
     pub generations_run: usize,
     pub candidates_evaluated: u64,
+    /// #1207: `book.missing_score`; `None` for a run.json of a build that carried the position.
+    pub missing_score: Option<String>,
     /// In `archive_rank` order.
     pub members: Vec<RunMember>,
 }
@@ -82,8 +84,27 @@ impl RunFront {
                 .and_then(|s| s.get("candidates_evaluated"))
                 .and_then(Json::as_f64)
                 .map_or(0, |v| v as u64),
+            missing_score: j.get("book").and_then(|b| b.get("missing_score")).and_then(Json::as_str).map(str::to_string),
             members,
         })
+    }
+}
+
+/// #1207: a re-selection prices the front under the rule of this build. The
+/// source must name the same rule in `book.missing_score`; a source of a build
+/// that carried the position across a missing score names none.
+pub fn check_book_rule(source: &str, saved: Option<&str>) -> Result<(), String> {
+    let current = crate::trading::MissingScore::default().name();
+    match saved {
+        Some(rule) if rule == current => Ok(()),
+        Some(rule) => Err(format!(
+            "{}: book.missing_score is '{}', this build prices '{}'; re-selecting would price the front on other books",
+            source, rule, current
+        )),
+        None => Err(format!(
+            "{}: has no book.missing_score: it was written by a build that carried the position across a missing score, this build prices '{}'",
+            source, current
+        )),
     }
 }
 

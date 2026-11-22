@@ -104,6 +104,8 @@ typedef struct RcPit {
 } RcPit;
 
 typedef struct RcPitHostOut {
+    int n;
+    int n_kept;
     int *leaf;
     unsigned char *keep;
     unsigned char *found;
@@ -138,14 +140,14 @@ static void rc_free(void *p)
     if (p) cudaFree(p);
 }
 
-static void rc_upload(void *dst, const void *src, size_t bytes)
+static cudaError_t rc_upload(void *dst, const void *src, size_t bytes)
 {
-    if (bytes) cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice);
+    return bytes ? cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice) : cudaSuccess;
 }
 
-static void rc_download(void *dst, const void *src, size_t bytes)
+static cudaError_t rc_download(void *dst, const void *src, size_t bytes)
 {
-    if (bytes) cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost);
+    return bytes ? cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost) : cudaSuccess;
 }
 
 static void stats_begin(RcPit *c)
@@ -370,20 +372,21 @@ RcPit *rc_pit_create(const long long *times, const long long *chain, int n,
     cudaDeviceSynchronize();
     c->last.alloc_ms = rc_now_ms() - c->batch_start_ms;
 
-    rc_upload(c->d_time, times, rows * sizeof(long long));
-    rc_upload(c->d_chain, chain, rows * sizeof(long long));
-    rc_upload(c->d_seg_start, seg_start, nr * sizeof(int));
-    rc_upload(c->d_seg_len, seg_len, nr * sizeof(int));
-    rc_upload(c->d_leaf_start, leaf_start, nr * sizeof(int));
-    rc_upload(c->d_leaf_len, leaf_len, nr * sizeof(int));
+    int up_bad = 0;
+    up_bad |= rc_upload(c->d_time, times, rows * sizeof(long long)) != cudaSuccess;
+    up_bad |= rc_upload(c->d_chain, chain, rows * sizeof(long long)) != cudaSuccess;
+    up_bad |= rc_upload(c->d_seg_start, seg_start, nr * sizeof(int)) != cudaSuccess;
+    up_bad |= rc_upload(c->d_seg_len, seg_len, nr * sizeof(int)) != cudaSuccess;
+    up_bad |= rc_upload(c->d_leaf_start, leaf_start, nr * sizeof(int)) != cudaSuccess;
+    up_bad |= rc_upload(c->d_leaf_len, leaf_len, nr * sizeof(int)) != cudaSuccess;
     if (nleaf > 0) {
-        rc_upload(c->d_key, key, (size_t)nleaf * sizeof(long long));
-        rc_upload(c->d_member, member, (size_t)nleaf * sizeof(unsigned char));
+        up_bad |= rc_upload(c->d_key, key, (size_t)nleaf * sizeof(long long)) != cudaSuccess;
+        up_bad |= rc_upload(c->d_member, member, (size_t)nleaf * sizeof(unsigned char)) != cudaSuccess;
     }
     c->last.h2d_bytes = rows * 16 + nr * 16 + (size_t)nleaf * 9;
     cudaDeviceSynchronize();
     cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
+    if (up_bad || err != cudaSuccess) {
         rc_pit_destroy(c);
         return NULL;
     }
@@ -435,10 +438,15 @@ extern "C" void rc_pit_test_force_cub_fail(int on)
     g_force_cub_fail = on;
 }
 
-/* Run one join. `step` is the gap bucket size. */
+/* Run one join. `step` is the gap bucket size. The previous result is
+ * invalid from entry on. Codes: 1 to 3 arguments, 4 host memory, 5 chunk
+ * count, 6 chunk buffers, 7 to 10 launches, 11 and 12 scans, 13 self-check,
+ * 14 copy. */
 int rc_pit_run(RcPit *c, long long step, int threads, int chunk_rows)
 {
-    if (!c || step <= 0) return 1;
+    if (!c) return 1;
+    c->ran = 0;
+    if (step <= 0) return 1;
     if (threads < 32 || threads > 1024 || threads % 32 != 0) return 2;
     if (chunk_rows < 1) return 3;
     stats_begin(c);
@@ -451,8 +459,16 @@ int rc_pit_run(RcPit *c, long long step, int threads, int chunk_rows)
         free(seg_len);
         return 4;
     }
-    rc_download(seg_start, c->d_seg_start, (size_t)c->nseg * sizeof(int));
-    rc_download(seg_len, c->d_seg_len, (size_t)c->nseg * sizeof(int));
+    cudaError_t seg_err = rc_download(seg_start, c->d_seg_start, (size_t)c->nseg * sizeof(int));
+    if (seg_err == cudaSuccess)
+        seg_err = rc_download(seg_len, c->d_seg_len, (size_t)c->nseg * sizeof(int));
+    if (seg_err != cudaSuccess) {
+        cudaGetLastError();
+        free(seg_start);
+        free(seg_len);
+        c->last.failed = 1;
+        return 14;
+    }
     long long nchunk_ll = 0;
     for (int s = 0; s < c->nseg; ++s)
         nchunk_ll += ((long long)seg_len[s] + chunk_rows - 1) / chunk_rows;
@@ -566,15 +582,18 @@ int rc_pit_run(RcPit *c, long long step, int threads, int chunk_rows)
 
     int tail_dest = 0;
     unsigned char tail_keep = 0;
-    rc_download(&tail_dest, c->d_dest + (c->n - 1), sizeof(int));
-    rc_download(&tail_keep, c->d_keep + (c->n - 1), 1);
+    if (rc_download(&tail_dest, c->d_dest + (c->n - 1), sizeof(int)) != cudaSuccess ||
+        rc_download(&tail_keep, c->d_keep + (c->n - 1), 1) != cudaSuccess) {
+        cudaGetLastError();
+        c->last.failed = 1;
+        return 14;
+    }
     c->n_kept = tail_dest + (tail_keep ? 1 : 0);
     c->n_chunks = nchunk;
     c->last.n_kept = c->n_kept;
     c->last.n_chunks = c->n_chunks;
     c->last.loads = loads;
     c->last.d2h_bytes = sizeof(loads) + sizeof(int) + 1;
-    c->ran = 1;
 
     /* Self-check of the join just produced; the expected count is zero. */
     cudaMemset(c->d_counter, 0, sizeof(unsigned long long));
@@ -582,11 +601,16 @@ int rc_pit_run(RcPit *c, long long step, int threads, int chunk_rows)
                              c->d_key, c->d_leaf, c->n, c->d_counter);
     cudaDeviceSynchronize();
     unsigned long long viol = 0;
-    rc_download(&viol, c->d_counter, sizeof(viol));
+    cudaError_t viol_err = rc_download(&viol, c->d_counter, sizeof(viol));
     c->last.violations = viol;
     c->last.d2h_bytes += sizeof(viol);
     stats_end_phase(c, 0);
-    return cudaGetLastError() == cudaSuccess ? 0 : 11;
+    if (viol_err != cudaSuccess || cudaGetLastError() != cudaSuccess) {
+        c->last.failed = 1;
+        return 13;
+    }
+    c->ran = 1;
+    return 0;
 }
 
 /* Count look-ahead violations of a caller-supplied leaf index column. */
@@ -594,7 +618,7 @@ int rc_pit_check(RcPit *c, const int *idx, unsigned long long *violations)
 {
     if (!c || !idx || !violations) return 1;
     stats_begin(c);
-    rc_upload(c->d_check_idx, idx, (size_t)c->n * sizeof(int));
+    cudaError_t up_err = rc_upload(c->d_check_idx, idx, (size_t)c->n * sizeof(int));
     int *d_row_seg = c->d_row_seg;
     int *d_first = c->d_first;
     int threads = 256;
@@ -604,7 +628,9 @@ int rc_pit_check(RcPit *c, const int *idx, unsigned long long *violations)
         c->d_check_idx, c->n, c->d_counter);
     cudaDeviceSynchronize();
     cudaError_t err = cudaGetLastError();
-    rc_download(violations, c->d_counter, sizeof(unsigned long long));
+    if (up_err != cudaSuccess) err = up_err;
+    if (rc_download(violations, c->d_counter, sizeof(unsigned long long)) != cudaSuccess && err == cudaSuccess)
+        err = cudaErrorUnknown;
     c->last.h2d_bytes = (unsigned long long)c->n * sizeof(int);
     c->last.d2h_bytes = sizeof(unsigned long long);
     if (err != cudaSuccess) c->last.failed = 1;
@@ -612,24 +638,35 @@ int rc_pit_check(RcPit *c, const int *idx, unsigned long long *violations)
     return err == cudaSuccess ? 0 : 2;
 }
 
+/* Rows kept by the last successful run; -1 when no run succeeded. */
+int rc_pit_n_kept(RcPit *c)
+{
+    return (c && c->ran) ? c->n_kept : -1;
+}
+
+/* 3: the host capacities do not match the context; nothing is copied. */
 int rc_pit_download(RcPit *c, RcPitHostOut *out)
 {
     if (!c || !out || !c->ran) return 1;
+    if (out->n != c->n || out->n_kept != c->n_kept) return 3;
     stats_begin(c);
     size_t n = (size_t)c->n;
-    rc_download(out->leaf, c->d_leaf, n * sizeof(int));
-    rc_download(out->keep, c->d_keep, n);
-    rc_download(out->found, c->d_found, n);
-    rc_download(out->as_of, c->d_as_of, n * sizeof(long long));
-    rc_download(out->gap, c->d_gap, n * sizeof(unsigned int));
-    rc_download(out->chain_ord, c->d_chain_loc, n * sizeof(int));
     int keep_n = c->n_kept;
-    rc_download(out->kept_rows, c->d_kept_rows, (size_t)keep_n * sizeof(int));
+    int bad = 0;
+    bad |= rc_download(out->leaf, c->d_leaf, n * sizeof(int)) != cudaSuccess;
+    bad |= rc_download(out->keep, c->d_keep, n) != cudaSuccess;
+    bad |= rc_download(out->found, c->d_found, n) != cudaSuccess;
+    bad |= rc_download(out->as_of, c->d_as_of, n * sizeof(long long)) != cudaSuccess;
+    bad |= rc_download(out->gap, c->d_gap, n * sizeof(unsigned int)) != cudaSuccess;
+    bad |= rc_download(out->chain_ord, c->d_chain_loc, n * sizeof(int)) != cudaSuccess;
+    bad |= rc_download(out->kept_rows, c->d_kept_rows, (size_t)keep_n * sizeof(int)) != cudaSuccess;
     cudaError_t err = cudaGetLastError();
+    if (bad) err = cudaErrorUnknown;
     c->last.n_kept = c->n_kept;
     c->last.n_chunks = c->n_chunks;
     c->last.d2h_bytes = n * (4 + 1 + 1 + 8 + 4 + 4) + (size_t)keep_n * 4;
     stats_end_phase(c, 2);
+    if (err != cudaSuccess) c->last.failed = 1;
     return err == cudaSuccess ? 0 : 2;
 }
 

@@ -853,3 +853,105 @@ fn refused_later_cub_scan_fails_pit_run_then_recovers() {
     let cpu = panel_pit::join(&block, p).unwrap();
     pit::assert_same("after refusal", &cpu, &gpu.output().expect("output"));
 }
+
+extern "C" {
+    fn rc_prep_test_force_download_fail(on: i32);
+}
+
+/// #1073: the device check between `run` and `output` must not change what
+/// `output` copies.
+#[test]
+fn pit_output_after_the_device_check_keeps_the_kept_rows() {
+    if !would_use_gpu() {
+        rcsr::backend::skip_without_device("skipping: no CUDA device");
+        return;
+    }
+    for (name, block, p) in pit_cases() {
+        let cpu = panel_pit::join(&block, p).unwrap();
+        let mut gpu = PitGpu::new(&block).unwrap();
+        assert!(gpu.run(p), "{name}");
+        assert_eq!(gpu.lookahead_violations(&cpu.leaf), Some(0), "{name}");
+        let out = gpu.output().expect("output");
+        assert_eq!(out.kept_rows, cpu.kept_rows, "{name}");
+        pit::assert_same(name, &cpu, &out);
+    }
+}
+
+fn small_pit_block() -> PitBlock {
+    PitBlock {
+        times: vec![999, 1000, 1001, 1999, 2000, 2001, 2999, 3000, 3001, 3500, 3501],
+        chain: vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1],
+        segments: vec![rcsr::panel_pit::PitSegment { start: 0, len: 11, leaf_start: 0, leaf_len: 3 }],
+        keys: vec![1000, 2000, 3000],
+        member: vec![1, 0, 1],
+    }
+}
+
+/// #1073: a failed re-run leaves no result to download, and the next run works.
+#[test]
+fn pit_output_is_refused_after_a_failed_rerun() {
+    if !would_use_gpu() {
+        rcsr::backend::skip_without_device("skipping: no CUDA device");
+        return;
+    }
+    let block = small_pit_block();
+    let p = PitParams::membership(1);
+    let cpu = panel_pit::join(&block, p).unwrap();
+    let mut gpu = PitGpu::new(&block).expect("context");
+    assert!(gpu.run(p));
+    assert!(gpu.output().is_some());
+
+    unsafe { rc_pit_test_force_cub_fail(1) };
+    let refused = gpu.run(p);
+    unsafe { rc_pit_test_force_cub_fail(0) };
+    assert!(!refused, "a refused CUB scan must fail the run");
+    assert!(gpu.output().is_none(), "no result after a failed run");
+
+    assert!(gpu.run(p), "no error may stay pending");
+    pit::assert_same("after refusal", &cpu, &gpu.output().expect("output"));
+}
+
+/// #1073: a failed copy in the prep download is reported, not returned as
+/// zero buckets, and leaves no error pending.
+#[test]
+fn prep_download_failure_is_reported() {
+    if !would_use_gpu() {
+        rcsr::backend::skip_without_device("skipping: no CUDA device");
+        return;
+    }
+    let (bars, segments) = mixed_fixture();
+    let mut gpu = PrepGpu::new(&bars, &segments).expect("context");
+    assert!(gpu.run(900, 3600, true));
+
+    unsafe { rc_prep_test_force_download_fail(1) };
+    let refused = gpu.output();
+    unsafe { rc_prep_test_force_download_fail(0) };
+    assert!(refused.is_none(), "a failed copy must not return buckets");
+
+    assert!(gpu.run(900, 3600, true), "no error may stay pending");
+    let cpu = cpu_prepare(&bars, &segments, 900, 3600, true).unwrap();
+    assert_outputs_equal("after failed download", &cpu, &gpu.output().expect("output"));
+}
+
+/// #1073: after a failed re-run the prep context has no result to download.
+#[test]
+fn prep_output_is_refused_after_a_failed_rerun() {
+    if !would_use_gpu() {
+        rcsr::backend::skip_without_device("skipping: no CUDA device");
+        return;
+    }
+    let (bars, segments) = mixed_fixture();
+    let mut gpu = PrepGpu::new(&bars, &segments).expect("context");
+    assert!(gpu.run(900, 3600, true));
+    assert!(gpu.output().is_some());
+
+    unsafe { rc_prep_test_force_cub_fail(2) };
+    let refused = gpu.run(900, 3600, true);
+    unsafe { rc_prep_test_force_cub_fail(0) };
+    assert!(!refused, "a refused CUB scan must fail the run");
+    assert!(gpu.output().is_none(), "no result after a failed run");
+
+    assert!(gpu.run(900, 3600, true), "no error may stay pending");
+    let cpu = cpu_prepare(&bars, &segments, 900, 3600, true).unwrap();
+    assert_outputs_equal("after refusal", &cpu, &gpu.output().expect("output"));
+}

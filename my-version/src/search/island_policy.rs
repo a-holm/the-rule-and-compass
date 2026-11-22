@@ -1338,10 +1338,10 @@ mod tests {
             assert_eq!(name, want_name);
             let (out, text, restarts) = checkpointed(&cfg, None);
             assert!(restarts > 0, "{name}: the run restarts an island, else the pin proves less");
-            // #1166: the qd_* records are new; every line the base wrote keeps its bytes.
+            // #1166, #1207: the qd_* and book records are new; every line the base wrote keeps its bytes.
             let kept = text
                 .lines()
-                .filter(|l| !l.starts_with("build ") && !l.starts_with("qd_"))
+                .filter(|l| !l.starts_with("build ") && !l.starts_with("qd_") && !l.starts_with("book "))
                 .fold(0xcbf2_9ce4_8422_2325u64, |h, l| fnv(fnv(h, l.as_bytes()), b"\n"));
             if (out.archive.hash(), kept) != (want_archive, want_text) {
                 differs.push(format!("(\"{name}\", {:#018x}, {kept:#018x})", out.archive.hash()));
