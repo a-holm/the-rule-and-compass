@@ -1345,6 +1345,9 @@ struct GpuSearch {
     fit_fallback: usize,
     /// #169: pending offspring screened before the fit batch (admission).
     fit_screened: usize,
+    /// #1142: the pre-fit clones of the admitted slots, kept only after a
+    /// failed re-score so the loss path can gate the CPU fit against them.
+    prefit: Vec<((usize, usize), Ind)>,
     /// #448: candidates with constants admitted without a screening score (wide admission).
     fit_admitted_wide: usize,
     /// #169: CPU fallback counts labelled by cause.
@@ -1684,6 +1687,7 @@ impl GpuSearch {
                     fit_gpu: 0,
                     fit_fallback: 0,
                     fit_screened: 0,
+                    prefit: Vec::new(),
                     fit_admitted_wide: 0,
                     fit_fallback_by_cause: BTreeMap::new(),
                     fit_fallback_improved_by_cause: BTreeMap::new(),
@@ -2044,11 +2048,18 @@ impl GpuSearch {
             if let Some(pending_check) = begun {
                 self.check_end(islands, pending_check, generation);
             }
-            if generation >= 2 && crate::gpu::injected_fault("rescore") {
-                return Err(format!("{}the re-score after the fit", crate::gpu::INJECTED_REFUSAL));
+            let rescored = if generation >= 2 && crate::gpu::injected_fault("rescore") {
+                Err(format!("{}the re-score after the fit", crate::gpu::INJECTED_REFUSAL))
+            } else {
+                // Re-score the survivors so selection sees their fitted constants.
+                self.evaluate_the_batch(islands, &admitted, data, cfg, generation, dispatcher)
+            };
+            if let Err(e) = rescored {
+                if gate {
+                    self.prefit = admitted.iter().copied().zip(before).collect();
+                }
+                return Err(e);
             }
-            // Re-score the survivors so selection sees their fitted constants.
-            self.evaluate_the_batch(islands, &admitted, data, cfg, generation, dispatcher)?;
             // #1078: a slot keeps the fit only when it is not worse than its
             // pre-fit score; this covers the fold, the device fit and the CPU tail.
             for (&(i, j), unfitted) in admitted.iter().zip(before) {
@@ -2733,6 +2744,11 @@ fit_fallback_bounded: self.fit_fallback_bounded,
         self.fallback
             .take()
             .expect("the fallback pool is taken at most once")
+    }
+
+    /// #1142: hand the pre-fit clones of a failed call to the loss path.
+    fn take_prefit(&mut self) -> Vec<((usize, usize), Ind)> {
+        std::mem::take(&mut self.prefit)
     }
 }
 
@@ -3663,7 +3679,8 @@ fn pending_slots(islands: &[Vec<Ind>]) -> Vec<(usize, usize)> {
 /// `refit`, and the exact CPU score on `rows`. A tree the fit made
 /// dimension-inconsistent keeps `+inf`.
 /// #1078: under `--fit-accept fitness` each fitted slot is compared with its
-/// score before the CPU fit.
+/// score before the CPU fit. #1142: a slot in `prefit` is
+/// compared with its pre-fit tree instead of its current one.
 #[cfg(feature = "cuda")]
 fn finish_on_cpu(
     islands: &mut [Vec<Ind>],
@@ -3672,6 +3689,7 @@ fn finish_on_cpu(
     cfg: &Config,
     pool: &FallbackPool,
     refit: bool,
+    prefit: &[((usize, usize), Ind)],
     counts: Option<&FitAcceptCounts>,
 ) {
     let train = rows.sample;
@@ -3685,7 +3703,9 @@ fn finish_on_cpu(
             let ind = &mut islands[i][j];
             if ind.error.is_nan() {
                 if cfg.fit_accept == FitAccept::Fitness {
-                    unfitted.push((i, j, Ind::evaluated(ind.tree.clone(), rows, cfg)));
+                    // #1142: a slot whose fit ran before the failure is gated against its pre-fit tree.
+                    let baseline = prefit.iter().find(|(slot, _)| *slot == (i, j)).map_or(&ind.tree, |(_, pre)| &pre.tree);
+                    unfitted.push((i, j, Ind::evaluated(baseline.clone(), rows, cfg)));
                 }
                 crate::fit::fit_weighted_metric_thresholds(
                     &mut ind.tree,
@@ -3757,8 +3777,9 @@ fn score_generation(
             gpu_lost(cfg, e, backend_reason)?;
             // #121: keep the fallback pool alive for the rescore below.
             let fallback = g.take_fallback();
+            let prefit = g.take_prefit(); // #1142
             *gpu = None;
-            finish_on_cpu(islands, &entry, data, cfg, &fallback, defers_fit_to_gpu(cfg, true), counts);
+            finish_on_cpu(islands, &entry, data, cfg, &fallback, defers_fit_to_gpu(cfg, true), &prefit, counts);
             Ok(false)
         }
     }
@@ -3995,7 +4016,7 @@ fn finish_pipeline_loss(
     for slots in results.iter_mut() {
         slots.iter_mut().for_each(|r| *r = None);
     }
-    finish_on_cpu(islands, &entry, rows, cfg, pool, defers_fit_to_gpu(cfg, true), counts);
+    finish_on_cpu(islands, &entry, rows, cfg, pool, defers_fit_to_gpu(cfg, true), &[], counts);
 }
 
 /// #578: refit the first `--fit-fallback-max` fallbacks of the generation on
@@ -13192,7 +13213,7 @@ mod tests {
         let view = EvalSample::new(&s, &cfg);
         let (mut islands, entry) = loss_islands(&cfg);
         let untouched = (islands[0][0].tree.clone(), islands[0][0].error);
-        finish_on_cpu(&mut islands, &entry, &view, &cfg, &FallbackPool::new(2, 2), false, None);
+        finish_on_cpu(&mut islands, &entry, &view, &cfg, &FallbackPool::new(2, 2), false, &[], None);
         for &(i, j) in &entry {
             let want = score_tree(&islands[i][j].tree, &view, &cfg);
             assert_eq!(islands[i][j].error.to_bits(), want.to_bits(), "slot {i}/{j}");
@@ -13210,7 +13231,7 @@ mod tests {
         let tree = node(Op::Mul, vec![constant(5.0), input(0)]);
         let mut islands = vec![vec![Ind::pending(tree.clone(), &cfg)]];
         islands[0][0].set_error(99.0);
-        finish_on_cpu(&mut islands, &[(0, 0)], &view, &cfg, &FallbackPool::new(2, 2), true, None);
+        finish_on_cpu(&mut islands, &[(0, 0)], &view, &cfg, &FallbackPool::new(2, 2), true, &[], None);
         let mut want = Ind::pending(tree, &cfg).tree;
         crate::fit::fit_weighted_metric_thresholds(
             &mut want, &s.x, &s.y, &s.w, cfg.fit_iters, cfg.metric, cfg.fit_thresholds,
@@ -13239,7 +13260,7 @@ mod tests {
         let mut islands = vec![vec![Ind::pending(bad, &cfg), Ind::pending(good, &cfg)]];
         islands[0][0].set_error(0.5);
         islands[0][1].set_error(0.5);
-        finish_on_cpu(&mut islands, &[(0, 0), (0, 1)], &view, &cfg, &FallbackPool::new(2, 2), false, None);
+        finish_on_cpu(&mut islands, &[(0, 0), (0, 1)], &view, &cfg, &FallbackPool::new(2, 2), false, &[], None);
         assert_eq!(islands[0][0].error, f64::INFINITY);
         assert_eq!(islands[0][1].error.to_bits(), score_tree(&islands[0][1].tree, &view, &cfg).to_bits());
     }
@@ -13252,7 +13273,7 @@ mod tests {
         let view = EvalSample::new(&s, &cfg);
         let run = |pool: FallbackPool| {
             let (mut islands, entry) = loss_islands(&cfg);
-            finish_on_cpu(&mut islands, &entry, &view, &cfg, &pool, true, None);
+            finish_on_cpu(&mut islands, &entry, &view, &cfg, &pool, true, &[], None);
             islands
         };
         let one = run(FallbackPool::new(1, 1));
@@ -13263,8 +13284,42 @@ mod tests {
         }
     }
 
+    /// #1142: one entry slot whose current tree (`3 * x1`, a stand-in for a
+    /// folded fit) differs from its pre-fit tree (`1 * x0`, exact on `sample()`).
+    #[cfg(feature = "cuda")]
+    fn loss_gate_run(counts: Option<&FitAcceptCounts>) -> (Ind, Ind) {
+        let s = sample();
+        let cfg = Config { fit_accept: FitAccept::Fitness, fit_iters: 4, ..Config::default() };
+        let view = EvalSample::new(&s, &cfg);
+        let current = node(Op::Mul, vec![constant(3.0), input(1)]);
+        let pre = node(Op::Mul, vec![constant(1.0), input(0)]);
+        let mut islands = vec![vec![Ind::pending(current, &cfg)]];
+        islands[0][0].set_error(99.0);
+        let prefit = vec![((0usize, 0usize), Ind::pending(pre.clone(), &cfg))];
+        finish_on_cpu(&mut islands, &[(0, 0)], &view, &cfg, &FallbackPool::new(2, 2), true, &prefit, counts);
+        (islands[0][0].clone(), Ind::evaluated(pre, &view, &cfg))
+    }
+
     #[cfg(feature = "cuda")]
     #[test]
+    fn loss_gate_compares_with_the_pre_fit_tree() {
+        let (slot, pre) = loss_gate_run(None);
+        assert!(expr::same(&slot.tree, &pre.tree), "the pre-fit tree wins over the worse fit");
+        assert_eq!(slot.error.to_bits(), pre.error.to_bits());
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn loss_gate_counts_the_pre_fit_decision_once() {
+        let counts = FitAcceptCounts::default();
+        loss_gate_run(Some(&counts));
+        let report = counts.snapshot();
+        assert_eq!(report.path("lost_batch"), Some((0, 1)));
+        assert_eq!(report.path("device"), Some((0, 0)));
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
     fn pipeline_loss_scores_on_the_generation_rows() {
         let full = sample();
         let subset = Sample {
