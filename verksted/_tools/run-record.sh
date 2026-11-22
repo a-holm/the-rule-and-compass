@@ -5,6 +5,8 @@
 #        run-record.sh close --id <id> --log <log>... [--metrics <file>] [--after-seal <verdict file>]
 #                            [--artefact <path>]... [--deviation <text>]...
 #        run-record.sh latest [--kind <kind>] [--slug <slug>]
+# Writes: only under $VLOCAL/runs/ (RCSR_LOCAL overrides $VLOCAL).
+# Exit: 0 ok; 1 refused or failed; 2 usage.
 # The run registry: one card per run at $VLOCAL/runs/<id>/run.md (template _templates/local/run.md) and the generated runs/_index.md.
 # new: fills start (UTC), binary sha256 (sha256sum), commit (git -C <worktree> rev-parse HEAD, -dirty when the tree is not clean) and the
 #   stores. A store digest comes from the digest cache <store>.sha256.json when its size, mtime and inode still match the file; else the file
@@ -17,8 +19,6 @@
 #   protocol.lockbox.read_count > 0, protocol.lockbox.read_marker, lockbox.evaluated, lockbox.read_count > 0, locked_reads.
 #   Key metrics keep only the finite numbers and booleans at the top level of a development report; no raw data is stored.
 # latest: prints the path of the newest card (by start, then id), of one kind with --kind, of an id ending in -<slug> with --slug. Exit 1 when none.
-# Writes: only under $VLOCAL/runs/ (RCSR_LOCAL overrides $VLOCAL).
-# Exit: 0 ok; 1 refused or failed; 2 usage.
 set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
