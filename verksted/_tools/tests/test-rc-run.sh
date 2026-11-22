@@ -3,7 +3,7 @@
 # Hermetic test of rc-run.sh with a stub slot, lock and Xid command: modes, quoting, refusals, Xid and exit codes.
 # Writes: a temp dir that it removes.
 set -uo pipefail
-export RCSR_CRATE=crate-x
+unset RCSR_CRATE
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 . "$HERE/lib/fakes.sh"
 RC=$HERE/../rc-run.sh
@@ -32,9 +32,9 @@ has() {
   fi
 }
 
-mkdir -p "$T/gates" "$T/wt/crate-x" "$T/bin" "$T/oc"
+mkdir -p "$T/gates" "$T/wt/pkg" "$T/bin" "$T/oc"
 fake_timeout "$T/bin"
-touch "$T/wt/crate-x/Cargo.toml"
+printf '[package]\nname = "rule-and-compass"\n' > "$T/wt/pkg/Cargo.toml"
 echo 0 > "$T/xid"
 for kind in slot lock; do
   cat > "$T/$kind.sh" <<STUB
@@ -71,7 +71,7 @@ check build-last-line "$(tail -n 1 "$log" | cut -d' ' -f1-2)" "RC_DONE rc=0"
 check build-limit "$(head -n 1 "$T/timeouts")" "1500 show-args a"
 has build-jobs "$log" 'jobs=2'
 has build-noarch "$log" 'arch=none'
-has build-cwd "$log" "pwd=$T/wt/crate-x"
+has build-cwd "$log" "pwd=$T/wt/pkg"
 has build-timeout-default "$T/calls" 'timeout -k 30 1500 '
 
 # test --cuda and run use the lock and write the xid line; test without --cuda uses the slot

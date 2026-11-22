@@ -61,10 +61,7 @@ check ROOT-from-worktree "$(lib 'echo $ROOT' RCSR_ROOT="$side_top")" "$main_top"
 check RCSR_ROOT-from-worktree "$(lib 'echo $RCSR_ROOT' RCSR_ROOT="$side_top")" "$side_top"
 check WT "$(lib 'echo $WT' RCSR_ROOT="$side_top")" "$main_top/worktrees"
 
-# CRATE and VLOCAL
-check CRATE-override "$(lib 'echo $CRATE' RCSR_CRATE=/tmp/y)" "/tmp/y"
-check CRATE-default-found "$([ -f "$want_top/$(lib 'echo $CRATE')/Cargo.toml" ] && echo yes || echo no)" "yes"
-check CRATE-none "$(lib 'echo "[$CRATE]"' RCSR_ROOT="$main_top")" "[]"
+# VLOCAL
 check VLOCAL-default "$(lib 'echo $VLOCAL' RCSR_ROOT="$side_top")" "$main_top/verksted/_local"
 check VLOCAL-override "$(lib 'echo $VLOCAL' RCSR_LOCAL=/tmp/x)" "/tmp/x"
 
