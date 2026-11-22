@@ -829,6 +829,8 @@ pub use lexicase::{limit_refusal as lexicase_limit_refusal, metric_refusal as le
 use fit_route::{accept_fit, unfitted_wins};
 #[cfg(feature = "cuda")]
 use fit_route::{DeviceArm, ExactFits, FitRoute, FitSettings, Rotation, RouteCounts};
+#[cfg(all(test, feature = "cuda"))]
+pub(crate) use fit_route::route_capped_on_device;
 /// #495: default relative band of the finalist refit (`inf`: refit every unique tree).
 pub const DEFAULT_REFIT_BAND: f64 = f64::INFINITY;
 

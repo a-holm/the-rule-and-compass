@@ -586,3 +586,45 @@ fn evaluators_agree_on_finiteness_for_fixture_trees_216_and_237() {
         }
     }
 }
+
+/// #1071: a tail fit past `--fit-fallback-max` is not refit and keeps the
+/// finite device constants, not its starting constants. On the fixture with
+/// `fit_fallback_max = 1`, every fallback past the cap with device status 4, 5
+/// or 9 ends with exactly the constants `fit_batch_capped` returned, and its
+/// exact error is at most `1 + 1e-6` times the error at the start for at least
+/// 99 % of them.
+#[test]
+fn capped_tail_fits_keep_the_device_constants() {
+    need_device!();
+    let (x, y) = rows();
+    let trees = trees();
+    let device = device_results(&x, &y, &trees, 4 * ITERS);
+    let sample = Sample { x: x.clone(), y: y.clone(), w: Vec::new(), ys: Vec::new(), pairs: None };
+    let mut ev = fixture_evaluator(&x, &y);
+    let (settled, bounded) = search::route_capped_on_device(&mut ev, &trees, &sample, ITERS, 1);
+    let bits = |t: &Node| fit::constants_slots(t).iter().map(|c| c.to_bits()).collect::<Vec<_>>();
+    let fallbacks: Vec<usize> = (0..trees.len()).filter(|&k| search::tail_status_cause(device[k].0).is_some()).collect();
+    let held = &fallbacks[1.min(fallbacks.len())..];
+    assert_eq!(bounded, held.len(), "fallbacks past the cap");
+    let (mut checked, mut within, mut worst) = (0usize, 0usize, 0.0f64);
+    for &k in held {
+        let (status, dev) = &device[k];
+        if !matches!(status, 4 | 5 | 9) || !fit::constants_slots(dev).iter().all(|c| c.is_finite()) {
+            continue;
+        }
+        checked += 1;
+        assert_eq!(bits(&settled[k]), bits(dev), "tree {k} (status {status}) lost the device constants");
+        let start = sse(&trees[k], &x, &y);
+        let kept = sse(&settled[k], &x, &y);
+        let ratio = kept / start;
+        if ratio <= 1.0 + 1e-6 {
+            within += 1;
+        }
+        if ratio.is_finite() {
+            worst = worst.max(ratio);
+        }
+    }
+    eprintln!("capped tail: fallbacks {} held {} checked {checked} within 1+1e-6 {within} worst kept/start {worst:.6}", fallbacks.len(), held.len());
+    assert!(checked > 0, "no held fallback with status 4, 5 or 9 and finite constants");
+    assert!(within * 100 >= checked * 99, "{within} of {checked} held fits are within 1+1e-6 of the start error");
+}
