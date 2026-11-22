@@ -53,6 +53,42 @@ fn empty_cwd() -> &'static std::path::Path {
     })
 }
 
+/// #1349: whether a `--version` output belongs to a CUDA build (it carries a `cuda:` line).
+pub fn child_reports_cuda(version_text: &str) -> bool {
+    version_text.lines().any(|l| l.starts_with("cuda:"))
+}
+
+/// #1349: probe `program --version` once through `cell` and panic when it reports no CUDA build.
+/// `probes` counts the spawns.
+pub fn assert_child_has_cuda_once(
+    program: &str,
+    cell: &std::sync::OnceLock<()>,
+    probes: &std::sync::atomic::AtomicUsize,
+) {
+    cell.get_or_init(|| {
+        probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let out = without_injection(Command::new(program), std::env::vars_os())
+            .arg("--version")
+            .env("RCSR_GPU", "0")
+            .output()
+            .expect("run rcsr --version");
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            child_reports_cuda(&text),
+            "child rcsr built without cuda: {program} reports {text:?}; rebuild with --features cuda"
+        );
+    });
+}
+
+/// #1349: a CUDA test executable spawns the child fixed at compile time. A CPU build of that binary
+/// ignores the `cuda`-only fault hooks, so the test would pass or fail for the wrong reason.
+#[cfg(feature = "cuda")]
+fn assert_child_has_cuda(program: &str) {
+    static CELL: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    static PROBES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    assert_child_has_cuda_once(program, &CELL, &PROBES);
+}
+
 fn child(program: &str) -> Command {
     let mut cmd = without_injection(Command::new(program), std::env::vars_os());
     cmd.current_dir(empty_cwd());
@@ -61,6 +97,8 @@ fn child(program: &str) -> Command {
 
 /// `rcsr` with `RCSR_GPU=0`: no device probe, no CUDA context.
 pub fn rcsr() -> Command {
+    #[cfg(feature = "cuda")]
+    assert_child_has_cuda(env!("CARGO_BIN_EXE_rcsr"));
     let mut cmd = child(env!("CARGO_BIN_EXE_rcsr"));
     cmd.env("RCSR_GPU", "0");
     cmd
@@ -76,6 +114,8 @@ pub fn rcsr_bench() -> Command {
 /// `rcsr` that keeps the caller's environment: the default backend and `--gpu` run on the
 /// device. The test names a device purpose by calling this.
 pub fn rcsr_on_device() -> Command {
+    #[cfg(feature = "cuda")]
+    assert_child_has_cuda(env!("CARGO_BIN_EXE_rcsr"));
     child(env!("CARGO_BIN_EXE_rcsr"))
 }
 
