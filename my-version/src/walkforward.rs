@@ -4776,19 +4776,26 @@ pub(crate) fn declared_period(spec: &EvalSpec, opts: &ProtocolOptions) -> Option
     }
 }
 
+/// #1328: `--horizon S` with `--periods-per-year V` where V is more than the `rcsr trials` tolerance off
+/// `31536000 / S`: the report would be refused by `rcsr trials`.
+pub fn horizon_ppy_conflict(horizon: f64, ppy: f64) -> Option<String> {
+    if !(horizon.is_finite() && horizon >= 1.0 && horizon <= SECONDS_PER_YEAR) {
+        return None;
+    }
+    let implied = SECONDS_PER_YEAR / horizon;
+    (((ppy - implied) / implied).abs() > crate::trials::ANNUALIZATION_TOLERANCE).then(|| {
+        format!("--periods-per-year {} conflicts with --horizon {} s, which implies {} periods per year (tolerance 1 %); remove the flag or change the width", ppy, horizon, implied)
+    })
+}
+
 /// Refuse an explicit `--periods-per-year` that contradicts the declared period.
 fn check_explicit_ppy(spec: &EvalSpec, opts: &ProtocolOptions) -> Result<(), String> {
-    if let (Some(given), Some((s, source))) = (spec.periods_per_year, declared_period(spec, opts)) {
+    if let (Some(given), Some((s, PeriodSource::TargetSpec))) = (spec.periods_per_year, declared_period(spec, opts)) {
         let derived = SECONDS_PER_YEAR / s;
-        let tolerance = if source == PeriodSource::TargetSpec { 1e-9 } else { crate::trials::ANNUALIZATION_TOLERANCE };
-        if ((given - derived) / derived).abs() > tolerance {
-            let from = match source {
-                PeriodSource::TargetSpec => "the target spec period width (the larger of horizon_seconds and stride_seconds)",
-                _ => "--horizon",
-            };
+        if ((given - derived) / derived).abs() > 1e-9 {
             return Err(format!(
-                "--periods-per-year {} conflicts with {} periods per year derived from {} ({} s); remove the flag or change the width",
-                given, derived, from, s
+                "--periods-per-year {} conflicts with {} derived from the target spec period width ({} s, the larger of horizon_seconds and stride_seconds); remove the flag or edit the spec",
+                given, derived, s
             ));
         }
     }

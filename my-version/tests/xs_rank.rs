@@ -315,7 +315,7 @@ fn top_tercile_book_matches_hand_fixture() {
     let m = at(win, &["metrics"]);
     close(num(m, &["total_cost"]), COST);
     close(num(m, &["total_abs_delta"]), 10.0);
-    close(num(m, &["turnover"]), 10.0 * 365.0 / 3.0);
+    close(num(m, &["turnover"]), 10.0 * 8760.0 / 3.0);
     close(num(m, &["exposure"]), 6.0 / 18.0);
     assert_eq!(num(m, &["trades"]), 10.0);
     assert_eq!(num(m, &["entries"]), 6.0);

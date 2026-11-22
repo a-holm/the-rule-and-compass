@@ -13132,6 +13132,11 @@ fn run_walkforward(args: &[String]) -> ! {
         popts.row_rule = walkforward::RowRule::of_search(Some(fit_spec), s.return_column.as_deref().unwrap_or(&s.column), top_tercile, front_run.as_ref(), book_column);
         popts.delay = agree("--delay", delay_flag, s.delay_seconds);
     } else {
+        if let (Some(h), Some(v)) = (horizon, periods_per_year) {
+            if let Some(msg) = walkforward::horizon_ppy_conflict(h, v) {
+                usage_fail(&msg);
+            }
+        }
         popts.entry_offset = entry_offset_flag.unwrap_or(0.0);
         popts.delay = delay_flag.unwrap_or(0.0);
         popts.row_rule = walkforward::RowRule::of_search(None, target.as_deref().unwrap_or(""), policy == walkforward::Policy::TopTercile, front_run.as_ref(), None);
