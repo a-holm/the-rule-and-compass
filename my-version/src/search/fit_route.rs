@@ -1101,6 +1101,52 @@ impl FitRoute {
     }
 }
 
+/// #1071: the squared LM route over `trees` on a real device under
+/// `--fit-fallback-max cap`: the settled trees by slot and the count of
+/// fallbacks held past the cap.
+#[cfg(all(test, feature = "cuda"))]
+pub(crate) fn route_capped_on_device(
+    device: &mut crate::gpu::GpuEvaluator,
+    trees: &[Node],
+    rows: &Sample,
+    iters: usize,
+    cap: usize,
+) -> (Vec<Node>, usize) {
+    struct Flat(Vec<Node>);
+    impl FitSlots<usize> for Flat {
+        fn tree(&mut self, k: usize) -> &mut Node {
+            &mut self.0[k]
+        }
+        fn place(&self, k: usize) -> (usize, usize) {
+            (0, k)
+        }
+    }
+    let settings = FitSettings {
+        iters,
+        max_iters: 4 * iters,
+        metric: Metric::Squared,
+        polish: FitPolish::F64,
+        thresholds: false,
+        fallback_max: cap,
+        accept: FitAccept::Always,
+    };
+    let jobs: Vec<(usize, GpuFitPlan)> = trees
+        .iter()
+        .enumerate()
+        .map(|(k, t)| (k, crate::fit::gpu_fit_plan(t).expect("a fit plan")))
+        .collect();
+    let mut slots = Flat(trees.to_vec());
+    let mut route = FitRoute::new(settings, false);
+    let step = route.fit_on_device(device, DeviceArm::Lm(DeviceLoss::Squared), &jobs, &mut slots, rows, 2);
+    assert!(step.ok, "the device call failed");
+    let mut exact = ScopedFits::new(rows, &settings, 2);
+    let done = route.finish(&mut exact);
+    for s in done.settled {
+        slots.0[s.slot] = s.tree;
+    }
+    (slots.0, done.counts.bounded)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
