@@ -8,7 +8,9 @@
 # file (.csv, .tsv, .txt) is read for its header, its row count, its first and last time stamp, the median step of
 # its first 10000 rows and the zero count per numeric column. No data row is printed.
 # Writes: <out> only. No network.
-# Exit: 0 written; 1 <dir> missing or not a directory; 2 usage.
+# A row stamped at or after --dev-end counts in rows_after_dev_end and enters no other statistic. A table whose
+# time stamps cannot be parsed is refused and nothing is written.
+# Exit: 0 written; 1 <dir> missing or not a directory; 2 usage; 3 unparseable table.
 set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
@@ -29,6 +31,7 @@ done
 
 end_day=${dev_end:0:10}
 end_compact=${end_day//-/}
+end_sec=$(date -u -d "${dev_end:0:10}T${dev_end:11:8}" +%s 2> /dev/null) || end_sec=$(date -u -d "${end_day}T00:00:00" +%s)
 
 # name_stamp <name>: prints the first date stamp of a file name, or nothing.
 name_stamp() {
@@ -57,7 +60,7 @@ pattern_of() {
   printf '%s\n' "$1" | sed -E 's/[0-9]{4}-[0-9]{2}-[0-9]{2}/YYYY-MM-DD/; t d; s/[0-9]{4}-[0-9]{2}/YYYY-MM/; t d; s/(^|[^0-9])(19|20)[0-9]{6}([^0-9]|$)/\1YYYYMMDD\3/; :d; s/^[A-Z0-9]{2,}([-_.])/<SYMBOL>\1/'
 }
 
-# one table file -> one `|` separated line: unit, first, last, median step, rows, columns, volume zeros, zero counts, header
+# one table file -> one `|` separated line: unit, first, last, median step, rows, columns, volume zeros, zero counts, rows after dev_end, header; or BAD
 read -r -d '' PROFILE_AWK << 'AWK'
 function isnum(s) { return s ~ /^[-+]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][-+]?[0-9]+)?$/ }
 function days(y, m, d,   a, yy, mm, era, yoe, doy, doe) {
@@ -85,34 +88,46 @@ function stamp(s,   ip, n, y, m, d, hh, mi, ss) {
   }
   unit = ""; return -1
 }
-BEGIN { FS = sep; nrows = 0 }
+BEGIN { FS = sep; nrows = 0; after = 0; bad = 0 }
+function isname(s) { return s != "" && !isnum(s) && s !~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]/ }
 NR == 1 {
-  ncol = NF; first = $1; gsub(/^"|"$/, "", first)
-  hasheader = !(isnum(first) || first ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]/)
-  tcol = 1
+  ncol = NF
+  hasheader = 1
   for (j = 1; j <= NF; j++) {
     name[j] = $j; gsub(/^"|"$/, "", name[j])
-    if (hasheader && tolower(name[j]) ~ /^(time|ts|timestamp|date|datetime|open_time|opentime|open_ts)$/) { tcol = j; break }
+    if (!isname(name[j])) hasheader = 0
   }
-  for (j = 1; j <= NF; j++) { if (!hasheader) name[j] = "column" j; else { name[j] = $j; gsub(/^"|"$/, "", name[j]) } }
-  if (hasheader) { hdr = $0; next }
-  hdr = "none"
+  tcol = 0
+  if (hasheader) {
+    for (j = 1; j <= NF; j++) if (tolower(name[j]) ~ /^(time|ts|timestamp|date|datetime|open_time|opentime|open_ts)$/) { tcol = j; break }
+    if (tcol == 0) tcol = 1
+    hdr = $0
+  } else {
+    for (j = 1; j <= NF; j++) {
+      v = $j; gsub(/^"|"$/, "", v); name[j] = "column" j
+      if (tcol == 0 && ((isnum(v) && length(v) >= 9 && v !~ /\./) || v ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]/)) tcol = j
+    }
+    if (tcol == 0) { bad = 1; exit }
+    hdr = "none"
+  }
+  if (hasheader) next
 }
 {
-  nrows++
   t = stamp($tcol)
-  if (unit != "") {
-    if (nrows == 1) { firstt = t; funit = unit }
-    lastt = t
-    if (nrows > 1 && nrows <= 10001) { st = t - prev; hist[st]++; nst++ }
-    prev = t
-  }
+  if (unit == "") { bad = 1; exit }
+  if (t >= endsec) { after++; next }
+  nrows++
+  if (nrows == 1) { firstt = t; funit = unit }
+  lastt = t
+  if (nrows > 1 && nrows <= 10001) { st = t - prev; hist[st]++; nst++ }
+  prev = t
   for (j = 1; j <= ncol; j++) {
     if (j == tcol) continue
     if (isnum($j)) { isn[j] = 1; if ($j + 0 == 0) zc[j]++ }
   }
 }
 END {
+  if (bad) { print "BAD"; exit }
   med = "none"
   if (nst > 0) {
     k = 0
@@ -128,7 +143,7 @@ END {
     zlist = zlist (zlist == "" ? "" : ",") name[j] "=" (zc[j] + 0)
     if (tolower(name[j]) == "volume") zv = zc[j] + 0
   }
-  printf "%s|%s|%s|%s|%d|%d|%d|%s|%s\n", (funit == "" ? "none" : funit), (firstt == "" ? "none" : firstt), (lastt == "" ? "none" : lastt), med, nrows, ncol, zv, (zlist == "" ? "none" : zlist), hdr
+  printf "%s|%s|%s|%s|%d|%d|%d|%s|%d|%s\n", (funit == "" ? "none" : funit), (firstt == "" ? "none" : firstt), (lastt == "" ? "none" : lastt), med, nrows, ncol, zv, (zlist == "" ? "none" : zlist), after, hdr
 }
 AWK
 
@@ -159,7 +174,12 @@ while IFS= read -r path; do
       sep=,
       first=$(head -n 1 "$path" | tr -d '\r')
       case $first in *$'\t'*) sep=$'\t' ;; esac
-      awk -v sep="$sep" "$PROFILE_AWK" "$path" >> "$tmp/tables"
+      line=$(awk -v sep="$sep" -v endsec="$end_sec" "$PROFILE_AWK" "$path")
+      if [ -z "$line" ] || [ "$line" = BAD ]; then
+        echo "data-profile.sh: $base: no parseable time column; refused, nothing written" >&2
+        exit 3
+      fi
+      printf '%s\n' "$line" >> "$tmp/tables"
       ;;
     *) others=$((others + 1)) ;;
   esac
@@ -185,12 +205,12 @@ function iso(sec,   d, s, z, era, doe, yoe, y, doy, mp, m, dd) {
   return sprintf("%04d-%02d-%02dT%02d:%02d:%02dZ", y, m, dd, int(s / 3600), int((s % 3600) / 60), int(s % 60))
 }
 {
-  n++; units[$1] = 1; rows += $5; zv += $7
+  n++; units[$1] = 1; rows += $5; zv += $7; after += $9
   if ($2 != "none" && (first == "" || $2 + 0 < first + 0)) first = $2
   if ($3 != "none" && (last == "" || $3 + 0 > last + 0)) last = $3
   if ($4 != "none") meds[++nm] = $4 + 0
-  hdrs[$9] = 1
-  if (n == 1) { cols = $6; zc = $8; hdr = $9 }
+  hdrs[$10] = 1
+  if (n == 1) { cols = $6; zc = $8; hdr = $10 }
 }
 END {
   nu = 0; ulist = ""
@@ -205,7 +225,7 @@ END {
   nh = 0; for (h in hdrs) nh++
   raw = "none"
   if (n > 0 && hdr != "none") raw = hdr
-  printf "tables=%d\nheader=%s\ncolumns=%s\nraw=%s\nrows=%d\nfirst=%s\nlast=%s\nmed=%s\nunit=%s\nzv=%d\nzc=%s\nvariants=%d\n", n, (n > 0 ? hdr : "none"), (n > 0 ? cols : 0), raw, rows, (first == "" ? "none" : iso(first + 0)), (last == "" ? "none" : iso(last + 0)), med, ulist, zv, (n > 0 ? zc : "none"), nh
+  printf "tables=%d\nheader=%s\ncolumns=%s\nraw=%s\nrows=%d\nafter=%d\nfirst=%s\nlast=%s\nmed=%s\nunit=%s\nzv=%d\nzc=%s\nvariants=%d\n", n, (n > 0 ? hdr : "none"), (n > 0 ? cols : 0), raw, rows, after, (first == "" ? "none" : iso(first + 0)), (last == "" ? "none" : iso(last + 0)), med, ulist, zv, (n > 0 ? zc : "none"), nh
 }' "$tmp/tables")
 
 get() { sed -n "s/^$1=//p" <<< "$summary" | head -n 1; }
@@ -228,6 +248,7 @@ mkdir -p "$(dirname "$out")" || exit 1
   echo "columns: $(get columns)"
   echo "raw_columns: $raw"
   echo "rows: $(get rows)"
+  echo "rows_after_dev_end: $(get after)"
   echo "first_ts: $(get first)"
   echo "last_ts: $(get last)"
   echo "median_step_seconds: $(get med)"

@@ -67,6 +67,43 @@ bash "$PROF" --dir "$D" --dev-end nonsense --out "$T/x.md" > /dev/null 2>&1
 check bad-date "$?" 2
 check no-output-on-error "$([ -e "$T/x.md" ] && echo yes || echo no)" no
 
+
+# defect 1: a headerless file with a text first field prints no field of any row
+H=$T/headerless
+mkdir -p "$H"
+printf 'SECRETSYM,1577836800,12.3456,99\nSECRETSYM,1577840400,12.4,98\n' > "$H/x.csv"
+bash "$PROF" --dir "$H" --dev-end 2023-11-15 --out "$T/h.md" > "$T/h.out" 2>&1
+check headerless-rc "$?" 0
+check headerless-header "$(key header "$T/h.md")" none
+check headerless-columns "$(key columns "$T/h.md")" 4
+check headerless-rows "$(key rows "$T/h.md")" 2
+for marker in SECRETSYM 12.3456 12.4; do
+  check "headerless-no-$marker" "$(cat "$T/h.md" "$T/h.out" | grep -c -F "$marker")" 0
+done
+
+# defect 2: an undated file that spans dev_end contributes only its rows before it
+S=$T/span
+mkdir -p "$S"
+printf 'time,open,volume\n1577836800,1.5,0\n1700000000,2.5,7\n1700003600,3.5,0\n1800000000,4.5,0\n' > "$S/all.csv"
+bash "$PROF" --dir "$S" --dev-end 2023-11-15 --out "$T/s.md" > "$T/s.out" 2>&1
+check span-rc "$?" 0
+check span-rows "$(key rows "$T/s.md")" 3
+check span-after "$(key rows_after_dev_end "$T/s.md")" 1
+check span-last "$(key last_ts "$T/s.md")" 2023-11-14T23:13:20Z
+check span-zero-volume "$(key zero_volume_rows "$T/s.md")" 2
+check span-zero-counts "$(key zero_counts "$T/s.md")" "open=0,volume=2"
+for marker in 1800000000 2027 2023-11-15 4.5; do
+  check "span-no-$marker" "$(grep -v '^time_unit' "$T/s.md" "$T/s.out" | grep -c -F "$marker")" 0
+done
+
+# a file whose time stamps cannot be parsed is refused without partial output
+U=$T/unparsable
+mkdir -p "$U"
+printf 'time,open\nsoon,1\nlater,2\n' > "$U/u.csv"
+bash "$PROF" --dir "$U" --dev-end 2023-11-15 --out "$T/u.md" > /dev/null 2>&1
+check unparsable-rc "$?" 3
+check unparsable-no-output "$([ -e "$T/u.md" ] && echo yes || echo no)" no
+
 # the contract table and the adapt template hold the same keys
 contract=$(sed -n 's/^| `\([^|]*\)` | .*/\1/p' "$V/06_data/references/type-stage-contract.md" | tr -d '`' | tr ',' '\n' | tr -d ' ' | grep -v '^Key$' | LC_ALL=C sort)
 template=$(sed -n 's/^\([a-z_]*\): .*/\1/p' "$V/_templates/adapt.md" | LC_ALL=C sort)
