@@ -3,7 +3,7 @@
 #                          --bin <path> --worktree <path> [--store <path>]... [--cmd-file <path>]
 #                          [--features <text>] [--mask <cpu list>] [--split <id>] [--seed <n>]
 #        run-record.sh close --id <id> --log <log>... [--metrics <file>] [--after-seal <verdict file>]
-#                            [--artefact <path>]... [--deviation <text>]...
+#                            [--artefact <path>]... [--deviation <text>]... [--locked-range <start,end>]...
 #        run-record.sh latest [--kind <kind>] [--slug <slug>]
 # Writes: only under $VLOCAL/runs/ (RCSR_LOCAL overrides $VLOCAL).
 # Exit: 0 ok; 1 refused or failed; 2 usage.
@@ -16,7 +16,9 @@
 #   sets end, load and status (ok, failed or unknown without any rc line), then regenerates runs/_index.md.
 #   A --metrics JSON file that reports a locked read is refused (exit 1) unless --after-seal names an existing, non-empty verdict file.
 #   Locked-read keys (the engine's own detector): protocol.test_read, protocol.lockbox.evaluated, protocol.lockbox.rows > 0,
-#   protocol.lockbox.read_count > 0, protocol.lockbox.read_marker, lockbox.evaluated, lockbox.read_count > 0, locked_reads.
+#   protocol.lockbox.read_count > 0, protocol.lockbox.read_marker (any value), lockbox.evaluated, lockbox.read_count > 0, locked_reads,
+#   and the range reads: pooled and members[].series period_time inside [start,end), window_definition and cpcv.segments overlapping,
+#   for protocol.lockbox, its declared and also, the top-level lockbox and each --locked-range START,END (epoch seconds).
 #   Key metrics keep only the finite numbers and booleans at the top level of a development report; no raw data is stored.
 # latest: prints the path of the newest card (by start, then id), of one kind with --kind, of an id ending in -<slug> with --slug. Exit 1 when none.
 set -uo pipefail
@@ -146,20 +148,30 @@ cmd_new() {
   echo "$f"
 }
 
-# locked_reason <json file>: prints why the report reads locked data; returns 1 when it does not.
+# locked_reason <json file> <extra ranges as a JSON array of [start,end]>: prints why the report reads locked data; returns 1 when it does not.
+# Range logic as the engine's report check: a period time inside [s,e) or a window or segment with a < e and b > s, for every range
+# of protocol.lockbox, its declared and also members, the top-level lockbox, and the extra ranges. The reason holds no time.
 locked_reason() {
-  jq -r '
+  jq -r --argjson extra "$2" '
+    def isnum: type == "number";
+    def rng: select(type == "object" and (.start | isnum) and (.end | isnum) and .end > .start) | [.start, .end];
     (.protocol? | objects // {}) as $p
     | ($p.lockbox? | objects // {}) as $pl
     | (.lockbox? | objects // {}) as $l
+    | ([$pl, ($pl.declared? // null), ($pl.also? // null), $l] | map(rng) + $extra) as $ranges
+    | ([.pooled?.period_time?, (.members[]?.series?.period_time?)] | map(select(type == "array") | .[] | select(isnum))) as $times
+    | ([(.window_definition[]? | select(type == "object" and (.test_start | isnum) and (.test_end | isnum)) | [.test_start, .test_end]),
+        (.cpcv?.segments[]? | select(type == "object" and (.start | isnum) and (.end | isnum)) | [.start, .end])]) as $wins
     | [ (if $p.test_read == true then "protocol.test_read is true" else empty end),
         (if $pl.evaluated == true then "protocol.lockbox.evaluated is true" else empty end),
         (if (($pl.rows // 0) | numbers) > 0 then "protocol.lockbox.rows is above 0" else empty end),
         (if (($pl.read_count // 0) | numbers) > 0 then "protocol.lockbox.read_count is above 0" else empty end),
-        (if ($pl.read_marker // null) != null then "protocol.lockbox.read_marker is set" else empty end),
+        (if ($pl | has("read_marker")) then "protocol.lockbox.read_marker is set" else empty end),
         (if $l.evaluated == true then "lockbox.evaluated is true" else empty end),
         (if (($l.read_count // 0) | numbers) > 0 then "lockbox.read_count is above 0" else empty end),
-        (if (type == "object" and has("locked_reads")) then "locked_reads is present" else empty end)
+        (if (type == "object" and has("locked_reads")) then "locked_reads is present" else empty end),
+        (if ([$ranges[] as $r | $times[] | select(. >= $r[0] and . < $r[1])] | length) > 0 then "period times lie inside a locked range" else empty end),
+        (if ([$ranges[] as $r | $wins[] | select(.[0] < $r[1] and .[1] > $r[0])] | length) > 0 then "a test window overlaps a locked range" else empty end)
       ] | join("; ")' "$1" 2> /dev/null | { read -r r; [ -n "$r" ] && echo "$r"; }
 }
 
@@ -184,17 +196,21 @@ regen_index() {
 }
 
 cmd_close() {
-  local id= metrics= seal= logs=() arts=() devs=() f l
+  local id= metrics= seal= logs=() arts=() devs=() ranges=() extra="[]" f l r
   while [ $# -gt 0 ]; do
     [ $# -ge 2 ] || bad "$1 needs a value"
     case $1 in
       --id) id=$2 ;; --log) logs+=("$2") ;; --metrics) metrics=$2 ;; --after-seal) seal=$2 ;;
-      --artefact) arts+=("$2") ;; --deviation) devs+=("$2") ;;
+      --artefact) arts+=("$2") ;; --deviation) devs+=("$2") ;; --locked-range) ranges+=("$2") ;;
       *) bad "unexpected argument '$1'" ;;
     esac
     shift 2
   done
   [ -n "$id" ] && [ ${#logs[@]} -gt 0 ] || bad "close needs --id and at least one --log"
+  for r in "${ranges[@]}"; do
+    [[ $r =~ ^[0-9]+(\.[0-9]+)?,[0-9]+(\.[0-9]+)?$ ]] && awk -F, -v r="$r" 'BEGIN { split(r, a, ","); exit !(a[2] > a[1]) }' || bad "--locked-range needs START,END (epoch seconds, END after START): $r"
+    extra=$(jq -c --argjson e "[${r}]" '. + [$e]' <<< "$extra")
+  done
   valid_id "$id" || bad "--id must be YYYYMMDD-slug: $id"
   f=$RUNS/$id/run.md
   [ -f "$f" ] || die "no run card $f"
@@ -204,7 +220,7 @@ cmd_close() {
   if [ -n "$metrics" ]; then
     [ -f "$metrics" ] || die "no such metrics file: $metrics"
     jq -e . "$metrics" > /dev/null 2>&1 || die "metrics file is not JSON: $metrics"
-    if reason=$(locked_reason "$metrics"); then
+    if reason=$(locked_reason "$metrics" "$extra"); then
       if [ -z "$seal" ]; then
         die "refused: $metrics reports a locked read ($reason); a locked-window result is recorded only after the seal, with --after-seal <verdict file>"
       fi

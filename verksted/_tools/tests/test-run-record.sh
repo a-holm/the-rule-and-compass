@@ -63,7 +63,7 @@ printf 'STOP: Xid check failed (start=missing); failing closed\nplain line\n' > 
 printf 'plain line\n' > "$T/e.log"
 : > "$T/empty.md"
 printf 'not json\n' > "$T/bad.json"
-before=$(cd "$T" && find . -path ./local -prune -o -type f -exec cksum {} + | sort)
+before=$(cd "$T" && find . \( -path ./local -o -path ./cases \) -prune -o -type f -exec cksum {} + | sort)
 
 # new
 out=$(rr new --id 20260101-first --kind search --bin "$T/rcsr" --worktree "$W" --store "$T/store1.csv" --store "$T/store2.csv" \
@@ -159,6 +159,47 @@ check seal-note "$(key "$CL" locked_read | grep -c "^after seal, verdict $T/verd
 check seal-alone "$(rc_of "$(rr close --id 20260101-locked --log "$T/a.log" --after-seal "$T/verdict.md")")" "rc=2"
 check metrics-not-json "$(rc_of "$(rr close --id 20260101-locked --log "$T/a.log" --metrics "$T/bad.json")")" "rc=1"
 
+
+# locked-read detection, one isolated case per key and per range source
+chk_locked() { # <name> <json> <want rc>
+  mkdir -p "$T/cases"
+  printf '%s\n' "$2" > "$T/cases/case.json"
+  rr new --id 20260102-case --kind walkforward --bin "$T/rcsr" --worktree "$W" > /dev/null
+  out=$(rr close --id 20260102-case --log "$T/a.log" --metrics "$T/cases/case.json")
+  check "key-$1" "$(rc_of "$out")" "rc=$3"
+  rm -rf "$L/runs/20260102-case"
+}
+LB='"lockbox":{"start":100,"end":200,"rows":0}'
+chk_locked clean '{"stop_reason":"time","protocol":{"test_read":false,"lockbox":{"rows":0,"read_count":0,"start":100,"end":200}},"lockbox":{"evaluated":false,"rows":0}}' 0
+chk_locked test_read '{"protocol":{"test_read":true}}' 1
+chk_locked pl_evaluated '{"protocol":{"lockbox":{"evaluated":true}}}' 1
+chk_locked pl_rows '{"protocol":{"lockbox":{"rows":3}}}' 1
+chk_locked pl_read_count '{"protocol":{"lockbox":{"read_count":1}}}' 1
+chk_locked read_marker_true '{"protocol":{"lockbox":{"read_marker":true}}}' 1
+chk_locked read_marker_false '{"protocol":{"lockbox":{"read_marker":false}}}' 1
+chk_locked lb_evaluated '{"lockbox":{"evaluated":true}}' 1
+chk_locked lb_read_count '{"lockbox":{"read_count":2}}' 1
+chk_locked locked_reads '{"locked_reads":[]}' 1
+chk_locked range_window "{\"protocol\":{\"test_read\":false,$LB},\"window_definition\":[{\"test_start\":150,\"test_end\":180}]}" 1
+chk_locked range_window_straddle "{\"protocol\":{$LB},\"window_definition\":[{\"test_start\":50,\"test_end\":101}]}" 1
+chk_locked range_pooled "{\"protocol\":{$LB},\"pooled\":{\"period_time\":[150,160]}}" 1
+chk_locked range_pooled_start "{\"protocol\":{$LB},\"pooled\":{\"period_time\":[50,100]}}" 1
+chk_locked range_members "{\"protocol\":{$LB},\"members\":[{\"series\":{\"period_time\":[10]}},{\"series\":{\"period_time\":[199]}}]}" 1
+chk_locked range_cpcv "{\"protocol\":{$LB},\"cpcv\":{\"segments\":[{\"start\":190,\"end\":300}]}}" 1
+chk_locked range_declared '{"protocol":{"lockbox":{"declared":{"start":100,"end":200}}},"pooled":{"period_time":[120]}}' 1
+chk_locked range_also '{"protocol":{"lockbox":{"also":{"start":100,"end":200}}},"pooled":{"period_time":[120]}}' 1
+chk_locked range_top_lockbox '{"lockbox":{"start":100,"end":200,"rows":0},"window_definition":[{"test_start":150,"test_end":180}]}' 1
+chk_locked near_miss_window "{\"protocol\":{$LB},\"window_definition\":[{\"test_start\":50,\"test_end\":100},{\"test_start\":200,\"test_end\":250}],\"cpcv\":{\"segments\":[{\"start\":0,\"end\":100},{\"start\":200,\"end\":210}]}}" 0
+chk_locked near_miss_period "{\"protocol\":{$LB},\"pooled\":{\"period_time\":[99,200,250]},\"members\":[{\"series\":{\"period_time\":[1,200]}}]}" 0
+chk_locked bad_range_ignored '{"protocol":{"lockbox":{"start":200,"end":100}},"pooled":{"period_time":[150]}}' 0
+mkdir -p "$T/cases"
+printf '%s\n' "$(printf '{"pooled":{"period_time":[150]}}')" > "$T/cases/case.json"
+rr new --id 20260102-case --kind walkforward --bin "$T/rcsr" --worktree "$W" > /dev/null
+check extra-range "$(rc_of "$(rr close --id 20260102-case --log "$T/a.log" --metrics "$T/cases/case.json" --locked-range 100,200)")" "rc=1"
+check extra-range-clear "$(rc_of "$(rr close --id 20260102-case --log "$T/a.log" --metrics "$T/cases/case.json" --locked-range 200,300)")" "rc=0"
+check extra-range-bad "$(rc_of "$(rr close --id 20260102-case --log "$T/a.log" --metrics "$T/cases/case.json" --locked-range 5,5)")" "rc=2"
+rm -rf "$L/runs/20260102-case"
+
 # argument errors
 check close-no-card "$(rc_of "$(rr close --id 20260101-none --log "$T/a.log")")" "rc=1"
 check close-no-log "$(rc_of "$(rr close --id 20260101-first)")" "rc=2"
@@ -168,7 +209,7 @@ check no-args "$(rc_of "$(RCSR_LOCAL=$L bash "$RR" 2>&1; echo "rc=$?")")" "rc=2"
 check help "$(RCSR_LOCAL=$L bash "$RR" --help | head -n 1 | cut -c1-20)" "Usage: run-record.sh"
 
 # nothing outside the local area changed; nothing stray inside runs/
-check outside-unchanged "$(cd "$T" && find . -path ./local -prune -o -type f -exec cksum {} + | sort)" "$before"
+check outside-unchanged "$(cd "$T" && find . \( -path ./local -o -path ./cases \) -prune -o -type f -exec cksum {} + | sort)" "$before"
 check no-temp-files "$(find "$L" -name '.card.*' -o -name '.index.*' | wc -l)" "0"
 check only-runs "$(ls "$L")" "runs"
 
