@@ -12145,7 +12145,9 @@ OPTIONS:
                              horizon a period is one timestamp. With a target
                              spec a different value exits 2; with --horizon
                              alone a value more than 1 % off exits 2, else it
-                             overrides
+                             overrides;
+                             with neither, a value more than 1 % off the
+                             inferred one exits 2
   --device-pnl               recompute each test block through the fused
                              long-only reduction (f64 canonical segments; the
                              CUDA kernel when built with --features cuda) and

@@ -2576,6 +2576,7 @@ impl Accum {
         let mut strata_in = StrataIn::new(opts.regime_exprs.len());
         let mut entry_times = 0usize;
         let validated_windows = self.windows.iter().filter(|d| d.validation_start.is_some()).count();
+        check_undeclared_ppy(spec, opts, &self.windows)?;
         let window_count = self.windows.len();
         for (window_index, mut d) in self.windows.into_iter().enumerate() {
             // #1199: the target grid, its period width and the rows that define it come from the rows before the gate.
@@ -4801,6 +4802,27 @@ fn check_explicit_ppy(spec: &EvalSpec, opts: &ProtocolOptions) -> Result<(), Str
                 given, derived, s
             ));
         }
+    }
+    Ok(())
+}
+
+/// #1328: an explicit `--periods-per-year` with no declared period width is used as given, but `rcsr trials`
+/// compares it with the median step of `pooled.period_time`. Refuse a value more than the `trials` tolerance off
+/// the value the inferred branch of `window_period` would write.
+fn check_undeclared_ppy(spec: &EvalSpec, opts: &ProtocolOptions, windows: &[WindowData]) -> Result<(), String> {
+    let (Some(given), None) = (spec.periods_per_year, declared_period(spec, opts)) else {
+        return Ok(());
+    };
+    let mut steps: Vec<f64> = windows.iter().filter_map(|d| infer_frequency(&d.test_rows).1).collect();
+    let Some(step) = median(&mut steps) else {
+        return Ok(());
+    };
+    let implied = SECONDS_PER_YEAR / step;
+    if ((given - implied) / implied).abs() > crate::trials::ANNUALIZATION_TOLERANCE {
+        return Err(format!(
+            "--periods-per-year {} conflicts with the median step of the labelled rows ({} s, {} periods per year; tolerance 1 %); set --horizon or a target spec, or remove the flag",
+            given, step, implied
+        ));
     }
     Ok(())
 }
