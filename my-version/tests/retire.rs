@@ -211,7 +211,7 @@ fn wf(data: &str, extra: &[&str]) -> (i32, String, String) {
     let w = format!("w,{},{},{},{}", T0, T0 + 100 * H, T0 + 110 * H, T0 + 250 * H);
     let mut a = vec![
         "walkforward", "--data", data, "--target", "y", "--expr", "x", "--time", "ts", "--horizon", "5",
-        "--cost-bps", "5", "--periods-per-year", "365", "--json", "--window", &w,
+        "--cost-bps", "5", "--periods-per-year", "6307200", "--json", "--window", &w,
     ];
     a.extend_from_slice(extra);
     rcsr(&a)

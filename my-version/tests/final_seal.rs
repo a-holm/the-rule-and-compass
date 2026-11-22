@@ -64,7 +64,7 @@ fn store_rows(dir: &Path, name: &str, rows: i64) -> String {
 fn wf(data: &str, ledger: &str, exprs: &[&str], extra: &[&str]) -> (i32, String, String) {
     let mut a = vec![
         "walkforward", "--data", data, "--target", "y", "--time", "ts", "--horizon", "5", "--cost-bps", "5",
-        "--periods-per-year", "365", "--json", "--ledger", ledger,
+        "--periods-per-year", "6307200", "--json", "--ledger", ledger,
     ];
     for e in exprs {
         a.extend_from_slice(&["--expr", e]);
@@ -311,7 +311,7 @@ fn ladder_fixture(name: &str) -> (Scratch, PathBuf, String, String, String, Stri
     let wfd = window("dev", 0, 150, 160, 250);
     let (code, _, err) = rcsr(&[
         "walkforward", "--data", &d, "--target", "y", "--expr", "f1", "--time", "ts", "--group-by", "sym", "--horizon", "5",
-        "--cost-bps", "5", "--periods-per-year", "365", "--json", "--ledger", &l, "--window", &wfd,
+        "--cost-bps", "5", "--periods-per-year", "6307200", "--json", "--ledger", &l, "--window", &wfd,
     ]);
     assert_eq!(code, 0, "{}", err);
     let (code, _, err) = rcsr(&["protocol", "seal", "--final", "--ledger", &l, "--out", &sealed]);
@@ -517,7 +517,7 @@ fn sealed_ladder_read(name: &str) -> (Scratch, String, String, String) {
     let wfd = window("dev", 0, 150, 160, 250);
     let (code, _, err) = rcsr(&[
         "walkforward", "--data", &d, "--target", "y", "--expr", "f1", "--time", "ts", "--group-by", "sym", "--horizon", "5",
-        "--cost-bps", "5", "--periods-per-year", "365", "--json", "--ledger", &l, "--window", &wfd,
+        "--cost-bps", "5", "--periods-per-year", "6307200", "--json", "--ledger", &l, "--window", &wfd,
     ]);
     assert_eq!(code, 0, "{}", err);
     let (code, _, err) = rcsr(&["protocol", "seal", "--final", "--ledger", &l, "--out", &sealed]);

@@ -302,7 +302,7 @@ fn top_tercile_book_matches_hand_fixture() {
     let o = rcsr(&[
         "walkforward", "--data", &data, "--target", "r", "--expr", "x", "--vars", "x", "--time", "t",
         "--group-by", "sym", "--horizon", "3600", "--cost-bps", "10", "--window", &w,
-        "--periods-per-year", "365", "--policy", "top-tercile", "--out", &wf_path, "--json",
+        "--periods-per-year", "8760", "--policy", "top-tercile", "--out", &wf_path, "--json",
     ]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let j = read_json(&wf_path);

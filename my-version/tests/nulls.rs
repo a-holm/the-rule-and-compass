@@ -763,7 +763,7 @@ fn walkforward_locked_test_refuses_null_store() {
     let wf = |extra: &[&str]| -> Output {
         let mut a = vec![
             "walkforward", "--data", &data, "--target", "target", "--expr", "x", "--time", "ts", "--horizon", "1", "--cost-bps", "5",
-            "--lockbox", "200,300", "--ledger", &ledger, "--periods-per-year", "365", "--json",
+            "--lockbox", "200,300", "--ledger", &ledger, "--periods-per-year", "31536000", "--json",
         ];
         a.extend_from_slice(extra);
         run(&a)
@@ -951,7 +951,7 @@ fn regimes_after_read_refuses_null_store() {
     let (ledger, sealed) = (p(dir, "ledger.jsonl"), p(dir, "sealed.json"));
     let wf = |window: &str, extra: &[&str]| -> Output {
         let mut a = vec![
-            "walkforward", "--data", &data, "--target", "y", "--time", "ts", "--horizon", "5", "--cost-bps", "5", "--periods-per-year", "365", "--json",
+            "walkforward", "--data", &data, "--target", "y", "--time", "ts", "--horizon", "5", "--cost-bps", "5", "--periods-per-year", "6307200", "--json",
             "--ledger", &ledger, "--expr", "x", "--window", window,
         ];
         a.extend_from_slice(extra);

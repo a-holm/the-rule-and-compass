@@ -121,7 +121,7 @@ fn an_explicit_lockbox_flag_declares_the_range_for_a_csv_without_a_sidecar() {
 fn wf(data: &str, ledger: Option<&str>, extra: &[&str]) -> (i32, String, String) {
     let mut a = vec![
         "walkforward", "--data", data, "--target", "y", "--expr", "x", "--time", "ts", "--horizon", "5",
-        "--cost-bps", "5", "--periods-per-year", "365", "--json",
+        "--cost-bps", "5", "--periods-per-year", "6307200", "--json",
     ];
     if let Some(l) = ledger {
         a.extend_from_slice(&["--ledger", l]);
@@ -468,7 +468,7 @@ fn development_outputs_ignore_locked_prices() {
         let window = format!("f1,{},{},{},{}", T0, T0 + 150 * H, T0 + 160 * H, test_end);
         rcsr(&[
             "walkforward", "--data", d, "--target", "y", "--expr", "f1", "--time", "ts", "--group-by", "sym",
-            "--horizon", "3600", "--cost-bps", "5", "--periods-per-year", "365", "--json", "--window", &window,
+            "--horizon", "3600", "--cost-bps", "5", "--periods-per-year", "8760", "--json", "--window", &window,
         ])
     };
     for d in [&a, &b] {
@@ -508,7 +508,7 @@ fn walkforward_locked_scheme_trains_at_least_the_label_purge_before_the_start() 
     let run = |extra: &[&str]| {
         let mut args = vec![
             "walkforward", "--data", a.as_str(), "--target", "y", "--expr", "f1", "--time", "ts", "--group-by",
-            "sym", "--horizon", "3600", "--cost-bps", "5", "--periods-per-year", "365", "--json", "--ledger", &l,
+            "sym", "--horizon", "3600", "--cost-bps", "5", "--periods-per-year", "8760", "--json", "--ledger", &l,
         ];
         args.extend_from_slice(extra);
         rcsr(&args)
@@ -1054,7 +1054,7 @@ fn emb_wf(data: &str, test_start: i64, test_end: i64, extra: &[&str]) -> (i32, S
     let window = format!("f1,{},{},{},{}", T0, T0 + 100 * H, test_start, test_end);
     let mut a = vec![
         "walkforward", "--data", data, "--target", "y", "--expr", "f1", "--time", "ts", "--group-by", "sym",
-        "--horizon", "3600", "--cost-bps", "5", "--periods-per-year", "365", "--threshold-fixed", "0", "--json",
+        "--horizon", "3600", "--cost-bps", "5", "--periods-per-year", "8760", "--threshold-fixed", "0", "--json",
         "--window", &window,
     ];
     a.extend_from_slice(extra);
@@ -1327,7 +1327,7 @@ fn a_sealed_read_keeps_every_other_declared_range_sealed() {
     let window = format!("w,{},{},{},{}", T0, T0 + 150 * H, primary.start, primary.end);
     let (code, _, err) = rcsr(&[
         "walkforward", "--data", &d, "--target", "y", "--expr", "f1", "--time", "ts", "--group-by", "sym",
-        "--horizon", "3600", "--cost-bps", "5", "--periods-per-year", "365", "--json", "--locked-test", "--ledger", &l,
+        "--horizon", "3600", "--cost-bps", "5", "--periods-per-year", "8760", "--json", "--locked-test", "--ledger", &l,
         "--sealed", &sealed, "--window", &window,
     ]);
     assert_eq!(code, 3, "{}", err);
@@ -1909,7 +1909,7 @@ fn ladder_verify_read_without_allow_in_sample_scores_nothing() {
     let dev = format!("dev,{},{},{},{}", T0, T0 + 150 * H, T0 + 160 * H, T0 + 250 * H);
     let (code, _, err) = rcsr(&[
         "walkforward", "--data", &data, "--target", "y", "--expr", "f1", "--time", "ts", "--group-by", "sym", "--horizon", "5",
-        "--cost-bps", "5", "--periods-per-year", "365", "--json", "--ledger", &l, "--lockbox", &lock, "--window", &dev,
+        "--cost-bps", "5", "--periods-per-year", "6307200", "--json", "--ledger", &l, "--lockbox", &lock, "--window", &dev,
     ]);
     assert_eq!(code, 0, "{}", err);
     let (code, _, err) = rcsr(&["protocol", "seal", "--final", "--ledger", &l, "--out", &sealed]);
