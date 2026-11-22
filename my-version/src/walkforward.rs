@@ -6470,7 +6470,7 @@ mod missing_score_cut_tests {
         let rows = rows();
         let scores: Vec<f64> =
             (0..600).map(|i| if (120..160).contains(&(i % 300)) { f64::NAN } else { 1.0 + ((i as f64) * 0.618_033_988_749_894_9).fract() }).collect();
-        let fit = CutFit { min_entry_times: 1, blocks: 2, lambda: 1.0 };
+        let fit = CutFit { min_entry_times: 1, blocks: 1, lambda: 1.0 };
         let trading_rows = crate::trading::TradingRows {
             time: rows.iter().map(|r| r.time).collect(),
             group: rows.iter().map(|r| r.group).collect(),

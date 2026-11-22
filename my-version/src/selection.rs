@@ -1172,7 +1172,8 @@ mod tests {
         let q: Vec<f64> = (0..600).map(|i| if (120..160).contains(&(i % 300)) { 0.0 } else { 1.0 }).collect();
         let spec = crate::trading::TradingSpec { cost_bps: 10.0, threshold: 0.5, ..crate::trading::TradingSpec::default() };
         let trading_rows = crate::trading::TradingRows { time: s.times.clone(), group: s.groups.clone(), funding: Vec::new() };
-        for (rule, expect) in [(MissingScore::Flat, 1usize), (MissingScore::Hold, 0usize)] {
+        // `Hold` carries the score through the stretch loss, so it also prefers `q`; only `Flat` differs from the old carried book.
+        for (rule, expect) in [(MissingScore::Flat, 1usize), (MissingScore::Hold, 1usize)] {
             let options = BandOptions { missing_score: rule, ..options() };
             let candidates: Vec<BandCandidate<'_>> = [(&p, 0usize), (&q, 1usize)]
                 .iter()
