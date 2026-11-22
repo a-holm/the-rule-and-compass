@@ -10,6 +10,6 @@ Git-ignored state of this machine and campaign. Layout and rules: `verksted/_sha
 | `rules-local.md` | rules for this machine or campaign: paths, core masks, lock dates | the orchestrator |
 | `lessons/<type>.md` | lessons that hold for this data or machine | `06_data/stages/09_lessons` |
 | `measurements/<date>-<slug>.md` | one record per measurement | the measuring agent |
-| `runs/<run-id>/run.md` | one run card per run | `_tools/run-record.sh` |
-| `runs/_index.md` | one line per run, newest first, generated | `_tools/run-record.sh` |
+| `runs/<run-id>/run.md` | one run card per run | `run-record.sh` |
+| `runs/_index.md` | one line per run, newest first, generated | `run-record.sh` |
 | `datasets/<id>/` | `card.md`, `adapt.md`, `manifest.md` of a prepared dataset | `06_data/stages/08_verify_manifest` |

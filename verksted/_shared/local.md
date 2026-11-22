@@ -17,8 +17,8 @@ Where: `$VLOCAL`, defined in `_tools/lib.sh` as `verksted/_local/` of the main c
 | `rules-local.md` | rules that hold on this machine or in this campaign: paths, core masks, lock dates | the orchestrator |
 | `lessons/<type>.md` | lessons that hold for this data or machine | `06_data/stages/09_lessons` |
 | `measurements/<date>-<slug>.md` | one record per measurement, method in `measurement.md` | the measuring agent |
-| `runs/<run-id>/run.md` | one run card per run | `_tools/run-record.sh` |
-| `runs/_index.md` | one line per run, newest first, generated | `_tools/run-record.sh` |
+| `runs/<run-id>/run.md` | one run card per run | `run-record.sh` |
+| `runs/_index.md` | one line per run, newest first, generated | `run-record.sh` |
 | `datasets/<id>/` | `card.md`, `adapt.md`, `manifest.md` of a prepared dataset | `06_data/stages/08_verify_manifest` |
 
 A run card holds: id, kind, start and end (UTC), the exact command or the path of the script that holds it, binary sha256 and commit, build features, the stores read with their sha256, split id and seed, CPU mask, wall seconds, user CPU seconds, lock-hours, machine load, new Xid lines, key metrics on development rows, paths of the artefacts outside git, deviations, status.
