@@ -1425,14 +1425,82 @@ fn a_lexicase_long_pnl_run_resumes_exactly() {
     let text = checkpoint_text(&lex(12), &train, &test);
     let (resumed, resumed_state) = last_generation(Some(Checkpoint::from_text(&text).expect("parse")));
     assert_eq!(full_state, resumed_state, "populations, generators and the search archive must match");
-    // A resumed run reports the front rebuilt on every row, which takes the
-    // canonical member among trees with the same regret bits; an uninterrupted
-    // CPU run reports the search archive. Compare the reported errors and costs.
-    let bits = |o: &Outcome| o.archive.items.iter().map(|s| (s.error.to_bits(), s.cost.to_bits())).collect::<Vec<_>>();
-    assert_eq!(bits(&uninterrupted), bits(&resumed));
+    assert_eq!(describe(&uninterrupted), describe(&resumed));
     assert_eq!(uninterrupted.candidates_evaluated, resumed.candidates_evaluated);
     let lexicographic = search::run(&Config { selection: search::Selection::Lexicographic, ..lex(24) }, &train, &test);
     assert_ne!(uninterrupted.archive.hash(), lexicographic.archive.hash(), "lexicase must change the trajectory");
+}
+
+/// A `--fitness pnl` book with 2 groups and 2 time blocks: trees with the same
+/// positions have the same regret bits, so errors tie within a cost.
+fn block_book_fitness(train: &Sample) -> search::Fitness {
+    let slice = rcsr::data::TradingSlice {
+        rows: rcsr::trading::TradingRows {
+            time: (0..train.len()).map(|i| 900.0 * (i % 120) as f64).collect(),
+            group: (0..train.len()).map(|i| (i / 120) as u64).collect(),
+            funding: Vec::new(),
+        },
+        ret: train.x.iter().map(|r| 0.002 * (r[1] - 0.5)).collect(),
+    };
+    let spec = rcsr::trading::TradingSpec { cost_bps: 2.0, min_trades: 0, ..Default::default() };
+    let book = rcsr::trading::FitnessBook::with_blocks(&slice, &spec, 900.0, 2, 1.0).expect("book");
+    search::Fitness::LongPnl(std::sync::Arc::new(book))
+}
+
+/// #1171: a CPU run resumed from an exact (f64) checkpoint reports the front
+/// trees of the uninterrupted run, wherever the run is cut. Under `--fitness
+/// pnl` trees with the same positions tie on error bits, so the reported tree
+/// at a cost depends on whether the front is rebuilt after the resume.
+#[test]
+fn a_resumed_cpu_run_reports_the_uninterrupted_front_trees() {
+    let train = sample(240);
+    let test = sample(80);
+    let mut differing = Vec::new();
+    for seed in 17u32..20 {
+        let fixtures = [
+            ("pnl", Config { generations: 24, gpu: false, ..pnl_config(seed, 5.0, &train) }),
+            ("block pnl", Config { generations: 24, gpu: false, fitness: block_book_fitness(&train), ..config(seed) }),
+        ];
+        for (name, base) in fixtures {
+            let uninterrupted = search::run(&base, &train, &test);
+            for cut in [1usize, 5, 12, 23] {
+                let text = checkpoint_text(&Config { generations: cut, ..base.clone() }, &train, &test);
+                let saved = Checkpoint::from_text(&text).expect("parse");
+                let resumed = search::run_resumable(&base, &train, &test, Some(saved), 0, |_| {}).expect("resume");
+                if describe(&uninterrupted) != describe(&resumed) {
+                    differing.push(format!("{name} seed {seed} cut {cut}"));
+                }
+            }
+            let (chunks, _) = chunked(&base, true, 3, &train, &test);
+            if describe(&uninterrupted) != describe(&chunks) {
+                differing.push(format!("{name} seed {seed} interim chunks"));
+            }
+        }
+    }
+    assert!(differing.is_empty(), "resumed fronts differ from the uninterrupted front: {differing:?}");
+}
+
+/// #1171: a checkpoint whose errors are not exact keeps the rebuild. On the
+/// fixture where the exact resume reports the uninterrupted trees, the same
+/// checkpoint marked `f32_proxy` reports the rebuilt front, which takes the
+/// lowest structural hash among trees that tie on error and cost.
+#[test]
+fn a_resume_of_an_f32_proxy_checkpoint_still_rebuilds_the_front() {
+    let train = sample(240);
+    let test = sample(80);
+    let base = Config { generations: 24, gpu: false, fitness: block_book_fitness(&train), ..config(18) };
+    let uninterrupted = search::run(&base, &train, &test);
+    let text = checkpoint_text(&Config { generations: 12, ..base.clone() }, &train, &test);
+    assert!(text.contains("\nerror_kind f64\n"));
+    let resume = |text: &str| {
+        let saved = Checkpoint::from_text(text).expect("parse");
+        search::run_resumable(&base, &train, &test, Some(saved), 0, |_| {}).expect("resume")
+    };
+    assert_eq!(describe(&uninterrupted), describe(&resume(&text)));
+    let proxy = resume(&text.replace("\nerror_kind f64\n", "\nerror_kind f32_proxy\n"));
+    assert_ne!(describe(&uninterrupted), describe(&proxy), "the rebuild picks the canonical tie member");
+    let unknown = resume(&text.replace("\nerror_kind f64\n", "\nerror_kind unknown\n"));
+    assert_eq!(describe(&proxy), describe(&unknown));
 }
 
 /// #598: the pipeline depth is an execution setting. A resume takes the one it
