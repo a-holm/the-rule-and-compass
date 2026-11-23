@@ -71,10 +71,7 @@ fn local_area_is_not_tracked() {
     assert!(tracked.trim().is_empty(), "tracked files under verksted/_local/:\n{tracked}");
 }
 
-const MACHINE_PATH_FILES: [&str; 3] = ["_shared/rules.md", "_shared/commands.md", "setup/questionnaire.md"];
-
 #[test]
-#[ignore = "enabled by #1376: seven files still name /mnt/ or /home/"]
 fn tracked_workshop_names_no_machine_path_outside_lib() {
     let root = workshop_root();
     let mut files = Vec::new();
@@ -82,9 +79,6 @@ fn tracked_workshop_names_no_machine_path_outside_lib() {
     let mut offenders = Vec::new();
     for file in files {
         let rel = file.strip_prefix(&root).expect("under root").to_string_lossy().into_owned();
-        if MACHINE_PATH_FILES.contains(&rel.as_str()) {
-            continue;
-        }
         let text = std::fs::read_to_string(&file).unwrap_or_default();
         if text.contains("/mnt/") || text.contains("/home/") {
             offenders.push(rel);

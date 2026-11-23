@@ -2,8 +2,10 @@
 # Usage: local-init.sh [--dataset <id> [--card <file>] [--adapt <file>] [--manifest <file>]]
 # Creates the local area $VLOCAL from the starters of _templates/local/. Never overwrites a file.
 # --dataset creates datasets/<id>/ and copies each given file there as card.md, adapt.md, manifest.md.
+# machine.md starts from the template with `<set me>` for every key; the tools exit 2 naming a key until it is set.
 # Writes: $VLOCAL (RCSR_LOCAL overrides it).
 set -uo pipefail
+LIB_NO_MACHINE=1
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 dataset=

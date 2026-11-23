@@ -4,6 +4,7 @@
 # Writes: a temp dir that it removes.
 set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+. "$HERE/lib/machine.sh"
 LINT=$HERE/../issue-lint.sh
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT

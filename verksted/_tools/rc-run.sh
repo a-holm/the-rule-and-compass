@@ -75,13 +75,6 @@ case "$prog" in
 esac
 need_gates
 
-machine_key() {
-  local f=$VLOCAL/machine.md v
-  [ -f "$f" ] || refuse "$f missing; key $1 is not set (run local-init.sh, then seed machine.md)"
-  v=$(sed -n "s/^- *$1: *//p" "$f" | head -n 1 | sed 's/[[:space:]]*$//')
-  [ -n "$v" ] || refuse "key $1 missing in $f"
-  printf '%s\n' "$v"
-}
 pin_key=PIN_CORES_BUILD
 if [ -x "$OC/desktop-busy.sh" ] && "$OC/desktop-busy.sh"; then pin_key=PIN_CORES_BUSY; fi
 pin=$(machine_key "$pin_key") || exit 2

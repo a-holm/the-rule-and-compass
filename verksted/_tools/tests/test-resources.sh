@@ -5,6 +5,7 @@
 # Writes: a temp dir that it removes.
 set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+. "$HERE/lib/machine.sh"
 . "$HERE/lib/fakes.sh"
 S=$HERE/../resources.sh
 T=$(cd "$(mktemp -d)" && pwd -P)
@@ -23,19 +24,21 @@ export RCSR_MACHINE_DIR=$T/oc RCSR_LOCAL=$T/local
 printf '#!/bin/sh\necho "$1" > "%s/volume-arg"\necho "${FAKE_FREE:-0}"\n' "$T" > "$T/free"
 chmod +x "$T/free"
 export RCSR_FREE_CMD=$T/free RCSR_PS_CMD="printf 'bash\nrustc\n'"
-profile() { printf -- '- BUILD_VOLUME: %s\n- DISK_MIN_FREE: %s\n- BUILD_SLOTS: %s\n' "$1" "$2" "$3" > "$T/local/machine.md"; }
+libkeys='- GATES: /lib/gates\n- MACHINE_SCRIPTS: /lib/scripts\n- SANITIZER: /lib/san\n- CUDA_ARCH: sm_lib\n'
+profile() { { printf -- "$libkeys"; printf -- '- BUILD_VOLUME: %s\n- DISK_MIN_FREE: %s\n- BUILD_SLOTS: %s\n' "$1" "$2" "$3"; } > "$T/local/machine.md"; }
+partial() { { printf -- "$libkeys"; printf -- "$1"; } > "$T/local/machine.md"; }
 run() { bash "$S" "$@" > "$T/out" 2> "$T/err"; echo $?; }
 
 check no-machine-md-rc "$(run)" 2
-check no-machine-md-names-key "$(grep -c 'DISK_MIN_FREE' "$T/err")" 1
+check no-machine-md-names-key "$(grep -c 'key GATES missing' "$T/err")" 1
 
-printf -- '- BUILD_VOLUME: /vol\n- BUILD_SLOTS: 3\n' > "$T/local/machine.md"
+partial '- BUILD_VOLUME: /vol\n- BUILD_SLOTS: 3\n'
 check no-min-rc "$(run)" 2
 check no-min-names-key "$(grep -c 'key DISK_MIN_FREE missing' "$T/err")" 1
-printf -- '- DISK_MIN_FREE: 10 GB\n- BUILD_SLOTS: 3\n' > "$T/local/machine.md"
+partial '- DISK_MIN_FREE: 10 GB\n- BUILD_SLOTS: 3\n'
 check no-volume-rc "$(run)" 2
 check no-volume-names-key "$(grep -c 'key BUILD_VOLUME missing' "$T/err")" 1
-printf -- '- BUILD_VOLUME: /vol\n- DISK_MIN_FREE: 10 GB\n' > "$T/local/machine.md"
+partial '- BUILD_VOLUME: /vol\n- DISK_MIN_FREE: 10 GB\n'
 check no-slots-rc "$(run)" 2
 check no-slots-names-key "$(grep -c 'key BUILD_SLOTS missing' "$T/err")" 1
 profile /vol lots 3

@@ -5,14 +5,14 @@ Commands that work on this machine. Run them from the run root (`RUN`) unless a 
 ## Run variables
 
 ```sh
-source verksted/_tools/lib.sh               # defines ROOT, WT, BASE, GATES, G, B, L, PAUSE, SANITIZER
+source verksted/_tools/lib.sh               # defines ROOT, WT, BASE, GATES, G, B, L, PAUSE, SANITIZER, CUDA_ARCH
 N=<issue> SLUG=<slug>                       # issue number and kebab-case slug
 W=$WT/issue-$N-$SLUG                        # this ticket's worktree
 RUN=$W                                      # checkout that holds this run's output/ files
 V=$RUN/verksted
 ```
 
-`GATES` is `${RCSR_GATES:-/mnt/lager/tmp/rcsr-gates}`; logs go to `$G/issue$N-<what>.log`. `B` is the build slot, `L` the test lock; use them through `rc-run.sh`. Every `RCSR_*` override is listed in `lib.sh`.
+`GATES`, `MACHINE_SCRIPTS`, `SANITIZER` and `CUDA_ARCH` come from `machine.md` (`_shared/local.md`); a missing key stops the script with exit 2. Logs go to `$G/issue$N-<what>.log`. `B` is the build slot, `L` the test lock; use them through `rc-run.sh`. Every `RCSR_*` override is listed in `lib.sh`.
 
 Data and run variables: `DATA`, `STORE`, `ENRICHED`, `MEMBERSHIP`, `TARGET`, `LABEL`. Memory file: `MEM`. Their values come from `../setup/questionnaire.md` or the dispatcher.
 
@@ -53,12 +53,12 @@ The log is `$G/issue$N-<tag>.log`; its last line is `RC_DONE rc=<n>`. Lock holds
 verksted/_tools/test-summary.sh "$G/issue$N-<what>.log"        # passed, failed, ignored, warnings
 ```
 
-While the desktop streams video the scripts pin work to CPUs 2,3,6,7, the build slots drop to 1 and `RUST_TEST_THREADS=4`. Force the streaming restriction, clear it, and check it:
+While the desktop streams video the scripts pin work to `PIN_CORES_BUSY`, the build slots drop to `BUILD_SLOTS_BUSY` and `RUST_TEST_THREADS=4`. Force the streaming restriction, clear it, and check it:
 
 ```sh
-touch /mnt/lager/tmp/opencode/STREAMING
-rm /mnt/lager/tmp/opencode/STREAMING
-/mnt/lager/tmp/opencode/desktop-busy.sh; echo $?   # 0 = desktop busy, 1 = free
+touch "$STREAMING"
+rm "$STREAMING"
+"$OC/desktop-busy.sh"; echo $?   # 0 = desktop busy, 1 = free
 ```
 
 ## Full gate (once, on the integration tip)
@@ -67,7 +67,7 @@ rm /mnt/lager/tmp/opencode/STREAMING
 verksted/_tools/gate.sh "$WT/integration-gpu-hardening" <tag>   # logs: $G/<tag>-{cpu,cuda,bench}.log
 ```
 
-Three lock holds: `cargo test --release --no-fail-fast`; `RCSR_CUDA_ARCH=sm_86 cargo test --release --features cuda --no-fail-fast`; `cargo build --release && ./target/release/rcsr-bench --tiny` (must print `recovered 27/27`). Start it as one background shell and wait for the notification.
+Three lock holds: `cargo test --release --no-fail-fast`; `RCSR_CUDA_ARCH=$CUDA_ARCH cargo test --release --features cuda --no-fail-fast`; `cargo build --release && ./target/release/rcsr-bench --tiny` (must print `recovered 27/27`). Start it as one background shell and wait for the notification.
 
 ## Waiting
 
@@ -140,14 +140,14 @@ test ! -e "$W"
 ## Rust experiments
 
 ```sh
-nice -n 19 rustc -O /mnt/lager/tmp/<scratch>/exp.rs -o /mnt/lager/tmp/<scratch>/exp   # single file, outside the repo
+nice -n 19 rustc -O "$GATES/issue$N-scratch/exp.rs" -o "$GATES/issue$N-scratch/exp"   # single file, outside the repo
 perl -0pi -e 's/old/new/' <file>                                                      # scripted edits: perl or sed, never python
 git ls-files '*.py'                                                                   # must print nothing
 ```
 
 ## GPU safety
 
-The build selects the newest CUDA 13 toolkit by rule (`docs/gpu-backend.md`); on this machine that is `/usr/local/cuda-13.0/bin/nvcc`. The sanitizer is `/usr/local/cuda-13.0/bin/compute-sanitizer` (`$SANITIZER`); the system 12.0 `compute-sanitizer` cannot attach on this driver.
+The build selects the newest CUDA 13 toolkit by rule (`docs/gpu-backend.md`); the sanitizer is `$SANITIZER` (`machine.md`); the system 12.0 `compute-sanitizer` cannot attach on this driver.
 
 ```sh
 verksted/_tools/sanitize.sh "$W" "$N" memcheck --test <file> -- <filter>    # builds, then runs under compute-sanitizer through the lock; exit 0 before any plain GPU run

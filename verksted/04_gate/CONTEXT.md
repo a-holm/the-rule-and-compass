@@ -2,7 +2,7 @@
 
 One job: prove that the integration branch builds and passes, once for all merged tickets.
 
-Evidence: 20 distinct full gates in `/mnt/lager/tmp/rcsr-gates/` for a handful of PRs, each about an hour of CPU and GPU; the user's correction on 2026-10-30 ("Bare merge dem til integration worktree ... kjøre gaten en gang til slutt"). Agents run targeted tests only; this pipeline owns the single full gate.
+Evidence: 20 distinct full gates in `$GATES` for a handful of PRs, each about an hour of CPU and GPU; the user's correction on 2026-10-30 ("Bare merge dem til integration worktree ... kjøre gaten en gang til slutt"). Agents run targeted tests only; this pipeline owns the single full gate.
 
 ## Inputs
 

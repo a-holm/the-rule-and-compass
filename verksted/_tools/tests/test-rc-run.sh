@@ -5,6 +5,7 @@
 set -uo pipefail
 unset RCSR_CRATE
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+. "$HERE/lib/machine.sh"
 . "$HERE/lib/fakes.sh"
 RC=$HERE/../rc-run.sh
 T=$(mktemp -d)
@@ -452,11 +453,11 @@ check pin-idle-mask "$(cat "$T/bin/taskset.mask")" "0,1"
 rm -f "$T/oc/desktop-busy.sh"
 # no default stands in for a missing key or file
 cp "$T/local/machine.md" "$T/machine.md.keep"
-printf -- '- PIN_CORES_BUSY: 0\n' > "$T/local/machine.md"
+printf -- '%s- PIN_CORES_BUSY: 0\n' "$FAKE_LIB_KEYS" > "$T/local/machine.md"
 rc bash "$RC" cpu "$T/wt" 9 t -- show-args > /dev/null 2> "$T/err"; r=$?
 check pin-key-missing-rc "$r" "2"
 check pin-key-missing-names-key "$(grep -c 'PIN_CORES_BUILD' "$T/err")" "1"
-printf -- '- PIN_CORES_BUILD: 0,x\n' > "$T/local/machine.md"
+printf -- '%s- PIN_CORES_BUILD: 0,x\n' "$FAKE_LIB_KEYS" > "$T/local/machine.md"
 rc bash "$RC" cpu "$T/wt" 9 t -- show-args > /dev/null 2>&1; check pin-key-bad-rc "$?" "2"
 rm "$T/local/machine.md"
 rc bash "$RC" cpu "$T/wt" 9 t -- show-args > /dev/null 2>&1; check pin-no-file-rc "$?" "2"

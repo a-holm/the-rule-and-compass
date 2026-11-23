@@ -18,7 +18,7 @@ Do NOT load: starting new work before the file is gone.
 ## Process
 
 1. If an input is missing or empty, stop and say which.
-2. `rm /mnt/lager/tmp/opencode/PAUSE`. Queued runs start by themselves.
+2. `source verksted/_tools/lib.sh; rm "$PAUSE"`. Queued runs start by themselves.
 3. Write `report.md` per `output-format.md`: measured numbers, actions taken, what is left to the user.
 
 ## Outputs
@@ -29,7 +29,7 @@ Do NOT load: starting new work before the file is gone.
 ## Check
 
 ```sh
-test ! -e /mnt/lager/tmp/opencode/PAUSE
+source verksted/_tools/lib.sh; test ! -e "$PAUSE"
 ```
 
 Exit 0 writes `pass`. Anything else writes `fail: <what was measured and what was wrong>` to `output/check.md`; `_tools/check.sh` does this. A red result is never rewritten as green.

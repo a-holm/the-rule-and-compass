@@ -4,8 +4,9 @@
 # Usage: one-full-suite.sh bash -c 'cd <worktree>/<crate dir> && cargo test --release'
 # While the pause file exists, new runs wait before queueing for the lock.
 set -euo pipefail
-LOCK="${RCSR_TEST_LOCK:-/mnt/lager/tmp/opencode/full-suite.lock}"
-PAUSE="${RCSR_TEST_PAUSE:-/mnt/lager/tmp/opencode/PAUSE}"
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+LOCK="${RCSR_TEST_LOCK:-$HERE/full-suite.lock}"
+PAUSE="${RCSR_TEST_PAUSE:-$HERE/PAUSE}"
 mkdir -p "$(dirname "$LOCK")"
 if [ -e "$PAUSE" ]; then
   echo "[one-full-suite] paused while $PAUSE exists; waiting" >&2
@@ -19,6 +20,6 @@ fi
 echo "[one-full-suite] lock held: $*" >&2
 echo 19 > /proc/self/autogroup 2>/dev/null || true
 # While the desktop streams video, keep cores 0 and 1 (and their hyperthreads) free.
-if /mnt/lager/tmp/opencode/desktop-busy.sh; then cpus="${RCSR_CPUS_DISCORD:-2,3,6,7}"; else cpus="${RCSR_CPUS:-0-7}"; fi
+if "$HERE/desktop-busy.sh"; then cpus="${RCSR_CPUS_DISCORD:-2,3,6,7}"; else cpus="${RCSR_CPUS:-0-7}"; fi
 export RUST_TEST_THREADS="${RUST_TEST_THREADS:-4}"
 exec taskset -c "$cpus" chrt -i 0 nice -n 19 ionice -c 3 "$@"

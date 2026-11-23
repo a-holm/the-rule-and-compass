@@ -109,6 +109,11 @@ fn describe(tasks: &[Task]) -> String {
         .join("\n")
 }
 
+/// A local area with a synthetic machine.md: every script test reads the four lib.sh keys from it, never from the real one.
+fn local_fixture() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/local")
+}
+
 /// Runs `bash <args>` with its output in `log`. None on exit 0, else the reason.
 fn run_bash(args: &[&str], log: &Path, guard: &Guard) -> Option<String> {
     let file = fs::File::create(log).expect("create log");
@@ -121,6 +126,7 @@ fn run_bash(args: &[&str], log: &Path, guard: &Guard) -> Option<String> {
     // Script tests start with the machine paths pointing at nothing; a test that needs a directory sets its own.
     cmd.env("RCSR_MACHINE_DIR", "/nonexistent-machine-dir");
     cmd.env("RCSR_TEST_LOCK", "/nonexistent-machine-dir/full-suite.lock");
+    cmd.env("RCSR_LOCAL", local_fixture());
     let mut child = cmd
         .args(args)
         .stdin(Stdio::null())
@@ -472,4 +478,22 @@ fn idle_needs_every_thread_blocked_and_nothing_moving() {
     extra.push(t(3, 'S'));
     assert!(!idle(&base, &extra));
     assert!(!idle(&[], &[]));
+}
+
+/// Every script test starts with a synthetic machine.md that holds the four keys lib.sh reads.
+#[test]
+fn script_tests_start_with_a_synthetic_machine_profile() {
+    let scratch = Scratch::new("profile");
+    let log = scratch.path().join("env.log");
+    let lib = tools_dir().join("lib.sh");
+    let script = format!(
+        "source '{}'; printf '%s\\n%s\\n%s\\n%s\\n%s\\n' \"$VLOCAL\" \"$GATES\" \"$OC\" \"$SANITIZER\" \"$CUDA_ARCH\"",
+        lib.display()
+    );
+    assert_eq!(run_bash(&["-c", &script], &log, &FAST), None);
+    let text = fs::read_to_string(&log).expect("read profile log");
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 5, "{text}");
+    assert_eq!(lines[0], local_fixture().to_string_lossy());
+    assert_eq!(&lines[1..], ["/nonexistent-gates", "/nonexistent-machine-dir", "/nonexistent-sanitizer/compute-sanitizer", "sm_fixture"]);
 }
