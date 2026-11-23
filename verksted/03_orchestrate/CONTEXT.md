@@ -23,12 +23,12 @@ Do NOT load: the ticket pipelines' stages, earlier runs' `output/`, the rest of 
 
 ## Process
 
-1. `stages/01_wave_plan/`: pick file-disjoint tickets, at most 10 agents, at most 3 tickets using the machine (lock waiters do not count).
-2. `stages/02_brief/`: one brief per ticket, rendered by `brief.sh` from the templates.
-3. `stages/03_dispatch/`: dispatch with the model set explicitly, record agent ids.
-4. `stages/04_watchdog/`: one background watcher, alert after 45 minutes of silence.
-5. `stages/05_receive_and_verify/`: check every hand-back against PR state, git and logs; a verifier (`brief.sh verifier`) verifies the evidence.
-6. `stages/06_merge_cleanup/`: after each verifier run, update the integration worktree and report; the merge itself is `../08_close/CONTEXT.md`.
+1. [01_wave_plan](stages/01_wave_plan/CONTEXT.md): pick file-disjoint tickets, at most 10 agents, at most 3 tickets using the machine (lock waiters do not count).
+2. [02_brief](stages/02_brief/CONTEXT.md): one brief per ticket, rendered by `brief.sh` from the templates.
+3. [03_dispatch](stages/03_dispatch/CONTEXT.md): dispatch with the model set explicitly, record agent ids.
+4. [04_watchdog](stages/04_watchdog/CONTEXT.md): one background watcher, alert after 45 minutes of silence.
+5. [05_receive_and_verify](stages/05_receive_and_verify/CONTEXT.md): check every hand-back against PR state, git and logs; a verifier (`brief.sh verifier`) verifies the evidence.
+6. [06_merge_cleanup](stages/06_merge_cleanup/CONTEXT.md): after each verifier run, update the integration worktree and report; the merge itself is `../08_close/CONTEXT.md`.
 
 ## Outputs
 

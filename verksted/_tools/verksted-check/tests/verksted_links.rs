@@ -39,14 +39,12 @@ fn workshop_holds_no_python() {
 }
 
 #[test]
-#[ignore = "enabled by #1359"]
 fn workshop_graph_links_every_pipeline_to_its_stages() {
     let problems = check::graph_stage_problems(&workshop_root());
     assert!(problems.is_empty(), "pipeline contracts miss stage links:\n{}", problems.join("\n"));
 }
 
 #[test]
-#[ignore = "enabled by #1359: the shared notes carry no description yet"]
 fn workshop_references_carry_a_description() {
     let problems = check::reference_description_problems(&workshop_root());
     assert!(problems.is_empty(), "references without a description:\n{}", problems.join("\n"));

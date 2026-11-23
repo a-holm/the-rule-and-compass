@@ -1,3 +1,8 @@
+---
+type: reference
+description: Layout of a step's output, the check.md and report formats, artefact starters and naming rules.
+---
+
 # Output format: check.md, reports and names
 
 ## Every step writes to output/
@@ -66,6 +71,9 @@ pass | fail: <reason>
 | agent brief | `brief.md` + `../_templates/brief.md`, `brief-research.md`, `brief-verifier.md`; `../_tools/brief.sh` prints the dispatch prompt | starts with the no-resume line |
 | verification comment | `../_templates/verification-comment.md` | one row per criterion |
 | status message | `../_templates/status.md` | outcome first |
+| dataset card | `../_templates/dataset-card.md` | source, licence, earliest bar, lock window; written by `06_data/stages/01_intake/`, kept in the local area |
+| adapt.md | `../_templates/adapt.md` | the type stage records how the dataset maps to the engine; one file per dataset |
+| local run card | `../_templates/local/run.md` | one card per run; `../_tools/run-record.sh` fills and closes it |
 
 ## Names
 

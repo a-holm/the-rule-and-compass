@@ -26,13 +26,13 @@ Sanitizer first: a GPU crash or a CPU/GPU delta in changed CUDA code runs `verks
 
 ## Process
 
-1. `stages/01_prove_stuck/`: numbers that separate stuck from slow.
-2. `stages/02_stack/`: backtraces of every thread.
-3. `stages/03_wait_graph/`: the wait-for graph and every cycle.
-4. `stages/04_repro_red/`: a small deterministic repro that hangs on unfixed code.
-5. `stages/05_fix_bounded/`: the fix, plus bounded waits so a future bug fails loudly.
-6. `stages/06_medium_run/`: a medium-store run under 10 minutes instead of the huge test.
-7. `stages/07_classify_deltas/`: production bug (own issue) or numeric tier (declared).
+1. [01_prove_stuck](stages/01_prove_stuck/CONTEXT.md): numbers that separate stuck from slow.
+2. [02_stack](stages/02_stack/CONTEXT.md): backtraces of every thread.
+3. [03_wait_graph](stages/03_wait_graph/CONTEXT.md): the wait-for graph and every cycle.
+4. [04_repro_red](stages/04_repro_red/CONTEXT.md): a small deterministic repro that hangs on unfixed code.
+5. [05_fix_bounded](stages/05_fix_bounded/CONTEXT.md): the fix, plus bounded waits so a future bug fails loudly.
+6. [06_medium_run](stages/06_medium_run/CONTEXT.md): a medium-store run under 10 minutes instead of the huge test.
+7. [07_classify_deltas](stages/07_classify_deltas/CONTEXT.md): production bug (own issue) or numeric tier (declared).
 
 ## Outputs
 

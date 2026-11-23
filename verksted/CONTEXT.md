@@ -33,14 +33,14 @@ Each pipeline is a job that repeated in the agent logs: one Claude Code orchestr
 03_orchestrate: wave_plan -> brief -> dispatch -> watchdog -> receive_and_verify -> merge_cleanup
 04_gate: targeted_tests -> integration_merge -> full_gate -> tested_vs_merged -> merge_main
 05_diagnose: prove_stuck -> stack -> wait_graph -> repro_red -> fix_bounded -> medium_run -> classify_deltas
-06_data: acquire -> import_prep -> panel_pit -> enrich -> audit_lockbox -> verify_manifest
+06_data: intake -> acquire -> profile -> type stage (04_ohlcv or 04_new_type) -> panel_pit -> enrich -> audit_lock -> verify_manifest -> lessons
 07_longrun: preconditions -> launch -> monitor -> resume -> audit -> report
 08_close: verifier -> close -> cleanup
 09_handoff: state -> status -> memory -> handoff_file -> restart_check
 10_machine: lock -> pause -> measure -> priority -> resume
 ```
 
-Factory (stable, every run): `_shared/commands.md`, `_shared/rules.md`, `_shared/brief.md`, `_shared/output-format.md`, `_shared/failure-modes.md`, `_templates/`, `_tools/`.
+Factory (stable, every run): `_shared/commands.md`, `_shared/rules.md`, `_shared/brief.md`, `_shared/models.md`, `_shared/measurement.md`, `_shared/local.md`, `_shared/output-format.md`, `_shared/failure-modes.md`, `_templates/`, `_tools/`. Local (this machine, git-ignored): the local area `_local/` described in `_shared/local.md`: machine profile, local rules, decisions, lessons, datasets and the run registry.
 Product (new each run): each stage's `output/` (git-ignored).
 
 A run is set up once from `setup/questionnaire.md`. Its answers are already written to `_shared/` and are not asked again.
@@ -51,7 +51,7 @@ A run is set up once from `setup/questionnaire.md`. Its answers are already writ
 verksted/_tools/links.sh [--strict]
 ```
 
-It builds the crate `_tools/verksted-check/` in the build slot and runs `links` and `walk` on `verksted/`. `links` checks that every relative link and every backticked input path resolves. `walk` checks that every pipeline and stage holds the four contract headings in order, that `AGENTS.md` routes every pipeline, that no `.py` file exists, that `CLAUDE.md` is exactly `@AGENTS.md`, that every script header follows the convention below, and that every `_tools/<path>` mention in a markdown file exists. `--strict` adds three checks: `_index.md` matches the tree, every tool is mentioned in a file other than `_index.md`, and the repo `AGENTS.md` links `verksted/AGENTS.md`. The non-strict rules run in `cargo test --release` in `<crate>/` through `tests/verksted_links.rs`, the strict rules through `tests/verksted_walk.rs` (run `--test verksted_walk` after adding or renaming a tool); `tests/verksted_tools.rs` runs `bash -n` on every script and every `_tools/tests/*.sh`. Exit 0 means the tree is clean.
+It builds the crate `_tools/verksted-check/` in the build slot and runs `links` and `walk` on `verksted/`. `links` checks that every relative link and every backticked input path resolves. `walk` checks that every pipeline and stage holds the four contract headings in order, that the repo `../AGENTS.md` routes every pipeline, that no `.py` file exists, that every script header follows the convention below, and that every `_tools/<path>` mention in a markdown file exists. `--strict` adds four checks: `_index.md` matches the tree, every tool is mentioned in a file other than `_index.md`, every reference note has a frontmatter `description`, and every pipeline contract links each of its stages. The guard tests live in `verksted/_tools/verksted-check/`: the non-strict rules run in `cargo test --release` there through `tests/verksted_links.rs`, the strict rules through `tests/verksted_walk.rs` (run `--test verksted_walk` after adding or renaming a tool); `tests/verksted_tools.rs` runs `bash -n` on every script and every `_tools/tests/*.sh`. `links --external` also checks references outside `verksted/`. Exit 0 means the tree is clean.
 
 ## Scripts
 

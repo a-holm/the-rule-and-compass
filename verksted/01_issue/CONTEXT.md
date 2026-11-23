@@ -26,12 +26,12 @@ Do NOT load: other pipelines' stages, earlier runs' `output/`, the rest of `../_
 
 ## Process
 
-1. `stages/01_worktree/`: create (with `wt-new.sh`) `worktrees/issue-N-SLUG` on `issue/N-SLUG` from `BASE`.
-2. `stages/02_issue_body/`: freeze the issue into a run card, one proof line per acceptance criterion.
-3. `stages/03_prove_red/`: a failing test or repro on the unfixed code.
-4. `stages/04_implement/`: smallest change, targeted tests through `rc-run.sh`, commits with `Refs #N`.
-5. `stages/05_docs_sync/`: `--help`, `rcsr schema`, README and `docs/` match the change.
-6. `stages/06_pr/`: push, open the pull request against `BASE`, write the report.
+1. [01_worktree](stages/01_worktree/CONTEXT.md): create (with `wt-new.sh`) `worktrees/issue-N-SLUG` on `issue/N-SLUG` from `BASE`.
+2. [02_issue_body](stages/02_issue_body/CONTEXT.md): freeze the issue into a run card, one proof line per acceptance criterion.
+3. [03_prove_red](stages/03_prove_red/CONTEXT.md): a failing test or repro on the unfixed code.
+4. [04_implement](stages/04_implement/CONTEXT.md): smallest change, targeted tests through `rc-run.sh`, commits with `Refs #N`.
+5. [05_docs_sync](stages/05_docs_sync/CONTEXT.md): `--help`, `rcsr schema`, README and `docs/` match the change.
+6. [06_pr](stages/06_pr/CONTEXT.md): push, open the pull request against `BASE`, write the report.
 
 ## Outputs
 

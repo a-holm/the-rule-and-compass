@@ -1127,12 +1127,21 @@ fn name_of(path: &Path) -> String {
     path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string()
 }
 
+/// The repository root: the parent of the workshop directory. Its `AGENTS.md` is the entry file.
+fn repo_of(root: &Path) -> PathBuf {
+    root.canonicalize()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn entry_text(root: &Path) -> String {
+    fs::read_to_string(repo_of(root).join("AGENTS.md")).unwrap_or_default()
+}
+
 pub fn structure_problems(root: &Path) -> Vec<String> {
     let mut problems = Vec::new();
-    let agents = fs::read_to_string(root.join("AGENTS.md")).unwrap_or_default();
-    if agents.lines().count() > 60 {
-        problems.push("AGENTS.md: more than 60 lines; it routes and holds nothing else".to_string());
-    }
+    let agents = entry_text(root);
     for pipeline in numbered_subdirs(root) {
         let pname = name_of(&pipeline);
         let context = pipeline.join("CONTEXT.md");
@@ -1142,7 +1151,7 @@ pub fn structure_problems(root: &Path) -> Vec<String> {
         }
         problems.extend(contract_problems(root, &context, &format!("# {pname}: ")));
         if !agents.contains(&format!("{pname}/CONTEXT.md")) {
-            problems.push(format!("AGENTS.md: no route to {pname}/CONTEXT.md"));
+            problems.push(format!("../AGENTS.md: no route to {pname}/CONTEXT.md"));
         }
         let pipeline_text = fs::read_to_string(&context).unwrap_or_default();
         let stages_dir = pipeline.join("stages");
@@ -1232,15 +1241,6 @@ pub fn header_problems(root: &Path) -> Vec<String> {
     problems
 }
 
-/// `DIR/CLAUDE.md` is exactly `@AGENTS.md` and a newline.
-pub fn claude_problems(root: &Path) -> Vec<String> {
-    match fs::read_to_string(root.join("CLAUDE.md")) {
-        Ok(text) if text == "@AGENTS.md\n" => Vec::new(),
-        Ok(_) => vec!["CLAUDE.md: must be exactly `@AGENTS.md` and a newline".to_string()],
-        Err(_) => vec!["CLAUDE.md: missing".to_string()],
-    }
-}
-
 fn is_ref_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || "_./-".contains(c)
 }
@@ -1284,11 +1284,7 @@ fn tool_mentions(line: &str) -> Vec<(bool, String)> {
 
 /// Every `_tools/<path>` mention in a workshop markdown file resolves.
 pub fn refs_problems(root: &Path) -> Vec<String> {
-    let repo = root
-        .canonicalize()
-        .ok()
-        .and_then(|p| p.parent().map(Path::to_path_buf))
-        .unwrap_or_else(|| PathBuf::from("."));
+    let repo = repo_of(root);
     let mut files = Vec::new();
     collect_markdown(root, &mut files);
     let mut problems = Vec::new();
@@ -1455,19 +1451,16 @@ pub fn orphan_problems(root: &Path) -> Vec<String> {
     problems
 }
 
-/// The repository `AGENTS.md` links the workshop entry file.
+/// The repository `AGENTS.md` links every pipeline contract of the workshop directory.
 pub fn root_route_problems(root: &Path) -> Vec<String> {
-    let repo = root
-        .canonicalize()
-        .ok()
-        .and_then(|p| p.parent().map(Path::to_path_buf))
-        .unwrap_or_else(|| PathBuf::from("."));
-    let text = fs::read_to_string(repo.join("AGENTS.md")).unwrap_or_default();
-    if text.contains("verksted/AGENTS.md") {
-        Vec::new()
-    } else {
-        vec!["../AGENTS.md: does not link verksted/AGENTS.md".to_string()]
-    }
+    let text = entry_text(root);
+    let dir = root.canonicalize().map(|p| name_of(&p)).unwrap_or_else(|_| name_of(root));
+    numbered_subdirs(root)
+        .iter()
+        .map(|p| format!("{dir}/{}/CONTEXT.md", name_of(p)))
+        .filter(|target| !text.contains(&format!("]({target})")))
+        .map(|target| format!("../AGENTS.md: does not link {target}"))
+        .collect()
 }
 
 /// All `walk` rules; `strict` adds the index, orphan and root route rules.
@@ -1478,7 +1471,6 @@ pub fn walk_problems(root: &Path, strict: bool) -> Vec<String> {
     for p in py {
         problems.push(format!("{}: Python is not allowed", rel_of(root, &p)));
     }
-    problems.extend(claude_problems(root));
     problems.extend(header_problems(root));
     problems.extend(refs_problems(root));
     problems.extend(crate_name_problems(root));
@@ -1547,8 +1539,9 @@ mod tests {
 
     #[test]
     fn a_stage_without_the_four_headings_is_reported() {
-        let root = scratch("contract");
-        write(&root.join("AGENTS.md"), "# AGENTS.md\n\n- `01_p/CONTEXT.md`\n");
+        let base = scratch("contract");
+        let root = base.join("verksted");
+        write(&base.join("AGENTS.md"), "# AGENTS.md\n\n- `01_p/CONTEXT.md`\n");
         write(
             &root.join("01_p/CONTEXT.md"),
             "# 01_p: job\n\nOne job: x.\n\nDo NOT load: y.\n\n## Inputs\n## Process\n## Outputs\n## Check\n\n`stages/01_s/`\n",
@@ -1560,7 +1553,7 @@ mod tests {
         let problems = structure_problems(&root);
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(problems[0].contains("## headings"), "{problems:?}");
-        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -1631,24 +1624,6 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    #[test]
-    fn claude_red_missing_or_different_text_is_reported() {
-        let root = scratch("claude_red");
-        assert_eq!(claude_problems(&root), vec!["CLAUDE.md: missing".to_string()]);
-        write(&root.join("CLAUDE.md"), "@AGENTS.md");
-        assert_eq!(claude_problems(&root).len(), 1);
-        write(&root.join("CLAUDE.md"), "@AGENTS.md\n\n");
-        assert_eq!(claude_problems(&root).len(), 1);
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn claude_green_exact_text_passes() {
-        let root = scratch("claude_green");
-        write(&root.join("CLAUDE.md"), "@AGENTS.md\n");
-        assert!(claude_problems(&root).is_empty());
-        let _ = fs::remove_dir_all(&root);
-    }
 
     fn index_tree(name: &str) -> PathBuf {
         let root = scratch(name);
@@ -1709,17 +1684,47 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    #[test]
-    fn strict_walk_adds_the_root_route() {
-        let base = scratch("root_route");
+    fn pipeline(name: &str) -> String {
+        format!("# {name}: job\n\nOne job: x.\n\nDo NOT load: y.\n\n## Inputs\n## Process\n## Outputs\n## Check\n\n1. [01_s](stages/01_s/CONTEXT.md)\n")
+    }
+
+    const STAGE: &str = "# 01_s: job\n\nOne job: s.\n\nDo NOT load: y.\n\n## Inputs\n## Process\n## Outputs\n## Check\n";
+
+    fn walk_tree(name: &str) -> (PathBuf, PathBuf) {
+        let base = scratch(name);
         let root = base.join("verksted");
-        write(&root.join("AGENTS.md"), "# AGENTS.md\n");
-        write(&root.join("CLAUDE.md"), "@AGENTS.md\n");
+        write(&root.join("01_p/CONTEXT.md"), &pipeline("01_p"));
+        write(&root.join("01_p/stages/01_s/CONTEXT.md"), STAGE);
         write(&root.join("_index.md"), &render_index(&root));
-        assert_eq!(root_route_problems(&root).len(), 1);
-        write(&base.join("AGENTS.md"), "[w](verksted/AGENTS.md)\n");
+        (base, root)
+    }
+
+    #[test]
+    fn strict_walk_reads_the_routes_from_the_root_agents_file() {
+        let (base, root) = walk_tree("root_route");
+        assert!(!root.join("AGENTS.md").exists());
+        write(&base.join("AGENTS.md"), "# AGENTS.md\n\nNo routes.\n");
+        assert_eq!(root_route_problems(&root), ["../AGENTS.md: does not link verksted/01_p/CONTEXT.md"]);
+        assert!(walk_problems(&root, false).iter().any(|p| p == "../AGENTS.md: no route to 01_p/CONTEXT.md"));
+        assert_eq!(walk_problems(&root, true).len(), 2, "{:?}", walk_problems(&root, true));
+        write(&base.join("AGENTS.md"), "# AGENTS.md\n\n[p](verksted/01_p/CONTEXT.md)\n");
         assert!(root_route_problems(&root).is_empty());
         assert!(walk_problems(&root, true).is_empty(), "{:?}", walk_problems(&root, true));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_root_agents_file_without_one_pipeline_route_fails_the_walk() {
+        let (base, root) = walk_tree("root_route_missing");
+        write(&root.join("02_q/CONTEXT.md"), &pipeline("02_q"));
+        write(&root.join("02_q/stages/01_s/CONTEXT.md"), STAGE);
+        write(&base.join("AGENTS.md"), "[p](verksted/01_p/CONTEXT.md)\n");
+        let problems = walk_problems(&root, false);
+        assert!(problems.iter().any(|p| p == "../AGENTS.md: no route to 02_q/CONTEXT.md"), "{problems:?}");
+        assert!(!problems.iter().any(|p| p.contains("no route to 01_p")), "{problems:?}");
+        write(&base.join("AGENTS.md"), "[p](verksted/01_p/CONTEXT.md) [q](verksted/02_q/CONTEXT.md)\n");
+        let problems = walk_problems(&root, false);
+        assert!(!problems.iter().any(|p| p.contains("no route")), "{problems:?}");
         let _ = fs::remove_dir_all(&base);
     }
 

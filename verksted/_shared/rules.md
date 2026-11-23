@@ -1,3 +1,8 @@
+---
+type: reference
+description: Numbered hard requirements for every pipeline, each with its source.
+---
+
 # Rules: hard requirements for every pipeline
 
 The rules most often broken, each with its source. Sources: `AGENTS.md` and `docs/issue-workflow.md` of this repo, the user's global rules, and dated user instructions ("user, YYYY-MM-DD"). Failures behind them: `failure-modes.md`.
