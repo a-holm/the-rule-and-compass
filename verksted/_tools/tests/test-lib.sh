@@ -76,6 +76,21 @@ check no-machine-md-names "$(grep -c "key GATES missing in $T/none/machine.md" <
 d=$(mach empty "- GATES:
 $(grep -v '^- GATES:' <<< "$all_keys")")
 check empty-value-rc "$(lib 'echo reached' RCSR_LOCAL="$d" >/dev/null 2>&1; echo $?)" "2"
+# interactive shell: the source reports status 2 and the shell survives; a script still stops at the source line
+ilib() { env -u RCSR_GATES -u RCSR_MACHINE_DIR -u RCSR_SANITIZER "$@" bash -ic "source '$LIB'; r=\$?; echo alive; echo rc=\$r" 2> /dev/null; }
+check interactive-missing "$(ilib RCSR_LOCAL="$T/none" | tr '\n' ' ')" "alive rc=2 "
+check interactive-ok "$(ilib RCSR_LOCAL="$DEFLOCAL" | tr '\n' ' ')" "alive rc=0 "
+d=$(mach iph "$(sed 's/^- SANITIZER: .*/- SANITIZER: <set me>/' <<< "$all_keys")")
+check interactive-placeholder "$(ilib RCSR_LOCAL="$d" | tr '\n' ' ')" "alive rc=2 "
+printf '#!/usr/bin/env bash\nsource "%s"\necho continued\n' "$LIB" > "$T/src.sh"
+out=$(env -u RCSR_GATES RCSR_LOCAL="$T/none" bash "$T/src.sh" 2> /dev/null); rc=$?
+check script-stops-at-source "$rc:$out" "2:"
+out=$(env RCSR_LOCAL="$T/none" bash -c "source '$LIB'; echo continued" 2> /dev/null); rc=$?
+check bash-c-stops-at-source "$rc:$out" "2:"
+# --help of a tool with an unseeded machine.md: the source stops it first, exit 2
+out=$(RCSR_LOCAL="$T/none" bash "$HERE/../resources.sh" -h 2>&1); rc=$?
+check tool-help-unseeded-rc "$rc" "2"
+check tool-help-unseeded-names "$(grep -c 'key GATES missing' <<< "$out")" "1"
 # an override replaces its key, the other keys still come from machine.md
 d=$(mach ov "- CUDA_ARCH: sm_fx
 ")

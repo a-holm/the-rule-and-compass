@@ -3,7 +3,7 @@
 # Writes: nothing.
 # Defines the paths, the RCSR_* overrides and the helpers every script shares. GATES, MACHINE_SCRIPTS, SANITIZER
 # and CUDA_ARCH come from $VLOCAL/machine.md (RCSR_GATES, RCSR_MACHINE_DIR and RCSR_SANITIZER override the first
-# three); no tracked file holds a machine value. A script that sources this exits 2 when a key is missing.
+# three); no tracked file holds a machine value. A script that sources this exits 2 when a key is missing; an interactive shell gets status 2 from the source and stays alive.
 # local-init.sh sets LIB_NO_MACHINE=1 before it sources this, because it creates machine.md. No function creates $GATES.
 
 VERKSTED=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -31,13 +31,15 @@ crate_dir() {
 }
 VLOCAL=${RCSR_LOCAL:-$ROOT/verksted/_local}
 # machine_key <KEY>: prints the value of the line `- KEY: value` of $VLOCAL/machine.md (first match, trimmed).
-# Exit 2 with a message naming the key when machine.md or the line is missing, or the value is empty or `<set me>`.
-# Inside $(...) the exit leaves the subshell only; write `X=$(machine_key KEY) || exit 2`.
+# Status 2 with a message naming the key when machine.md or the line is missing, or the value is empty or `<set me>`:
+# `return` in an interactive shell, `exit` otherwise, so a script never continues with the key unset.
+# Inside $(...) only the subshell ends; write `X=$(machine_key KEY) || exit 2`.
 machine_key() {
   local v=
   [ -f "$VLOCAL/machine.md" ] && v=$(sed -n "s/^- *$1: *//p" "$VLOCAL/machine.md" | head -n 1 | sed 's/[[:space:]]*$//')
   if [ -z "$v" ] || [ "$v" = "<set me>" ]; then
     echo "key $1 missing in $VLOCAL/machine.md (run local-init.sh, then set it; see _shared/local.md)" >&2
+    [[ $- == *i* ]] && return 2
     exit 2
   fi
   printf '%s\n' "$v"
@@ -46,12 +48,12 @@ WT=$ROOT/worktrees
 BASE=${RCSR_BASE:-integration/gpu-hardening}
 if [ -z "${LIB_NO_MACHINE:-}" ]; then
   GATES=${RCSR_GATES:-}
-  [ -n "$GATES" ] || GATES=$(machine_key GATES) || exit 2
+  [ -n "$GATES" ] || GATES=$(machine_key GATES) || { [[ $- == *i* ]] && return 2; exit 2; }
   MACHINE_SCRIPTS=${RCSR_MACHINE_DIR:-}
-  [ -n "$MACHINE_SCRIPTS" ] || MACHINE_SCRIPTS=$(machine_key MACHINE_SCRIPTS) || exit 2
+  [ -n "$MACHINE_SCRIPTS" ] || MACHINE_SCRIPTS=$(machine_key MACHINE_SCRIPTS) || { [[ $- == *i* ]] && return 2; exit 2; }
   SANITIZER=${RCSR_SANITIZER:-}
-  [ -n "$SANITIZER" ] || SANITIZER=$(machine_key SANITIZER) || exit 2
-  CUDA_ARCH=$(machine_key CUDA_ARCH) || exit 2
+  [ -n "$SANITIZER" ] || SANITIZER=$(machine_key SANITIZER) || { [[ $- == *i* ]] && return 2; exit 2; }
+  CUDA_ARCH=$(machine_key CUDA_ARCH) || { [[ $- == *i* ]] && return 2; exit 2; }
   G=$GATES
   # /proc/*/fd links hold the physical path, so lock probes need $OC without symlinks.
   OC=$(cd "$MACHINE_SCRIPTS" 2> /dev/null && pwd -P || echo "$MACHINE_SCRIPTS")

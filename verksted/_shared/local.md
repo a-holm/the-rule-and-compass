@@ -25,7 +25,7 @@ A run card holds: id, kind, start and end (UTC), the exact command or the path o
 
 ## Machine profile keys
 
-Tracked text names these keys and never their values. `machine.md` holds one line per key, `- KEY: value`; `local-init.sh` creates it from the template with `<set me>` as the value of every key. `lib.sh` reads `GATES`, `MACHINE_SCRIPTS`, `SANITIZER` and `CUDA_ARCH` through `machine_key`, `resources.sh` reads three more; a missing key, an empty value or `<set me>` makes the script exit 2 and name the key. No tracked script holds a default for any of them. `TOOLS_WT` lives in `rules-local.md`, the other keys in `machine.md`.
+Tracked text names these keys and never their values. `machine.md` holds one line per key, `- KEY: value`; `local-init.sh` creates it from the template with `<set me>` as the value of every key. `lib.sh` reads `GATES`, `MACHINE_SCRIPTS`, `SANITIZER` and `CUDA_ARCH` through `machine_key`, `resources.sh` reads three more; a missing key, an empty value or `<set me>` makes the script exit 2 (an interactive `source` returns 2) and name the key. No tracked script holds a default for any of them. `TOOLS_WT` lives in `rules-local.md`, the other keys in `machine.md`.
 
 | Key | Meaning |
 |---|---|
