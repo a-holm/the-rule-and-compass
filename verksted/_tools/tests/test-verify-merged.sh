@@ -18,6 +18,7 @@ check() {
   fi
 }
 git_q() { git -c user.name=t -c user.email=t@t.invalid "$@"; }
+export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t.invalid GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t.invalid
 
 # the tools under test, with a stub rc-run.sh next to them
 mkdir -p "$T/tools"
