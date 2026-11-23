@@ -1463,6 +1463,42 @@ pub fn root_route_problems(root: &Path) -> Vec<String> {
         .collect()
 }
 
+/// The git lines of a Check block that name `$BASE` as a ref without `origin/`: the local base branch lags `origin`.
+/// `origin "$BASE"` (a fetch argument), `origin/$BASE` and a gh `--head`/`--base` branch name are fine; a line without `git` is not a ref use.
+pub fn base_ref_problems(root: &Path) -> Vec<String> {
+    let mut files = Vec::new();
+    collect_markdown(root, &mut files);
+    files.sort();
+    let mut problems = Vec::new();
+    for file in files {
+        if name_of(&file) != "CONTEXT.md" {
+            continue;
+        }
+        let rel = rel_of(root, &file);
+        let mut in_check = false;
+        let mut in_block = false;
+        for line in read_lines(&file) {
+            if line.starts_with("## ") {
+                in_check = line == "## Check";
+                in_block = false;
+            } else if in_check && line == "```sh" {
+                in_block = true;
+            } else if in_block && line == "```" {
+                in_block = false;
+            } else if in_block && line.split(|c: char| !c.is_alphanumeric()).any(|w| w == "git") {
+                for (at, _) in line.match_indices("$BASE").chain(line.match_indices("${BASE}")) {
+                    let before = line[..at].trim_end_matches('"');
+                    if !["origin/", "origin ", "--head ", "--base "].iter().any(|ok| before.ends_with(ok)) {
+                        problems.push(format!("{rel}: Check uses $BASE as a git ref without origin/: {}", line.trim()));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    problems
+}
+
 /// All `walk` rules; `strict` adds the index, orphan and root route rules.
 pub fn walk_problems(root: &Path, strict: bool) -> Vec<String> {
     let mut problems = structure_problems(root);
@@ -1474,6 +1510,7 @@ pub fn walk_problems(root: &Path, strict: bool) -> Vec<String> {
     problems.extend(header_problems(root));
     problems.extend(refs_problems(root));
     problems.extend(crate_name_problems(root));
+    problems.extend(base_ref_problems(root));
     if strict {
         problems.extend(index_problems(root));
         problems.extend(orphan_problems(root));
@@ -1725,6 +1762,33 @@ mod tests {
         write(&base.join("AGENTS.md"), "[p](verksted/01_p/CONTEXT.md) [q](verksted/02_q/CONTEXT.md)\n");
         let problems = walk_problems(&root, false);
         assert!(!problems.iter().any(|p| p.contains("no route")), "{problems:?}");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    fn stage_with_check(block: &str) -> String {
+        STAGE.replace("## Check\n", &format!("## Check\n\n```sh\n{block}\n```\n"))
+    }
+
+    #[test]
+    fn a_check_naming_the_local_base_as_a_git_ref_fails_the_walk() {
+        let (base, root) = walk_tree("base_ref_red");
+        write(&base.join("AGENTS.md"), "[p](verksted/01_p/CONTEXT.md)\n");
+        let stage = root.join("01_p/stages/01_s/CONTEXT.md");
+        write(&stage, &stage_with_check("git -C \"$W\" log \"$BASE\"..HEAD"));
+        let problems = walk_problems(&root, true);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("01_p/stages/01_s/CONTEXT.md: Check uses $BASE as a git ref without origin/"));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_check_using_origin_base_or_a_base_name_comparison_passes_the_walk() {
+        let (base, root) = walk_tree("base_ref_green");
+        write(&base.join("AGENTS.md"), "[p](verksted/01_p/CONTEXT.md)\n");
+        let block = "git fetch -q origin \"$BASE\" && git log \"origin/$BASE\"..HEAD\ntest \"$(gh pr view 1 -q .base)\" = \"$BASE\"";
+        write(&root.join("01_p/stages/01_s/CONTEXT.md"), &stage_with_check(block));
+        assert!(base_ref_problems(&root).is_empty(), "{:?}", base_ref_problems(&root));
+        assert!(walk_problems(&root, true).is_empty(), "{:?}", walk_problems(&root, true));
         let _ = fs::remove_dir_all(&base);
     }
 

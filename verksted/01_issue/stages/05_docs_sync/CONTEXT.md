@@ -30,7 +30,7 @@ Do NOT load: code changes, tests, other tickets.
 ## Check
 
 ```sh
-d=$(git -C "$W" diff --name-only "$BASE"...HEAD); echo "$d" | grep -qE '^(README\.md|docs/|verksted/)' || { l=$(head -1 "$V/01_issue/stages/05_docs_sync/output/docs.md"); case "$l" in "docs already correct: "*) test -e "$W/${l#docs already correct: }" ;; *) false ;; esac; }
+git -C "$W" fetch -q origin "$BASE" || exit 1; d=$(git -C "$W" diff --name-only "origin/$BASE"...HEAD) || exit 1; echo "$d" | grep -qE '^(README\.md|docs/|verksted/)' || { l=$(head -1 "$V/01_issue/stages/05_docs_sync/output/docs.md"); case "$l" in "docs already correct: "*) test -e "$W/${l#docs already correct: }" ;; *) false ;; esac; }
 ```
 
 Exit 0 writes `pass`. Anything else writes `fail: <what was measured and what was wrong>` to `output/check.md`; `_tools/check.sh` does this. A red result is never rewritten as green.

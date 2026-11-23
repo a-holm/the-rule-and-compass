@@ -31,7 +31,7 @@ Do NOT load: gate runs, unmerged branches.
 ## Check
 
 ```sh
-for n in $(grep -o '^| #[0-9]*' "$V/04_gate/stages/01_targeted_tests/output/tickets.md" | tr -d '| #'); do git log --format=%B main.."$BASE" | grep -q "Refs #$n" || exit 1; done
+git fetch -q origin main && git fetch -q origin "$BASE" && for n in $(grep -o '^| #[0-9]*' "$V/04_gate/stages/01_targeted_tests/output/tickets.md" | tr -d '| #'); do git log --format=%B origin/main.."origin/$BASE" | grep -q "Refs #$n" || exit 1; done
 ```
 
 Exit 0 writes `pass`. Anything else writes `fail: <what was measured and what was wrong>` to `output/check.md`; `_tools/check.sh` does this. A red result is never rewritten as green.

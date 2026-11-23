@@ -35,7 +35,7 @@ References: [rules 59 to 66](../../../_shared/rules.md) (location, base, main ch
 ## Check
 
 ```sh
-case "$W" in "$ROOT"/worktrees/issue-"$N"-*) ;; *) exit 1 ;; esac; test "$(git -C "$W" branch --show-current)" = "issue/$N-$SLUG" && git -C "$ROOT" worktree list --porcelain | grep -qxF "worktree $W" && git -C "$W" merge-base --is-ancestor "$BASE" HEAD
+case "$W" in "$ROOT"/worktrees/issue-"$N"-*) ;; *) exit 1 ;; esac; test "$(git -C "$W" branch --show-current)" = "issue/$N-$SLUG" && git -C "$ROOT" worktree list --porcelain | grep -qxF "worktree $W" && git -C "$W" fetch -q origin "$BASE" && git -C "$W" merge-base --is-ancestor "origin/$BASE" HEAD
 ```
 
 Exit 0 writes `pass`. Anything else writes `fail: <what was measured and what was wrong>` to `output/check.md`; `_tools/check.sh` does this. A red result is never rewritten as green.

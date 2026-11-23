@@ -29,7 +29,7 @@ Do NOT load: new features, a second gate.
 ## Check
 
 ```sh
-git diff --quiet "$(sed -n 's/^tested: //p' "$V/04_gate/stages/03_full_gate/output/gate.md")" "$BASE" -- . ':(exclude)verksted' ':(exclude)docs' ':(exclude)*.md'
+git fetch -q origin "$BASE" && git diff --quiet "$(sed -n 's/^tested: //p' "$V/04_gate/stages/03_full_gate/output/gate.md")" "origin/$BASE" -- . ':(exclude)verksted' ':(exclude)docs' ':(exclude)*.md'
 ```
 
 Exit 0 writes `pass`. Anything else writes `fail: <what was measured and what was wrong>` to `output/check.md`; `_tools/check.sh` does this. A red result is never rewritten as green.
