@@ -110,6 +110,7 @@ check ok-doc-hold "$(grep -- '--features cuda --no-fail-fast --doc$' "$T/cmds" |
 check ok-build "$(grep -c -- "--no-run --message-format=json" "$T/cmds")" 2
 check ok-no-run-in-hold "$(grep -- '--no-fail-fast' "$T/cmds" | grep -c -- '--no-run')" 0
 check ok-summary "$(grep -c 'rc=0' "$T/gates/ok-cuda-summary.log")" 6
+check ok-verksted-step "$(grep -c -- "cargo test --release && .*links --external " "$T/cmds")" 1
 check ok-line "$(grep -c '^cuda: targets=6 failed=0 timeouts=0$' "$T/out-ok")" 1
 check ok-cpu-holds "$(grep -v -- "--features cuda" "$T/cmds" | grep -c -- "--no-fail-fast")" 6
 check ok-cpu-doc-hold "$(grep -v -- "--features cuda" "$T/cmds" | grep -c -- "--no-fail-fast --doc$")" 1
@@ -122,7 +123,7 @@ check ok-cpu-log-headers "$(grep -c "^=== " "$T/gates/ok-cpu.log")" 6
 check ok-cpu-counts "$(grep "^cpu: ok=" "$T/out-ok")" "cpu: ok=6 failed=0"
 check ok-cpu-summary-no-xid "$(grep -c " xid=" "$T/gates/ok-cpu-summary.log")" 0
 check ok-cpu-wait-run "$(grep -c " wait=7 run=30 " "$T/gates/ok-cpu-summary.log")" 6
-check ok-exit-line "$(grep -c "^exit cpu=0 cuda=0 bench=0$" "$T/out-ok")" 1
+check ok-exit-line "$(grep -c "^exit cpu=0 cuda=0 bench=0 verksted=0$" "$T/out-ok")" 1
 check ok-bench-line "$(grep -c "^bench: recovered 27/27 (100.0%)" "$T/out-ok")" 1
 check ok-wait-run "$(grep -c " wait=7 run=30 " "$T/gates/ok-cuda-summary.log")" 6
 check ok-no-secs "$(grep -c " secs=" "$T/gates/ok-cuda-summary.log")" 0
@@ -205,7 +206,7 @@ check cputimeout-labelled "$(grep -c '^lib rc=124 .*| timeout$' "$T/gates/cputim
 check cputimeout-others-ok "$(grep -c 'rc=0' "$T/gates/cputimeout-cpu-summary.log")" 5
 check cputimeout-line "$(grep -c '^cpu: targets=6 failed=1 timeouts=1$' "$T/out-cputimeout")" 1
 check cputimeout-cuda-line "$(grep -c '^cuda: targets=6 failed=0 timeouts=0$' "$T/out-cputimeout")" 1
-check cputimeout-exit-line "$(grep -c '^exit cpu=1 cuda=0 bench=0$' "$T/out-cputimeout")" 1
+check cputimeout-exit-line "$(grep -c '^exit cpu=1 cuda=0 bench=0 verksted=0$' "$T/out-cputimeout")" 1
 
 # A failing CPU target is reported FAILED, every other target still reports a result, and exit cpu=1.
 RCSR_STUB_CPU_RC=$T/rc-fail run_gate cpufail "$T/rc-ok"
@@ -215,7 +216,7 @@ check cpufail-failed-result "$(grep -c '^test result: FAILED' "$T/gates/cpufail-
 check cpufail-every-target-has-a-result "$(grep -c '^test result' "$T/gates/cpufail-cpu.log")" 6
 check cpufail-counts "$(grep '^cpu: ok=' "$T/out-cpufail")" "cpu: ok=5 failed=1"
 check cpufail-line "$(grep -c '^cpu: targets=6 failed=1 timeouts=0$' "$T/out-cpufail")" 1
-check cpufail-exit-line "$(grep -c '^exit cpu=1 cuda=0 bench=0$' "$T/out-cpufail")" 1
+check cpufail-exit-line "$(grep -c '^exit cpu=1 cuda=0 bench=0 verksted=0$' "$T/out-cpufail")" 1
 
 # A CPU build that fails runs no CPU hold, is counted by the error line, and the CUDA suite still runs.
 echo 'error: cpu build failed' > "$T/cpu-build-bad.json"
@@ -223,7 +224,7 @@ RCSR_STUB_CPU_BUILD=$T/cpu-build-bad.json run_gate cpubuild "$T/rc-ok"
 check cpubuild-exit-nonzero "$([ "$?" -ne 0 ] && echo yes || echo no)" yes
 check cpubuild-no-cpu-holds "$(grep -v -- "--features cuda" "$T/cmds" | grep -c -- "--no-fail-fast")" 0
 check cpubuild-counted "$(grep '^cpu: ok=' "$T/out-cpubuild")" "cpu: ok=0 failed=1"
-check cpubuild-exit-line "$(grep -c '^exit cpu=1 cuda=0 bench=0$' "$T/out-cpubuild")" 1
+check cpubuild-exit-line "$(grep -c '^exit cpu=1 cuda=0 bench=0 verksted=0$' "$T/out-cpubuild")" 1
 check cpubuild-cuda-ran "$(grep -c -- '--features cuda --no-fail-fast' "$T/cmds")" 6
 
 # An empty CPU target list is a failure and runs no hold.
@@ -232,7 +233,7 @@ RCSR_STUB_CPU_BUILD=$T/cpu-build-empty.json run_gate cpuempty "$T/rc-ok"
 check cpuempty-exit-nonzero "$([ "$?" -ne 0 ] && echo yes || echo no)" yes
 check cpuempty-no-cpu-holds "$(grep -v -- "--features cuda" "$T/cmds" | grep -c -- "--no-fail-fast")" 0
 check cpuempty-message "$(grep -c '^cpu build lists no test target$' "$T/gates/cpuempty-cpu-summary.log")" 1
-check cpuempty-exit-line "$(grep -c '^exit cpu=1 cuda=0 bench=0$' "$T/out-cpuempty")" 1
+check cpuempty-exit-line "$(grep -c '^exit cpu=1 cuda=0 bench=0 verksted=0$' "$T/out-cpuempty")" 1
 
 # A build that fails (CPU and CUDA) runs no hold.
 echo 'error: build failed' > "$T/build.json"

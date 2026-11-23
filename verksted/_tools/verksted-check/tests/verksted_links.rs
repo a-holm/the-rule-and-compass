@@ -86,3 +86,16 @@ fn tracked_workshop_names_no_machine_path_outside_lib() {
     }
     assert!(offenders.is_empty(), "machine paths in tracked files:\n{}", offenders.join("\n"));
 }
+
+#[test]
+fn crate_dir_matches_the_shell_lookup() {
+    let root = workshop_root();
+    let repo = root.join("..").canonicalize().expect("repo root");
+    let output = std::process::Command::new(root.join("_tools/crate-dir.sh"))
+        .arg(&repo)
+        .output()
+        .expect("run crate-dir.sh");
+    assert!(output.status.success(), "crate-dir.sh failed: {}", String::from_utf8_lossy(&output.stderr));
+    let shell = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim_end());
+    assert_eq!(check::crate_dir(&repo), Some(shell));
+}

@@ -5,9 +5,9 @@
 # --message-format=json), then every test target (lib, each bin, each --test file, --doc) runs in its own lock hold under
 # `timeout LOCK_HOLD_MAX-20`, so one target that times out or fails never stops the others and no hold exceeds the cap.
 # A target above the limit is a failure: size it, the limit is never raised.
-# Exit 0 only when every suite passes, no target failed or timed out, and the benchmark recovers 27/27.
+# Exit 0 only when every suite passes, the verksted-check tests and `links --external` pass (log $D/<tag>-verksted.log), no target failed or timed out, and the benchmark recovers 27/27.
 # Exit 70 at once when a new Xid line appeared (or the Xid check failed) during a CUDA target (the remaining targets are not run).
-# Writes: $D/<tag>-{cpu,cuda,bench}.log, $D/<tag>-{cpu,cuda}-{build,summary}.log, $D/<tag>-{cpu,cuda}-<target>.log
+# Writes: $D/<tag>-{cpu,cuda,bench}.log, $D/<tag>-verksted.log, $D/<tag>-{cpu,cuda}-{build,summary}.log, $D/<tag>-{cpu,cuda}-<target>.log
 # The summary has one line per target: <target> rc=<n> [xid=new:<n>] wait=<s> run=<s> | <test result line> [| timeout]. The xid field is CUDA only.
 # wait is the time from asking for the lock to the hold start (the hold writes its own start time, RCSR_NOW_CMD, default `date +%s`); run is the time from the hold start to its end.
 # Every hold (each CPU and CUDA target, benchmark) runs through lock-run.sh: a process the command leaves holding the lock is ended by pid.
@@ -140,6 +140,7 @@ suite cuda "$cuda_env" "$cuda_cargo" 1
 g=$s
 cuda_targets=$n_targets cuda_failed=$n_failed cuda_timeouts=$n_timeouts
 step bench "timeout -k $KILL_AFTER 5400 cargo build --release && timeout -k $KILL_AFTER 1800 ./target/release/rcsr-bench --tiny"; b=$?
+"$B" bash -c "cd '$W/verksted/_tools/verksted-check' && CARGO_BUILD_JOBS=2 timeout -k $KILL_AFTER 3000 cargo test --release && CARGO_BUILD_JOBS=2 timeout -k $KILL_AFTER 1800 cargo run --release -- links --external '$W/verksted'" > "$D/$T-verksted.log" 2>&1; v=$?
 bad=0
 for k in cpu cuda; do
   f=$D/$T-$k.log
@@ -152,8 +153,8 @@ echo "cpu: targets=$cpu_targets failed=$cpu_failed timeouts=$cpu_timeouts"
 echo "cuda: targets=$cuda_targets failed=$cuda_failed timeouts=$cuda_timeouts"
 rec=$(grep -a -E '^recovered [0-9]+/[0-9]+' "$D/$T-bench.log" | tail -n 1)
 echo "bench: ${rec:-no recovered line}"
-echo "exit cpu=$c cuda=$g bench=$b"
+echo "exit cpu=$c cuda=$g bench=$b verksted=$v"
 echo "tested: $(git -C "$W" rev-parse HEAD)"
 case "$rec" in *"recovered 27/27"*) ;; *) bad=1 ;; esac
 [ "$g" -ne 70 ] || exit 70
-[ "$c" -eq 0 ] && [ "$g" -eq 0 ] && [ "$b" -eq 0 ] && [ "$bad" -eq 0 ]
+[ "$c" -eq 0 ] && [ "$g" -eq 0 ] && [ "$b" -eq 0 ] && [ "$v" -eq 0 ] && [ "$bad" -eq 0 ]

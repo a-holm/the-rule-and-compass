@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const USAGE: &str = "usage:
-  verksted-check links [--icm] [DIR]
+  verksted-check links [--icm | --external] [DIR]
   verksted-check graph [--dot] [--out FILE] [DIR]
   verksted-check walk [--strict] [DIR]
   verksted-check refs [DIR]
@@ -56,12 +56,15 @@ fn main() -> ExitCode {
     let allowed: &[&str] = match cmd.as_str() {
         "walk" => &["--strict"],
         "index" => &["--check"],
-        "links" => &["--icm"],
+        "links" => &["--icm", "--external"],
         "graph" => &["--dot"],
         "refs" => &[],
         _ => return usage(),
     };
     if dirs.len() > 1 || flags.iter().any(|f| !allowed.contains(f)) {
+        return usage();
+    }
+    if cmd == "links" && flags.contains(&"--icm") && flags.contains(&"--external") {
         return usage();
     }
     let dir = PathBuf::from(dirs.first().copied().unwrap_or("verksted"));
@@ -80,7 +83,12 @@ fn main() -> ExitCode {
             }
         }
         "links" => {
-            let report = check::check_tree(&dir);
+            let external = flags.contains(&"--external");
+            if external && dir.canonicalize().ok().and_then(|d| d.parent().and_then(check::crate_dir)).is_none() {
+                eprintln!("links --external: no engine crate directory (package rule-and-compass) next to {}", dir.display());
+                return ExitCode::from(1);
+            }
+            let report = check::check_tree_with(&dir, external);
             eprintln!("{} files, {} links and inputs checked", report.files, report.checked);
             finish(&report.broken, "links")
         }
