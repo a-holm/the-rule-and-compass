@@ -227,8 +227,8 @@ chmod +x "$T/run/bin/rcsr"
 pc=$V/$PC/output/precond.md
 echo 'blocking: none' > "$pc"
 st $PC; check precond-pass "$?" 0
-cp /usr/bin/sleep "$T/bin/rcsr"
-"$T/bin/rcsr" 60 &
+cp "$(command -v tail)" "$T/bin/rcsr"
+"$T/bin/rcsr" -f /dev/null &
 other=$!
 pids+=("$other")
 check precond-other-rcsr-running "$(test "$(ps -eo comm= | grep -cx rcsr)" -ge 1 && echo yes)" yes
