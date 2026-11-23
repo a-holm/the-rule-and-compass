@@ -622,3 +622,77 @@ fn a_spawning_binary_cannot_be_device() {
     let scratch = scratch_tests("sandev", &[("runs.rs", "fn t() { std::process::Command::new(\"true\").output().unwrap(); }\n")]);
     assert_eq!(spawners_not_app_only("runs * device why\n", &scratch.path()), vec!["runs".to_string()]);
 }
+
+const SHARD_STAR: &str = "lib * app-only why\n";
+
+fn shard_plan(shards: &str) -> String {
+    format!("{SHARD_STAR}{shards}")
+}
+
+#[test]
+fn shard_mode_takes_only_a_shard_name_and_a_prefix_list() {
+    assert!(parse("lib shard=a shard gpu:: why\n").is_ok());
+    assert!(parse("lib shard=rest shard rest why\n").is_ok());
+    assert!(parse("lib a_shard shard gpu:: why\n").is_err());
+    assert!(parse("lib shard= shard gpu:: why\n").is_err());
+    assert!(parse("lib shard=a shard\n").is_err());
+}
+
+#[test]
+fn a_valid_shard_plan_passes() {
+    let plan = shard_plan("lib shard=gpu shard gpu:: why\nlib shard=fit shard fit::,search:: why\nlib shard=rest shard rest why\n");
+    assert_eq!(check(&plan, &root()), Vec::<String>::new());
+}
+
+#[test]
+fn a_shard_line_needs_a_rest_line() {
+    let errors = check(&shard_plan("lib shard=gpu shard gpu:: why\n"), &root());
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("exactly one rest shard"), "{errors:?}");
+    let two = shard_plan("lib shard=a shard rest why\nlib shard=b shard rest why\n");
+    assert!(check(&two, &root()).iter().any(|e| e.contains("exactly one rest shard")));
+}
+
+#[test]
+fn shard_prefixes_must_not_nest() {
+    let plan = shard_plan("lib shard=a shard gpu:: why\nlib shard=b shard gpu::fit_tests:: why\nlib shard=rest shard rest why\n");
+    let errors = check(&plan, &root());
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("'gpu::fit_tests::' is inside 'gpu::'"), "{errors:?}");
+    let same = shard_plan("lib shard=a shard gpu:: why\nlib shard=b shard gpu:: why\nlib shard=rest shard rest why\n");
+    assert!(check(&same, &root()).iter().any(|e| e.contains("claimed twice")));
+}
+
+#[test]
+fn a_shard_prefix_names_a_real_module_and_ends_in_a_path_separator() {
+    let plan = shard_plan("lib shard=a shard no_such_module:: why\nlib shard=b shard gpu why\nlib shard=rest shard rest why\n");
+    let errors = check(&plan, &root());
+    assert!(errors.iter().any(|e| e.contains("no `mod no_such_module`")), "{errors:?}");
+    assert!(errors.iter().any(|e| e.contains("'gpu' must end in ::")), "{errors:?}");
+}
+
+#[test]
+fn a_sharded_binary_needs_an_app_only_or_device_star_line() {
+    let rest = "lib shard=gpu shard gpu:: why\nlib shard=rest shard rest why\n";
+    for star in ["lib * skip why\n", "lib * no-cuda why\n", ""] {
+        let errors = check(&format!("{star}{rest}"), &root());
+        assert!(errors.iter().any(|e| e.contains("star line that is app-only or device")), "{star:?}: {errors:?}");
+    }
+    assert!(check(&format!("lib * device why\n{rest}"), &root()).is_empty());
+}
+
+#[test]
+fn shard_names_are_unique_and_only_lib_or_bin_binaries_are_sharded() {
+    let dup = shard_plan("lib shard=a shard gpu:: why\nlib shard=a shard fit:: why\nlib shard=rest shard rest why\n");
+    assert!(check(&dup, &root()).iter().any(|e| e.contains("shard 'a' twice")));
+    let errors = check("attach * app-only why\nattach shard=a shard x:: why\nattach shard=rest shard rest why\n", &root());
+    assert!(errors.iter().any(|e| e.contains("only lib and bin-")), "{errors:?}");
+}
+
+#[test]
+fn the_checked_in_lib_is_split_into_shards_and_a_rest() {
+    let lines = parse(PLAN).expect("plan parses");
+    let shards: Vec<&Line> = lines.iter().filter(|l| l.binary == "lib" && l.mode == "shard").collect();
+    assert!(shards.len() >= 3, "lib needs several shards");
+    assert_eq!(shards.iter().filter(|l| l.args.split_whitespace().next() == Some("rest")).count(), 1);
+}
