@@ -312,6 +312,7 @@ fn device_enumerate_finds_the_planted_rule() {
 /// to exit 1: no CPU fallback.
 #[test]
 fn device_enumerate_refuses_with_bytes() {
+    let _alloc_gate = crate::gpu::alloc_state_gate::exclusive();
     if !device() {
         return;
     }

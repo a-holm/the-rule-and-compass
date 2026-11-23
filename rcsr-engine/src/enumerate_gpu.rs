@@ -249,6 +249,8 @@ impl Enumerator {
             return Err(format!("{} block ids for {} rows", ids.len(), rows));
         }
         let ranks32: Vec<u32> = ranks.iter().map(|&r| r as u32).collect();
+        #[cfg(test)]
+        let _alloc_gate = crate::gpu::alloc_state_gate::shared();
         let h = unsafe {
             rc_enum_create(
                 ev.raw_context(),
