@@ -1,0 +1,17 @@
+amihud96
+avg_trade_size96
+btc_volume_share
+cmf20
+cvd_proxy
+mfi14
+obv_z96
+taker_imb16
+taker_ratio96
+trade_intensity96
+vol20_ratio
+vol_z96
+vwap
+vwap20_dev
+vwap_dev96
+vz96
+xs_rank_amihud96
