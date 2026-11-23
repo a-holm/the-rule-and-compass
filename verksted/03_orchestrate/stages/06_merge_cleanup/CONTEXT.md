@@ -7,7 +7,7 @@ One job: bring the integration worktree up to date after each verifier run and r
 **This run:**
 - `../05_receive_and_verify/output/verify.md`
 - `../05_receive_and_verify/output/check.md` (must be `pass`)
-- the `report.md` of each verifier run (`../../../08_close/stages/03_cleanup/output/report.md` and `$OUT/report.md` of the verifier, `$VLOCAL/verifier/<PR>/`)
+- the `report.md` of each verifier run (`../../../08_close/stages/03_cleanup/output/report.md` and the `report.md` in the verifier record directory `OUT`)
 
 **Reference (every run):**
 - `../../../_shared/rules.md`

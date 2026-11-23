@@ -5,8 +5,8 @@ One job: close the issue when every criterion row is met or owned by another ope
 ## Inputs
 
 **This run:**
-- `$OUT/verification.md` (`OUT` is `$VLOCAL/verifier/$PR`, printed by `brief.sh verifier`)
-- `$OUT/check.md` (must be `pass`)
+- the `verification.md` in the verifier record directory `OUT` (printed by `brief.sh verifier`)
+- the `check.md` in `OUT` (must be `pass`)
 
 **Reference (every run):**
 - `../../../_shared/rules.md`
