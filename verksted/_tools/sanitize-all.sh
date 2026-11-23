@@ -21,7 +21,7 @@
 # Plan mode `<binary> * app-only <reason>` runs the test process under memcheck with `--target-processes application-only` and gives the normal verdict (rc 0 and `ERROR SUMMARY: 0 errors`): for a binary whose test process makes CUDA calls but whose children must not be traced (the sanitizer crashes on them or they are not meant to run on the device). The reason names what stays unsanitized.
 # Plan mode `<binary> * device <reason>` lists a binary that calls CUDA by design; the runner treats it exactly like an unlisted binary (default --target-processes all, normal verdict, not counted as no-cuda). It may be combined with named `skip` and `api-errors-no` lines. tests/sanitizer_plan.rs requires exactly one `*` line per test executable.
 # A listed binary whose run printed an ERROR SUMMARY called CUDA: it gets the normal verdict and the line ends `listed no-cuda but called CUDA`.
-# Plan mode `<binary> shard=<name> shard <prefix>[,<prefix>...]|rest <reason>` (lib and bin-<name> only, next to the binary's one `*` line) splits one binary into several runs, each its own lock hold with the log <id>-san-<binary>-shard-<name>. The runner lists the binary with --list, a shard takes every test whose full path starts with one of its prefixes (a prefix ends in ::), `rest` takes every test no shard claims, and each run passes the exact names with --exact. A bare test name on a skip or api-errors-no line resolves to the one full path that ends in ::<name>; no match or two matches fail the pass. A shard with no test, or a test claimed by two shards, fails the pass.
+# Plan mode `<binary> shard=<name> shard <prefix>[,<prefix>...]|rest <reason>` (`shard-no-cuda` instead of `shard` lists a shard that makes no CUDA call, judged like a no-cuda binary) (lib and bin-<name> only, next to the binary's one `*` line) splits one binary into several runs, each its own lock hold with the log <id>-san-<binary>-shard-<name>. The runner lists the binary with --list, a shard takes every test whose full path starts with one of its prefixes (a prefix ends in ::), `rest` takes every test no shard claims, and each run passes the exact names with --exact. A bare test name on a skip or api-errors-no line resolves to the one full path that ends in ::<name>; no match or two matches fail the pass. A shard with no test, or a test claimed by two shards, fails the pass.
 # The summary ends with the counts `no-cuda binaries`, `unexpected no-cuda` and `listed no-cuda but called CUDA`.
 # A run with rc 255, `running 0 tests`, a non-zero filtered-out count and the sanitizer message `terminated before first instrumented API call` (the plan filtered out every test) is written as `<binary> skipped by plan | ...` and is not a failure.
 # Exit: 0 when every run has rc 0 and `ERROR SUMMARY: 0 errors`; 70 at once when a new Xid line appeared or the Xid check failed; 1 otherwise; 3 when $SANITIZER is missing or not CUDA 13; 2 usage.
@@ -68,7 +68,7 @@ plan_lines=$(awk '/^[[:space:]]*(#|$)/ { next } {
   printf "%s\t%s\t%s\t%s\n", $1, $2, $3, reason }' "$plan")
 while IFS=$'\t' read -r b t m r; do
   [ -n "$b" ] || continue
-  case "$m" in skip|api-errors-no) ;; shard) case "$t" in shard=?*) ;; *) echo "sanitize-all: shard needs shard=<name> as the test, got '$t' for $b in $plan" >&2; exit 2 ;; esac ;; no-cuda|no-cuda-app-only|app-only|device|run-bin) [ "$t" = "*" ] || { echo "sanitize-all: $m needs '*' as the test, got '$t' for $b in $plan" >&2; exit 2; } ;; *) echo "sanitize-all: bad mode '$m' in $plan" >&2; exit 2 ;; esac
+  case "$m" in skip|api-errors-no) ;; shard|shard-no-cuda) case "$t" in shard=?*) ;; *) echo "sanitize-all: shard needs shard=<name> as the test, got '$t' for $b in $plan" >&2; exit 2 ;; esac ;; no-cuda|no-cuda-app-only|app-only|device|run-bin) [ "$t" = "*" ] || { echo "sanitize-all: $m needs '*' as the test, got '$t' for $b in $plan" >&2; exit 2; } ;; *) echo "sanitize-all: bad mode '$m' in $plan" >&2; exit 2 ;; esac
   [ -n "$r" ] || { echo "sanitize-all: empty reason for $b $t in $plan" >&2; exit 2; }
 done <<< "$plan_lines"
 run_bin_names=$(printf '%s\n' "$plan_lines" | awk -F'\t' '$3 == "run-bin" && !seen[$1]++ { print $1 }')
@@ -170,10 +170,13 @@ run_one() { # label tag api bin args...
 }
 
 plan_shards_for() { # binary -> shard names of its `shard=` lines
-  printf '%s\n' "$plan_lines" | awk -F'\t' -v b="$1" '$1 == b && $3 == "shard" { sub(/^shard=/, "", $2); print $2 }'
+  printf '%s\n' "$plan_lines" | awk -F'\t' -v b="$1" '$1 == b && ($3 == "shard" || $3 == "shard-no-cuda") { sub(/^shard=/, "", $2); print $2 }'
 }
 plan_shard_spec() { # binary shard -> the comma list of prefixes (or `rest`), the first word of the reason
-  printf '%s\n' "$plan_lines" | awk -F'\t' -v b="$1" -v s="shard=$2" '$1 == b && $2 == s && $3 == "shard" { split($4, a, " "); print a[1] }'
+  printf '%s\n' "$plan_lines" | awk -F'\t' -v b="$1" -v s="shard=$2" '$1 == b && $2 == s && ($3 == "shard" || $3 == "shard-no-cuda") { split($4, a, " "); print a[1] }'
+}
+plan_shard_mode() { # binary shard -> shard or shard-no-cuda
+  printf '%s\n' "$plan_lines" | awk -F'\t' -v b="$1" -v s="shard=$2" '$1 == b && $2 == s { print $3 }'
 }
 list_tests() { # test binary -> one full libtest name per line
   "$1" --list 2> /dev/null | sed -n 's/: test$//p'
@@ -237,7 +240,9 @@ run_sharded() { # name bin (target_args and listed are set by run_binary)
       fails=$((fails + 1))
       continue
     fi
+    [ "$(plan_shard_mode "$name" "$s")" = shard-no-cuda ] && listed=1 || listed=0
     run_one "$name:shard=$s" "san-$name-shard-$s" "" "$bin" "${names[@]}" --exact
+    listed=0
   done <<< "$(plan_shards_for "$name")"
   for full in ${apifull[@]+"${apifull[@]}"}; do
     run_one "$name:$full" "san-$name-${full//::/-}" no "$bin" "$full" --exact

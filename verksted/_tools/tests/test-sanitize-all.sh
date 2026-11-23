@@ -52,7 +52,7 @@ cat > "$T/bin/cargo" <<'STUB'
 echo "cargo $*" >> "$FAKE_DIR/cargo-calls"
 art() { echo "{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"$1\",\"kind\":[\"$2\"]},\"profile\":{\"test\":$3},\"executable\":$4}"; }
 art rcsr lib false null
-art rcsr lib true '"/fake/deps/rcsr-aaa"'
+art rcsr lib true "\"${FAKE_LIB_BIN:-/fake/deps/rcsr-aaa}\""
 art rcsr bin true '"/fake/deps/rcsr_bin-bbb"'
 art gpu_parity test true '"/fake/deps/gpu_parity-ccc"'
 art gpu_big test true '"/fake/deps/gpu_big-ddd"'
@@ -392,6 +392,68 @@ has runbin-two-lines2 "$sum" '^rcsr-gpu-bench-2 rc=0 '
 printf '%s\n' 'rcsr-gpu-bench  x  run-bin  --batch 1' > "$T/plan-badbin"
 PLAN=$T/plan-badbin run "$T/wt" 9 > /dev/null 2>&1; r=$?
 check runbin-badtest-rc "$r" "2"
+
+# shard lines: one run per shard from the binary's --list, exact names, rest takes the unclaimed tests, a bare api-errors-no name resolves to its full path
+cat > "$T/bin/libbin" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' 'a::t1: test' 'a::t2: test' 'b::sub::t3: test' 'b::slow_case: test' 'c::t4: test' '' '5 tests, 0 benchmarks'
+STUB
+chmod +x "$T/bin/libbin"
+cat > "$T/plan-shard" <<'PLAN'
+lib * app-only the child makes no CUDA call
+lib shard=first shard a:: first module
+lib shard=second shard b::sub:: one submodule
+lib shard=rest shard rest everything else
+lib slow_case api-errors-no provokes an out-of-memory on purpose
+PLAN
+FAKE_LIB_BIN=$T/bin/libbin PLAN=$T/plan-shard run "$T/wt" 9 --only lib > /dev/null 2>&1; r=$?
+check shard-rc "$r" "0"
+has shard-first "$T/san-calls" 'target-processes application-only --leak-check no --error-exitcode 99 /.*/libbin a::t1 a::t2 --exact$'
+has shard-second "$T/san-calls" 'error-exitcode 99 /.*/libbin b::sub::t3 --exact$'
+has shard-rest "$T/san-calls" 'error-exitcode 99 /.*/libbin c::t4 --exact$'
+has shard-api "$T/san-calls" 'error-exitcode 99 --report-api-errors no /.*/libbin b::slow_case --exact$'
+check shard-runs "$(wc -l < "$T/san-calls" | tr -d ' ')" "4"
+has shard-line-first "$sum" '^lib:shard=first rc=0 xid=0 secs='
+has shard-line-rest "$sum" '^lib:shard=rest rc=0 xid=0 secs='
+has shard-line-api "$sum" '^lib:b::slow_case rc=0 xid=0 secs='
+check shard-locks "$(grep -c '^lock .*timeout -k 30 580 ' "$T/calls")" "4"
+test -f "$T/gates/issue9-san-lib-shard-first.log" && test -f "$T/gates/issue9-san-lib-shard-rest.log" && test -f "$T/gates/issue9-san-lib-b-slow_case.log"; check shard-logs "$?" "0"
+
+# dry run: one line per shard, no binary needed
+PLAN=$T/plan-shard run "$T/wt" 9 --only lib --dry-run > "$T/out" 2>&1; r=$?
+check shard-dry-rc "$r" "0"
+has shard-dry-first "$T/out" '^run lib:shard=first: .* a::'
+has shard-dry-rest "$T/out" '^run lib:shard=rest: .* <tests of shard rest: rest>'
+
+# a shard that selects no test, a test claimed by two shards and a bare name that matches nothing fail the pass
+printf '%s\n' 'lib * app-only x' 'lib shard=gone shard zzz:: stale prefix' 'lib shard=rest shard rest r' > "$T/plan-empty"
+FAKE_LIB_BIN=$T/bin/libbin PLAN=$T/plan-empty run "$T/wt" 9 --only lib > /dev/null 2>&1; r=$?
+check shard-empty-rc "$r" "1"
+has shard-empty-line "$sum" '^lib:shard=gone empty \| no test matches zzz::'
+printf '%s\n' 'lib * app-only x' 'lib shard=wide shard b:: x' 'lib shard=narrow shard b::sub:: x' 'lib shard=rest shard rest r' > "$T/plan-overlap"
+FAKE_LIB_BIN=$T/bin/libbin PLAN=$T/plan-overlap run "$T/wt" 9 --only lib > /dev/null 2>&1; r=$?
+check shard-overlap-rc "$r" "1"
+has shard-overlap-line "$sum" '^lib overlap \| 1 tests match'
+printf '%s\n' 'lib * app-only x' 'lib shard=rest shard rest r' 'lib no_such_test skip x' > "$T/plan-missing"
+FAKE_LIB_BIN=$T/bin/libbin PLAN=$T/plan-missing run "$T/wt" 9 --only lib > /dev/null 2>&1; r=$?
+check shard-missing-rc "$r" "1"
+has shard-missing-line "$sum" '^lib:no_such_test missing \| no single test named or ending in ::no_such_test'
+
+# shard-no-cuda is judged like a no-cuda binary; a plain shard with no CUDA call is unexpected
+printf '%s\n' 'lib * app-only x' 'lib shard=cpu shard-no-cuda a:: cpu only' 'lib shard=rest shard rest r' > "$T/plan-shard-nc"
+FAKE_NC_MODE=noattach FAKE_NC_ON=a::t1 FAKE_LIB_BIN=$T/bin/libbin PLAN=$T/plan-shard-nc run "$T/wt" 9 --only lib > /dev/null 2>&1; r=$?
+check shard-nc-rc "$r" "0"
+has shard-nc-line "$sum" '^lib:shard=cpu no CUDA call \(listed\) \| test result: ok'
+has shard-nc-rest-ran "$sum" '^lib:shard=rest rc=0 '
+printf '%s\n' 'lib * app-only x' 'lib shard=cpu shard a:: cpu only' 'lib shard=rest shard rest r' > "$T/plan-shard-plain"
+FAKE_NC_MODE=noattach FAKE_NC_ON=a::t1 FAKE_LIB_BIN=$T/bin/libbin PLAN=$T/plan-shard-plain run "$T/wt" 9 --only lib > /dev/null 2>&1; r=$?
+check shard-plain-nc-rc "$r" "1"
+has shard-plain-nc-line "$sum" '^lib:shard=cpu unexpected no CUDA call'
+
+# a shard line needs shard=<name> as the test
+printf '%s\n' 'lib x shard a:: why' > "$T/plan-badshard"
+PLAN=$T/plan-badshard run "$T/wt" 9 --only lib > /dev/null 2>&1; r=$?
+check shard-badtest-rc "$r" "2"
 
 check help-rc "$(bash "$ALL" -h > "$T/h"; echo $?)" "0"
 has help-usage "$T/h" '^Usage: sanitize-all.sh <worktree>'

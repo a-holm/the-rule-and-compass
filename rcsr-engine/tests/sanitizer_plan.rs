@@ -34,8 +34,14 @@ fn parse(text: &str) -> Result<Vec<Line>, String> {
             _ => return Err(format!("line {no}: need <binary> <test> <mode> <reason>")),
         };
         let reason = it.collect::<Vec<_>>().join(" ");
-        if !["skip", "api-errors-no", "no-cuda", "no-cuda-app-only", "app-only", "device", "run-bin"].contains(&mode) {
+        if !["skip", "api-errors-no", "no-cuda", "no-cuda-app-only", "app-only", "device", "run-bin", "shard", "shard-no-cuda"].contains(&mode) {
             return Err(format!("line {no}: unknown mode '{mode}'"));
+        }
+        if mode.starts_with("shard") {
+            let named = test.strip_prefix("shard=").is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
+            if !named {
+                return Err(format!("line {no}: {mode} needs shard=<name> (lowercase letters, digits, -) as the test"));
+            }
         }
         if (mode.starts_with("no-cuda") || mode == "app-only" || mode == "device" || mode == "run-bin") && test != "*" {
             return Err(format!("line {no}: {mode} needs '*' as the test"));
@@ -132,8 +138,11 @@ fn check(plan: &str, root: &Path) -> Vec<String> {
                 continue;
             }
         };
+        if l.mode.starts_with("shard") {
+            continue;
+        }
         if l.test == "*" {
-            if lines.iter().any(|o| o.binary == l.binary && o.test != "*" && !((l.mode == "app-only" || l.mode == "device") && (o.mode == "skip" || o.mode == "api-errors-no"))) {
+            if lines.iter().any(|o| o.binary == l.binary && o.test != "*" && !((l.mode == "app-only" || l.mode == "device") && (o.mode == "skip" || o.mode == "api-errors-no" || o.mode.starts_with("shard")))) {
                 errors.push(format!("line {}: '{}' has both '*' and named lines", l.no, l.binary));
             }
             continue;
@@ -152,6 +161,95 @@ fn check(plan: &str, root: &Path) -> Vec<String> {
                     "line {}: '{}' is a substring of '{other}', so libtest --skip would match both",
                     l.no, l.test
                 ));
+            }
+        }
+    }
+    errors.extend(shard_errors(&lines, root));
+    errors
+}
+
+/// Shard prefixes of a sharded binary: the plan's `shard` and `shard-no-cuda` lines carry a comma list of test-path prefixes, or `rest`, as the first word of the reason.
+fn shard_lines(lines: &[Line]) -> Vec<&Line> {
+    lines.iter().filter(|l| l.mode == "shard" || l.mode == "shard-no-cuda").collect()
+}
+
+fn shard_prefixes(l: &Line) -> Vec<&str> {
+    l.args.split_whitespace().next().unwrap_or("").split(',').collect()
+}
+
+/// The top-level `mod` names of src/lib.rs, with or without a visibility or a cfg attribute on the line before.
+fn lib_modules(root: &Path) -> BTreeSet<String> {
+    let text = fs::read_to_string(root.join("src/lib.rs")).unwrap_or_default();
+    let mut mods = BTreeSet::new();
+    for line in text.lines().map(str::trim) {
+        let line = line.strip_prefix("pub(crate) ").or_else(|| line.strip_prefix("pub ")).unwrap_or(line);
+        let Some(rest) = line.strip_prefix("mod ") else { continue };
+        let name: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+        if !name.is_empty() && rest[name.len()..].trim_start().starts_with([';', '{']) {
+            mods.insert(name);
+        }
+    }
+    mods
+}
+
+/// Shard rules: only `lib` and `bin-*`, an `app-only` or `device` star line next to them, unique names, exactly one `rest`, prefixes that
+/// contain `::`, start in a module of src/lib.rs, and never lie inside one another (a test would run in two holds).
+fn shard_errors(lines: &[Line], root: &Path) -> Vec<String> {
+    let mut errors = Vec::new();
+    let shards = shard_lines(lines);
+    let mut binaries: Vec<&str> = shards.iter().map(|l| l.binary.as_str()).collect();
+    binaries.sort_unstable();
+    binaries.dedup();
+    for binary in binaries {
+        let mine: Vec<&&Line> = shards.iter().filter(|l| l.binary == binary).collect();
+        if binary != "lib" && !binary.starts_with("bin-") {
+            errors.push(format!("'{binary}' has shard lines, only lib and bin-<name> can be sharded"));
+            continue;
+        }
+        let star_ok = lines.iter().any(|l| l.binary == binary && l.test == "*" && (l.mode == "app-only" || l.mode == "device"));
+        if !star_ok {
+            errors.push(format!("'{binary}' has shard lines and needs a star line that is app-only or device"));
+        }
+        let mut names = BTreeSet::new();
+        for l in &mine {
+            let name = l.test.trim_start_matches("shard=");
+            if !names.insert(name) {
+                errors.push(format!("line {}: shard '{name}' twice for '{binary}'", l.no));
+            }
+        }
+        let rests = mine.iter().filter(|l| shard_prefixes(l) == ["rest"]).count();
+        if rests != 1 {
+            errors.push(format!("'{binary}' needs exactly one rest shard (a shard line whose prefix list is `rest`), found {rests}"));
+        }
+        let modules = lib_modules(root);
+        let mut all: Vec<(usize, &str)> = Vec::new();
+        for l in &mine {
+            for p in shard_prefixes(l) {
+                if p == "rest" {
+                    if shard_prefixes(l).len() > 1 {
+                        errors.push(format!("line {}: `rest` cannot share a shard with prefixes", l.no));
+                    }
+                    continue;
+                }
+                let first = p.split("::").next().unwrap_or("");
+                if !p.contains("::") {
+                    errors.push(format!("line {}: prefix '{p}' must contain :: (module::...)", l.no));
+                } else if binary == "lib" && !modules.contains(first) {
+                    errors.push(format!("line {}: prefix '{p}' names no `mod {first}` in src/lib.rs", l.no));
+                }
+                all.push((l.no, p));
+            }
+        }
+        for (i, (no, p)) in all.iter().enumerate() {
+            for (j, (_, q)) in all.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                if p == q && i < j {
+                    errors.push(format!("line {no}: prefix '{p}' claimed twice"));
+                } else if p != q && p.starts_with(q) {
+                    errors.push(format!("line {no}: prefix '{p}' is inside '{q}', so its tests would run in two holds"));
+                }
             }
         }
     }
@@ -664,11 +762,11 @@ fn shard_prefixes_must_not_nest() {
 }
 
 #[test]
-fn a_shard_prefix_names_a_real_module_and_ends_in_a_path_separator() {
+fn a_shard_prefix_names_a_real_module_and_needs_a_path_separator() {
     let plan = shard_plan("lib shard=a shard no_such_module:: why\nlib shard=b shard gpu why\nlib shard=rest shard rest why\n");
     let errors = check(&plan, &root());
     assert!(errors.iter().any(|e| e.contains("no `mod no_such_module`")), "{errors:?}");
-    assert!(errors.iter().any(|e| e.contains("'gpu' must end in ::")), "{errors:?}");
+    assert!(errors.iter().any(|e| e.contains("'gpu' must contain ::")), "{errors:?}");
 }
 
 #[test]
