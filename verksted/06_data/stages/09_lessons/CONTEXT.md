@@ -34,7 +34,7 @@ Do NOT load: locked-window results, raw data files, other datasets' lessons.
 ## Check
 
 ```sh
-o="$V/06_data/stages/09_lessons/output"; test -s "$o/lessons-general.md" && test -s "$o/lessons-local.md" && ! grep -qE '/mnt/|/home/' "$o/lessons-general.md" && { grep -qx none "$o/lessons-general.md" || grep -q 'Source: ' "$o/lessons-general.md"; }
+o="$V/06_data/stages/09_lessons/output"; test -s "$o/lessons-general.md" && test -s "$o/lessons-local.md" && ! grep -qE '/(mnt|home)/' "$o/lessons-general.md" && { grep -qx none "$o/lessons-general.md" || grep -q 'Source: ' "$o/lessons-general.md"; }
 ```
 
 Exit 0 writes `pass`. Anything else writes `fail: <what was measured and what was wrong>` to `output/check.md`; `_tools/check.sh` does this. A red result is never rewritten as green.
