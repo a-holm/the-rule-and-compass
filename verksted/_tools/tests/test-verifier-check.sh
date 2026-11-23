@@ -50,11 +50,11 @@ fi
 GH
 chmod +x "$T/bin/gh"
 export PATH="$T/bin:$PATH" RCSR_ROOT="$T/clone" RCSR_GATES="$T/gates" RCSR_BASE=main
-export FAKE_GH_COUNT=$T/count RCSR_RETRY_SLEEP=0
+export FAKE_GH_COUNT=$T/count RCSR_RETRY_SLEEP=0 RCSR_CRATE=crate-x
 
 pr_json() {
   printf '{"state":"%s","baseRefName":"%s","headRefName":"feat","headRefOid":"%s","mergeable":"%s","files":[{"path":"shared.txt"},{"path":"src/a.rs"}]}\n' \
-    "$1" "$2" "$head" "$3" > "$T/pr.json"
+    "$1" "$2" "${PRHEAD:-$head}" "$3" > "$T/pr.json"
   export FAKE_GH_JSON=$T/pr.json
 }
 run() { bash "$TOOLS/verifier-check.sh" "$@" 2>&1; }
@@ -68,7 +68,7 @@ pr_json OPEN main MERGEABLE
 out=$(run 7 --claims "$T/claims-ok" --scope 'shared.txt' --scope 'src/*'); rc=$?
 check ok-rc "$rc" 0
 check ok-state "$(grep -c "^state: OPEN  base: main  mergeable: MERGEABLE  head: $head" <<<"$out")" 1
-check ok-found "$(grep -c '|found$' <<<"$out")" 1
+check ok-found "$(grep -c '|found' <<<"$out")" 1
 check ok-merge "$(grep -c "^merge: gh pr merge 7 --squash" <<<"$out")" 1
 check ok-stat "$(grep -c 'src/a.rs' <<<"$out")" 2
 out=$(run 7 --claims "$T/claims-nolog"); rc=$?
@@ -120,6 +120,78 @@ pr_json MERGED main MERGEABLE
 out=$(run 7); check wt-merged-none "$(grep -c '^  none:' <<<"$out")" 1
 pr_json OPEN main MERGEABLE
 git_q -C "$T/clone" worktree remove "$T/wt-feat"
+
+
+# merge line: delete the branch and take the body from a file
+pr_json OPEN main MERGEABLE
+out=$(run 7)
+check merge-delete-branch "$(grep -c '^merge: .*--delete-branch' <<<"$out")" 1
+check merge-body-file "$(grep -c "^merge: .*--body-file" <<<"$out")" 1
+check merge-no-inline-body "$(grep -c "^merge: .*--body " <<<"$out")" 0
+
+# claims on the commit that merges: RC_HEAD in the log against the PR head over the crate directory and scripts
+git_q -C "$T/clone" checkout -q -b feat2 "$head"
+mkdir -p "$T/clone/crate-x" "$T/clone/docs" "$T/clone/scripts"
+printf 'code\n' > "$T/clone/crate-x/lib.rs"
+git_q -C "$T/clone" add -A
+git_q -C "$T/clone" commit -q -m "crate"
+logsha=$(git -C "$T/clone" rev-parse HEAD)
+printf 'doc\n' > "$T/clone/docs/n.md"
+git_q -C "$T/clone" add -A
+git_q -C "$T/clone" commit -q -m "docs only"
+docsha=$(git -C "$T/clone" rev-parse HEAD)
+printf 'code 2\n' > "$T/clone/crate-x/lib.rs"
+git_q -C "$T/clone" commit -q -am "crate change"
+codesha=$(git -C "$T/clone" rev-parse HEAD)
+git_q -C "$T/clone" checkout -q --detach "$docsha"
+printf '#!/bin/sh\n' > "$T/clone/scripts/run.sh"
+git_q -C "$T/clone" add -A
+git_q -C "$T/clone" commit -q -m "script change"
+scriptsha=$(git -C "$T/clone" rev-parse HEAD)
+git_q -C "$T/clone" checkout -q main
+printf 'RC_HEAD sha=%s dirty=0\nok line\n' "$logsha" > "$T/log-h.log"
+printf '%s\n' "unit|$T/log-h.log|ok [a-z]+" > "$T/claims-h"
+PRHEAD=$logsha pr_json OPEN main MERGEABLE
+out=$(PRHEAD=$logsha run 7 --claims "$T/claims-h"); rc=$?
+check head-same-rc "$rc" 0
+check head-same-found "$(grep -c '|found$' <<<"$out")" 1
+PRHEAD=$docsha pr_json OPEN main MERGEABLE
+out=$(PRHEAD=$docsha run 7 --claims "$T/claims-h"); rc=$?
+check head-docs-only-rc "$rc" 0
+check head-docs-only-found "$(grep -c '|found$' <<<"$out")" 1
+PRHEAD=$codesha pr_json OPEN main MERGEABLE
+out=$(PRHEAD=$codesha run 7 --claims "$T/claims-h"); rc=$?
+check head-stale-rc "$rc" 1
+check head-stale-row "$(grep -c '|stale' <<<"$out")" 1
+check head-stale-not-found "$(grep -c '|found$' <<<"$out")" 0
+PRHEAD=$scriptsha pr_json OPEN main MERGEABLE
+out=$(PRHEAD=$scriptsha run 7 --claims "$T/claims-h"); rc=$?
+check head-scripts-stale-rc "$rc" 1
+check head-scripts-stale-row "$(grep -c '|stale' <<<"$out")" 1
+# a log without RC_HEAD, or with a head the repository does not hold, is an unknown head: not stale, no exit 1
+PRHEAD=$codesha pr_json OPEN main MERGEABLE
+out=$(PRHEAD=$codesha run 7 --claims "$T/claims-ok"); rc=$?
+check head-unknown-rc "$rc" 0
+check head-unknown-row "$(grep -c '|found (unknown head)$' <<<"$out")" 1
+printf 'RC_HEAD sha=%s dirty=0\nok line\n' 0123456789012345678901234567890123456789 > "$T/log-x.log"
+printf '%s\n' "unit|$T/log-x.log|ok [a-z]+" > "$T/claims-x"
+out=$(PRHEAD=$codesha run 7 --claims "$T/claims-x"); rc=$?
+check head-missing-commit-rc "$rc" 0
+check head-missing-commit-row "$(grep -c '|found (unknown head)$' <<<"$out")" 1
+# a log whose test result line ran nothing is empty, also when the claim pattern matches that line
+printf 'RC_HEAD sha=%s dirty=0\ntest golden_a ... ignored\ntest result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out\n' "$logsha" > "$T/log-e.log"
+printf '%s\n' "golden|$T/log-e.log|test result: ok" > "$T/claims-e"
+PRHEAD=$logsha pr_json OPEN main MERGEABLE
+out=$(PRHEAD=$logsha run 7 --claims "$T/claims-e"); rc=$?
+check empty-rc "$rc" 1
+check empty-row "$(grep -c '|empty$' <<<"$out")" 1
+# no match stays no match, whatever the head
+printf '%s\n' "unit|$T/log-h.log|zzz" > "$T/claims-z"
+out=$(PRHEAD=$codesha run 7 --claims "$T/claims-z"); rc=$?
+check nomatch-before-stale-rc "$rc" 1
+check nomatch-before-stale-row "$(grep -c '|no match$' <<<"$out")" 1
+unset PRHEAD
+pr_json OPEN main MERGEABLE
 
 # read-only: the clone's refs and worktree are unchanged apart from the fetch
 check readonly-status "$(git -C "$T/clone" status --porcelain)" ""

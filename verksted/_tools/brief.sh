@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Usage: brief.sh impl|research|verifier --issue <n> [--slug <s>] [--epic <n>] [--pr <n>] [--model sonnet|opus|fable] [--owned <paths>]
 # Prints a dispatch prompt: line 1 is the no-resume line; then the values N, SLUG, W, BRANCH, BASE, G, EPIC, PR;
-# then "Read and follow verksted/_shared/brief.md and verksted/_templates/<template> exactly."
+# then "Read and follow verksted/_shared/brief.md and verksted/_templates/<template> exactly." For a verifier, W is its scratch worktree $WT/verifier-<PR> (verify-merged.sh creates and removes it).
 # --model sonnet (default), opus or fable. An opus or fable prompt adds: use tractatus thinking, context7 and web search; a fable prompt
 # adds the dispatch line `subagent_type fable-52`. Every prompt ends with a line that names $VLOCAL/rules-local.md (resolved path).
 # Required: impl needs --issue, --slug; research needs --issue, --slug; verifier needs --issue, --pr.
@@ -52,7 +52,7 @@ esac
 case "$kind" in
   impl) template=brief.md; w=$WT/issue-$issue-$slug; branch=issue/$issue-$slug ;;
   research) template=brief-research.md; w=$WT/research-$slug; branch="none (detached read-only worktree)" ;;
-  verifier) template=brief-verifier.md; w="none (wt-done.sh $issue finds it)"; branch="none (the PR head)"
+  verifier) template=brief-verifier.md; w=$WT/verifier-$pr; branch="none (the PR head)"
     [ -z "$slug" ] || branch=issue/$issue-$slug ;;
 esac
 out=$(
