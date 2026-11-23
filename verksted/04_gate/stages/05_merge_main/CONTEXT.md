@@ -21,7 +21,7 @@ Do NOT load: re-gating, new tickets.
 1. If an input is missing or empty, stop and say which. Unless the trigger of this run quotes the project lead's written instruction to merge into `main`, with its date, stop and write `fail: no instruction from the project lead`.
 2. Open the PR `BASE` -> `main` with the gate numbers and one `Refs #N` line per ticket. Merge it alone, never at the same time as another merge. `Closes` is forbidden.
 3. Use `gh pr merge <pr> --merge` with a hand-written subject and body (section "Merge" of `commands.md`). Then `git fetch` and check the merge sha is on `origin/main`.
-4. Fast-forward the main checkout: `git -C "$ROOT" merge --ff-only origin/main`. A refusal is a `fail`; report it and do not reset or force the checkout.
+4. The user fast-forwards the main checkout: ask the user to run `git pull --ff-only` there (in Claude Code, `! git pull --ff-only`). Agents never change the main checkout. The Check below stays red until the user has done it.
 5. Write `report.md`: gate numbers, tested sha, merge sha. Closing the issues is `../../08_close/CONTEXT.md`.
 
 ## Outputs
