@@ -72,6 +72,13 @@ case $KILL_AFTER in
   *) KILL_AFTER=30 ;;
 esac
 
+# tools_behind <worktree>: prints how many commits of origin/$BASE that touch verksted/ the worktree HEAD lacks.
+# Status 1 (nothing printed) when origin/$BASE does not exist.
+tools_behind() {
+  git -C "$1" rev-parse --verify -q "refs/remotes/origin/$BASE^{commit}" > /dev/null || return 1
+  git -C "$1" rev-list --count "HEAD..refs/remotes/origin/$BASE" -- verksted
+}
+
 need_gates() {
   if [ ! -d "$GATES" ]; then
     echo "gates dir $GATES missing; link it to the log directory or set RCSR_GATES" >&2

@@ -109,16 +109,15 @@ One issue gets its own checkout so that concurrent work never stomps on another
 branch. The base branch is `main`, or the integration branch the orchestrator names (today `integration/gpu-hardening`). `wt-new.sh` fetches `origin` and branches from `origin/<base>`.
 
 ```sh
-cd /path/to/the-rule-and-compass
-
 N=12
 SLUG=metrics-expansion          # short, kebab-case, from the issue title
+VERKSTED=<absolute path of verksted/ that brief.sh prints>   # never run tools from the main checkout
 
 # fetch, then create branch + worktree in the ignored folder
-verksted/_tools/wt-new.sh "$N" "$SLUG" --base <base>
+"$VERKSTED/_tools/wt-new.sh" "$N" "$SLUG" --base <base>
 
 # work there from now on
-cd "worktrees/issue-$N-$SLUG"
+cd <W printed by wt-new.sh>
 ```
 
 `worktrees/` is listed in `.gitignore`, so these checkouts never show up in
@@ -230,7 +229,7 @@ Then squash-merge into the base (integration merges only; `main` only on the lea
 
 ```sh
 gh pr merge <pr> --squash --delete-branch --subject "<type(area): subject> (#<pr>)" --body-file <file>
-verksted/_tools/wt-done.sh "$N"
+"$VERKSTED/_tools/wt-done.sh" "$N"
 ```
 
 `--delete-branch` fails to delete a local branch that a worktree has checked out, so the worktree goes first or is removed right after. `wt-done.sh` removes the worktree and both branches, and refuses unless the worktree is clean and the PR is merged.
