@@ -152,6 +152,139 @@ sugg headerless12 'SUGSYM,1577836800,4242.5,2,1,1.5,3,1577840399,4,5,6,7\nSUGSYM
 sugg headerless7 '1577836800,4242.5,2,1,1.5,3,9\n1577840400,7777.5,3,1,2,4,9\n' 04_ohlcv
 sugg headerless4 'SUGSYM,1577836800,4242.5,99\nSUGSYM,1577840400,7777.5,98\n' 04_new_type
 
+# lock boundary: a time stamp with an offset or Z is converted to UTC before it meets dev_end
+HDR='time,open,high,low,close,volume'
+O=$T/offset
+mkdir -p "$O"
+printf '%s\n' "$HDR" '2024-06-30T10:00:00-05:00,4242.5,2,1,1.5,3' '2024-07-01T01:00:00+02:00,4243.5,2,1,1.5,3' '2024-06-30T22:00:00-05:00,7777.5,2,1,1.5,3' '2024-07-01T00:00:00Z,7778.5,2,1,1.5,3' > "$O/x.csv"
+bash "$PROF" --dir "$O" --dev-end 2024-07-01 --out "$T/o.md" > "$T/o.out" 2>&1
+check offset-rc "$?" 0
+check offset-rows "$(key rows "$T/o.md")" 2
+check offset-after "$(key rows_after_dev_end "$T/o.md")" 2
+check offset-first "$(key first_ts "$T/o.md")" 2024-06-30T15:00:00Z
+check offset-last "$(key last_ts "$T/o.md")" 2024-06-30T23:00:00Z
+check offset-step "$(key median_step_seconds "$T/o.md")" 28800
+for marker in 4242.5 4243.5 7777.5 7778.5 22:00:00 2024-07-01T00; do
+  check "offset-no-$marker" "$(cat "$T/o.md" "$T/o.out" | grep -c -F "$marker")" 0
+done
+
+# CRLF with offsets
+printf '%s\r\n' "$HDR" '2024-06-30T10:00:00-05:00,4242.5,2,1,1.5,3' '2024-06-30T22:00:00-05:00,7777.5,2,1,1.5,3' > "$O/x.csv"
+bash "$PROF" --dir "$O" --dev-end 2024-07-01 --out "$T/oc.md" > "$T/oc.out" 2>&1
+check crlf-offset-rc "$?" 0
+check crlf-offset-rows "$(key rows "$T/oc.md")" 1
+check crlf-offset-after "$(key rows_after_dev_end "$T/oc.md")" 1
+check crlf-offset-last "$(key last_ts "$T/oc.md")" 2024-06-30T15:00:00Z
+check crlf-offset-header "$(key header "$T/oc.md")" "$HDR"
+
+# headerless with offsets
+printf '%s\n' '2024-06-30T10:00:00-05:00,4242.5,2,1,1.5,3' '2024-06-30T22:00:00-05:00,7777.5,2,1,1.5,3' > "$O/x.csv"
+bash "$PROF" --dir "$O" --dev-end 2024-07-01 --out "$T/oh.md" > "$T/oh.out" 2>&1
+check headerless-offset-rc "$?" 0
+check headerless-offset-header "$(key header "$T/oh.md")" none
+check headerless-offset-rows "$(key rows "$T/oh.md")" 1
+check headerless-offset-after "$(key rows_after_dev_end "$T/oh.md")" 1
+check headerless-offset-last "$(key last_ts "$T/oh.md")" 2024-06-30T15:00:00Z
+check headerless-offset-type "$(key type_stage_suggestion "$T/oh.md")" 04_ohlcv
+for marker in 4242.5 7777.5; do
+  check "headerless-offset-no-$marker" "$(cat "$T/oh.md" "$T/oh.out" | grep -c -F "$marker")" 0
+done
+
+# a zone-less time of day needs --tz
+printf '%s\n' "$HDR" '2024-07-01 01:00:00,4242.5,2,1,1.5,3' > "$O/x.csv"
+rm -f "$T/z.md"
+bash "$PROF" --dir "$O" --dev-end 2024-07-01 --out "$T/z.md" > /dev/null 2>&1
+check zoneless-rc "$?" 3
+check zoneless-no-output "$([ -e "$T/z.md" ] && echo yes || echo no)" no
+bash "$PROF" --dir "$O" --dev-end 2024-07-01 --tz +02:00 --out "$T/z.md" > /dev/null 2>&1
+check tz-plus-rc "$?" 0
+check tz-plus-rows "$(key rows "$T/z.md")" 1
+bash "$PROF" --dir "$O" --dev-end 2024-07-01 --tz UTC --out "$T/z2.md" > /dev/null 2>&1
+check tz-utc-after "$(key rows_after_dev_end "$T/z2.md")" 1
+bash "$PROF" --dir "$O" --dev-end 2024-07-01 --tz nonsense --out "$T/z3.md" > /dev/null 2>&1
+check tz-bad-rc "$?" 2
+
+# dev_end with an offset is converted too
+printf '%s\n' "$HDR" '2024-06-30T23:30:00Z,4242.5,2,1,1.5,3' '2024-07-01T00:30:00Z,7777.5,2,1,1.5,3' > "$O/x.csv"
+bash "$PROF" --dir "$O" --dev-end 2024-07-01T02:00:00+02:00 --out "$T/de.md" > /dev/null 2>&1
+check dev-end-offset-rows "$(key rows "$T/de.md")" 1
+check dev-end-offset-after "$(key rows_after_dev_end "$T/de.md")" 1
+
+# zip-only directory, the documented main layout: monthly zips, streamed, nothing extracted
+Z=$T/ziponly
+mkdir -p "$Z" "$T/zsrc"
+printf '%s\r\n' "$HDR" '1577836800,4242.5,2,1,1.5,0' '1577840400,4243.5,2,1,1.5,3' > "$T/zsrc/SYM-2020-01.csv"
+printf '%s\n' "$HDR" '1706745600,7777.5,2,1,1.5,3' > "$T/zsrc/SYM-2024-02.csv"
+printf '%s\n' "$HDR" '1577844000,4244.5,2,1,1.5,3' '1800000000,7778.5,2,1,1.5,3' > "$T/zsrc/undated.csv"
+(cd "$T/zsrc" && zip -q "$Z/SYM-2020-01.zip" SYM-2020-01.csv SYM-2024-02.csv undated.csv)
+before=$(cd "$Z" && ls -laR)
+bash "$PROF" --dir "$Z" --dev-end 2023-11-15 --out "$T/zo.md" > "$T/zo.out" 2>&1
+check zip-only-rc "$?" 0
+check zip-only-tables "$(key tables "$T/zo.md")" 2
+check zip-only-type "$(key type_stage_suggestion "$T/zo.md")" 04_ohlcv
+check zip-only-rows "$(key rows "$T/zo.md")" 3
+check zip-only-after "$(key rows_after_dev_end "$T/zo.md")" 1
+check zip-only-refused "$(key files_at_or_after_dev_end "$T/zo.md")" 1
+check zip-only-members "$(key zip_members "$T/zo.md")" 2
+check zip-only-last "$(key last_ts "$T/zo.md")" 2020-01-01T02:00:00Z
+check zip-only-header "$(key header "$T/zo.md")" "$HDR"
+check zip-only-zv "$(key zero_volume_rows "$T/zo.md")" 1
+after=$(cd "$Z" && ls -laR)
+check zip-only-no-extract "$after" "$before"
+for marker in 4242.5 4243.5 4244.5 7777.5 7778.5 1800000000 1706745600; do
+  check "zip-only-no-$marker" "$(cat "$T/zo.md" "$T/zo.out" | grep -c -F "$marker")" 0
+done
+
+# gzip table with CRLF and offsets goes through the same filter
+G=$T/gz
+mkdir -p "$G"
+printf '%s\r\n' "$HDR" '2024-06-30T10:00:00-05:00,4242.5,2,1,1.5,3' '2024-06-30T22:00:00-05:00,7777.5,2,1,1.5,3' | gzip -c > "$G/SYM.csv.gz"
+bash "$PROF" --dir "$G" --dev-end 2024-07-01 --out "$T/g.md" > "$T/g.out" 2>&1
+check gzip-rc "$?" 0
+check gzip-tables "$(key tables "$T/g.md")" 1
+check gzip-rows "$(key rows "$T/g.md")" 1
+check gzip-after "$(key rows_after_dev_end "$T/g.md")" 1
+check gzip-last "$(key last_ts "$T/g.md")" 2024-06-30T15:00:00Z
+check gzip-others "$(key other_files "$T/g.md")" 0
+for marker in 4242.5 7777.5; do
+  check "gzip-no-$marker" "$(cat "$T/g.md" "$T/g.out" | grep -c -F "$marker")" 0
+done
+
+# a newest-first table: ordered first and last, positive step
+N=$T/desc
+mkdir -p "$N"
+printf '%s\n' "$HDR" '1577844000,4242.5,2,1,1.5,3' '1577840400,4243.5,2,1,1.5,3' '1577836800,4244.5,2,1,1.5,3' > "$N/x.csv"
+bash "$PROF" --dir "$N" --dev-end 2023-11-15 --out "$T/d.md" > "$T/d.out" 2>&1
+check desc-rc "$?" 0
+check desc-first "$(key first_ts "$T/d.md")" 2020-01-01T00:00:00Z
+check desc-last "$(key last_ts "$T/d.md")" 2020-01-01T02:00:00Z
+check desc-step "$(key median_step_seconds "$T/d.md")" 3600
+check desc-order "$(key order "$T/d.md")" descending
+check asc-order "$(key order "$T/s.md")" ascending
+
+# an unsorted table is refused
+printf '%s\n' "$HDR" '1577840400,4242.5,2,1,1.5,3' '1577836800,4243.5,2,1,1.5,3' '1577844000,4244.5,2,1,1.5,3' > "$N/x.csv"
+rm -f "$T/us.md"
+bash "$PROF" --dir "$N" --dev-end 2023-11-15 --out "$T/us.md" > "$T/us.out" 2>&1
+check unsorted-rc "$?" 3
+check unsorted-no-output "$([ -e "$T/us.md" ] && echo yes || echo no)" no
+check unsorted-message "$(grep -c 'not sorted' "$T/us.out")" 1
+check unsorted-no-value "$(grep -c -F 4242.5 "$T/us.out")" 0
+
+# a banner line is skipped with its own message and never printed
+B=$T/banner
+mkdir -p "$B"
+printf '# BANNERTEXT vendor, v2\n%s\n1577836800,4242.5,2,1,1.5,3\n1577840400,4243.5,2,1,1.5,3\n' "$HDR" > "$B/x.csv"
+bash "$PROF" --dir "$B" --dev-end 2023-11-15 --out "$T/b.md" > "$T/b.out" 2>&1
+check banner-rc "$?" 0
+check banner-key "$(key banner_lines "$T/b.md")" 1
+check banner-rows "$(key rows "$T/b.md")" 2
+check banner-header "$(key header "$T/b.md")" "$HDR"
+check banner-message "$(grep -c 'banner' "$T/b.out")" 1
+for marker in BANNERTEXT 4242.5; do
+  check "banner-no-$marker" "$(cat "$T/b.md" "$T/b.out" | grep -c -F "$marker")" 0
+done
+
 # the contract table and the adapt template hold the same keys
 contract=$(sed -n 's/^| `\([^|]*\)` | .*/\1/p' "$V/06_data/references/type-stage-contract.md" | tr -d '`' | tr ',' '\n' | tr -d ' ' | grep -v '^Key$' | LC_ALL=C sort)
 template=$(sed -n 's/^\([a-z_]*\): .*/\1/p' "$V/_templates/adapt.md" | LC_ALL=C sort)
