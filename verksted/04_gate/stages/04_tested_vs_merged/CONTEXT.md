@@ -18,7 +18,7 @@ Do NOT load: new features, a second gate.
 ## Process
 
 1. If an input is missing or empty, stop and say which.
-2. Read `tested: <sha>` from `gate.md`. Run `git diff --stat <sha> "$BASE" -- . ':(exclude)verksted' ':(exclude)docs' ':(exclude)*.md'` and save it as `diff.md`. The diff of code paths must be empty.
+2. Read `tested: <sha>` from `gate.md`. Run `git fetch -q origin "$BASE"`, then `git diff --stat <sha> "origin/$BASE" -- . ':(exclude)verksted' ':(exclude)docs' ':(exclude)*.md'` and save it as `diff.md`. The diff of code paths must be empty.
 3. If code changed after the gate, the gate result is void for that change: return to stage 03.
 
 ## Outputs

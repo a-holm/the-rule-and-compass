@@ -33,7 +33,7 @@ Do NOT load: the briefs' content, agents' worktrees.
 ## Check
 
 ```sh
-d="$V/03_orchestrate/stages/03_dispatch/output/dispatch.md"; w="$V/03_orchestrate/stages/01_wave_plan/output/wave.md"; for n in $(grep -o '^| #[0-9]*' "$w" | tr -d '| #'); do grep -qE "^\| #$n \| [^ |]+ \| (sonnet|opus|fable-52) \|" "$d" || exit 1; done
+d="$V/03_orchestrate/stages/03_dispatch/output/dispatch.md"; w="$V/03_orchestrate/stages/01_wave_plan/output/wave.md"; test -s "$d" && test -s "$w" && test -n "$(grep -o '^| #[0-9]*' "$w")" && for n in $(grep -o '^| #[0-9]*' "$w" | tr -d '| #'); do grep -qE "^\| #$n \| [^ |]+ \| (sonnet|opus|fable-52) \|" "$d" || exit 1; done
 ```
 
 Exit 0 writes `pass`. Anything else writes `fail: <what was measured and what was wrong>` to `output/check.md`; `_tools/check.sh` does this. A red result is never rewritten as green.
