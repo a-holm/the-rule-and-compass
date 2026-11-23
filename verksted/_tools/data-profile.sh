@@ -1,28 +1,33 @@
 #!/usr/bin/env bash
-# Usage: data-profile.sh --dir <dir> --dev-end <ISO date or time> --out <file>
+# Usage: data-profile.sh --dir <dir> --dev-end <ISO date or time> [--tz <offset>] --out <file>
 # Profiles the development files below <dir> and writes `key: value` lines to <out>: files, name_pattern, header,
 # columns, raw_columns, type_stage_suggestion, rows, first_ts, last_ts, median_step_seconds, time_unit, zero_volume_rows, zero_counts,
-# zip_files, zip_members, other_files, files_at_or_after_dev_end. A file or zip member whose name carries a date
+# order, banner_lines, zip_files, zip_members, other_files, files_at_or_after_dev_end. A file or zip member whose name carries a date
 # (YYYY-MM, YYYY-MM-DD or YYYYMMDD) at or after --dev-end is counted and never read or named. A directory whose
 # name ends in -sealed is never entered. Zip member names come from `unzip -Z1`; nothing is extracted. A table
-# file (.csv, .tsv, .txt) is read for its header, its row count, its first and last time stamp, the median step of
+# file (.csv, .tsv, .txt, also gzip-compressed or as a zip member) is streamed through one filter and read for its header, its row count, its first and last time stamp, the median step of
 # its first 10000 rows and the zero count per numeric column; a trailing carriage return is stripped from every line. No data row is printed.
 # type_stage_suggestion is 04_ohlcv when the header names open, high, low and close (aliases o, h, l, c), or when a headerless
 # first table has 6, 7 or 12 columns (the documented bar layouts), else 04_new_type; it reads no row value.
 # Writes: <out> only. No network.
-# A row stamped at or after --dev-end counts in rows_after_dev_end and enters no other statistic. A table whose
-# time stamps cannot be parsed is refused and nothing is written.
-# Exit: 0 written; 1 <dir> missing or not a directory; 2 usage; 3 unparseable table.
+# Every time stamp is converted to UTC first: an offset or Z in the stamp is applied, and --dev-end may carry one. A
+# zone-less time of day needs --tz (Z, UTC, +hh:mm, -hh:mm, +hhmm or +hh) and is refused without it; epoch stamps and
+# date-only stamps need none. A row at or after --dev-end counts in rows_after_dev_end and enters no other statistic.
+# A table sorted newest first is profiled with order: descending (first_ts is the earliest stamp, the step is
+# positive); an unsorted table is refused. A first line with another field count than the second (or starting with #)
+# is a banner: it is skipped, counted in banner_lines and never printed. A table whose time stamps cannot be
+# parsed is refused and nothing is written.
+# Exit: 0 written; 1 <dir> missing or not a directory; 2 usage; 3 unparseable, zone-less without --tz, or unsorted table.
 set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-dir='' dev_end='' out=''
+dir='' dev_end='' out='' tz=''
 while [ $# -gt 0 ]; do
   case $1 in
     -h | --help) usage; exit 0 ;;
-    --dir | --dev-end | --out)
+    --dir | --dev-end | --out | --tz)
       [ $# -ge 2 ] || { usage >&2; exit 2; }
-      case $1 in --dir) dir=$2 ;; --dev-end) dev_end=$2 ;; --out) out=$2 ;; esac
+      case $1 in --dir) dir=$2 ;; --dev-end) dev_end=$2 ;; --out) out=$2 ;; --tz) tz=$2 ;; esac
       shift 2 ;;
     *) usage >&2; exit 2 ;;
   esac
@@ -31,9 +36,23 @@ done
 [[ $dev_end =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}([T\ ].*)?$ ]] || { echo "data-profile.sh: --dev-end is not an ISO date: $dev_end" >&2; exit 2; }
 [ -d "$dir" ] || { echo "data-profile.sh: $dir is not a directory" >&2; exit 1; }
 
-end_day=${dev_end:0:10}
+end_sec=$(date -u -d "$dev_end" +%s 2> /dev/null) || end_sec=$(date -u -d "${dev_end:0:10}T${dev_end:11:8}" +%s 2> /dev/null) || end_sec=$(date -u -d "${dev_end:0:10}T00:00:00" +%s) || exit 2
+end_day=$(date -u -d "@$end_sec" +%F)
 end_compact=${end_day//-/}
-end_sec=$(date -u -d "${dev_end:0:10}T${dev_end:11:8}" +%s 2> /dev/null) || end_sec=$(date -u -d "${end_day}T00:00:00" +%s)
+
+# tz_seconds <offset>: prints the offset in seconds east of UTC, or fails.
+tz_seconds() {
+  local s=$1 sign hh mm
+  case ${s^^} in Z | UTC) echo 0; return 0 ;; esac
+  [[ $s =~ ^([-+])([0-9]{2})(:?([0-9]{2}))?$ ]] || return 1
+  sign=${BASH_REMATCH[1]} hh=${BASH_REMATCH[2]} mm=${BASH_REMATCH[4]:-00}
+  [ "$((10#$hh))" -le 14 ] && [ "$((10#$mm))" -le 59 ] || return 1
+  echo "$(( ${sign}1 * (10#$hh * 3600 + 10#$mm * 60) ))"
+}
+tz_sec=''
+if [ -n "$tz" ]; then
+  tz_sec=$(tz_seconds "$tz") || { echo "data-profile.sh: --tz is not Z, UTC or an offset like +02:00: $tz" >&2; exit 2; }
+fi
 
 # name_stamp <name>: prints the first date stamp of a file name, or nothing.
 name_stamp() {
@@ -62,7 +81,7 @@ pattern_of() {
   printf '%s\n' "$1" | sed -E 's/[0-9]{4}-[0-9]{2}-[0-9]{2}/YYYY-MM-DD/; t d; s/[0-9]{4}-[0-9]{2}/YYYY-MM/; t d; s/(^|[^0-9])(19|20)[0-9]{6}([^0-9]|$)/\1YYYYMMDD\3/; :d; s/^[A-Z0-9]{2,}([-_.])/<SYMBOL>\1/'
 }
 
-# one table file -> one `|` separated line: unit, first, last, median step, rows, columns, volume zeros, zero counts, rows after dev_end, header; or BAD
+# one table stream on stdin -> one `|` separated line: unit, first, last, median step, rows, columns, volume zeros, zero counts, rows after dev_end, order, banner, header; or BAD, ZONELESS, UNSORTED
 read -r -d '' PROFILE_AWK << 'AWK'
 function isnum(s) { return s ~ /^[-+]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][-+]?[0-9]+)?$/ }
 function days(y, m, d,   a, yy, mm, era, yoe, doy, doe) {
@@ -71,7 +90,7 @@ function days(y, m, d,   a, yy, mm, era, yoe, doy, doe) {
   doe = yoe * 365 + int(yoe / 4) - int(yoe / 100) + doy
   return era * 146097 + doe - 719468
 }
-function stamp(s,   ip, n, y, m, d, hh, mi, ss) {
+function stamp(s,   ip, n, y, m, d, hh, mi, ss, rest, off, sign, mm2) {
   gsub(/^"|"$/, "", s)
   if (isnum(s)) {
     ip = s; sub(/\..*/, "", ip); n = length(ip)
@@ -82,55 +101,94 @@ function stamp(s,   ip, n, y, m, d, hh, mi, ss) {
   }
   if (match(s, /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]/)) {
     y = substr(s, 1, 4) + 0; m = substr(s, 6, 2) + 0; d = substr(s, 9, 2) + 0
-    hh = 0; mi = 0; ss = 0
-    if (substr(s, 11, 1) ~ /[T ]/ && substr(s, 12, 8) ~ /^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]/) {
-      hh = substr(s, 12, 2) + 0; mi = substr(s, 15, 2) + 0; ss = substr(s, 18, 2) + 0
+    hh = 0; mi = 0; ss = 0; off = 0
+    if (length(s) > 10) {
+      if (substr(s, 11, 1) !~ /[T ]/) { unit = ""; return -1 }
+      rest = substr(s, 12)
+      if (rest ~ /^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]/) { hh = substr(rest, 1, 2) + 0; mi = substr(rest, 4, 2) + 0; ss = substr(rest, 7, 2) + 0; rest = substr(rest, 9) }
+      else if (rest ~ /^[0-9][0-9]:[0-9][0-9]/) { hh = substr(rest, 1, 2) + 0; mi = substr(rest, 4, 2) + 0; rest = substr(rest, 6) }
+      else { unit = ""; return -1 }
+      sub(/^[.,][0-9]+/, "", rest); sub(/^ +/, "", rest)
+      if (rest == "") {
+        if (!(tzset + 0)) { unit = "zoneless"; return -1 }
+        off = tzsec + 0
+      } else if (rest ~ /^(Z|z|UTC)$/) off = 0
+      else if (rest ~ /^[-+][0-9][0-9](:?[0-9][0-9])?$/) {
+        sign = substr(rest, 1, 1) == "-" ? -1 : 1
+        mm2 = length(rest) >= 5 ? substr(rest, length(rest) - 1, 2) + 0 : 0
+        off = sign * (substr(rest, 2, 2) * 3600 + mm2 * 60)
+      } else { unit = ""; return -1 }
     }
-    unit = "iso"; return days(y, m, d) * 86400 + hh * 3600 + mi * 60 + ss
+    unit = "iso"; return days(y, m, d) * 86400 + hh * 3600 + mi * 60 + ss - off
   }
   unit = ""; return -1
 }
-BEGIN { FS = sep; nrows = 0; after = 0; bad = 0 }
-{ sub(/\r$/, "") }
 function isname(s) { return s != "" && !isnum(s) && s !~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]/ }
-NR == 1 {
-  ncol = NF
-  hasheader = 1
-  for (j = 1; j <= NF; j++) {
-    name[j] = $j; gsub(/^"|"$/, "", name[j])
-    if (!isname(name[j])) hasheader = 0
-  }
-  tcol = 0
-  if (hasheader) {
-    for (j = 1; j <= NF; j++) if (tolower(name[j]) ~ /^(time|ts|timestamp|date|datetime|open_time|opentime|open_ts)$/) { tcol = j; break }
-    if (tcol == 0) tcol = 1
-    hdr = $0
-  } else {
+function feed(line,   j, v, t) {
+  $0 = line
+  fed++
+  if (fed == 1) {
+    ncol = NF
+    hasheader = 1
     for (j = 1; j <= NF; j++) {
-      v = $j; gsub(/^"|"$/, "", v); name[j] = "column" j
-      if (tcol == 0 && ((isnum(v) && length(v) >= 9 && v !~ /\./) || v ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]/)) tcol = j
+      name[j] = $j; gsub(/^"|"$/, "", name[j])
+      if (!isname(name[j])) hasheader = 0
     }
-    if (tcol == 0) { bad = 1; exit }
-    hdr = "none"
+    tcol = 0
+    if (hasheader) {
+      for (j = 1; j <= NF; j++) if (tolower(name[j]) ~ /^(time|ts|timestamp|date|datetime|open_time|opentime|open_ts)$/) { tcol = j; break }
+      if (tcol == 0) tcol = 1
+      hdr = $0
+    } else {
+      for (j = 1; j <= NF; j++) {
+        v = $j; gsub(/^"|"$/, "", v); name[j] = "column" j
+        if (tcol == 0 && ((isnum(v) && length(v) >= 9 && v !~ /\./) || v ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]/)) tcol = j
+      }
+      if (tcol == 0) { bad = 1; return }
+      hdr = "none"
+    }
+    if (hasheader) return
   }
-  if (hasheader) next
-}
-{
   t = stamp($tcol)
-  if (unit == "") { bad = 1; exit }
-  if (t >= endsec) { after++; next }
+  if (unit == "zoneless") { bad = 2; return }
+  if (unit == "") { bad = 1; return }
+  if (t >= endsec) { after++; return }
   nrows++
-  if (nrows == 1) { firstt = t; funit = unit }
-  lastt = t
-  if (nrows > 1 && nrows <= 10001) { st = t - prev; hist[st]++; nst++ }
+  if (nrows == 1) { mint = t; maxt = t; funit = unit }
+  else {
+    if (t < prev) asc = 0
+    if (t > prev) desc = 0
+    if (!asc && !desc) { bad = 3; return }
+    if (t < mint) mint = t
+    if (t > maxt) maxt = t
+    if (nrows <= 10001) { st = t - prev; if (st < 0) st = -st; hist[st]++; nst++ }
+  }
   prev = t
   for (j = 1; j <= ncol; j++) {
     if (j == tcol) continue
     if (isnum($j)) { isn[j] = 1; if ($j + 0 == 0) zc[j]++ }
   }
 }
+BEGIN { FS = ","; nrows = 0; after = 0; bad = 0; asc = 1; desc = 1; banner = 0; fed = 0 }
+{ sub(/\r$/, "") }
+NR == 1 { held = $0; next }
+NR == 2 {
+  FS = index($0, "\t") ? "\t" : ","
+  n1 = split(held, parts, FS)
+  line2 = $0
+  $0 = line2
+  if (held ~ /^#/ || n1 != NF) banner = 1
+  else { feed(held); if (bad) exit }
+  feed(line2)
+  if (bad) exit
+  next
+}
+{ feed($0); if (bad) exit }
 END {
-  if (bad) { print "BAD"; exit }
+  if (NR == 1 && !bad) { FS = index(held, "\t") ? "\t" : ","; feed(held) }
+  if (bad == 1) { print "BAD"; exit }
+  if (bad == 2) { print "ZONELESS"; exit }
+  if (bad == 3) { print "UNSORTED"; exit }
   med = "none"
   if (nst > 0) {
     k = 0
@@ -146,9 +204,24 @@ END {
     zlist = zlist (zlist == "" ? "" : ",") name[j] "=" (zc[j] + 0)
     if (tolower(name[j]) == "volume") zv = zc[j] + 0
   }
-  printf "%s|%s|%s|%s|%d|%d|%d|%s|%d|%s\n", (funit == "" ? "none" : funit), (firstt == "" ? "none" : firstt), (lastt == "" ? "none" : lastt), med, nrows, ncol, zv, (zlist == "" ? "none" : zlist), after, hdr
+  printf "%s|%s|%s|%s|%d|%d|%d|%s|%d|%s|%d|%s\n", (funit == "" ? "none" : funit), (nrows == 0 ? "none" : mint), (nrows == 0 ? "none" : maxt), med, nrows, ncol, zv, (zlist == "" ? "none" : zlist), after, (asc ? "ascending" : "descending"), banner, hdr
 }
 AWK
+
+# profile_stream <label>: profiles the table on stdin; appends its line to $tmp/tables or exits 3 with a message
+profile_stream() {
+  local label=$1 line
+  line=$(awk -v tzset="${tz_sec:+1}" -v tzsec="${tz_sec:-0}" -v endsec="$end_sec" "$PROFILE_AWK")
+  case $line in
+    ZONELESS) echo "data-profile.sh: $label: time stamps carry no zone; pass --tz; refused, nothing written" >&2; exit 3 ;;
+    UNSORTED) echo "data-profile.sh: $label: time stamps are not sorted; refused, nothing written" >&2; exit 3 ;;
+    '' | BAD) echo "data-profile.sh: $label: no parseable time column; refused, nothing written" >&2; exit 3 ;;
+  esac
+  local banner
+  banner=$(cut -d'|' -f11 <<< "$line")
+  [ "$banner" != 1 ] || echo "data-profile.sh: $label: first line is a banner; skipped" >&2
+  printf '%s\n' "$line" >> "$tmp/tables"
+}
 
 tmp=$(mktemp -d) || exit 1
 trap 'rm -rf "$tmp"' EXIT
@@ -170,20 +243,18 @@ while IFS= read -r path; do
     *.zip)
       zips=$((zips + 1))
       while IFS= read -r member; do
-        if at_or_after "${member##*/}"; then refused=$((refused + 1)); else members=$((members + 1)); fi
+        if at_or_after "${member##*/}"; then refused=$((refused + 1)); continue; fi
+        members=$((members + 1))
+        case ${member,,} in
+          *.csv | *.tsv | *.txt)
+            esc=$(printf "%s" "$member" | sed "s/[][*?\\\\]/\\\\&/g")
+            profile_stream "${member##*/}" < <(unzip -p "$path" "$esc" 2> /dev/null)
+            ;;
+        esac
       done < <(unzip -Z1 "$path" 2> /dev/null)
       ;;
-    *.csv | *.tsv | *.txt)
-      sep=,
-      first=$(head -n 1 "$path" | tr -d '\r')
-      case $first in *$'\t'*) sep=$'\t' ;; esac
-      line=$(awk -v sep="$sep" -v endsec="$end_sec" "$PROFILE_AWK" "$path")
-      if [ -z "$line" ] || [ "$line" = BAD ]; then
-        echo "data-profile.sh: $base: no parseable time column; refused, nothing written" >&2
-        exit 3
-      fi
-      printf '%s\n' "$line" >> "$tmp/tables"
-      ;;
+    *.csv | *.tsv | *.txt) profile_stream "$base" < "$path" ;;
+    *.csv.gz | *.tsv.gz | *.txt.gz) profile_stream "$base" < <(gzip -dc -- "$path" 2> /dev/null) ;;
     *) others=$((others + 1)) ;;
   esac
 done < <(find "$dir" \( -name '*-sealed' -prune \) -o -type f -print | LC_ALL=C sort)
@@ -212,8 +283,8 @@ function iso(sec,   d, s, z, era, doe, yoe, y, doy, mp, m, dd) {
   if ($2 != "none" && (first == "" || $2 + 0 < first + 0)) first = $2
   if ($3 != "none" && (last == "" || $3 + 0 > last + 0)) last = $3
   if ($4 != "none") meds[++nm] = $4 + 0
-  hdrs[$10] = 1
-  if (n == 1) { cols = $6; zc = $8; hdr = $10 }
+  hdrs[$12] = 1; ords[$10] = 1; banners += $11
+  if (n == 1) { cols = $6; zc = $8; hdr = $12 }
 }
 END {
   nu = 0; ulist = ""
@@ -226,9 +297,11 @@ END {
     med = meds[int((nm + 1) / 2)]
   }
   nh = 0; for (h in hdrs) nh++
+  no = 0; ord = "none"; for (o in ords) { no++; ord = o }
+  if (no > 1) ord = "mixed"
   raw = "none"
   if (n > 0 && hdr != "none") raw = hdr
-  printf "tables=%d\nheader=%s\ncolumns=%s\nraw=%s\nrows=%d\nafter=%d\nfirst=%s\nlast=%s\nmed=%s\nunit=%s\nzv=%d\nzc=%s\nvariants=%d\n", n, (n > 0 ? hdr : "none"), (n > 0 ? cols : 0), raw, rows, after, (first == "" ? "none" : iso(first + 0)), (last == "" ? "none" : iso(last + 0)), med, ulist, zv, (n > 0 ? zc : "none"), nh
+  printf "order=%s\nbanners=%d\ntables=%d\nheader=%s\ncolumns=%s\nraw=%s\nrows=%d\nafter=%d\nfirst=%s\nlast=%s\nmed=%s\nunit=%s\nzv=%d\nzc=%s\nvariants=%d\n", ord, banners + 0, n, (n > 0 ? hdr : "none"), (n > 0 ? cols : 0), raw, rows, after, (first == "" ? "none" : iso(first + 0)), (last == "" ? "none" : iso(last + 0)), med, ulist, zv, (n > 0 ? zc : "none"), nh
 }' "$tmp/tables")
 
 get() { sed -n "s/^$1=//p" <<< "$summary" | head -n 1; }
@@ -263,10 +336,12 @@ mkdir -p "$(dirname "$out")" || exit 1
   echo "rows_after_dev_end: $(get after)"
   echo "first_ts: $(get first)"
   echo "last_ts: $(get last)"
+  echo "order: $(get order)"
   echo "median_step_seconds: $(get med)"
   echo "time_unit: $(get unit)"
   echo "zero_volume_rows: $(get zv)"
   echo "zero_counts: $(get zc)"
+  echo "banner_lines: $(get banners)"
   echo "zip_files: $zips"
   echo "zip_members: $members"
   echo "other_files: $others"
