@@ -565,6 +565,44 @@ pub fn injected_fault(site: &str) -> bool {
     fault_listed(env, site)
 }
 
+/// The device keeps one process-wide record of the last refused allocation.
+/// Every call that clears or sets it holds `shared()`; a test that reads it
+/// holds `exclusive()` for its whole body.
+#[cfg(test)]
+pub(crate) mod alloc_state_gate {
+    use std::cell::Cell;
+    use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+    static GATE: RwLock<()> = RwLock::new(());
+
+    thread_local! {
+        static OWNS_EXCLUSIVE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) struct Shared(#[allow(dead_code)] Option<RwLockReadGuard<'static, ()>>);
+
+    pub(crate) struct Exclusive(#[allow(dead_code)] RwLockWriteGuard<'static, ()>);
+
+    pub(crate) fn shared() -> Shared {
+        if OWNS_EXCLUSIVE.with(Cell::get) {
+            return Shared(None);
+        }
+        Shared(Some(GATE.read().unwrap_or_else(|e| e.into_inner())))
+    }
+
+    pub(crate) fn exclusive() -> Exclusive {
+        let guard = GATE.write().unwrap_or_else(|e| e.into_inner());
+        OWNS_EXCLUSIVE.with(|c| c.set(true));
+        Exclusive(guard)
+    }
+
+    impl Drop for Exclusive {
+        fn drop(&mut self) {
+            OWNS_EXCLUSIVE.with(|c| c.set(false));
+        }
+    }
+}
+
 type FaultList = Vec<(String, Option<u64>)>;
 
 static FAULTS_FROM_ENV: std::sync::OnceLock<FaultList> = std::sync::OnceLock::new();
@@ -1712,6 +1750,8 @@ impl GpuEvaluator {
         y: &[f32],
         budget: Option<u64>,
     ) -> Option<Self> {
+        #[cfg(test)]
+        let _alloc_gate = alloc_state_gate::shared();
         let ctx = unsafe {
             rc_create(
                 cols.as_ptr(),
@@ -1762,6 +1802,8 @@ impl GpuEvaluator {
         if tile_rows == 0 || cols.len() != n_rows * n_vars || y.len() != n_rows {
             return None;
         }
+        #[cfg(test)]
+        let _alloc_gate = alloc_state_gate::shared();
         let ctx = unsafe {
             rc_create_tiled(
                 cols.as_ptr(),
@@ -1831,6 +1873,8 @@ impl GpuEvaluator {
         let wp = if w.is_empty() { std::ptr::null() } else { w.as_ptr() };
         // #508: the device drops the slope pair mask with the rows it described.
         self.slope_pair_count = None;
+        #[cfg(test)]
+        let _alloc_gate = alloc_state_gate::shared();
         let ok = unsafe { rc_set_fit_data(self.ctx, cols.as_ptr(), y.as_ptr(), wp) == 0 };
         if ok {
             if let Some(r) = self.rec.as_mut() {
@@ -1895,6 +1939,8 @@ impl GpuEvaluator {
             return false;
         }
         let p = if sign.is_empty() { std::ptr::null() } else { sign.as_ptr() };
+        #[cfg(test)]
+        let _alloc_gate = alloc_state_gate::shared();
         let ok = unsafe { rc_set_fit_sign(self.ctx, p) == 0 };
         if let (true, Some(r)) = (ok, self.rec.as_mut()) {
             r.set_sign(sign);
@@ -1908,6 +1954,8 @@ impl GpuEvaluator {
     /// whose bit is clear and divide by `npairs`. An empty slice clears the
     /// mask, which restores the consecutive pairs of every row.
     pub fn set_slope_pairs(&mut self, bits: &[u32], npairs: usize) -> bool {
+        #[cfg(test)]
+        let _alloc_gate = alloc_state_gate::shared();
         if bits.is_empty() {
             self.slope_pair_count = None;
             return unsafe { rc_set_slope_pairs(self.ctx, std::ptr::null(), 0) == 0 };
@@ -1964,6 +2012,8 @@ impl GpuEvaluator {
     /// is skipped before its prediction is read. An empty slice clears the
     /// vector (every row weighs 1).
     pub fn set_score_weights(&mut self, w: &[f64]) -> bool {
+        #[cfg(test)]
+        let _alloc_gate = alloc_state_gate::shared();
         if w.is_empty() {
             return unsafe { rc_set_score_weights(self.ctx, std::ptr::null()) == 0 };
         }
@@ -2103,6 +2153,8 @@ impl GpuEvaluator {
                 excess.len()
             ));
         }
+        #[cfg(test)]
+        let _alloc_gate = alloc_state_gate::shared();
         let rc = unsafe {
             rc_set_pnl_book(
                 self.ctx,
@@ -11099,6 +11151,7 @@ mod alloc_ledger_tests {
     /// refuses the f64 twin, naming the allocation.
     #[test]
     fn a_budget_refuses_the_f64_twin_with_its_tag() {
+        let _alloc_gate = alloc_state_gate::exclusive();
         let n = 200_000usize;
         let (x32, x, y32, y) = data(n);
         let resident = (n * 4 + n * 4) as u64;
@@ -11119,6 +11172,7 @@ mod alloc_ledger_tests {
     /// bytes of an earlier refusal in the same process.
     #[test]
     fn a_second_refusal_does_not_quote_the_first_allocation() {
+        let _alloc_gate = alloc_state_gate::exclusive();
         let n = 200_000usize;
         let (x32, x, y32, y) = data(n);
         let resident = (n * 4 + n * 4) as u64;
