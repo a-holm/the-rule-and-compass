@@ -44,7 +44,7 @@ Do NOT load: the full suite, other tickets' branches, unrelated cleanups.
 ## Check
 
 ```sh
-verksted/_tools/test-summary.sh "$GATES/issue$N-green.log" >/dev/null && ! git -C "$W" log "$BASE"..HEAD --format=%B | grep -qiE '(close[sd]?|fix(es|ed)?|resolve[sd]?) #[0-9]+' && test -z "$(git -C "$W" status --porcelain)" && test -z "$(git -C "$W" ls-files '*.py')"
+verksted/_tools/test-summary.sh "$GATES/issue$N-green.log" >/dev/null && git -C "$W" fetch -q origin "$BASE" && ! git -C "$W" log "origin/$BASE"..HEAD --format=%B | grep -qiE '(close[sd]?|fix(es|ed)?|resolve[sd]?) #[0-9]+' && test -z "$(git -C "$W" status --porcelain)" && test -z "$(git -C "$W" ls-files '*.py')"
 ```
 
 Exit 0 writes `pass`. Anything else writes `fail: <what was measured and what was wrong>` to `output/check.md`; `_tools/check.sh` does this. A red result is never rewritten as green.

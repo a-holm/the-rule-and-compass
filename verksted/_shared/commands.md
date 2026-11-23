@@ -31,10 +31,11 @@ Data and run variables: `DATA`, `STORE`, `ENRICHED`, `MEMBERSHIP`, `TARGET`, `LA
 ## Check a stage
 
 ```sh
-verksted/_tools/check.sh "$V/<pipeline>/stages/<stage>/output" '<the stage Check command>'
+export N SLUG W V PR                       # every run variable the stage Check reads
+verksted/_tools/check.sh --stage <pipeline>/<stage>
 ```
 
-It writes `check.md` (line 1 `pass` or `fail: exit <code>: <last output line>`) and exits with the command's code. Export the run variables first.
+It reads the Check block of `$V/<pipeline>/stages/<stage>/CONTEXT.md`, sources `lib.sh`, exports the variables the block reads and runs it under `bash -u`. A variable still unset (`W`, `N`, `V`, ...) stops it with exit 2 and the name on stderr; a contract without exactly one Check block exits 2. It writes `$V/<pipeline>/stages/<stage>/output/check.md` (line 1 `pass` or `fail: exit <code>: <last output line>`) and exits with the block's code. Checks compare against `origin/$BASE` and fetch first; `verksted-check walk` fails a Check that names `$BASE` as a git ref without `origin/`. For a Check that lives outside a contract: `verksted/_tools/check.sh <output-dir> '<command>'`.
 
 ## Worktree
 
