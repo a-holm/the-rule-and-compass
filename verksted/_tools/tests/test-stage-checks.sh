@@ -25,6 +25,8 @@ cat > "$T/bin/gh" <<'GH'
 #!/usr/bin/env bash
 args="$*"
 case "$args" in
+  "pr list"*) echo 3 ;;
+  "pr view 3 --json mergeCommit"*) echo "$FAKE_MERGE_SHA" ;;
   "pr view"*) echo "${FAKE_PR_STATE:-MERGED}" ;;
   "issue view 7 "*) echo "${FAKE_OWNER_STATE:-OPEN}" ;;
   *"--json body"*) cat "$FAKE_BODY" ;;
@@ -67,6 +69,24 @@ printf 'cpu: ok=10 failed=0\ncuda: ok=5 failed=0\nrecovered 27/27\ntested: %s\ni
 run_check "$V4"; check gate-ignored-zero-alone "$?" 1
 printf 'cpu: ok=10 failed=0\ncuda: ok=5 failed=0\nrecovered 27/27\ntested: %s\nignored: y passed=10\n' "$sha" > "$g"
 run_check "$V4"; check gate-ignored-ten "$?" 0
+
+# 04_gate/stages/05_merge_main: the merge is on origin/main and the main checkout is at origin/main
+V5=04_gate/stages/05_merge_main/CONTEXT.md
+g5() { git -C "$1" -c user.name=t -c user.email=t@t.invalid "${@:2}"; }
+git init -q --bare "$T/origin.git"
+git clone -q "$T/origin.git" "$T/mroot" 2> /dev/null
+g5 "$T/mroot" checkout -q -b main
+g5 "$T/mroot" commit -q --allow-empty -m one
+g5 "$T/mroot" push -q origin main
+msha=$(git -C "$T/mroot" rev-parse HEAD)
+run5() { (cd "$T/mroot" && env BASE=integration/x ROOT="$T/mroot" PATH="$T/bin:$PATH" FAKE_MERGE_SHA="$msha" bash -c "$(check_cmd "$V5")" > /dev/null 2>&1); }
+run5; check merge-main-checkout-at-origin "$?" 0
+git clone -q "$T/origin.git" "$T/other" 2> /dev/null
+g5 "$T/other" commit -q --allow-empty -m two
+g5 "$T/other" push -q origin HEAD:main
+run5; check merge-main-checkout-behind "$?" 1
+g5 "$T/mroot" merge -q --ff-only origin/main
+run5; check merge-main-checkout-fast-forwarded "$?" 0
 
 if [ "$fails" -ne 0 ]; then
   echo "test-stage-checks: $fails failed"

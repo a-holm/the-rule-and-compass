@@ -299,3 +299,18 @@ fn walk_flags_the_crate_directory_name() {
     assert!(stdout(&o).contains("_templates/t.md:3"), "{}", stdout(&o));
     let _ = fs::remove_dir_all(&base);
 }
+
+#[test]
+fn links_external_reads_the_root_agents_file() {
+    let root = workshop("external_agents");
+    let base = root.parent().expect("base").to_path_buf();
+    write(&base.join("pkg/Cargo.toml"), "[package]\nname = \"rule-and-compass\"\n");
+    write(&base.join("AGENTS.md"), "[p](verksted/01_p/CONTEXT.md) [d](docs/gone.md)\n");
+    assert_eq!(code(&run(&["links", s(&root)])), 0);
+    let o = run(&["links", "--external", s(&root)]);
+    assert_eq!(code(&o), 1);
+    assert!(stdout(&o).contains("AGENTS.md: link docs/gone.md"), "{}", stdout(&o));
+    write(&root.join("_shared/main-absent.txt"), "docs/gone.md exists on the integration branch only\n");
+    assert_eq!(code(&run(&["links", "--external", s(&root)])), 0);
+    let _ = fs::remove_dir_all(&base);
+}
