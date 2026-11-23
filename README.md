@@ -1578,12 +1578,11 @@ and a ranked list of bottlenecks. See [`docs/dev-log.md`](docs/dev-log.md).
 
 How the parts fit together: [`docs/how-it-works.md`](docs/how-it-works.md).
 
-The agent workshop: [`verksted/AGENTS.md`](verksted/AGENTS.md).
+The agent workshop: the routes in [`AGENTS.md`](AGENTS.md), then `verksted/`.
 
 ```
 SPEC.md                       behaviour specification
 docs/how-it-works.md          how the engine, GPU backend, data pipeline, protocol and agent workflow fit together
-verksted/AGENTS.md            the workshop: numbered pipelines for the recurring agent workflows
 docs/how-symbolic-regression-works.md   plain-language explainer
 docs/optimisation.md          theory, literature and measurements behind the search
 docs/data-splitting.md        train/test splitting for time series and panel data

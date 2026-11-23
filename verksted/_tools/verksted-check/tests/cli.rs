@@ -31,9 +31,7 @@ fn stdout(o: &Output) -> String {
 fn workshop(name: &str) -> PathBuf {
     let base = scratch(name);
     let root = base.join("verksted");
-    write(&base.join("AGENTS.md"), "[w](verksted/AGENTS.md)\n");
-    write(&root.join("AGENTS.md"), "# AGENTS.md\n\n- `01_p/CONTEXT.md`\n");
-    write(&root.join("CLAUDE.md"), "@AGENTS.md\n");
+    write(&base.join("AGENTS.md"), "[p](verksted/01_p/CONTEXT.md)\n");
     write(
         &root.join("01_p/CONTEXT.md"),
         "# 01_p: job\n\nOne job: x.\n\nDo NOT load: y.\n\n## Inputs\n## Process\n## Outputs\n## Check\n\n`stages/01_s/` and `_tools/a.sh`\n\n[s](stages/01_s/CONTEXT.md)\n",
@@ -93,15 +91,15 @@ fn walk_non_strict_passes_and_strict_needs_the_index() {
 }
 
 #[test]
-fn walk_reports_python_and_a_wrong_claude_file() {
+fn walk_reports_python_and_a_missing_pipeline_route() {
     let root = workshop("walk_red");
     write(&root.join("x.py"), "pass\n");
-    write(&root.join("CLAUDE.md"), "other\n");
+    write(&root.join("../AGENTS.md"), "# AGENTS.md\n");
     let o = run(&["walk", s(&root)]);
     assert_eq!(code(&o), 1);
     let out = stdout(&o);
     assert!(out.contains("x.py"), "{out}");
-    assert!(out.contains("CLAUDE.md"), "{out}");
+    assert!(out.contains("../AGENTS.md: no route to 01_p/CONTEXT.md"), "{out}");
 }
 
 #[test]
@@ -188,7 +186,7 @@ fn graph_dot_prints_one_node_per_checked_file() {
     assert_eq!(code(&o), 0);
     let out = stdout(&o);
     assert!(out.starts_with("digraph "), "{out}");
-    assert_eq!(out.lines().filter(|l| l.ends_with(';') && !l.contains("->")).count(), 4, "{out}");
+    assert_eq!(out.lines().filter(|l| l.ends_with(';') && !l.contains("->")).count(), 2, "{out}");
     assert!(out.contains("\"01_p/CONTEXT.md\" -> \"01_p/stages/01_s/CONTEXT.md\";"), "{out}");
 }
 

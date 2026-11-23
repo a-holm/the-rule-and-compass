@@ -112,9 +112,8 @@ The machine is shared with a desktop, so builds and tests queue. Builds run in a
 
 Code is Rust only. Numerical experiments, fixtures and helpers are Rust, never Python, and a test guards this. Docs describe the present state and commits carry the history.
 
-The workshop in [`verksted/`](../verksted/AGENTS.md) holds the recurring routines as numbered pipelines: issue, research, orchestrate, gate, diagnose, data, long run, close, handoff and machine.
+The workshop in [`verksted/`](../verksted/_index.md) holds the recurring routines as numbered pipelines: issue, research, orchestrate, gate, diagnose, data, long run, close, handoff and machine.
 
 Details:
-* [`AGENTS.md`](../AGENTS.md): the non-negotiables for agents.
+* [`AGENTS.md`](../AGENTS.md): the non-negotiables for agents and the routes of the workshop.
 * [`docs/issue-workflow.md`](issue-workflow.md): issues, worktrees, pull requests, the lock and parallel work.
-* [`verksted/AGENTS.md`](../verksted/AGENTS.md): the workshop and its routing.

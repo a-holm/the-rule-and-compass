@@ -1,3 +1,8 @@
+---
+type: reference
+description: Rules every dispatched agent follows: setup, builds and tests, waiting, git, style and the final report.
+---
+
 You are not resumed automatically; block in your own turn until everything is done.
 
 Hard rules: never `pkill` or `killall` (kill only a pid you started, with `kill <pid>`); a wait uses `wait-for.sh`, never `pgrep -f`; no Python. A lint in `verksted_tools` fails on `pkill` and `killall` in scripts.

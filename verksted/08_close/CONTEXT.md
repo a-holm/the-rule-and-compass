@@ -24,9 +24,9 @@ Do NOT load: the implementation pipelines' stages, earlier runs' `output/`, the 
 
 ## Process
 
-1. `stages/01_verifier/`: the verifier (rule 69) checks evidence and criteria on the merged tree, merges, checks the tip, ticks the boxes it verified and posts one comment.
-2. `stages/02_close/`: close the issue as a separate act, when every row is `met` or `not run (#M)` with an open issue `#M` that owns the work (rule 58).
-3. `stages/03_cleanup/`: remove the worktree, local branch and remote branch of this ticket and the verifier worktree.
+1. [01_verifier](stages/01_verifier/CONTEXT.md): the verifier (rule 69) checks evidence and criteria on the merged tree, merges, checks the tip, ticks the boxes it verified and posts one comment.
+2. [02_close](stages/02_close/CONTEXT.md): close the issue as a separate act, when every row is `met` or `not run (#M)` with an open issue `#M` that owns the work (rule 58).
+3. [03_cleanup](stages/03_cleanup/CONTEXT.md): remove the worktree, local branch and remote branch of this ticket and the verifier worktree.
 
 ## Outputs
 

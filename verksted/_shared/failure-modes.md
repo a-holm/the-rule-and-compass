@@ -1,3 +1,8 @@
+---
+type: reference
+description: Numbered failures seen in past runs, each with its source and the rule that prevents it.
+---
+
 # Failure modes seen in the logs, each with its guard
 
 Mined from the Claude Code and opencode sessions of this repo and the orchestrator briefs (2026-10-18 to 2026-11-22). The guard is the rule in `rules.md` and the stage check that catches it.

@@ -21,11 +21,11 @@ Do NOT load: the ticket pipelines' stages, earlier runs' `output/`.
 
 ## Process
 
-1. `stages/01_lock/`: builds in the build slot, tests and GPU runs behind the test lock, live scripts checked against the canonical copies.
-2. `stages/02_pause/`: create the `PAUSE` file so new runs wait.
-3. `stages/03_measure/`: measure load, GPU and top consumers.
-4. `stages/04_priority/`: the desktop has priority; screen blanking and lock stay off; act only on processes you started; ask before restarting the terminal.
-5. `stages/05_resume/`: remove the `PAUSE` file and report.
+1. [01_lock](stages/01_lock/CONTEXT.md): builds in the build slot, tests and GPU runs behind the test lock, live scripts checked against the canonical copies.
+2. [02_pause](stages/02_pause/CONTEXT.md): create the `PAUSE` file so new runs wait.
+3. [03_measure](stages/03_measure/CONTEXT.md): measure load, GPU and top consumers.
+4. [04_priority](stages/04_priority/CONTEXT.md): the desktop has priority; screen blanking and lock stay off; act only on processes you started; ask before restarting the terminal.
+5. [05_resume](stages/05_resume/CONTEXT.md): remove the `PAUSE` file and report.
 
 ## Outputs
 

@@ -25,7 +25,7 @@ Do NOT load: the ticket and long-run pipelines, earlier runs' `output/`, the ref
 1. [01_intake](stages/01_intake/CONTEXT.md): `stages/01_intake/` writes the dataset card: source, licence, earliest bar, lock window, question.
 2. [02_acquire](stages/02_acquire/CONTEXT.md): `stages/02_acquire/` downloads and verifies checksums; files inside the lock are checksummed and never opened.
 3. [03_profile](stages/03_profile/CONTEXT.md): `stages/03_profile/` profiles development files by name, header and count and names the type stage.
-4. One type stage: `stages/04_ohlcv/` for OHLC and OHLCV bars, or `stages/04_new_type/` for a dataset no standard type covers.
+4. One type stage: [04_ohlcv](stages/04_ohlcv/CONTEXT.md) for OHLC and OHLCV bars, or [04_new_type](stages/04_new_type/CONTEXT.md) for a dataset no standard type covers.
 5. [05_panel_pit](stages/05_panel_pit/CONTEXT.md): `stages/05_panel_pit/` builds point-in-time membership and the panel, or records "single series".
 6. [06_enrich](stages/06_enrich/CONTEXT.md): `stages/06_enrich/` appends the feature view and the labels.
 7. [07_audit_lock](stages/07_audit_lock/CONTEXT.md): `stages/07_audit_lock/` audits leakage and proves the lock holds.

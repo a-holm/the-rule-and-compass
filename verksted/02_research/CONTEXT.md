@@ -28,11 +28,11 @@ Do NOT load: other pipelines' stages, earlier research of other issues, the rest
 
 ## Process
 
-1. `stages/01_question/`: scope, overlapping issues, evidence files, numbered premises.
-2. `stages/02_method/`: decompose with tractatus, read primary sources, tag every claim.
-3. `stages/03_premise/`: measure each premise before anything is built.
-4. `stages/04_decision/`: scope split, concrete spec, measurable acceptance criteria.
-5. `stages/05_issue_comment/`: post the decision as one issue comment and write the report.
+1. [01_question](stages/01_question/CONTEXT.md): scope, overlapping issues, evidence files, numbered premises.
+2. [02_method](stages/02_method/CONTEXT.md): decompose with tractatus, read primary sources, tag every claim.
+3. [03_premise](stages/03_premise/CONTEXT.md): measure each premise before anything is built.
+4. [04_decision](stages/04_decision/CONTEXT.md): scope split, concrete spec, measurable acceptance criteria.
+5. [05_issue_comment](stages/05_issue_comment/CONTEXT.md): post the decision as one issue comment and write the report.
 
 ## Outputs
 

@@ -1,3 +1,8 @@
+---
+type: reference
+description: Exact, copyable commands for the run variables, builds, tests, gates, waiting, git, data, the machine and the structure check.
+---
+
 # Commands: exact and copyable
 
 Commands that work on this machine. Run them from the run root (`RUN`) unless a line says otherwise. Longer explanations live in `../../docs/issue-workflow.md`. Hard rules and their sources: `rules.md`. Every script prints its usage with `-h`; `../_index.md` lists them all.
@@ -10,6 +15,13 @@ N=<issue> SLUG=<slug>                       # issue number and kebab-case slug
 W=$WT/issue-$N-$SLUG                        # this ticket's worktree
 RUN=$W                                      # checkout that holds this run's output/ files
 V=$RUN/verksted
+```
+
+`<crate>` is the engine crate directory of a worktree: the output of `verksted/_tools/crate-dir.sh "$W"` (the one first-level directory whose `Cargo.toml` declares package `rule-and-compass`; `RCSR_CRATE` names it instead). No tracked text names the directory. Print it, or enter it:
+
+```sh
+verksted/_tools/crate-dir.sh "$W"
+cd "$W/$(verksted/_tools/crate-dir.sh "$W")"
 ```
 
 `GATES`, `MACHINE_SCRIPTS`, `SANITIZER` and `CUDA_ARCH` come from `machine.md` (`_shared/local.md`); a missing key stops the script with exit 2. Logs go to `$G/issue$N-<what>.log`. `B` is the build slot, `L` the test lock; use them through `rc-run.sh`. Every `RCSR_*` override is listed in `lib.sh`.
@@ -52,6 +64,17 @@ The log is `$G/issue$N-<tag>.log`; its last line is `RC_DONE rc=<n>`. Lock holds
 ```sh
 verksted/_tools/test-summary.sh "$G/issue$N-<what>.log"        # passed, failed, ignored, warnings
 ```
+
+## Fast lint set (once per PR, on your head merged with the base tip)
+
+```sh
+verksted/_tools/lints.sh --tree "$W"        # prints the 12 `--test` arguments of the crate; one home of the list
+verksted/_tools/rc-run.sh test "$W" "$N" lints -- cargo test --release $(verksted/_tools/lints.sh --tree "$W")
+verksted/_tools/rc-run.sh cpu "$W" "$N" verksted -- bash -c 'cd "$1/verksted/_tools/verksted-check" && cargo test --release' _ "$W"
+verksted/_tools/links.sh --strict
+```
+
+The 12 crate targets plus `cargo test --release` in `verksted/_tools/verksted-check/` (links, walk and tools guard tests) are the whole set. A new test file that spawns processes needs a line in `<crate>/tests/sanitizer.plan`.
 
 While the desktop streams video the scripts pin work to `PIN_CORES_BUSY`, the build slots drop to `BUILD_SLOTS_BUSY` and `RUST_TEST_THREADS=4`. Force the streaming restriction, clear it, and check it:
 
@@ -153,6 +176,7 @@ The build selects the newest CUDA 13 toolkit by rule (`docs/gpu-backend.md`); th
 verksted/_tools/sanitize.sh "$W" "$N" memcheck --test <file> -- <filter>    # builds, then runs under compute-sanitizer through the lock; exit 0 before any plain GPU run
 # search-level tests: the config helper must set dispatch: DispatchMode::Device (CLI: --dispatch device), else the sanitized run stays on the CPU
 journalctl -k --since "<start>" | grep -i xid   # must print nothing
+journalctl -k --since "<start>" | grep -c 'NVRM: Xid'   # new lines since the start time of the step, never a journal total
 verksted/_tools/sanitize.sh "$W" "$N" memcheck --test <file> --api-errors no -- <test> --exact   # one test with driver API error reporting off
 verksted/_tools/sanitize-all.sh "$W" "$N" [--only <binary>]... [--dry-run]   # the planned memcheck pass (<crate>/tests/sanitizer.plan), one lock hold per run, summary log <id>-san-summary; a run-bin line runs a release binary with stated arguments; gate.sh has no sanitizer stage
 ```
@@ -167,6 +191,13 @@ verksted/_tools/ab-pair.sh --label <name> --a <bin> --b <bin> --seeds 1,2,3 -- <
 ## Data and runs
 
 ```sh
+verksted/_tools/local-init.sh --dataset "$DS" --card <card.md>        # creates the local area and datasets/<id>/; never overwrites
+verksted/_tools/data-profile.sh --dir "$DATA" --dev-end <date> --out <profile.md>   # stage 03: names, header, counts; no value row
+verksted/_tools/ohlcv-view.sh --variant ohlcv --series single              # stage 04_ohlcv: feature_groups and view_excludes
+rcsr lock check --record <record> <store dir>                              # stage 07: exit 0 clean, 4 a finding
+verksted/_tools/run-record.sh new --id <YYYYMMDD-slug> --kind store-build --bin <path> --worktree "$W"
+verksted/_tools/run-record.sh close --id <id> --log <log>
+verksted/_tools/run-record.sh latest [--kind <kind>]                      # the last run card
 rcsr import in.csv "$STORE" --group-rows 8192
 rcsr prep --input "$DATA" --out "$STORE" --resample 1h
 rcsr panel membership --data daily.csv --top 100 --lookback 90 --min-history 90 --rebalance 30 --out "$MEMBERSHIP"
@@ -202,6 +233,9 @@ ps -eo pid,user,pcpu,pmem,comm --sort=-pcpu | head -8
 
 ```sh
 verksted/_tools/links.sh --strict
+verksted/_tools/rc-run.sh cpu "$W" "$N" external -- bash -c 'cd "$1/verksted/_tools/verksted-check" && cargo run --release -- links --external "$1/verksted"' _ "$W"
 ```
+
+`links --external` also checks every path outside `verksted/` strictly and resolves `<crate>` through `crate-dir.sh`; `gate.sh` runs it.
 
 `lib.sh` and `runlib.sh` are sourced by the other scripts and by long runs (`../07_longrun/CONTEXT.md`).
