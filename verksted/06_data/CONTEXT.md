@@ -1,42 +1,44 @@
-# 06_data: from raw market files to a verified, leak-checked store
+# 06_data: from an unseen dataset to a verified, lock-checked store
 
-One job: turn raw spot market files into a verified `.rcsb` store with point-in-time membership, appended features, a passed audit and a verified manifest.
+One job: turn raw files of any supported data type into a verified `.rcsb` store with a dataset card, a declared locked test, a feature view that fits the columns the source has, a passed audit and a recorded manifest.
 
-Evidence: the crypto work of 2026-10-19 to 2026-10-22 and the Rust pipeline (`../../docs/data-pipeline.md`): `rcsr prep`, `rcsr panel`, `rcsr enrich`, `rcsr audit` and `rcsr verify-manifest`. Acquisition is shell today; a Rust tool is a separate issue and replaces stage 01 only.
+Stages with the same number are alternatives: exactly one type stage `04_*` runs per dataset, chosen by `stages/03_profile/output/profile.md`. Standard types and their slots: [data-types](references/data-types.md). This is the one place where the folder number is not a strict order.
 
 ## Inputs
 
 **This run:**
-- the raw data directory `DATA`, the output store path `STORE` and the target column
+- the dataset id `DS` (kebab-case), the raw directory `DATA`, the output store path `STORE`
+- the local area `$VLOCAL` (see `../_shared/local.md`)
 
 **Reference (every run):**
-- `../_shared/commands.md`
 - `../_shared/rules.md`
-- `../_shared/output-format.md`
-- `../../docs/panel.md`
-- `../../docs/ohlcv.md`
-- `../../docs/data-format.md`
+- `../_shared/local.md`
+- `references/data-types.md`
+- `references/type-stage-contract.md`
+- `references/time-rules.md`
 - `../../docs/time-series.md`
-- `../../docs/leakage.md`
 
-Do NOT load: the ticket and long-run pipelines, earlier runs' `output/`, the rest of `../_shared/`.
+Do NOT load: the ticket and long-run pipelines, earlier runs' `output/`, the references of a type stage that does not run, any file under a `*-sealed/` directory, any data file dated on or after the lock start.
 
 ## Process
 
-1. `stages/01_acquire/`: spot files with their vendor checksums.
-2. `stages/02_import_prep/`: `rcsr import` or `rcsr prep` into a store with a manifest.
-3. `stages/03_panel_pit/`: point-in-time membership and panel, delisted coins kept.
-4. `stages/04_enrich/`: append features, prove CPU and GPU agree.
-5. `stages/05_audit_lockbox/`: leakage audit and the 2026H2 lockbox refusal.
-6. `stages/06_verify_manifest/`: verify the manifest against the data, write the report.
+1. [01_intake](stages/01_intake/CONTEXT.md): `stages/01_intake/` writes the dataset card: source, licence, earliest bar, lock window, question.
+2. [02_acquire](stages/02_acquire/CONTEXT.md): `stages/02_acquire/` downloads and verifies checksums; files inside the lock are checksummed and never opened.
+3. [03_profile](stages/03_profile/CONTEXT.md): `stages/03_profile/` profiles development files by name, header and count and names the type stage.
+4. One type stage: `stages/04_ohlcv/` for OHLC and OHLCV bars, or `stages/04_new_type/` for a dataset no standard type covers.
+5. [05_panel_pit](stages/05_panel_pit/CONTEXT.md): `stages/05_panel_pit/` builds point-in-time membership and the panel, or records "single series".
+6. [06_enrich](stages/06_enrich/CONTEXT.md): `stages/06_enrich/` appends the feature view and the labels.
+7. [07_audit_lock](stages/07_audit_lock/CONTEXT.md): `stages/07_audit_lock/` audits leakage and proves the lock holds.
+8. [08_verify_manifest](stages/08_verify_manifest/CONTEXT.md): `stages/08_verify_manifest/` verifies hashes and writes the dataset manifest.
+9. [09_lessons](stages/09_lessons/CONTEXT.md): `stages/09_lessons/` records what this dataset taught.
 
 ## Outputs
 
-- `stages/06_verify_manifest/output/report.md`: store, hashes, audit verdict, deviations
-- `stages/06_verify_manifest/output/check.md`: `pass` or `fail: <reason>`
+- `stages/08_verify_manifest/output/report.md`: store, hashes, audit verdict, deviations
+- the dataset folder `datasets/<DS>/` in the local area: `card.md`, `adapt.md`, `manifest.md`
 
 ## Check
 
 ```sh
-for f in "$V"/06_data/stages/*/output/check.md; do test "$(head -1 "$f")" = pass || exit 1; done
+n=0; for f in "$V"/06_data/stages/*/output/check.md; do test "$(head -1 "$f")" = pass || exit 1; n=$((n+1)); done; test "$n" -ge 8 && test "$(ls -d "$V"/06_data/stages/04_*/output/check.md | wc -l)" = 1
 ```
