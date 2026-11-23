@@ -21,6 +21,7 @@
 # Plan mode `<binary> * app-only <reason>` runs the test process under memcheck with `--target-processes application-only` and gives the normal verdict (rc 0 and `ERROR SUMMARY: 0 errors`): for a binary whose test process makes CUDA calls but whose children must not be traced (the sanitizer crashes on them or they are not meant to run on the device). The reason names what stays unsanitized.
 # Plan mode `<binary> * device <reason>` lists a binary that calls CUDA by design; the runner treats it exactly like an unlisted binary (default --target-processes all, normal verdict, not counted as no-cuda). It may be combined with named `skip` and `api-errors-no` lines. tests/sanitizer_plan.rs requires exactly one `*` line per test executable.
 # A listed binary whose run printed an ERROR SUMMARY called CUDA: it gets the normal verdict and the line ends `listed no-cuda but called CUDA`.
+# Plan mode `<binary> shard=<name> shard <prefix>[,<prefix>...]|rest <reason>` (`shard-no-cuda` instead of `shard` lists a shard that makes no CUDA call, judged like a no-cuda binary) (lib and bin-<name> only, next to the binary's one `*` line) splits one binary into several runs, each its own lock hold with the log <id>-san-<binary>-shard-<name>. The runner lists the binary with --list, a shard takes every test whose full path starts with one of its prefixes (a prefix ends in ::), `rest` takes every test no shard claims, and each run passes the exact names with --exact. A bare test name on a skip or api-errors-no line resolves to the one full path that ends in ::<name>; no match or two matches fail the pass. A shard with no test, or a test claimed by two shards, fails the pass.
 # The summary ends with the counts `no-cuda binaries`, `unexpected no-cuda` and `listed no-cuda but called CUDA`.
 # A run with rc 255, `running 0 tests`, a non-zero filtered-out count and the sanitizer message `terminated before first instrumented API call` (the plan filtered out every test) is written as `<binary> skipped by plan | ...` and is not a failure.
 # Exit: 0 when every run has rc 0 and `ERROR SUMMARY: 0 errors`; 70 at once when a new Xid line appeared or the Xid check failed; 1 otherwise; 3 when $SANITIZER is missing or not CUDA 13; 2 usage.
@@ -67,7 +68,7 @@ plan_lines=$(awk '/^[[:space:]]*(#|$)/ { next } {
   printf "%s\t%s\t%s\t%s\n", $1, $2, $3, reason }' "$plan")
 while IFS=$'\t' read -r b t m r; do
   [ -n "$b" ] || continue
-  case "$m" in skip|api-errors-no) ;; no-cuda|no-cuda-app-only|app-only|device|run-bin) [ "$t" = "*" ] || { echo "sanitize-all: $m needs '*' as the test, got '$t' for $b in $plan" >&2; exit 2; } ;; *) echo "sanitize-all: bad mode '$m' in $plan" >&2; exit 2 ;; esac
+  case "$m" in skip|api-errors-no) ;; shard|shard-no-cuda) case "$t" in shard=?*) ;; *) echo "sanitize-all: shard needs shard=<name> as the test, got '$t' for $b in $plan" >&2; exit 2 ;; esac ;; no-cuda|no-cuda-app-only|app-only|device|run-bin) [ "$t" = "*" ] || { echo "sanitize-all: $m needs '*' as the test, got '$t' for $b in $plan" >&2; exit 2; } ;; *) echo "sanitize-all: bad mode '$m' in $plan" >&2; exit 2 ;; esac
   [ -n "$r" ] || { echo "sanitize-all: empty reason for $b $t in $plan" >&2; exit 2; }
 done <<< "$plan_lines"
 run_bin_names=$(printf '%s\n' "$plan_lines" | awk -F'\t' '$3 == "run-bin" && !seen[$1]++ { print $1 }')
@@ -168,6 +169,87 @@ run_one() { # label tag api bin args...
   fails=$((fails + 1))
 }
 
+plan_shards_for() { # binary -> shard names of its `shard=` lines
+  printf '%s\n' "$plan_lines" | awk -F'\t' -v b="$1" '$1 == b && ($3 == "shard" || $3 == "shard-no-cuda") { sub(/^shard=/, "", $2); print $2 }'
+}
+plan_shard_spec() { # binary shard -> the comma list of prefixes (or `rest`), the first word of the reason
+  printf '%s\n' "$plan_lines" | awk -F'\t' -v b="$1" -v s="shard=$2" '$1 == b && $2 == s && ($3 == "shard" || $3 == "shard-no-cuda") { split($4, a, " "); print a[1] }'
+}
+plan_shard_mode() { # binary shard -> shard or shard-no-cuda
+  printf '%s\n' "$plan_lines" | awk -F'\t' -v b="$1" -v s="shard=$2" '$1 == b && $2 == s { print $3 }'
+}
+list_tests() { # test binary -> one full libtest name per line
+  "$1" --list 2> /dev/null | sed -n 's/: test$//p'
+}
+resolve_test() { # list file, test -> the one full libtest name that is the test or ends in ::<test>; empty unless exactly one
+  awk -v t="$2" '{ n = length($0); k = length(t) } $0 == t || (n > k + 2 && substr($0, n - k - 1) == "::" t) { print; c++ } END { if (c != 1) exit 1 }' "$1"
+}
+shard_select() { # list file, prefix comma list or `rest`, every shard prefix list, excluded names file -> selected names
+  awk -v spec="$2" -v all="$3" -v exf="$4" '
+    BEGIN { while ((getline l < exf) > 0) ex[l] = 1; np = split(all, a, ","); ns = split(spec, s, ",") }
+    function claimed(name,   i) { for (i = 1; i <= np; i++) if (a[i] != "rest" && index(name, a[i]) == 1) return 1; return 0 }
+    function mine(name,   i) { for (i = 1; i <= ns; i++) if (index(name, s[i]) == 1) return 1; return 0 }
+    !($0 in ex) { if (spec == "rest" ? !claimed($0) : mine($0)) print }' "$1"
+}
+shard_overlaps() { # list file, one shard prefix list per line -> names claimed by more than one shard
+  awk -v all="$2" 'BEGIN { ns = split(all, sh, ";") } { c = 0; for (j = 1; j <= ns; j++) { np = split(sh[j], p, ","); for (i = 1; i <= np; i++) if (p[i] != "rest" && index($0, p[i]) == 1) { c++; break } } if (c > 1) print }' "$1"
+}
+
+run_sharded() { # name bin (target_args and listed are set by run_binary)
+  local name=$1 bin=$2 s spec all= prefixes= names=() ex sel n t full apifull=() list= mode r
+  while IFS= read -r s; do
+    spec=$(plan_shard_spec "$name" "$s")
+    all="$all${all:+,}$spec"
+    [ "$spec" = rest ] || prefixes="$prefixes${prefixes:+;}$spec"
+  done <<< "$(plan_shards_for "$name")"
+  if [ "$dry" -eq 1 ]; then
+    while IFS= read -r s; do
+      run_one "$name:shard=$s" "san-$name-shard-$s" "" "$bin" "<tests of shard $s: $(plan_shard_spec "$name" "$s")>" --exact
+    done <<< "$(plan_shards_for "$name")"
+    return 0
+  fi
+  list=$(mktemp)
+  ex=$(mktemp)
+  list_tests "$bin" > "$list"
+  if [ ! -s "$list" ]; then
+    emit "$name missing | $bin --list printed no tests"
+    fails=$((fails + 1))
+    rm -f "$list" "$ex"
+    return 0
+  fi
+  while IFS=$'\t' read -r b t mode r; do
+    [ "$b" = "$name" ] && { [ "$mode" = skip ] || [ "$mode" = api-errors-no ]; } && [ "$t" != "*" ] || continue
+    if full=$(resolve_test "$list" "$t"); then
+      echo "$full" >> "$ex"
+      [ "$mode" != api-errors-no ] || apifull+=("$full")
+    else
+      emit "$name:$t missing | no single test named or ending in ::$t in $bin --list"
+      fails=$((fails + 1))
+    fi
+  done <<< "$plan_lines"
+  n=$(shard_overlaps "$list" "$prefixes" | wc -l)
+  if [ "$n" -ne 0 ]; then
+    emit "$name overlap | $n tests match the prefixes of more than one shard"
+    fails=$((fails + 1))
+  fi
+  while IFS= read -r s; do
+    spec=$(plan_shard_spec "$name" "$s")
+    mapfile -t names < <(shard_select "$list" "$spec" "$all" "$ex")
+    if [ ${#names[@]} -eq 0 ]; then
+      emit "$name:shard=$s empty | no test matches $spec in $bin --list"
+      fails=$((fails + 1))
+      continue
+    fi
+    [ "$(plan_shard_mode "$name" "$s")" = shard-no-cuda ] && listed=1 || listed=0
+    run_one "$name:shard=$s" "san-$name-shard-$s" "" "$bin" "${names[@]}" --exact
+    listed=0
+  done <<< "$(plan_shards_for "$name")"
+  for full in ${apifull[@]+"${apifull[@]}"}; do
+    run_one "$name:$full" "san-$name-${full//::/-}" no "$bin" "$full" --exact
+  done
+  rm -f "$list" "$ex"
+}
+
 run_binary() { # name bin
   local name=$1 bin=$2 star args=() t mode
   star=$(plan_star_mode "$name")
@@ -184,6 +266,10 @@ run_binary() { # name bin
   esac
   if [ "$star" = api-errors-no ]; then
     run_one "$name" "san-$name" no "$bin"
+    return 0
+  fi
+  if [ -n "$(plan_shards_for "$name")" ]; then
+    run_sharded "$name" "$bin"
     return 0
   fi
   while IFS=$'\t' read -r b t mode r; do
