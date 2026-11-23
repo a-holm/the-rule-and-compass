@@ -7,6 +7,7 @@ unset RCSR_CRATE
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 . "$HERE/lib/machine.sh"
 . "$HERE/lib/fakes.sh"
+wall_clock_guard "$@"
 RC=$HERE/../rc-run.sh
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
@@ -295,9 +296,10 @@ mkdir -p "$T/fifo"
 cat > "$T/bin/b-holds" <<'STUB'
 #!/usr/bin/env bash
 # b-holds <ready fifo>: B takes its own flock on the lock path, reports ready or fail, and blocks holding it
+. "$FIFO_LIB"
 exec 7> "$FAKE_DIR/oc/full-suite.lock"
-if flock -n 7; then echo ready > "$1"; exec tail -f /dev/null > /dev/null 2>&1; fi
-echo fail > "$1"
+if flock -n 7; then fifo_put "$1" ready; exec tail -f /dev/null > /dev/null 2>&1; fi
+fifo_put "$1" fail
 STUB
 chmod +x "$T/bin/b-holds"
 cleanup_pids() { kill -KILL $(cat "$T"/pid-* 2> /dev/null) 2> /dev/null; rm -f "$T"/pid-*; }
@@ -309,10 +311,11 @@ trap '' TERM
 tail -f /dev/null > /dev/null 2>&1 &
 echo $! > "$FAKE_DIR/pid-held"
 rm -f "$FAKE_DIR/oc/full-suite.lock"
-rm -f "$FAKE_DIR/fifo/b"; mkfifo "$FAKE_DIR/fifo/b"
+. "$FIFO_LIB"
+fifo_make "$FAKE_DIR/fifo/b"
 b-holds "$FAKE_DIR/fifo/b" &
 echo $! > "$FAKE_DIR/pid-b"
-read -r _ < "$FAKE_DIR/fifo/b"
+fifo_line "$FAKE_DIR/fifo/b" || { echo "fifo-timeout: no line from b-holds" >&2; exit 98; }
 exit 3
 STUB
 chmod +x "$T/bin/replace-lock"
@@ -331,10 +334,11 @@ trap '' TERM
 flock -u 9
 tail -f /dev/null > /dev/null 2>&1 &
 echo $! > "$FAKE_DIR/pid-held"
-rm -f "$FAKE_DIR/fifo/b"; mkfifo "$FAKE_DIR/fifo/b"
+. "$FIFO_LIB"
+fifo_make "$FAKE_DIR/fifo/b"
 b-holds "$FAKE_DIR/fifo/b" &
 echo $! > "$FAKE_DIR/pid-b"
-read -r _ < "$FAKE_DIR/fifo/b"
+fifo_line "$FAKE_DIR/fifo/b" || { echo "fifo-timeout: no line from b-holds" >&2; exit 98; }
 exit 3
 STUB
 chmod +x "$T/bin/release-lock"
@@ -372,15 +376,16 @@ trap 'exit 7' TERM
 ( trap '' TERM; exec tail -f /dev/null > /dev/null 2>&1 ) &
 echo $! > "$FAKE_DIR/pid-held"
 echo "$$" > "$FAKE_DIR/pid-block"
-echo "$PPID" > "$FAKE_DIR/fifo/ready"
+. "$FIFO_LIB"
+fifo_put "$FAKE_DIR/fifo/ready" "$PPID"
 wait
 STUB
 chmod +x "$T/bin/block"
 flock_stub
-rm -f "$T/fifo/ready"; mkfifo "$T/fifo/ready"
+fifo_make "$T/fifo/ready"
 FAKE_DIR=$T rc bash "$RC" run "$T/wt" 9 t --cuda -- block > /dev/null 2>&1 &
 bg=$!
-read -r lockrun_pid < "$T/fifo/ready"
+if fifo_read "$T/fifo/ready" term-ready; then lockrun_pid=$REPLY; else lockrun_pid=$bg; fi
 kill -TERM "$lockrun_pid"
 wait "$bg"; r=$?
 check term-rc "$r" "7"
@@ -475,19 +480,20 @@ rc bash "$RC" cpu "$T/wt" 9 t -- "$T/wt/pkg/target/release/rcsr" > /dev/null 2>&
 check direct-rcsr-not-refused "$([ "$r" -ne 2 ] && echo yes || echo no)" "yes"
 
 # the same job twice at once: the second exits 3 naming the first pid and leaves the first log alone; another tag and a later rerun run
-mkfifo "$T/ready" "$T/go"
+fifo_make "$T/ready" "$T/go"
 cat > "$T/bin/wait-go" <<STUB
 #!/usr/bin/env bash
-echo "first started" 
-echo ready > "$T/ready"
-read -r _ < "$T/go"
+. "$FIFO_LIB"
+echo "first started"
+fifo_put "$T/ready" ready
+fifo_line "$T/go" || { echo "fifo-timeout: wait-go got no go line" >&2; exit 98; }
 STUB
 chmod +x "$T/bin/wait-go"
 rcenv=(env -u CARGO_TARGET_DIR RCSR_GATES="$T/gates" RCSR_SLOT_SCRIPT="$T/slot.sh" RCSR_LOCK_SCRIPT="$T/lock.sh"
   RCSR_XID_CMD="cat '$T/xid'" RCSR_MACHINE_DIR="$T/oc" RCSR_LOCAL="$T/local" PATH="$T/bin:$PATH" FAKE_TIMEOUT_LOG="$T/timeouts")
 "${rcenv[@]}" bash "$RC" cpu "$T/wt" 9 dup -- wait-go > /dev/null 2>&1 &
 first=$!
-read -r _ < "$T/ready"
+fifo_read "$T/ready" dup-ready
 duplog=$T/gates/issue9-dup.log
 "${rcenv[@]}" bash "$RC" cpu "$T/wt" 9 dup -- show-args > /dev/null 2> "$T/err"; r=$?
 check dup-rc "$r" "3"
@@ -496,7 +502,7 @@ check dup-log-kept "$(grep -c '^first started$' "$duplog")" "1"
 check dup-log-no-done "$(grep -c '^RC_DONE' "$duplog")" "0"
 "${rcenv[@]}" bash "$RC" cpu "$T/wt" 9 dup2 -- show-args > /dev/null 2>&1; check dup-other-tag-runs "$?" "0"
 "${rcenv[@]}" bash "$RC" cpu "$T/nogit" 9 dup -- show-args > /dev/null 2>&1; check dup-other-worktree-runs "$?" "0"
-echo go > "$T/go"
+fifo_put "$T/go" go
 wait "$first"; check dup-first-rc "$?" "0"
 "${rcenv[@]}" bash "$RC" cpu "$T/wt" 9 dup -- show-args > /dev/null 2>&1; check dup-rerun-after-end "$?" "0"
 
@@ -537,6 +543,42 @@ rc bash "$RC" run "$T/wt" 9 t --cuda -- show-args > /dev/null 2>&1; check stamp-
 echo cpu > "$stamp"
 rc bash "$RC" test "$T/wt" 9 t --cuda -- show-args > /dev/null 2>&1; check stamp-test-rebuilds-rc "$?" "0"
 rc bash "$RC" cpu "$T/wt" 9 t -- show-args > /dev/null 2>&1; check stamp-cpu-mode-no-check "$?" "0"
+
+# --- #1432: a FIFO writer that never arrives ends the stub with a named failure (exit 98), never a hang
+mv "$T/bin/b-holds" "$T/bin/b-holds.off"
+flock_stub
+FIFO_WAIT=2 FAKE_DIR=$T rc bash "$RC" run "$T/wt" 9 t --cuda -- replace-lock > /dev/null 2> "$T/err"; r=$?
+check fifo-dead-writer-nopath-replace "$r" "98"
+cleanup_pids
+FIFO_WAIT=2 FAKE_DIR=$T rc bash "$RC" run "$T/wt" 9 t --cuda -- release-lock > /dev/null 2> "$T/err"; r=$?
+check fifo-dead-writer-nopath-release "$r" "98"
+cleanup_pids
+mv "$T/bin/b-holds.off" "$T/bin/b-holds"
+cat > "$T/bin/block-silent" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+chmod +x "$T/bin/block-silent"
+fifo_make "$T/fifo/silent"
+FAKE_DIR=$T rc bash "$RC" run "$T/wt" 9 t --cuda -- block-silent > /dev/null 2>&1
+fifo_line "$T/fifo/silent" 1; r=$?
+check fifo-dead-writer-block "$([ "$r" -gt 128 ] && echo timeout || echo "rc=$r")" "timeout"
+out=$(fifo_read "$T/fifo/silent" fifo-named 1)
+check fifo-read-names-failure "$(grep -c '^FAIL fifo-named: ' <<<"$out")" "1"
+
+# the wall-clock limit: a file that blocks is killed with its children, exit 124 and a line on stderr
+cat > "$T/wall.sh" <<STUB
+#!/usr/bin/env bash
+. "$HERE/lib/fakes.sh"
+wall_clock_guard "\$@"
+tail -f /dev/null > /dev/null 2>&1 &
+echo \$! > "$T/pid-wall"
+wait
+STUB
+env -u TEST_WALL_GUARD TEST_WALL_SECONDS=3 bash "$T/wall.sh" > /dev/null 2> "$T/err"; r=$?
+check wall-limit-rc "$r" "124"
+has wall-limit-msg "$T/err" '^wall.sh: wall-clock limit exceeded$'
+check wall-limit-child-gone "$(alive "$(cat "$T/pid-wall")" && echo alive || echo gone)" "gone"
 
 # -h prints the header
 check help-rc "$(bash "$RC" -h > "$T/h"; echo $?)" "0"

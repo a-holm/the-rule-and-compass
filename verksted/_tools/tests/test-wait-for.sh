@@ -6,6 +6,7 @@ set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 . "$HERE/lib/machine.sh"
 . "$HERE/lib/fakes.sh"
+wall_clock_guard "$@"
 W=$HERE/../wait-for.sh
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
@@ -129,13 +130,13 @@ vclock_reset; w --exe "$T/bin/other" --timeout 2 > /dev/null; check exe-none-rc 
 # The first wait blocks in its first poll on fifos, so the lock is held at a known point.
 mkdir -p "$T/blk" "$T/locks"; fake_blocking_sleep "$T/blk"
 export RCSR_WAIT_LOCKS=$T/locks
-mkfifo "$T/ready" "$T/go"
+fifo_make "$T/ready" "$T/go"
 first_wait() { # first_wait <wait-for arguments>: starts the blocked first wait in the background; sets first
   FAKE_READY=$T/ready FAKE_GO=$T/go PATH="$T/blk:$PATH" RCSR_POLL=1 bash "$W" "$@" > /dev/null 2>&1 &
   first=$!
-  read -r _ < "$T/ready"
+  fifo_read "$T/ready" first-wait-ready
 }
-end_first() { kill "$first" 2> /dev/null; echo go > "$T/go"; wait "$first" 2> /dev/null; }
+end_first() { kill "$first" 2> /dev/null; fifo_put "$T/go" go; wait "$first" 2> /dev/null; }
 : > "$T/lock1.log"
 first_wait --log "$T/lock1.log" --timeout 600
 vclock_reset
@@ -169,6 +170,10 @@ vclock_reset; w --exe "$T/bin/blocker" --timeout 2 > /dev/null 2>&1; check lock-
 end_first
 kill "$bp2" 2> /dev/null
 wait "$bp2" 2> /dev/null
+
+# a blocking-sleep fake that never writes its ready line ends the read with a named timeout, not a hang
+fifo_line "$T/ready" 1; r=$?
+check fifo-dead-writer-ready "$([ "$r" -gt 128 ] && echo timeout || echo "rc=$r")" "timeout"
 
 # usage errors
 bash "$W" > /dev/null 2>&1; check usage-none "$?" 2

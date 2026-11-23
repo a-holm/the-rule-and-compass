@@ -5,6 +5,9 @@
 # A script test never reaches the real machine directory: a test that needs one sets RCSR_MACHINE_DIR itself.
 export RCSR_MACHINE_DIR=/nonexistent-machine-dir
 export RCSR_TEST_LOCK=/nonexistent-machine-dir/full-suite.lock
+FIFO_LIB=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fifo.sh
+export FIFO_LIB
+. "$FIFO_LIB"
 
 # fake_timeout <dir>: <dir>/timeout appends "<limit> <cmd...>" to $FAKE_TIMEOUT_LOG and the -k value, when given, to
 # $FAKE_TIMEOUT_LOG.kill. A command named hang stands for one that never ends: exit 124 without running it. Any other
@@ -85,13 +88,14 @@ release() {
 }
 
 # fake_blocking_sleep <dir>: <dir>/sleep tells the test that the caller reached its first sleep (a line in the fifo
-# $FAKE_READY), then blocks until a line arrives in the fifo $FAKE_GO. A test uses it to hold one wait-for.sh process
+# $FAKE_READY), then blocks until a line arrives in the fifo $FAKE_GO (exit 98 after FIFO_WAIT seconds). The test body made both with fifo_make. A test uses it to hold one wait-for.sh process
 # at a known point while it starts a second one.
 fake_blocking_sleep() {
   cat > "$1/sleep" <<'FAKE'
 #!/usr/bin/env bash
-echo ready > "${FAKE_READY:?}"
-read -r _ < "${FAKE_GO:?}"
+. "$FIFO_LIB"
+fifo_put "${FAKE_READY:?}" ready
+fifo_line "${FAKE_GO:?}" || { echo "fifo-timeout: blocking sleep got no go line" >&2; exit 98; }
 FAKE
   chmod +x "$1/sleep"
 }
