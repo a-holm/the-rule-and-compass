@@ -8,7 +8,7 @@ Each pipeline is a job that repeated in the agent logs: one Claude Code orchestr
 
 | Pipeline | Evidence | Why its own pipeline |
 |---|---|---|
-| `01_issue/` | 39 briefs; PRs up to #369; 14 (Claude Code) and 29 (opencode) `gh pr merge` calls | one ticket, one branch, one PR; red before green |
+| `01_issue/` | 39 briefs; PRs up to #369; 14 (Claude Code) and 29 (opencode) merge calls | one ticket, one branch, one PR; red before green |
 | `02_research/` | #254, #257, #291, #292, #293, #352, #364 | Opus, no code, ends in a comment, not a PR |
 | `03_orchestrate/` | 394 dispatches; 4 tickets against a cap of 3; 57 duplicate wait loops | the orchestrator never works in an agent's worktree |
 | `04_gate/` | 20 full gates for a handful of PRs; user correction 2026-10-30 | one gate for many tickets |

@@ -221,7 +221,7 @@ ticked, so a reviewer can check them without leaving the page.
 
 Before merging:
 
-1. All acceptance boxes ticked.
+1. Every acceptance criterion has evidence in the PR body. The verifier ticks the issue boxes it verified at the merge; nobody ticks the issue after it.
 2. CI (if configured) green; locally `cargo test --release` green.
 3. No unrelated changes in the diff.
 4. Output/docs updated.
@@ -248,7 +248,10 @@ true and recorded on the issue:
 3. edge cases, exactness/fallback behaviour and quantitative targets are
    evidenced;
 4. docs/help/schema/checkpoint/migration/provenance are updated;
-5. the combined CPU/CUDA/bench integration gate passes;
+5. the merged-tree checks passed (the lint set before and after the merge,
+   `--no-run` when pull requests cross); a criterion that needs the full gate,
+   a GPU run or a measurement is a `not run (#M)` row, and the issue stays open
+   unless another open issue owns that work;
 6. an independent verifier has mapped every requirement to evidence and found no
    hidden follow-up inside the original scope.
 

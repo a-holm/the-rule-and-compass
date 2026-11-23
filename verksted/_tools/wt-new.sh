@@ -41,14 +41,15 @@ if ! sha=$(git -C "$ROOT" rev-parse --verify -q "refs/remotes/origin/$base^{comm
   exit 1
 fi
 if [ "$research" -eq 1 ]; then
-  w=$WT/research-$slug
+  name=research-$slug
   scratch=$G/research-$slug-scratch
   branch=
 else
-  w=$WT/issue-$issue-$slug
+  name=issue-$issue-$slug
   scratch=$G/issue$issue-scratch
   branch=issue/$issue-$slug
 fi
+w=$WT/$name
 if [ -e "$w" ]; then
   echo "refused: $w exists" >&2
   exit 1
@@ -58,9 +59,9 @@ if [ -n "$branch" ] && git -C "$ROOT" show-ref --verify -q "refs/heads/$branch";
   exit 1
 fi
 if [ -n "$branch" ]; then
-  git -C "$ROOT" worktree add -q --no-track -b "$branch" "$w" "origin/$base" || exit 1
+  git -C "$ROOT" worktree add -q --no-track -b "$branch" "$WT/$name" "origin/$base" || exit 1
 else
-  git -C "$ROOT" worktree add -q --detach "$w" "origin/$base" || exit 1
+  git -C "$ROOT" worktree add -q --detach "$WT/$name" "origin/$base" || exit 1
 fi
 mkdir -p "$scratch"
 echo "W=$w"

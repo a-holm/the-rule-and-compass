@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Usage: brief.sh impl|research|clerk --issue <n> [--slug <s>] [--epic <n>] [--pr <n>] [--model sonnet|opus] [--owned <paths>]
+# Usage: brief.sh impl|research|verifier --issue <n> [--slug <s>] [--epic <n>] [--pr <n>] [--model sonnet|opus|fable] [--owned <paths>]
 # Prints a dispatch prompt: line 1 is the no-resume line; then the values N, SLUG, W, BRANCH, BASE, G, EPIC, PR;
-# then "Read and follow verksted/_shared/brief.md and verksted/_templates/<template> exactly."
-# An opus prompt adds: use mcp__tractatus_thinking__tractatus_thinking and context7 only; no WebSearch, no WebFetch.
-# Required: impl needs --issue, --slug; research needs --issue, --slug; clerk needs --issue, --pr.
+# then "Read and follow verksted/_shared/brief.md and verksted/_templates/<template> exactly." For a verifier, W is its scratch worktree $WT/verifier-<PR> (verify-merged.sh creates and removes it).
+# --model sonnet (default), opus or fable. An opus or fable prompt adds: use tractatus thinking, context7 and web search; a fable prompt
+# adds the dispatch line `subagent_type fable-52`. Every prompt ends with a line that names $VLOCAL/rules-local.md (resolved path).
+# Required: impl needs --issue, --slug; research needs --issue, --slug; verifier needs --issue, --pr.
 # Refuses when a required value is missing or the output still holds a `<placeholder>`.
 # Writes: nothing.
 # Exit: 0 printed; 1 refused; 2 usage.
@@ -12,7 +13,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 kind=${1:-}
 case "$kind" in
   -h|--help) usage; exit 0 ;;
-  impl|research|clerk) shift ;;
+  impl|research|verifier) shift ;;
   *) usage >&2; exit 2 ;;
 esac
 issue= slug= epic= pr= model=sonnet owned=
@@ -34,7 +35,7 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
-case "$model" in sonnet|opus) ;; *) usage >&2; exit 2 ;; esac
+case "$model" in sonnet|opus|fable) ;; *) usage >&2; exit 2 ;; esac
 for v in "$issue" "$epic" "$pr"; do
   case "$v" in ''|[0-9]*) ;; *) usage >&2; exit 2 ;; esac
   case "$v" in *[!0-9]*) usage >&2; exit 2 ;; esac
@@ -45,13 +46,13 @@ case "$kind" in
   impl|research)
     [ -n "$slug" ] || refuse "--slug is required for $kind"
     [[ $slug =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || refuse "slug '$slug' is not kebab-case" ;;
-  clerk)
-    [ -n "$pr" ] || refuse "--pr is required for clerk" ;;
+  verifier)
+    [ -n "$pr" ] || refuse "--pr is required for verifier" ;;
 esac
 case "$kind" in
   impl) template=brief.md; w=$WT/issue-$issue-$slug; branch=issue/$issue-$slug ;;
   research) template=brief-research.md; w=$WT/research-$slug; branch="none (detached read-only worktree)" ;;
-  clerk) template=brief-clerk.md; w="none (wt-done.sh $issue finds it)"; branch="none (the PR head)"
+  verifier) template=brief-verifier.md; w=$WT/verifier-$pr; branch="none (the PR head)"
     [ -z "$slug" ] || branch=issue/$issue-$slug ;;
 esac
 out=$(
@@ -64,14 +65,16 @@ out=$(
   echo "BRANCH=$branch"
   echo "BASE=$BASE"
   echo "G=$G"
-  echo "EPIC=${epic:-none given; read it from the issue metadata}"
+  echo "EPIC=${epic:-none given; read it from the issue metadata, else the default epic of rules-local.md}"
   echo "PR=${pr:-none yet}"
   [ "$kind" != impl ] || [ -z "$owned" ] || echo "OWNED=$owned"
   echo
   echo "Read and follow verksted/_shared/brief.md and verksted/_templates/$template exactly."
-  if [ "$model" = opus ]; then
-    echo "Use mcp__tractatus_thinking__tractatus_thinking and context7 only; no WebSearch, no WebFetch."
-  fi
+  case "$model" in
+    opus|fable) echo "Use tractatus thinking, context7 and web search." ;;
+  esac
+  [ "$model" != fable ] || echo "Dispatch with subagent_type fable-52."
+  echo "Read $VLOCAL/rules-local.md when it exists."
 )
 if printf '%s\n' "$out" | grep -qE '<[A-Za-z_][^>]*>'; then
   refuse "the prompt still holds a <placeholder>"

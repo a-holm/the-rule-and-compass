@@ -1,20 +1,23 @@
 #!/usr/bin/env bash
-# Usage: clerk-check.sh <pr> [--base <branch>] [--claims <file>] [--scope <glob>]...
-# Read-only evidence check for the merge clerk. git fetch origin, then prints:
+# Usage: verifier-check.sh <pr> [--base <branch>] [--claims <file>] [--scope <glob>]...
+# Read-only evidence check for the verifier. git fetch origin, then prints:
 #   state: <OPEN|MERGED|CLOSED>  base: <name>  mergeable: <MERGEABLE|CONFLICTING|UNKNOWN>  head: <sha>
 #   files: one changed path per line, `out of scope` after a path that matches no --scope glob
 #   stat:  git diff --stat origin/<base>...<head>
 #   worktree: for an OPEN PR, the worktree that has the head branch checked out: none | clean at head | dirty | at another commit than the PR head.
 #     `gh pr merge --delete-branch` removes that worktree after the merge (gh 2.103.3), so dirty or behind is exit 1 and none is expected after it.
 #   conflicts: on CONFLICTING, git merge-tree --write-tree --name-only origin/<base> <head>
-#   claims: one row per line `<label>|<log path>|<ERE>` of the claims file: found | no match | no log
-#   merge: the command to run, with a subject placeholder; never executed
+#   claims: one row per line `<label>|<log path>|<ERE>` of the claims file: found | no match | no log | empty | stale | found (unknown head)
+#     empty: the log matches but test-summary.sh gives `verdict: empty` (no test ran, rule 70). stale: the first line `RC_HEAD sha=<commit>` of the log names a commit whose
+#     <crate dir> or scripts differ from the PR head (rule 71). unknown head: no RC_HEAD line, or a commit this repository lacks; not stale, the verifier decides.
+#   merge: the command to run, with subject and body-file placeholders and --delete-branch; never executed
 # Retries while an OPEN PR has mergeable UNKNOWN, every 5 s for up to 60 s.
 # Writes: nothing (git fetch only).
-# Exit: 0 when state OPEN, base matches (default $BASE), MERGEABLE, every claim found, nothing out of scope and the worktree (if any) clean at the PR head; 1 otherwise; 2 usage.
+# Exit: 0 when state OPEN, base matches (default $BASE), MERGEABLE, every claim found (or found with an unknown head), nothing out of scope and the worktree (if any) clean at the PR head; 1 otherwise; 2 usage.
 set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 base=$BASE
+SUMMARY=$(dirname "${BASH_SOURCE[0]}")/test-summary.sh
 claims=
 scopes=()
 pr=
@@ -103,18 +106,28 @@ fi
 
 echo "claims:"
 if [ -n "$claims" ]; then
+  crate=$(crate_dir "$RCSR_ROOT" 2> /dev/null)
+  crate=${crate##*/}
   while IFS='|' read -r label log ere; do
     case "$label" in ''|'#'*) continue ;; esac
     if [ ! -f "$log" ]; then
       res="no log"
-    elif grep -qE -- "$ere" "$log"; then
-      res=found
-    else
+    elif ! grep -qE -- "$ere" "$log"; then
       res="no match"
+    elif sum=$("$SUMMARY" "$log"); [[ $sum == *$'\nverdict: empty' ]]; then
+      res=empty
+    else
+      res=found
+      lhead=$(sed -n 's/^RC_HEAD sha=\([0-9a-f]\{40\}\) .*/\1/p;/^RC_HEAD /q' "$log" | head -n 1)
+      if [ -z "$lhead" ] || ! git -C "$ROOT" cat-file -e "$lhead^{commit}" 2> /dev/null; then
+        res="found (unknown head)"
+      elif [ -n "$crate" ] && ! git -C "$ROOT" diff --quiet "$lhead" "$head" -- "$crate" scripts; then
+        res=stale
+      fi
     fi
-    [ "$res" = found ] || bad=1
+    case "$res" in found | "found (unknown head)") ;; *) bad=1 ;; esac
     echo "  $label|$log|$ere|$res"
   done < "$claims"
 fi
-echo "merge: gh pr merge $pr --squash --subject '<subject>' --body '<body>'"
+echo "merge: gh pr merge $pr --squash --delete-branch --subject '<subject>' --body-file '<file>'"
 exit "$bad"

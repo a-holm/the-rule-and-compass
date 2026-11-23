@@ -10,7 +10,7 @@
 # Run the whole planned pass with sanitize-all.sh.
 # Search-level tests must set dispatch: DispatchMode::Device (CLI --dispatch device), or every stage runs on the CPU.
 # Writes: the logs <id>-<tag>-build and <id>-<tag> (see rc-run.sh).
-# Exit: 0 when the log holds `ERROR SUMMARY: 0 errors` and the run exits 0; 1 otherwise; 3 when $SANITIZER is missing or not a CUDA 13 path; 70 a new Xid line appeared or the Xid check failed; 2 usage.
+# Exit: 0 when the log holds `ERROR SUMMARY: 0 errors` and the run exits 0; 1 otherwise; 3 when $SANITIZER is missing or not a CUDA 13 path, or the release rcsr binary is stamped for the CPU feature set (rc-run.sh; the message names the build command); 70 a new Xid line appeared or the Xid check failed; 2 usage.
 set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 RC_RUN=$(dirname "${BASH_SOURCE[0]}")/rc-run.sh
@@ -103,6 +103,12 @@ count=$(printf '%s' "$bins" | grep -c .)
 if [ "$count" -ne 1 ]; then
   echo "sanitize: expected exactly one test binary for ${target#test:}, found $count: $(printf '%s' "$bins" | tr '\n' ' ')" >&2
   exit 1
+fi
+
+stamp=$(crate_dir "$wt")/target/release/.rcsr-features
+if [ -f "$stamp" ] && [ "$(cat "$stamp")" != cuda ]; then
+  echo "sanitize: the release rcsr binary of $wt was built for the $(cat "$stamp") feature set; build it first: rc-run.sh build $wt $id $tag-build --cuda -- cargo build --release --features cuda --bin rcsr" >&2
+  exit 3
 fi
 
 "$RC_RUN" run "$wt" "$id" "$tag" --cuda --timeout "$timeout_s" -- \
