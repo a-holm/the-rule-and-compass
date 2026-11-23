@@ -7,7 +7,7 @@ description: Lessons that hold for any OHLC or OHLCV dataset, each with its sour
 
 One lesson per entry: a present-tense rule, then `Source:` with the date and the artefact kind. A lesson that holds only for one dataset or one machine belongs in the local area, not here. No entry holds a value from inside a locked range or a row of raw data.
 
-1. Check the store start against the first raw bar before every build. A start date copied from an older runbook cut four years of history unnoticed. Source: 2026-11-14, store build review.
+1. Check the store start against the first raw bar before every build. A start date copied from an older runbook can cut years of history unnoticed. Source: 2026-11-14, store build review.
 2. Declare the lock on the first store and extend it backwards only while no run has read the new range. Source: 2026-11-14, lock revision.
 3. A grep with a wide glob can read a sealed manifest. Keep every glob inside the staged and store directories, and disclose any exposure of names, hashes or sizes in the pre-registration. Source: 2026-11-21, store build.
 4. Count cross-section members per split group before choosing a floor. With the default floor a period with fewer members than the floor has no market column at all. Source: 2026-11-21, member counts.
