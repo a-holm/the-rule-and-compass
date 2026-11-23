@@ -5,10 +5,9 @@ Instructions for automated agents (and humans) working in this repository.
 ## What this is
 
 `the-rule-and-compass` is a symbolic-regression engine written in Rust: it
-error/complexity Pareto front. The engine crate directory is `<crate>`: run
-`verksted/_tools/crate-dir.sh "$W"` to print it for a worktree `$W`. The
-specification is [`SPEC.md`](SPEC.md), and the overview is
-[`README.md`](README.md).
+searches for interpretable formulas `y = f(x)` that fit data, ranked on an
+error/complexity Pareto front. The crate is in `<crate>` (print it with
+`verksted/_tools/crate-dir.sh "$W"`),
 the specification is [`SPEC.md`](SPEC.md), and the overview is
 [`README.md`](README.md).
 
