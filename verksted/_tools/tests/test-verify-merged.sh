@@ -6,6 +6,7 @@
 # Writes: a temp dir that it removes.
 set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+. "$HERE/lib/machine.sh"
 . "$HERE/lib/fakes.sh"
 T=$(cd "$(mktemp -d)" && pwd -P)
 trap 'rm -rf "$T"' EXIT
@@ -71,6 +72,8 @@ GH
 chmod +x "$T/bin/gh"
 export FAKE_DIR=$T PATH="$T/bin:$PATH" RCSR_ROOT="$T/clone" RCSR_GATES="$T/gates" RCSR_BASE=main RCSR_CRATE=crate-x FAKE_PR_HEAD=$head
 export RCSR_LOCAL="$T/local"
+mkdir -p "$T/local"
+printf -- "%s" "$FAKE_LIB_KEYS" > "$T/local/machine.md"
 V=$T/tools/verify-merged.sh
 WTP=$T/clone/worktrees/verifier-7
 run() { bash "$V" "$@" 2>&1; }
