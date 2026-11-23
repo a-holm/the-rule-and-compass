@@ -4,6 +4,7 @@
 # Writes: nothing.
 set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+. "$HERE/lib/machine.sh"
 S=$HERE/../brief.sh
 V=$HERE/../..
 export RCSR_GATES=/nonexistent-gates

@@ -4,6 +4,7 @@
 # Writes: a temp dir that it removes.
 set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+. "$HERE/lib/machine.sh"
 LIB=$HERE/../lib.sh
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
@@ -77,7 +78,7 @@ d=$(mach empty "- GATES:
 $(grep -v '^- GATES:' <<< "$all_keys")")
 check empty-value-rc "$(lib 'echo reached' RCSR_LOCAL="$d" >/dev/null 2>&1; echo $?)" "2"
 # interactive shell: the source reports status 2 and the shell survives; a script still stops at the source line
-ilib() { env -u RCSR_GATES -u RCSR_MACHINE_DIR -u RCSR_SANITIZER "$@" bash -ic "source '$LIB'; r=\$?; echo alive; echo rc=\$r" 2> /dev/null; }
+ilib() { env -u RCSR_GATES -u RCSR_MACHINE_DIR -u RCSR_SANITIZER "$@" bash --norc --noprofile -ic "source '$LIB'; r=\$?; echo alive; echo rc=\$r" 2> /dev/null; }
 check interactive-missing "$(ilib RCSR_LOCAL="$T/none" | tr '\n' ' ')" "alive rc=2 "
 check interactive-ok "$(ilib RCSR_LOCAL="$DEFLOCAL" | tr '\n' ' ')" "alive rc=0 "
 d=$(mach iph "$(sed 's/^- SANITIZER: .*/- SANITIZER: <set me>/' <<< "$all_keys")")

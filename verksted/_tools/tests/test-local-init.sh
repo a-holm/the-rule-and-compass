@@ -4,6 +4,7 @@
 # Writes: a temp dir that it removes.
 set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+. "$HERE/lib/machine.sh"
 INIT=$HERE/../local-init.sh
 TPL=$HERE/../../_templates/local
 T=$(mktemp -d)

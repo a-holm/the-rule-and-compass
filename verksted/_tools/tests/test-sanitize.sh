@@ -5,6 +5,7 @@
 set -uo pipefail
 export RCSR_CRATE=crate-x
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+. "$HERE/lib/machine.sh"
 . "$HERE/lib/fakes.sh"
 SAN=$HERE/../sanitize.sh
 T=$(mktemp -d)

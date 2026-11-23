@@ -5,6 +5,7 @@
 set -uo pipefail
 unset RCSR_CRATE
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+. "$HERE/lib/machine.sh"
 . "$HERE/lib/fakes.sh"
 RC=$HERE/../rc-run.sh
 T=$(mktemp -d)
