@@ -3,6 +3,9 @@
 # Hermetic test of issue-lint.sh: a filled fixture passes, each broken fixture gives its FAIL line, flags, stdin, stubbed gh.
 # Writes: a temp dir that it removes.
 set -uo pipefail
+unset $(compgen -e | grep -E '^(RCSR_|GIT_)')
+export LC_ALL=C
+[ -d "${TMPDIR:-/tmp}" ] || export TMPDIR=/tmp
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 . "$HERE/lib/machine.sh"
 LINT=$HERE/../issue-lint.sh
@@ -213,6 +216,28 @@ expect blocker-unknown 1 "$T/bad-blocker.md" "FAIL: blocker-unknown: #7"
 expect offline-skips-gh 0 "$T/bad-label.md" OK --offline
 export RCSR_GH=$T/missing-gh
 expect gh-unavailable 1 "$T/good.md" "FAIL: gh-unavailable"
+
+
+# a long Acceptance section: grep -q must not make the lint fail through SIGPIPE under pipefail
+awk '/^- \[ \] exits 0/ { for (i = 0; i < 3000; i++) print "- [ ] criterion " i; next } { print }' "$T/good.md" > "$T/long-acceptance.md"
+long_bad=0
+for _ in $(seq 20); do
+  lint "$T/long-acceptance.md" --offline
+  [ "$RC" -eq 0 ] && [ "$OUT" = OK ] || long_bad=$((long_bad + 1))
+done
+check long-acceptance-failures "$long_bad" 0
+
+# the test result does not depend on the caller environment; two runs in parallel both pass
+if [ -z "${ISSUE_LINT_TEST_INNER:-}" ]; then
+  for k in a b; do
+    ISSUE_LINT_TEST_INNER=1 RCSR_ROOT=/nonexistent RCSR_GH=/nonexistent GIT_DIR=/nonexistent LC_ALL=xx_XX.UTF-8 TMPDIR=/nonexistent \
+      bash "$HERE/test-issue-lint.sh" > "$T/inner-$k.out" 2>&1 &
+  done
+  wait
+  for k in a b; do
+    check "polluted-env-$k" "$(tail -n 1 "$T/inner-$k.out")" "test-issue-lint: ok"
+  done
+fi
 
 if [ "$fails" -ne 0 ]; then
   echo "test-issue-lint: $fails failed"

@@ -200,7 +200,8 @@ if in_list Scope "${heads[@]}"; then
 fi
 
 if in_list "Acceptance criteria" "${heads[@]}"; then
-  if ! section "Acceptance criteria" | grep -qE '^[[:space:]]*-[[:space:]]\[[ xX]\][[:space:]]*[^[:space:]]'; then
+  acceptance=$(section "Acceptance criteria")
+  if ! grep -qE '^[[:space:]]*-[[:space:]]\[[ xX]\][[:space:]]*[^[:space:]]' <<< "$acceptance"; then
     fail "acceptance-missing: no '- [ ]' criterion"
   fi
 fi
