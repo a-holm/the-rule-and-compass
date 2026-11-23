@@ -93,7 +93,7 @@ The narrow fixture is 30,364,090 bytes; the wide one is 92,696,166 bytes. A
 wide but small-on-disk file is therefore no longer mistaken for cheap: the
 estimate grows with rows x columns, and a narrow but large file is no longer
 multiplied by 33. Tests for both shapes live in
-`my-version/tests/memory_estimate.rs`.
+`rcsr-engine/tests/memory_estimate.rs`.
 
 When the estimate is above the budget, `rcsr` prints the file size, the
 rows x columns basis, the estimate and the budget, suggests `--force` and
@@ -487,7 +487,7 @@ the same model gives **10.54 GB**, against the earlier forced full load's
 **15.9M × 56** case scales linearly with cells to **42.2 GB**, not by a global
 per-cell constant; that is the case a 64 GB host can choose resident.
 
-The estimator fixtures in `my-version/tests/store_estimator.rs` pin the v1/v2
+The estimator fixtures in `rcsr-engine/tests/store_estimator.rs` pin the v1/v2
 resident widths, dictionary and row-group terms, the projection identity, the
 3.9M/15.9M cases, the full-load decision and the explicit-sample/refusal
 behaviour. The old 300 B/cell constant is gone.
@@ -528,7 +528,7 @@ dictionary and a code block; v2 stores it as i64 with no codes.
 
 ## Tests
 
-`my-version/tests/store.rs` covers: byte-exact round trip (numeric columns,
+`rcsr-engine/tests/store.rs` covers: byte-exact round trip (numeric columns,
 numeric dictionaries and text dictionaries), a hand-built v1 store read with
 correct short/last groups, a version mismatch, truncation, hash sampling and
 row alignment, the CSV-vs-store search front, the guard (exit 3) for both

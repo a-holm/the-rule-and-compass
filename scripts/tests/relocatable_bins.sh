@@ -6,7 +6,7 @@
 
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-REL="$(cd "${1:-$ROOT/my-version/target/release}" && pwd)" || exit 1
+REL="$(cd "${1:-$ROOT/rcsr-engine/target/release}" && pwd)" || exit 1
 BINS="rcsr rcsr-gpu-bench rcsr-bench cpu_bench rcsr_serve"
 fail() { echo "FAIL: $*" >&2; exit 1; }
 need() { [[ -n "$1" && -f "$1" ]] || fail "missing path: '$1'"; }
@@ -38,11 +38,12 @@ env -i PATH="$PATH" "$dir/rcsr" --version >/dev/null || fail "copied rcsr --vers
 echo "ok copied rcsr runs outside the target dir"
 
 n=0
-for src in "$ROOT"/my-version/tests/*.rs; do
+for src in "$ROOT"/rcsr-engine/tests/*.rs; do
   name="$(basename "$src" .rs)"
   for t in "$REL"/deps/"$name"-*; do
     [[ -f "$t" && -x "$t" && "$t" != *.d ]] || continue
     ! cmp -s "$t" "$REL/$name" || continue
+    grep -qa RUST_TEST_THREADS "$t" || continue
     check_elf "$t" "$(basename "$t")"
     "$t" --list >/dev/null 2>&1 || fail "$(basename "$t") --list failed"
     n=$((n + 1))

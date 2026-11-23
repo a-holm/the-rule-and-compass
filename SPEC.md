@@ -1,4 +1,4 @@
-# SPEC — `my-version`: a symbolic-regression engine (Rust)
+# SPEC: rcsr, a symbolic-regression engine (Rust)
 
 Goal: a working Linux implementation of a symbolic-regression engine, written in
 Rust, with tests. This spec describes **behaviour and interfaces**.

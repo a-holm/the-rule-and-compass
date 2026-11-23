@@ -37,7 +37,7 @@ traceable, reviewable and parallel-safe.
    `target/` and local-only directories out of git (they already are).
 10. **Rust only.** No Python files, no `python3` calls in tests, scripts, docs or
     workflows. Experiments, reference computations, fixtures and measurement
-    tools are written in Rust. The guard is `my-version/tests/no_python.rs`.
+    tools are written in Rust. The guard is `rcsr-engine/tests/no_python.rs`.
 
 ---
 
@@ -134,7 +134,7 @@ build directory, is what serialises builds:
 
 ```sh
 /mnt/lager/tmp/opencode/one-full-suite.sh bash -c \
-  'cd worktrees/issue-<n>-<slug>/my-version && cargo test --release'
+  'cd worktrees/issue-<n>-<slug>/rcsr-engine && cargo test --release'
 ```
 
 ---
@@ -144,7 +144,7 @@ build directory, is what serialises builds:
 Read the issue's acceptance criteria as the definition of done. Then:
 
 ```sh
-cd my-version
+cd rcsr-engine
 cargo build --release
 cargo test  --release
 cargo clippy --release -- -D warnings   # if clippy is installed
@@ -221,7 +221,7 @@ ticked, so a reviewer can check them without leaving the page.
 
 Before merging:
 
-1. All acceptance boxes ticked.
+1. Every acceptance criterion has evidence in the PR body. The verifier ticks the issue boxes it verified at the merge; nobody ticks the issue after it.
 2. CI (if configured) green; locally `cargo test --release` green.
 3. No unrelated changes in the diff.
 4. Output/docs updated.
@@ -248,7 +248,10 @@ true and recorded on the issue:
 3. edge cases, exactness/fallback behaviour and quantitative targets are
    evidenced;
 4. docs/help/schema/checkpoint/migration/provenance are updated;
-5. the combined CPU/CUDA/bench integration gate passes;
+5. the merged-tree checks passed (the lint set before and after the merge,
+   `--no-run` when pull requests cross); a criterion that needs the full gate,
+   a GPU run or a measurement is a `not run (#M)` row, and the issue stays open
+   unless another open issue owns that work;
 6. an independent verifier has mapped every requirement to evidence and found no
    hidden follow-up inside the original scope.
 
@@ -287,7 +290,7 @@ its own `issue/<n>-<slug>` branch.
 ### One full-suite test at a time
 
 Parallel *editing* is fine; parallel **building and testing** is not. Each
-worktree that keeps its own `my-version/target/` bypasses cargo's own target
+worktree that keeps its own `rcsr-engine/target/` bypasses cargo's own target
 lock, so two agents can compile and run the whole suite at once. On an 8-thread
 machine that pushed the load average to 13 and made every run slower and noisier.
 
@@ -301,14 +304,14 @@ Rules:
 
   ```sh
   /mnt/lager/tmp/opencode/build-slot.sh bash -c \
-    'cd worktrees/issue-<n>-<slug>/my-version && CARGO_BUILD_JOBS=2 cargo test --release --no-run'
+    'cd worktrees/issue-<n>-<slug>/rcsr-engine && CARGO_BUILD_JOBS=2 cargo test --release --no-run'
   ```
 
 * Tests and benchmarks keep the single test lock, which queues instead of competing:
 
   ```sh
   /mnt/lager/tmp/opencode/one-full-suite.sh bash -c \
-    'cd worktrees/issue-<n>-<slug>/my-version && cargo test --release'
+    'cd worktrees/issue-<n>-<slug>/rcsr-engine && cargo test --release'
   ```
 
 * Both scripts run the command under SCHED_IDLE (`chrt -i 0`), nice 19 and ionice
@@ -326,7 +329,7 @@ Rules:
   full test (gate plus large-store arms) runs once on the integration branch,
   after all issues are done.
 
-* **Stable tests.** A test that can pass or fail on the same code tests nothing. `my-version/tests/test_hygiene.rs` enforces two rules over `tests/` and `src/`. R1: no `set_var` or `remove_var` call anywhere (a process-wide environment change races with other test threads and leaks into spawned children). R2: no `Instant::now` or `.elapsed()` inside a `#[test]` without `#[ignore`; a measurement goes into an `#[ignore = "..."]` test or `rcsr-bench`. A function that must break a rule is listed in `my-version/tests/hygiene-allow.txt` as `<path>:<fn> <reason>`; an entry that matches nothing fails the check.
+* **Stable tests.** A test that can pass or fail on the same code tests nothing. `rcsr-engine/tests/test_hygiene.rs` enforces two rules over `tests/` and `src/`. R1: no `set_var` or `remove_var` call anywhere (a process-wide environment change races with other test threads and leaks into spawned children). R2: no `Instant::now` or `.elapsed()` inside a `#[test]` without `#[ignore`; a measurement goes into an `#[ignore = "..."]` test or `rcsr-bench`. A function that must break a rule is listed in `rcsr-engine/tests/hygiene-allow.txt` as `<path>:<fn> <reason>`; an entry that matches nothing fails the check.
 
 * **Never point several worktrees at one `CARGO_TARGET_DIR`.** Cargo's
   fingerprints do not distinguish two checkouts of the same crate and version,

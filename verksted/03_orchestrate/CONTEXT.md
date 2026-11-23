@@ -28,7 +28,7 @@ Do NOT load: the ticket pipelines' stages, earlier runs' `output/`, the rest of 
 3. `stages/03_dispatch/`: dispatch with the model set explicitly, record agent ids.
 4. `stages/04_watchdog/`: one background watcher, alert after 45 minutes of silence.
 5. `stages/05_receive_and_verify/`: check every hand-back against PR state, git and logs; a verifier (`brief.sh verifier`) verifies the evidence.
-6. `stages/06_merge_cleanup/`: merge into `BASE` one at a time, clean up path by path.
+6. `stages/06_merge_cleanup/`: after each verifier run, update the integration worktree and report; the merge itself is `../08_close/CONTEXT.md`.
 
 ## Outputs
 

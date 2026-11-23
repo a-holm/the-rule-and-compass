@@ -109,7 +109,7 @@ Two tracked examples implement the contract:
 * [`scripts/run-long.sh`](../scripts/run-long.sh) — one uninterrupted or
   resumed run; requires `--gpu`/`--cpu` and writes a manifest, atomic result,
   command record, progress log and a per-label development log.
-* [`rcsr-launch`](../my-version/src/bin/rcsr_launch.rs) (`my-version/target/release/rcsr-launch`) — several
+* [`rcsr-launch`](../rcsr-engine/src/bin/rcsr_launch.rs) (`rcsr-engine/target/release/rcsr-launch`) — several
   walk-forward windows; derives `SHA-256(label:seed)`, reuses the same backend
   on resume, and writes one manifest/log/result set per window. `--dry-run`
   prints the resolved commands without searching.
@@ -117,10 +117,10 @@ Two tracked examples implement the contract:
 Use the tracked launchers
 above, or the `rcsr walkforward` command directly. Do not resume a long run
 with per-process salted seeds, `/dev/null` stderr, or plain `--json` redirected
-to a file without a manifest. The repository contains no Python; `my-version/tests/no_python.rs` fails on a
+to a file without a manifest. The repository contains no Python; `rcsr-engine/tests/no_python.rs` fails on a
 tracked `.py` file or a `python` shebang.
 
-`my-version/tests/launchers.rs` enforces the contract on every tracked
+`rcsr-engine/tests/launchers.rs` enforces the contract on every tracked
 `scripts/*.sh` and on `rcsr-launch`: no `DEVNULL`, an explicit backend, and
 `--run-manifest`/`--json-out`/`--progress`. It also runs `run-long.sh`
 end-to-end and checks the manifest with `rcsr verify-manifest`.

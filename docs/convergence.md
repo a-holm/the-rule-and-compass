@@ -15,7 +15,7 @@ They are emitted with every `--progress` event, in the final `--json` object
 under `"convergence": {...}`, and in the NDJSON `progress` and `done` events.
 Without `--progress`/`--ndjson` the default text output is unchanged; `--json`
 is already a machine-readable opt-in and always includes the object. The code
-is [`my-version/src/progress_stats.rs`](../my-version/src/progress_stats.rs).
+is [`rcsr-engine/src/progress_stats.rs`](../rcsr-engine/src/progress_stats.rs).
 
 ## The window
 
@@ -197,7 +197,7 @@ problem the search can also find the exact law in two generations and stop on
 the search's solved floor; confidence is then 1 by definition, stability is 1
 and maturity is only `(2-1)/2 = 0.5`, giving `percent_converged = 0.9`. The
 tests in
-[`my-version/tests/progress_stats.rs`](../my-version/tests/progress_stats.rs)
+[`rcsr-engine/tests/progress_stats.rs`](../rcsr-engine/tests/progress_stats.rs)
 run an easy and a hard problem with the same shape of configuration and assert
 that the first lands in the converged range and the second does not (the numbers
 above are from the CLI runs, not hard-coded test expectations).

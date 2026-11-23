@@ -77,7 +77,7 @@ row-level signal that a plain constant could not.
 
 A target built directly from a meta value is therefore a constant column, and
 the parsimony pressure will normally prefer a one-node constant to the larger
-meta expression. The recovery test in `my-version/tests/meta.rs` says this
+meta expression. The recovery test in `rcsr-engine/tests/meta.rs` says this
 plainly: it verifies the wiring end to end, not a predictive advantage.
 
 ## Enabling them

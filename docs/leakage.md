@@ -3,8 +3,8 @@
 Statistical gates (DSR, PBO, SPA) cannot detect leakage: a leaked P&L passes
 all of them. Leakage has to be caught differentially — run a pipeline twice on
 inputs that differ only where the answer must not change. The detectors live in
-`my-version/src/leakage.rs`, are exercised by `my-version/tests/leakage.rs` and
-`my-version/tests/leakage_audit.rs`, and run in the `rcsr audit` subcommand.
+`rcsr-engine/src/leakage.rs`, are exercised by `rcsr-engine/tests/leakage.rs` and
+`rcsr-engine/tests/leakage_audit.rs`, and run in the `rcsr audit` subcommand.
 
 ## The suite
 

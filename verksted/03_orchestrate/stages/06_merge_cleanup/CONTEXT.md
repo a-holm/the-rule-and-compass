@@ -1,18 +1,17 @@
-# 06_merge_cleanup: merge one at a time, clean path by path
+# 06_merge_cleanup: after each verifier run
 
-One job: merge verified PRs into the base and remove only finished tickets' leftovers.
+One job: bring the integration worktree up to date after each verifier run and report what merged.
 
 ## Inputs
 
 **This run:**
 - `../05_receive_and_verify/output/verify.md`
 - `../05_receive_and_verify/output/check.md` (must be `pass`)
+- the `report.md` of each verifier run (`../../../08_close/stages/03_cleanup/output/report.md` and `../../../08_close/stages/01_verifier/output/report.md`)
 
 **Reference (every run):**
 - `../../../_shared/rules.md`
 - `../../../_shared/commands.md`
-- `../../../_templates/brief-verifier.md`
-- `../../../_tools/wt-done.sh`
 - `../../CONTEXT.md`
 
 Do NOT load: unfinished agents' worktrees, bulk deletion.
@@ -20,10 +19,9 @@ Do NOT load: unfinished agents' worktrees, bulk deletion.
 ## Process
 
 1. If an input is missing or empty, stop and say which.
-2. The verifier (`brief.sh verifier`) merges one PR at a time into `BASE` only, never `main` (rule 41): `gh pr merge <pr> --squash --delete-branch --subject "<type(area): subject> (#<pr>)" --body-file <file>` with a hand-written subject and body. No gate per merge.
-3. After each merge the verifier comments on the issue with the merge sha and the verified facts (rule 41). Then `git fetch` and update the integration worktree with `--ff-only`.
-4. Clean up that ticket only with `verksted/_tools/wt-done.sh <issue>`. It refuses unless the worktree is clean, no process runs inside it and the PR is merged; then it removes the worktree, the local branch and the remote branch. Never `rm -rf`, never in bulk while agents live.
-5. Write `report.md`: tickets merged with merge shas, tickets still open, deviations.
+2. Read the verifier's `report.md`. The merge, the comment on the issue, the close and the clean-up of the ticket's worktree and branches are `../../../08_close/CONTEXT.md` (one home): this stage runs none of them.
+3. `git fetch` and update the integration worktree with `--ff-only`.
+4. Write `report.md`: tickets merged with merge shas, tickets kept open, tickets whose tip checks were not clean, deviations.
 
 ## Outputs
 
