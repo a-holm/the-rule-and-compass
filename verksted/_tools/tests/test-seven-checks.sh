@@ -30,7 +30,7 @@ V=$T/v
 mkdir -p "$T/bin" "$T/gh" "$T/gates" "$V/_tools"
 for s in 03_orchestrate/stages/01_wave_plan 03_orchestrate/stages/03_dispatch 03_orchestrate/stages/05_receive_and_verify \
   03_orchestrate/stages/06_merge_cleanup 06_data 06_data/stages/04_new_type 06_data/stages/05_panel_pit \
-  07_longrun/stages/01_preconditions 08_close/stages/02_close; do
+  07_longrun/stages/01_preconditions 07_longrun/stages/02_launch 08_close/stages/02_close; do
   mkdir -p "$V/$s"
   cp "$REPO/verksted/$s/CONTEXT.md" "$V/$s/CONTEXT.md"
 done
@@ -270,6 +270,32 @@ st $RV; check receive-pass "$?" 0
 echo '| #5 | 9 | ghsha | other |' > "$vf"
 st $RV; check receive-mismatch-fail "$?" 1
 : > "$vf"; st $RV; check receive-empty-fail "$?" 1
+
+# 02_launch: the units of this run come from run.pid; another rcsr process does not count
+LA=07_longrun/stages/02_launch
+mkdir -p "$V/$LA/output"
+printf -- '--cpu --run-manifest --json-out --progress --dev-log\n' > "$V/$LA/output/dry.txt"
+echo 'windows: 2' > "$V/$LA/output/launch.md"
+"$T/bin/rcsr" -f /dev/null &
+u1=$!
+"$T/bin/rcsr" -f /dev/null &
+u2=$!
+"$T/bin/rcsr" -f /dev/null &
+u3=$!
+pids+=("$u1" "$u2" "$u3")
+printf '%s\n%s\n' "$u1" "$u2" > "$T/run/run.pid"
+st $LA; check launch-other-rcsr-process-pass "$?" 0
+printf '%s\n' "$u1" > "$T/run/run.pid"
+st $LA; check launch-one-of-two-fail "$?" 1
+printf '%s\n%s\n%s\n' "$u1" "$u2" "$u3" > "$T/run/run.pid"
+st $LA; check launch-three-live-pids-fail "$?" 1
+rm "$T/run/run.pid"
+st $LA; check launch-no-pid-file-fail "$?" 1
+printf '%s\n%s\n' "$u1" "$u2" > "$T/run/run.pid"
+echo '--cpu' > "$V/$LA/output/dry.txt"
+st $LA; check launch-dry-run-flags-missing-fail "$?" 1
+kill "$u1" "$u2" "$u3"; wait "$u1" "$u2" "$u3" 2> /dev/null
+rm -f "$T/run/run.pid"
 
 # the process step of 04_tested_vs_merged names origin/$BASE
 TV=$REPO/verksted/04_gate/stages/04_tested_vs_merged/CONTEXT.md
