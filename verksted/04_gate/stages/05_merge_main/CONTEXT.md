@@ -21,7 +21,8 @@ Do NOT load: re-gating, new tickets.
 1. If an input is missing or empty, stop and say which. Unless the trigger of this run quotes the project lead's written instruction to merge into `main`, with its date, stop and write `fail: no instruction from the project lead`.
 2. Open the PR `BASE` -> `main` with the gate numbers and one `Refs #N` line per ticket. Merge it alone, never at the same time as another merge. `Closes` is forbidden.
 3. Use `gh pr merge <pr> --merge` with a hand-written subject and body (section "Merge" of `commands.md`). Then `git fetch` and check the merge sha is on `origin/main`.
-4. Write `report.md`: gate numbers, tested sha, merge sha. Closing the issues is `../../08_close/CONTEXT.md`.
+4. Fast-forward the main checkout: `git -C "$ROOT" merge --ff-only origin/main`. A refusal is a `fail`; report it and do not reset or force the checkout.
+5. Write `report.md`: gate numbers, tested sha, merge sha. Closing the issues is `../../08_close/CONTEXT.md`.
 
 ## Outputs
 
@@ -31,7 +32,7 @@ Do NOT load: re-gating, new tickets.
 ## Check
 
 ```sh
-pr=$(gh pr list --base main --head "$BASE" --state merged --json number -q '.[0].number'); sha=$(gh pr view "$pr" --json mergeCommit -q .mergeCommit.oid); git fetch origin main && git merge-base --is-ancestor "$sha" origin/main
+pr=$(gh pr list --base main --head "$BASE" --state merged --json number -q '.[0].number'); sha=$(gh pr view "$pr" --json mergeCommit -q .mergeCommit.oid); git fetch origin main && git merge-base --is-ancestor "$sha" origin/main && test "$(git -C "$ROOT" rev-parse HEAD)" = "$(git -C "$ROOT" rev-parse origin/main)"
 ```
 
 Exit 0 writes `pass`. Anything else writes `fail: <what was measured and what was wrong>` to `output/check.md`; `_tools/check.sh` does this. A red result is never rewritten as green.

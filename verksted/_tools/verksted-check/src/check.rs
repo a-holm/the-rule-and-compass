@@ -232,7 +232,7 @@ fn check_target(dir: &Path, dir_abs: &Path, ctx: &Ctx, rel: &str, target: &str, 
     }
     report.checked += 1;
     let decoded = percent_decode(path_part);
-    if !dir.join(&decoded).exists() && !ctx.loosely_ok(dir_abs, &decoded) {
+    if !dir.join(&decoded).exists() && !ctx.loosely_ok(dir_abs, &decoded) && !ctx.allowed(dir_abs, &decoded) {
         report.broken.push(format!("{rel}: link {target}"));
     }
 }
@@ -314,7 +314,7 @@ fn check_file(root: &Path, file: &Path, ctx: &Ctx, report: &mut Report) {
                 }
                 report.checked += 1;
                 let candidates = [dir.join(span), root.join(span)];
-                if candidates.iter().any(|c| c.exists()) || ctx.loosely_ok(&dir_abs, span) {
+                if candidates.iter().any(|c| c.exists()) || ctx.loosely_ok(&dir_abs, span) || ctx.allowed(&dir_abs, span) {
                     continue;
                 }
                 if !line_strict {
@@ -381,11 +381,34 @@ pub fn crate_dir(repo: &Path) -> Option<PathBuf> {
 
 const CRATE_PLACEHOLDER: &str = "<crate>";
 
+/// Repo-relative paths that exist on the integration branch only (`links --external` skips them).
+const ALLOW_FILE: &str = "_shared/main-absent.txt";
+
+/// Lines of `<path> <reason>`; blank lines and `#` lines are skipped. A line without a reason is a problem.
+fn read_allow(root_abs: &Path) -> (Vec<String>, Vec<String>) {
+    let mut paths = Vec::new();
+    let mut problems = Vec::new();
+    let Ok(text) = fs::read_to_string(root_abs.join(ALLOW_FILE)) else { return (paths, problems) };
+    for (i, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        match line.split_once(char::is_whitespace) {
+            Some((path, reason)) if !reason.trim().is_empty() => paths.push(path.to_string()),
+            _ => problems.push(format!("{ALLOW_FILE}:{}: entry needs a path and a reason", i + 1)),
+        }
+    }
+    (paths, problems)
+}
+
 /// Where one check run resolves references: the workshop root, its repo and the engine crate name.
 struct Ctx {
     root_abs: PathBuf,
     external: bool,
     crate_name: Option<String>,
+    allow: Vec<String>,
+    allow_problems: Vec<String>,
 }
 
 impl Ctx {
@@ -395,15 +418,31 @@ impl Ctx {
             .parent()
             .and_then(crate_dir)
             .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()));
-        Ctx { root_abs, external, crate_name }
+        let (allow, allow_problems) = if external { read_allow(&root_abs) } else { (Vec::new(), Vec::new()) };
+        Ctx { root_abs, external, crate_name, allow, allow_problems }
+    }
+
+    /// True when the repo-relative path (engine crate shown as `<crate>`) is listed in the allow file.
+    fn allowed(&self, dir_abs: &Path, target: &str) -> bool {
+        let resolved = normalize(&dir_abs.join(target));
+        let Some(repo) = self.root_abs.parent() else { return false };
+        let Ok(rel) = resolved.strip_prefix(repo) else { return false };
+        let mut parts: Vec<String> = rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+        if let (Some(first), Some(name)) = (parts.first_mut(), &self.crate_name) {
+            if first == name {
+                *first = CRATE_PLACEHOLDER.to_string();
+            }
+        }
+        let key = parts.join("/");
+        self.allow.iter().any(|a| *a == key)
     }
 
     /// The absolute folder of a file under `root`.
     fn dir_abs(&self, root: &Path, dir: &Path) -> PathBuf {
-        match dir.strip_prefix(root) {
+        fs::canonicalize(dir).unwrap_or_else(|_| match dir.strip_prefix(root) {
             Ok(rel) => self.root_abs.join(rel),
             Err(_) => dir.to_path_buf(),
-        }
+        })
     }
 
     /// A reference that resolves outside the workshop passes in the default mode when its folder exists.
@@ -425,6 +464,16 @@ pub fn check_tree_with(root: &Path, external: bool) -> Report {
     for file in &files {
         report.files += 1;
         check_file(root, file, &ctx, &mut report);
+    }
+    if external {
+        if let Some(repo) = ctx.root_abs.parent() {
+            let agents = repo.join("AGENTS.md");
+            if agents.is_file() {
+                report.files += 1;
+                check_file(repo, &agents, &ctx, &mut report);
+            }
+        }
+        report.broken.extend(ctx.allow_problems.iter().cloned());
     }
     report
 }
@@ -1889,6 +1938,35 @@ mod tests {
         let report = check_tree_with(&root, false);
         assert_eq!(report.broken.len(), 2, "{:?}", report.broken);
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn external_reads_the_links_of_the_root_agents_file() {
+        let root = external_tree("external_agents");
+        let base = root.parent().expect("base");
+        write(&root.join("s/CONTEXT.md"), "# s\n");
+        write(&base.join("AGENTS.md"), "[ok](docs/there.md) [dead](docs/gone.md)\n");
+        assert!(check_tree_with(&root, false).broken.is_empty());
+        let report = check_tree_with(&root, true);
+        assert_eq!(report.broken, ["AGENTS.md: link docs/gone.md"]);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn external_allow_file_skips_listed_missing_paths_and_demands_a_reason() {
+        let root = external_tree("external_allow");
+        let base = root.parent().expect("base");
+        write(&base.join("AGENTS.md"), "[dead](docs/gone.md)\n");
+        write(
+            &root.join("_shared/main-absent.txt"),
+            "# comment\n<crate>/src/missing.rs exists on the integration branch only\ndocs/gone.md exists on the integration branch only\nnodir/gone.md\n",
+        );
+        let report = check_tree_with(&root, true);
+        assert_eq!(
+            report.broken,
+            ["s/CONTEXT.md: input `../../nodir/gone.md`", "_shared/main-absent.txt:4: entry needs a path and a reason"]
+        );
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]

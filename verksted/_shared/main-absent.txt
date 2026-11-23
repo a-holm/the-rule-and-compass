@@ -1,0 +1,8 @@
+# Paths named by the workshop that `main` lacks. `verksted-check links --external` skips a listed path that does not exist.
+# Format: <repo-relative path> <reason>. The engine crate directory is written <crate>.
+<crate>/tests/sanitizer.plan exists on the integration branch only
+<crate>/src/bin/rcsr_launch.rs exists on the integration branch only
+scripts/stacks.sh exists on the integration branch only
+scripts/stall-watch.sh exists on the integration branch only
+docs/how-it-works.md exists on the integration branch only
+docs/data-pipeline.md exists on the integration branch only
