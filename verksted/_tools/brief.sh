@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Usage: brief.sh impl|research|verifier --issue <n> [--slug <s>] [--epic <n>] [--pr <n>] [--model sonnet|opus|fable] [--owned <paths>]
 # Prints a dispatch prompt: line 1 is the no-resume line; then the values N, SLUG, W, BRANCH, BASE, G, EPIC, PR;
+# then, for verifier only, OUT=$VLOCAL/verifier/<PR> (the durable place of verification.md, report.md and check.md; verify-merged.sh --done never removes it);
 # then "Read and follow verksted/_shared/brief.md and verksted/_templates/<template> exactly." For a verifier, W is its scratch worktree $WT/verifier-<PR> (verify-merged.sh creates and removes it).
 # --model sonnet (default), opus or fable. An opus or fable prompt adds: use tractatus thinking, context7 and web search; a fable prompt
 # adds the dispatch line `subagent_type fable-52`. Every prompt ends with a line that names $VLOCAL/rules-local.md (resolved path).
@@ -67,6 +68,7 @@ out=$(
   echo "G=$G"
   echo "EPIC=${epic:-none given; read it from the issue metadata, else the default epic of rules-local.md}"
   echo "PR=${pr:-none yet}"
+  [ "$kind" != verifier ] || echo "OUT=$VLOCAL/verifier/$pr"
   [ "$kind" != impl ] || [ -z "$owned" ] || echo "OWNED=$owned"
   echo
   echo "Read and follow verksted/_shared/brief.md and verksted/_templates/$template exactly."

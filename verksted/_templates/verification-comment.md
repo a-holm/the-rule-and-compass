@@ -2,7 +2,7 @@ Merged into <base> as <short sha> (PR #<PR>).
 
 # Verification: <issue number and title>
 
-Instructions, delete this paragraph and the status paragraph before posting: copy to `../08_close/stages/01_verifier/output/verification.md`, fill in, and post it as one issue comment. The verifier did not implement the issue and edits no code.
+Instructions, delete this paragraph and the status paragraph before posting: copy to `$OUT/verification.md` (`OUT` is printed by `brief.sh verifier`), fill in, and post it as one issue comment. The verifier did not implement the issue and edits no code. For a hold, replace line 1 by `Hold: PR #<PR> kept open, <reasons>.` and end with `Verdict: HOLD` (the PR stays OPEN, no box is ticked).
 
 | Row | Criterion | Evidence | Status |
 |---|---|---|---|

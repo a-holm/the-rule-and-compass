@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Usage: verify-merged.sh <PR> [--tip] [--lints] [--build] [--goldens] [--walk] [--worktree <path>]
-#        verify-merged.sh <PR> --done [--worktree <path>]
+#        verify-merged.sh <PR> --done [--out <dir>] [--worktree <path>]
+# Writes: the worktree, the job log.
 # Merged-tree checks of the verifier (rules 56 and 68, routine 08_close/stages/01_verifier). The worktree $WT/verifier-<PR> is created, or
 # reused, detached at origin/$BASE. Without --tip the PR head is merged into it with `git merge --no-ff --no-commit` (a conflict prints
 # `conflict: <file>` per file, aborts the merge and exits 1 before any build). With --tip the worktree stays at the base tip, for the check after the merge.
@@ -8,11 +9,13 @@
 #   --lints     cargo test of the lint set (lints.sh --tree) and of the verksted-check crate
 #   --build     cargo test --release --no-run
 #   --goldens   cargo test of every test file of the engine crate whose name has `golden` or that pins a sha256 or view id
-#   --walk      verksted-check walk (non-strict) on the verksted tree
+#   --walk      verksted-check walk --strict on the verksted tree (every failure is a hold)
 # Then prints the test-summary.sh block of the log; a verdict other than ok (an empty run included) is exit 1.
-# --done aborts an unfinished merge and removes the worktree (nothing else); a missing worktree prints `already gone`.
+# --done aborts an unfinished merge and removes the worktree (nothing else); a missing worktree prints `already gone`. With --out <dir> it first requires
+# verification.md, report.md and check.md, each non-empty, in <dir> and otherwise exits 1 naming the missing files without removing anything (the verifier record
+# lives in <dir>, never in the worktree). Without --out nothing is checked.
+# The job runs under rc-run.sh --timeout 3000 and can outlive a short caller timeout: start it once and wait for it with one long tracked wait (wait-for.sh --log <log> --pattern RC_DONE).
 # --worktree names another path; a path outside $WT is refused.
-# Writes: the worktree, the job log.
 # Exit: 0 green; 1 red, conflict or setup failure; 2 usage; 3 the same job already runs (rc-run.sh); 75 the build slot gave up (rc-run.sh).
 set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -22,7 +25,7 @@ SUMMARY=$(dirname "${BASH_SOURCE[0]}")/test-summary.sh
 fail() { echo "verify-merged: $1" >&2; exit 1; }
 bad_usage() { echo "verify-merged: $1" >&2; usage >&2; exit 2; }
 
-pr= tip=0 lints=0 build=0 goldens=0 walk=0 done_=0 w=
+pr= tip=0 lints=0 build=0 goldens=0 walk=0 done_=0 w= out=
 while [ $# -gt 0 ]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
@@ -33,6 +36,7 @@ while [ $# -gt 0 ]; do
     --walk) walk=1 ;;
     --done) done_=1 ;;
     --worktree) [ $# -ge 2 ] || bad_usage "--worktree needs a path"; w=$2; shift ;;
+    --out) [ $# -ge 2 ] || bad_usage "--out needs a directory"; out=$2; shift ;;
     -*) bad_usage "unknown option $1" ;;
     *) [ -z "$pr" ] || bad_usage "one pull request number"; pr=$1 ;;
   esac
@@ -43,6 +47,7 @@ checks=$((lints + build + goldens + walk))
 if [ "$done_" -eq 1 ]; then
   [ "$checks" -eq 0 ] && [ "$tip" -eq 0 ] || bad_usage "--done takes no check option"
 else
+  [ -z "$out" ] || bad_usage "--out belongs to --done"
   [ "$checks" -gt 0 ] || bad_usage "select at least one of --lints, --build, --goldens, --walk"
 fi
 w=${w:-$WT/verifier-$pr}
@@ -57,6 +62,13 @@ w=$w_real
 in_merge() { git -C "$w" rev-parse -q --verify MERGE_HEAD > /dev/null 2>&1; }
 
 if [ "$done_" -eq 1 ]; then
+  if [ -n "$out" ]; then
+    missing=
+    for f in verification.md report.md check.md; do
+      [ -s "$out/$f" ] || missing="$missing $f"
+    done
+    [ -z "$missing" ] || fail "missing or empty in $out:$missing"
+  fi
   if [ ! -e "$w" ]; then
     echo "already gone: $w"
     exit 0
@@ -116,7 +128,7 @@ fi
 [ "$build" -eq 0 ] || script="$script
 cargo test --release --no-run || rc=1"
 [ "$walk" -eq 0 ] || script="$script
-(cd $(printf '%q' "$check_crate") && cargo run --release -q -- walk $(printf '%q' "$w/verksted")) || rc=1"
+(cd $(printf '%q' "$check_crate") && cargo run --release -q -- walk --strict $(printf '%q' "$w/verksted")) || rc=1"
 script="$script
 exit \$rc"
 
