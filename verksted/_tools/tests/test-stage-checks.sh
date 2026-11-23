@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Usage: test-stage-checks.sh
-# Hermetic test of the Check commands of 08_close/stages/02_close and 03_cleanup, and 04_gate/stages/03_full_gate.
+# Hermetic test of the Check commands of 08_close/stages/03_cleanup and 04_gate/stages/03_full_gate (02_close is in test-seven-checks.sh).
 # Each Check is read from its CONTEXT.md and run on fixture outputs with a fake gh.
 # Writes: a temp dir that it removes.
 set -uo pipefail
@@ -39,27 +39,6 @@ run_check() { # run_check <CONTEXT.md> [env assignments...]: exit code of the Ch
   shift
   (cd "$T" && env V="$T/out" OUT="$T/out/verifier" N=5 PR=9 WT="$T/wt" PATH="$T/bin:$PATH" FAKE_BODY="$T/body.md" FAKE_COMMENT="$T/out/verifier/verification.md" "$@" bash -c "$(check_cmd "$rel")" > /dev/null 2>&1)
 }
-
-# 01_verifier: its Check is verifier-done.sh, tested in test-verifier-done.sh
-ver=$T/out/verifier/verification.md
-
-# 02_close: every row met, or not run with an open owner issue
-V2=08_close/stages/02_close/CONTEXT.md
-cat > "$ver" <<'MD'
-| AC1 | first | log a | met |
-| AC2 | second | needs a measurement | not run (#7) |
-
-Verdict: CLOSE
-MD
-run_check "$V2"; check close-ok "$?" 0
-run_check "$V2" FAKE_OWNER_STATE=CLOSED; check close-owner-closed "$?" 1
-run_check "$V2" FAKE_ISSUE_STATE=OPEN; check close-not-closed "$?" 1
-sed -i 's/not run (#7)/not run/' "$ver"
-run_check "$V2"; check close-ownerless-not-run "$?" 1
-sed -i 's/| not run |/| unmet |/' "$ver"
-run_check "$V2"; check close-unmet "$?" 1
-printf '| AC1 | first | log a | met |\n\nVerdict: KEEP OPEN\n' > "$ver"
-run_check "$V2"; check close-keep-open "$?" 1
 
 # 03_cleanup: no ticket worktree, no verifier worktree, no branch
 V3=08_close/stages/03_cleanup/CONTEXT.md

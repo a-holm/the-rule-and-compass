@@ -5,7 +5,7 @@ One job: remove this ticket's worktree and branches and the verifier worktree, a
 ## Inputs
 
 **This run:**
-- `../02_close/output/closed.md` (the closed issue, or the line `kept open: <rows>`: the pull request is merged either way)
+- `../02_close/output/check.md` (must be `pass`; `../02_close/output/closed.md` holds the closed issue or the line `kept open: <rows>`: the pull request is merged either way)
 
 **Reference (every run):**
 - `../../../_shared/rules.md`

@@ -40,5 +40,5 @@ Do NOT load: the ticket and long-run pipelines, earlier runs' `output/`, the ref
 ## Check
 
 ```sh
-n=0; for f in "$V"/06_data/stages/*/output/check.md; do test "$(head -1 "$f")" = pass || exit 1; n=$((n+1)); done; test "$n" -ge 8 && test "$(ls -d "$V"/06_data/stages/04_*/output/check.md | wc -l)" = 1
+for s in 01_intake 02_acquire 03_profile 05_panel_pit 06_enrich 07_audit_lock 08_verify_manifest 09_lessons; do test "$(head -1 "$V/06_data/stages/$s/output/check.md")" = pass || exit 1; done; set -- "$V"/06_data/stages/04_*/output/check.md; test "$#" = 1 && test "$(head -1 "$1")" = pass
 ```

@@ -17,8 +17,8 @@ Do NOT load: briefs, dispatch, running agents' worktrees.
 ## Process
 
 1. List candidate tickets and the files each will touch (from the issue's design section).
-2. Pick file-disjoint tickets: at most 10 agents, at most 3 tickets using the machine at once. A ticket whose agent waits on the lock does not count. Tickets that share a file wait for the first to merge. A fourth ticket needs a line `exception: <who allowed it, YYYY-MM-DD>` in `wave.md`.
-3. Write `wave.md`: one row per ticket `| #N | file,file | sonnet |`. Research tickets and genuinely difficult implementation run `opus` and use `../../02_research/CONTEXT.md`.
+2. Pick file-disjoint tickets: at most 10 agents, at most 3 tickets using the machine at once. A ticket whose agent waits on the lock does not count. Tickets that share a file wait for the first to merge. A fourth ticket that uses the machine needs a line `exception: <who allowed it, YYYY-MM-DD>` in `wave.md`.
+3. Write `wave.md`: one row per ticket `| #N | file,file | sonnet |`. Add a fourth column `lock-wait` (`| #N | file,file | sonnet | lock-wait |`) to a ticket whose agent waits on the lock; it does not count toward the 3. `wave.md` is never empty. Research tickets and genuinely difficult implementation run `opus` and use `../../02_research/CONTEXT.md`.
 4. Parked issues stay untouched unless the user names them.
 
 ## Outputs
@@ -29,7 +29,7 @@ Do NOT load: briefs, dispatch, running agents' worktrees.
 ## Check
 
 ```sh
-w="$V/03_orchestrate/stages/01_wave_plan/output/wave.md"; r=$(grep -c '^| #[0-9]' "$w"); { test "$r" -ge 1 && test "$r" -le 3; } || grep -q '^exception: ' "$w"; test -z "$(grep '^| #[0-9]' "$w" | cut -d'|' -f3 | tr ', ' '\n\n' | grep . | sort | uniq -d)"
+w="$V/03_orchestrate/stages/01_wave_plan/output/wave.md"; r=$(grep -c '^| #[0-9]' "$w"); m=$(awk -F'|' '/^\| #[0-9]/ && $5 !~ /lock-wait/' "$w" | wc -l); test "$r" -ge 1 && test "$r" -le 10 && { test "$m" -le 3 || grep -q '^exception: ' "$w"; } && test -z "$(grep '^| #[0-9]' "$w" | cut -d'|' -f3 | tr ', ' '\n\n' | grep . | sort | uniq -d)"
 ```
 
 Exit 0 writes `pass`. Anything else writes `fail: <what was measured and what was wrong>` to `output/check.md`; `_tools/check.sh` does this. A red result is never rewritten as green.
