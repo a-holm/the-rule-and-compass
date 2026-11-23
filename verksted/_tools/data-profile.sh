@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # Usage: data-profile.sh --dir <dir> --dev-end <ISO date or time> --out <file>
 # Profiles the development files below <dir> and writes `key: value` lines to <out>: files, name_pattern, header,
-# columns, raw_columns, rows, first_ts, last_ts, median_step_seconds, time_unit, zero_volume_rows, zero_counts,
+# columns, raw_columns, type_stage_suggestion, rows, first_ts, last_ts, median_step_seconds, time_unit, zero_volume_rows, zero_counts,
 # zip_files, zip_members, other_files, files_at_or_after_dev_end. A file or zip member whose name carries a date
 # (YYYY-MM, YYYY-MM-DD or YYYYMMDD) at or after --dev-end is counted and never read or named. A directory whose
 # name ends in -sealed is never entered. Zip member names come from `unzip -Z1`; nothing is extracted. A table
 # file (.csv, .tsv, .txt) is read for its header, its row count, its first and last time stamp, the median step of
 # its first 10000 rows and the zero count per numeric column; a trailing carriage return is stripped from every line. No data row is printed.
+# type_stage_suggestion is 04_ohlcv when the header names open, high, low and close (aliases o, h, l, c), or when a headerless
+# first table has 6, 7 or 12 columns (the documented bar layouts), else 04_new_type; it reads no row value.
 # Writes: <out> only. No network.
 # A row stamped at or after --dev-end counts in rows_after_dev_end and enters no other statistic. A table whose
 # time stamps cannot be parsed is refused and nothing is written.
@@ -238,6 +240,14 @@ fi
 header_display=$header
 [ "$header" = none ] || header_display=$(printf '%s' "$header" | tr '\t' ',' | tr -d '"')
 
+type_stage_suggestion=04_new_type
+if [ "$header" != none ]; then
+  has_ohlc=$(printf '%s\n' "$header_display" | awk -F, '{ for (i = 1; i <= NF; i++) { n = tolower($i); gsub(/^ +| +$/, "", n); if (n == "open" || n == "o") a = 1; else if (n == "high" || n == "h") b = 1; else if (n == "low" || n == "l") c = 1; else if (n == "close" || n == "c") d = 1 } print (a && b && c && d) ? 1 : 0 }')
+  [ "$has_ohlc" = 1 ] && type_stage_suggestion=04_ohlcv
+else
+  case $(get columns) in 6 | 7 | 12) type_stage_suggestion=04_ohlcv ;; esac
+fi
+
 mkdir -p "$(dirname "$out")" || exit 1
 {
   echo "files: $files"
@@ -248,6 +258,7 @@ mkdir -p "$(dirname "$out")" || exit 1
   echo "header_variants: $(get variants)"
   echo "columns: $(get columns)"
   echo "raw_columns: $raw"
+  echo "type_stage_suggestion: $type_stage_suggestion"
   echo "rows: $(get rows)"
   echo "rows_after_dev_end: $(get after)"
   echo "first_ts: $(get first)"
