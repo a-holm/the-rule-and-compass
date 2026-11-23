@@ -2,12 +2,12 @@
 # Self-test for scripts/stall-watch.sh (issue #353), about 2 minutes.
 #
 # Needs the helper built first (through the machine lock):
-#   cd my-version && cargo build --release --example hung
+#   cd rcsr-engine && cargo build --release --example hung
 # Run it outside cargo: scripts/tests/stall_watch.sh
 
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-HUNG="${HUNG_BIN:-$ROOT/my-version/target/release/examples/hung}"
+HUNG="${HUNG_BIN:-$ROOT/rcsr-engine/target/release/examples/hung}"
 [[ -x "$HUNG" ]] || { echo "missing $HUNG" >&2; exit 2; }
 
 dir="$(mktemp -d)"

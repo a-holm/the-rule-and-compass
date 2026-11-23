@@ -5,7 +5,7 @@ Scoring 512 candidates over 2.4 M rows, fitting four constants on one candidate,
 selecting a tournament winner and writing a checkpoint have different work
 shapes and different transfer/launch overheads. The old gates
 (`maximum_gpu_fit_worthwhile`, `median_gpu_fit_worthwhile`, `defers_fit_to_gpu`)
-were boolean special cases of the model in `my-version/src/dispatch.rs`.
+were boolean special cases of the model in `rcsr-engine/src/dispatch.rs`.
 
 ## The model
 
@@ -168,7 +168,7 @@ come from the `f64` rebuild.
 
 ## Tests
 
-`my-version/src/dispatch.rs` pins:
+`rcsr-engine/src/dispatch.rs` pins:
 
 * a route and machine reason for every stage;
 * monotonicity in rows, candidates, nodes, constants and sweeps;

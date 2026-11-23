@@ -101,7 +101,7 @@ discriminant, and terminal weights are two `f64`s.
 
 ## Tests
 
-`my-version/tests/complexity.rs` covers the contract:
+`rcsr-engine/tests/complexity.rs` covers the contract:
 
 * the default model equals `expr::complexity` (node count) bit for bit on a
   table of trees including `if`, `pow`, `neg`, inputs and constants;

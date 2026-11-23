@@ -3,15 +3,16 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-const ROOTS: [&str; 4] = ["docs", "README.md", "my-version/src", "my-version/tests"];
-
 #[test]
 fn tracked_files_hold_no_conflict_markers() {
-    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let crate_name = manifest.file_name().expect("crate directory name").to_str().expect("utf-8 name");
+    let roots = ["docs".to_string(), "README.md".to_string(), format!("{crate_name}/src"), format!("{crate_name}/tests")];
+    let repo = manifest.join("..");
     let out = Command::new("git")
         .current_dir(&repo)
         .args(["ls-files", "-z", "--"])
-        .args(ROOTS)
+        .args(&roots)
         .output()
         .expect("run git ls-files");
     assert!(out.status.success(), "git ls-files failed");

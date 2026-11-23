@@ -599,7 +599,7 @@ Every rolling mean and standard deviation of the engine comes from block-local c
 
 ### Compact parity fixture
 
-`my-version/tests/fixtures/enrich/compact_15m_ohlcv.csv` is a contiguous 7,200
+`rcsr-engine/tests/fixtures/enrich/compact_15m_ohlcv.csv` is a contiguous 7,200
 row (two symbols x 3,600 bars) 15 m slice with raw OHLCV/flow. The expected file
 holds the compact builder's 52 columns for the last 300 hourly rows. The test
 `compact_matches_the_python_builder_on_a_contiguous_slice` compares every finite
@@ -714,7 +714,7 @@ declined until a larger share is measured.
 and Bollinger windows, ATR50, stochastic, ADX/DI, OBV z-score, VWAP deviation,
 Parkinson/Garman-Klass, 96-bar skew/kurt, `r192`, month/day-of-month cycles and
 BTC market joins). The committed fixture
-`my-version/tests/fixtures/enrich/btc_15m_py15m_expected.csv` is 400 rows of the
+`rcsr-engine/tests/fixtures/enrich/btc_15m_py15m_expected.csv` is 400 rows of the
 legacy `panel_15m_rich.csv`, preceded by 1,000 rows of pre-roll in
 `btc_15m_ohlcv.csv`; the test compares values within a pre-registered
 `1e-6` absolute-or-relative tolerance. Two deliberate fixes are documented:
@@ -1188,7 +1188,7 @@ The fixture has 24 symbols x 6,000 bars (116,820 rows) with holes, a 5 h and a 3
 
 ```sh
 # Whole harness; one test at a time under the machine lock
-cd my-version && RCSR_CUDA_ARCH=sm_86 cargo test --release --features cuda --test gpu_parity -- --nocapture
+cd rcsr-engine && RCSR_CUDA_ARCH=sm_86 cargo test --release --features cuda --test gpu_parity -- --nocapture
 # One test by name; RCSR_PARITY_PER_SYMBOL sets a larger fixture
 RCSR_PARITY_PER_SYMBOL=21000 cargo test --release --features cuda --test gpu_parity device_columns_match -- --nocapture
 # Per-column numbers

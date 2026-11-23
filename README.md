@@ -111,7 +111,7 @@ zero-gradient guard and a worked unit-circle example.
 Requires a Rust toolchain (`rustup` recommended). No third-party crates are used.
 
 ```sh
-cd my-version
+cd rcsr-engine
 cargo build --release
 
 # demo on the bundled sample: recover y = 2x + 1
@@ -337,7 +337,7 @@ single-page app embedded in the executable, so it has no CDN, framework or
 network dependency at runtime and binds loopback only:
 
 ```sh
-cd my-version
+cd rcsr-engine
 cargo build --release
 ./target/release/rcsr_serve --port 8080 --open
 # open http://127.0.0.1:8080
@@ -1224,7 +1224,7 @@ known** â€” small Feynman-style physics laws and elementary dynamical systems â€
 with and without noise:
 
 ```sh
-cd my-version
+cd rcsr-engine
 cargo run --release --bin rcsr-bench -- --suite known-truth --noise 0.0,0.01,0.1
 cargo run --release --bin rcsr-bench -- --tiny          # fast CI subset, seconds
 cargo run --release --bin rcsr-bench -- --tiny --json   # machine-readable
@@ -1611,7 +1611,7 @@ docs/dev-log.md               optional per-generation development log and `dev-r
 docs/qd.md                    opt-in CVT-MAP-Elites quality-diversity layer (--qd/--qd-policy)
 docs/gui.md                   design for a GUI over the JSON/NDJSON contract
 docs/gpu-backend.md           the optional CUDA evaluator and the DGX Spark plan
-my-version/
+rcsr-engine/
   Cargo.toml
   build.rs      compiles the CUDA backend (static archive, no RUNPATH) when --features cuda is used
   src/

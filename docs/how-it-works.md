@@ -37,7 +37,7 @@ Dispatch decides per stage, not per run, where work runs: on the device, on the 
 
 An explicit `--gpu` fails closed. If the device is missing or fails after the probe, the run exits non-zero and writes no result, and the last checkpoint stays for `--resume --gpu`. Without `--gpu`, a CUDA build prefers the device and falls back to the CPU with a recorded reason. A checkpoint records its backend, and `--resume` refuses a backend change unless you pass `--allow-backend-change`.
 
-A device out-of-bounds access can crash the driver and freeze the machine. Any change to CUDA code, and any test of an allocation-failure path, runs first under `compute-sanitizer` memcheck with small inputs. Device allocation and CUB calls go through the guard helpers in `my-version/src/cuda/`. `--gpu-memory` caps what a run may plan on.
+A device out-of-bounds access can crash the driver and freeze the machine. Any change to CUDA code, and any test of an allocation-failure path, runs first under `compute-sanitizer` memcheck with small inputs. Device allocation and CUB calls go through the guard helpers in `rcsr-engine/src/cuda/`. `--gpu-memory` caps what a run may plan on.
 
 Details:
 * [`docs/gpu-backend.md`](gpu-backend.md): build, kernels, exactness contracts and verified results.
@@ -106,7 +106,7 @@ Details:
 
 Work follows one rule: one issue, one worktree, one branch, one pull request. The branch is `issue/<n>-<slug>` and the worktree lives under the git-ignored `worktrees/`. No agent commits to `main`. Every non-trivial change starts from a GitHub issue with acceptance criteria.
 
-Pull requests target the integration branch `integration/gpu-hardening`, not `main`. A separate clerk agent checks the evidence of each pull request before the orchestrator merges it there. The full gate, build plus tests, runs once on the integration branch after all tickets are merged. Only then does the branch go to `main`, on the lead's instruction.
+Pull requests target the integration branch `integration/gpu-hardening`, not `main`. A separate verifier agent checks the evidence of each pull request before the orchestrator merges it there. The full gate, build plus tests, runs once on the integration branch after all tickets are merged. Only then does the branch go to `main`, on the lead's instruction.
 
 The machine is shared with a desktop, so builds and tests queue. Builds run in a build slot, up to three machine-wide. Tests and every GPU run take the single test lock. Both run at low priority (`SCHED_IDLE`, nice 19, idle I/O) and give way to the desktop. A ticket runs only the tests it adds or touches. Each worktree keeps its own `target/`.
 

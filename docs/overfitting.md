@@ -186,7 +186,7 @@ block still contains the dependence the label has. The report and JSON record
 `p_value`. `--null-block` without `--null-runs` runs 19 permutations. Use the
 i.i.d. null (`--null-runs` alone) only when rows are genuinely exchangeable;
 use the block null whenever time order or overlapping labels create dependence.
-The calibration test in `my-version/tests/nulls.rs` shows the difference on
+The calibration test in `rcsr-engine/tests/nulls.rs` shows the difference on
 synthetic AR(1) data: i.i.d. shuffling over-rejects, block permutation does not.
 
 **Honest limitation:** it tests the *combination* of data and search power. A
@@ -794,7 +794,7 @@ but not to choose a model. Selecting the best of many candidates by
 becomes a validation slice, separated from fit-train by the `--gap` embargo.
 Selection ranks on validation by default (`--select-by validation|train|aicc`)
 and `test_error` stays scoring-only. The synthetic test in
-`my-version/tests/validation.rs` demonstrates the leak: ranking by test reports
+`rcsr-engine/tests/validation.rs` demonstrates the leak: ranking by test reports
 a smaller test error than the validation-selected candidate, while the
 test-selected candidate is the worse model on validation.
 

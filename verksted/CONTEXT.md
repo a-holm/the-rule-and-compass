@@ -21,7 +21,7 @@ Each pipeline is a job that repeated in the agent logs: one Claude Code orchestr
 
 ## Deliberately outside
 
-- Rust-only experiments: no pipeline. They are one rule (`_shared/rules.md` rule 9), one command block (`_shared/commands.md`, "Rust experiments") and one test (`my-version/tests/no_python.rs`). Stage `01_issue/stages/03_prove_red/` and `01_issue/stages/04_implement/` apply it.
+- Rust-only experiments: no pipeline. They are one rule (`_shared/rules.md` rule 9), one command block (`_shared/commands.md`, "Rust experiments") and one test (`<crate>/tests/no_python.rs`). Stage `01_issue/stages/03_prove_red/` and `01_issue/stages/04_implement/` apply it.
 - Product-specific one-off research projects: they do not repeat.
 - Issue creation: a template (`_templates/issue-body.md`) and the checks in `01_issue/stages/02_issue_body/`, not a pipeline.
 
@@ -51,7 +51,7 @@ A run is set up once from `setup/questionnaire.md`. Its answers are already writ
 verksted/_tools/links.sh [--strict]
 ```
 
-It builds the crate `_tools/verksted-check/` in the build slot and runs `links` and `walk` on `verksted/`. `links` checks that every relative link and every backticked input path resolves. `walk` checks that every pipeline and stage holds the four contract headings in order, that `AGENTS.md` routes every pipeline, that no `.py` file exists, that `CLAUDE.md` is exactly `@AGENTS.md`, that every script header follows the convention below, and that every `_tools/<path>` mention in a markdown file exists. `--strict` adds three checks: `_index.md` matches the tree, every tool is mentioned in a file other than `_index.md`, and the repo `AGENTS.md` links `verksted/AGENTS.md`. The non-strict rules run in `cargo test --release` in `my-version/` through `tests/verksted_links.rs`, the strict rules through `tests/verksted_walk.rs` (run `--test verksted_walk` after adding or renaming a tool); `tests/verksted_tools.rs` runs `bash -n` on every script and every `_tools/tests/*.sh`. Exit 0 means the tree is clean.
+It builds the crate `_tools/verksted-check/` in the build slot and runs `links` and `walk` on `verksted/`. `links` checks that every relative link and every backticked input path resolves. `walk` checks that every pipeline and stage holds the four contract headings in order, that `AGENTS.md` routes every pipeline, that no `.py` file exists, that `CLAUDE.md` is exactly `@AGENTS.md`, that every script header follows the convention below, and that every `_tools/<path>` mention in a markdown file exists. `--strict` adds three checks: `_index.md` matches the tree, every tool is mentioned in a file other than `_index.md`, and the repo `AGENTS.md` links `verksted/AGENTS.md`. The non-strict rules run in `cargo test --release` in `<crate>/` through `tests/verksted_links.rs`, the strict rules through `tests/verksted_walk.rs` (run `--test verksted_walk` after adding or renaming a tool); `tests/verksted_tools.rs` runs `bash -n` on every script and every `_tools/tests/*.sh`. Exit 0 means the tree is clean.
 
 ## Scripts
 

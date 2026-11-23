@@ -7,8 +7,8 @@ contains that law. This document describes the known-truth benchmark suite, the
 recovery criterion, how to run it, and the results recorded on this repository's
 current hardware.
 
-The harness lives in `my-version/src/bench.rs` (the suite and scoring) and
-`my-version/src/bin/rcsr_bench.rs` (the `rcsr-bench` CLI). It is driven through
+The harness lives in `rcsr-engine/src/bench.rs` (the suite and scoring) and
+`rcsr-engine/src/bin/rcsr_bench.rs` (the `rcsr-bench` CLI). It is driven through
 the library API (`search::run`), so it measures the engine, not the input
 plumbing.
 
@@ -103,7 +103,7 @@ Two choices keep the measurement honest:
 ## 4. Running the benchmark
 
 ```sh
-cd my-version
+cd rcsr-engine
 cargo build --release
 
 # the full sweep: 25 problems × 3 noise levels
@@ -379,7 +379,7 @@ answers `Σ stage_s + unaccounted_s = wall_s` within 1 %; a CPU run still report
 
 `known-truth` is saturated at its criterion: at the default budget the front holds a member above R² 0.99 in 75 of 75 runs, and the seed-to-seed spread at a small budget is as large as the effect of a search change. The `hard` and `signal` suites, the oracle criterion, the time-to-hit fields, many seeds and `rcsr-bench compare` exist to rank a search change with a known error bar. `known-truth` is unchanged: `rcsr-bench --suite known-truth --seed 1 --cpu --json` gives the same `recovered`, `test_r2`, `complexity`, `train_error`, `test_rmse` and `expression` for all 75 runs as the harness before this section.
 
-The suites live in `my-version/src/bench_suites.rs`, the statistics and the comparison in `my-version/src/bench_stats.rs`.
+The suites live in `rcsr-engine/src/bench_suites.rs`, the statistics and the comparison in `rcsr-engine/src/bench_stats.rs`.
 
 ### 8.1 The `hard` suite
 
@@ -442,7 +442,7 @@ The time-to-hit fields come from a reporting-only hook, `search::Config::front_o
 ### 8.4 Running
 
 ```sh
-cd my-version
+cd rcsr-engine
 rcsr-bench --suite hard --noise 0 --seeds 1-3 --cpu --ndjson > hard.ndjson
 rcsr-bench --suite signal --seeds 1 --cpu --ndjson > signal.ndjson
 rcsr-bench --suite all --problems nguyen9,sig_tanh --seeds 1,2 --generations 20 --json
@@ -487,7 +487,7 @@ Unit tests pin the statistics: Wilson 7/10 is [0.397, 0.892], McNemar (0, 6) is 
 
 Recorded on the 8-thread i7-3770K with `--features cuda` for the GPU rows, with other jobs running on the machine, so absolute seconds are inflated and noisy. CPU data recorded at `b1f6390`, GPU data at `e6431cc` (the commits differ only in the `--dispatch` knob). Raw NDJSON is not committed; each row lists its command.
 
-| row | command (after `cd my-version`) | runs | recovered | oracle_recovered | median `hit_s` | summed seconds |
+| row | command (after `cd rcsr-engine`) | runs | recovered | oracle_recovered | median `hit_s` | summed seconds |
 |---|---|---:|---|---|---:|---:|
 | `known-truth`, seed 1, 3 noise levels, CPU | `rcsr-bench --suite known-truth --seed 1 --cpu --json` | 75 | 75/75 | | | 445.0 |
 | `hard`, noise 0, seeds 1-3, CPU | `rcsr-bench --suite hard --noise 0 --seeds 1 --cpu --ndjson` and `--seeds 2-3` | 60 | 53/60 [0.778, 0.942] | 23/60 (38.3 %) [0.271, 0.510] | 0.33 s (n = 53) | 242.4 |

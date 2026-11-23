@@ -31,7 +31,7 @@ If row `k` originally has weight `wₖ`, doubling it adds `wₖ·ℓₖ` to the 
 and `wₖ` to the denominator. A duplicate copy of the same row contributes
 exactly the same two terms to an unweighted mean. With a plain division by `n`
 the numerator would grow but the denominator would not, and a weight of 2 would
-mean something else entirely. The tests in `my-version/tests/weights.rs` assert
+mean something else entirely. The tests in `rcsr-engine/tests/weights.rs` assert
 the equivalence to `1e-12` for the metrics and for the fitted constants.
 
 A zero weight removes the row from the numerator and adds nothing to the

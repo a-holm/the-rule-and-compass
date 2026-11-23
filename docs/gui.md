@@ -24,7 +24,7 @@ above stays the target while the present state is unambiguous.
 ### How to run it
 
 ```sh
-cd my-version
+cd rcsr-engine
 cargo build --release
 ./target/release/rcsr_serve --port 8080 --open
 # open the printed URL (default http://127.0.0.1:8080)
@@ -122,7 +122,7 @@ functions, and the page can hand back the equivalent command.
 
 ### Headless test strategy
 
-`my-version/tests/gui.rs` starts the real server on port 0, speaks HTTP/1.1 over
+`rcsr-engine/tests/gui.rs` starts the real server on port 0, speaks HTTP/1.1 over
 a socket and exercises the real endpoints:
 
 1. `/api/schema` returns 200 and valid JSON with `options`, `operators` and

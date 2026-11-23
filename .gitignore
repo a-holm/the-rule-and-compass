@@ -1,6 +1,5 @@
 # Rust build artifacts
-/target/
-my-version/target/
+target/
 **/*.rs.bk
 
 # Per-issue worktrees (see docs/issue-workflow.md)

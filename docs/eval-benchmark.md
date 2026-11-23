@@ -10,7 +10,7 @@ worktree must point at it explicitly. Run from the repository root:
 
 ```sh
 /usr/bin/time -f '%e s wall, %M KiB peak RSS' \
-  my-version/target/release/rcsr walkforward \
+  rcsr-engine/target/release/rcsr walkforward \
   --data arbeidsmappe/crypto-rcsr/pilot/panel_hourly_v2.rcsb --target y60 \
   --expr r16 --vars r16 --time ts --group-by symbol --horizon 172800 \
   --window '2024,1609459200,1704067200,1704240000,1735689600' \
