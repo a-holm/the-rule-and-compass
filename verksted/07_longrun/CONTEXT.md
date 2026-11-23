@@ -26,7 +26,7 @@ Do NOT load: the ticket and data pipelines' stages, earlier runs' `output/`, the
 
 ## Process
 
-1. [01_preconditions](stages/01_preconditions/CONTEXT.md): no open work left, binary from the tip of `$BASE` pinned with sha256, nothing old running.
+1. [01_preconditions](stages/01_preconditions/CONTEXT.md): the named blocking issues closed, binary from the tip of `$BASE` pinned with sha256, no process of an earlier run of this worktree left.
 2. [02_launch](stages/02_launch/CONTEXT.md): a runbook on `runlib.sh` (holds under 10 minutes), a dry run first.
 3. [03_monitor](stages/03_monitor/CONTEXT.md): one look per call (`status.sh`, dev log tail); waits through `wait-for.sh`.
 4. [04_resume](stages/04_resume/CONTEXT.md): chunked search; resume from the checkpoint while the stop reason is the time budget.

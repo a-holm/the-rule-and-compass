@@ -33,7 +33,7 @@ Do NOT load: the agents' prose, their transcripts.
 ## Check
 
 ```sh
-awk -F'|' '/^\| #[0-9]/{gsub(/ /,"",$3);gsub(/ /,"",$4);gsub(/ /,"",$5);print $3,$4,$5}' "$V/03_orchestrate/stages/05_receive_and_verify/output/verify.md" | while read -r pr live said; do test "$live" = "$said" && test "$live" = "$(gh pr view "$pr" --json headRefOid -q .headRefOid)" || exit 1; done
+v="$V/03_orchestrate/stages/05_receive_and_verify/output/verify.md"; rows=$(awk -F'|' '/^\| #[0-9]/{gsub(/ /,"",$3);gsub(/ /,"",$4);gsub(/ /,"",$5);print $3,$4,$5}' "$v"); test -n "$rows" && printf '%s\n' "$rows" | while read -r pr live said; do test "$live" = "$said" && test "$live" = "$(gh pr view "$pr" --json headRefOid -q .headRefOid)" || exit 1; done
 ```
 
 Exit 0 writes `pass`. Anything else writes `fail: <what was measured and what was wrong>` to `output/check.md`; `_tools/check.sh` does this. A red result is never rewritten as green.

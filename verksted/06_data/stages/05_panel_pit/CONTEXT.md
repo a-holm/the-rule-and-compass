@@ -25,7 +25,7 @@ Do NOT load: ranking by today's liquidity, any file of a type stage that did not
 5. If membership refuses the start, record the message and use the first start it accepts; no other start without approval.
 6. A jump failure names a symbol and time: add it to the relist list and rerun; nothing is bridged.
 7. A delisted symbol stops at its last bar. Nothing is forward-filled or interpolated.
-8. Write `panel.md`: commands, exit codes and the count of symbols that end before the last rebalance.
+8. Write `panel.md`: commands, exit codes and the line `ended: <n>`, the count of symbols that end before the last rebalance; `0` is a valid count. The Check recomputes the count from the membership file.
 
 ## Outputs
 
@@ -35,7 +35,7 @@ Do NOT load: ranking by today's liquidity, any file of a type stage that did not
 ## Check
 
 ```sh
-p="$V/06_data/stages/05_panel_pit/output/panel.md"; a=$(ls "$V"/06_data/stages/04_*/output/adapt.md); if grep -qx 'series: single' "$a"; then grep -qx 'panel: not applicable (single series)' "$p"; else m=$MEMBERSHIP; head -1 "$m" | grep -qx 'as_of,symbol,member,adv_usd,n_bars' && awk -F, 'NR>1{if($1>max)max=$1; if($1>last[$2])last[$2]=$1} END{n=0; for(s in last) if(last[s]<max) n++; exit !(n>=1)}' "$m" && "$(verksted/_tools/crate-dir.sh "$RUN")/target/release/rcsr" panel validate --data "$PANEL" --base "$STORE" --membership "$m"; fi
+p="$V/06_data/stages/05_panel_pit/output/panel.md"; a=$(ls "$V"/06_data/stages/04_*/output/adapt.md); if grep -qx 'series: single' "$a"; then grep -qx 'panel: not applicable (single series)' "$p"; else m=$MEMBERSHIP; want=$(sed -n 's/^ended: //p' "$p"); head -1 "$m" | grep -qx 'as_of,symbol,member,adv_usd,n_bars' && awk -F, -v want="$want" 'NR>1{if($1>max)max=$1; if($1>last[$2])last[$2]=$1} END{n=0; for(s in last) if(last[s]<max) n++; exit !(want ~ /^[0-9]+$/ && n==want+0)}' "$m" && "$("$V/_tools/crate-dir.sh" "$RUN")/target/release/rcsr" panel validate --data "$PANEL" --base "$STORE" --membership "$m"; fi
 ```
 
 Exit 0 writes `pass`. Anything else writes `fail: <what was measured and what was wrong>` to `output/check.md`; `_tools/check.sh` does this. A red result is never rewritten as green.
