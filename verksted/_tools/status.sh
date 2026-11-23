@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Usage: status.sh [--no-fetch] [--section all|git|agents|machine]
 # One read-only report for the orchestrator. Sections and their lines:
-#   git:     clock (UTC and local); origin/$BASE tip (short sha, subject); open PRs: number, branch, head, updatedAt
+#   git:     clock (UTC and local); origin/$BASE tip (short sha, subject); open PRs: number, branch, head, updatedAt;
+#            tools worktree (TOOLS_WT of $VLOCAL/rules-local.md): ok, or STALE with the count of verksted/ commits of origin/$BASE it lacks, or unset or missing
 #   agents:  one line per worktree under $WT: branch, dirty y/n, minutes since the newest file change outside
 #            the engine crate target directory and .git, SILENT when 45 or more and no cargo, rustc, nvcc, rcsr or flock process
 #            has its cwd inside
@@ -62,6 +63,16 @@ if want git; then
     if [ -n "$prs" ]; then echo "$prs" | sed 's/^/  /'; else echo "  none"; fi
   else
     echo "open PRs: unavailable"
+  fi
+  tw=$(sed -n 's/^- *TOOLS_WT: *//p' "$VLOCAL/rules-local.md" 2>/dev/null | head -n 1 | awk '{print $1}')
+  if [ -z "$tw" ]; then
+    echo "tools worktree: unset (TOOLS_WT in $VLOCAL/rules-local.md)"
+  elif [ ! -d "$tw" ]; then
+    echo "tools worktree: $tw missing"
+  elif nb=$(tools_behind "$tw"); then
+    if [ "$nb" -eq 0 ]; then echo "tools worktree: $tw ok"; else echo "tools worktree: $tw STALE, $nb verksted/ commit(s) behind origin/$BASE"; fi
+  else
+    echo "tools worktree: $tw unknown (origin/$BASE not found)"
   fi
 fi
 

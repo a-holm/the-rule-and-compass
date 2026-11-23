@@ -7,11 +7,11 @@ You are not resumed automatically; block in your own turn until everything is do
 
 Hard rules: never `pkill` or `killall` (kill only a pid you started, with `kill <pid>`); a wait uses `wait-for.sh`, never `pgrep -f`; no Python. A lint in `verksted_tools` fails on `pkill` and `killall` in scripts.
 
-Rules for every agent in this repo. The ticket section follows below. `brief.sh` prints the values N, SLUG, W, BRANCH, BASE, G, EPIC and PR; use them wherever a rule says `$N`, `$W`, `$BASE`, `$G`. `G` is `$GATES` (`lib.sh`). Rule numbers refer to `rules.md`. Tool paths are relative to your worktree `$W`; each tool prints its usage with `-h`.
+Rules for every agent in this repo. The ticket section follows below. `brief.sh` prints the values N, SLUG, W, BRANCH, BASE, G, EPIC, PR and VERKSTED; use them wherever a rule says `$N`, `$W`, `$BASE`, `$G`, `$VERKSTED`. `G` is `$GATES` (`lib.sh`). Rule numbers refer to `rules.md`. A path `verksted/...` in the rules lives under `$VERKSTED` before your worktree exists and under `$W/verksted` after; run tools by those absolute paths, never from the main checkout. Each tool prints its usage with `-h`.
 
 Setup and scope
 - Read `AGENTS.md` and `docs/issue-workflow.md` first. Work only in the worktree `$W`. Never touch the repo root or another worktree (rule 2).
-- Create the worktree with `verksted/_tools/wt-new.sh <issue> <slug>` from the repo root. Never rebase or force-push: when the base moves, `git merge origin/$BASE` (rules 3, 33). If merging the base gives a conflict that is not trivial, stop and report the files.
+- Create the worktree with the command named in your prompt (`$VERKSTED/_tools/wt-new.sh <issue> <slug>`, absolute path). Never run workshop tools from the main checkout (rule 61). Never rebase or force-push: when the base moves, `git merge origin/$BASE` (rules 3, 33). If merging the base gives a conflict that is not trivial, stop and report the files.
 - Every worktree you create lives in `$WT`; remove your scratch worktrees before you hand back (rule 59).
 - Open your pull request against `$BASE`, never `main`: `gh pr create --base $BASE ...`. Do not merge; the orchestrator merges (rule 41).
 - Many agents edit the same shared sources in parallel (`src/search.rs`, `src/main.rs`, `src/schema.rs`, `tests/gpu_fit.rs`): keep hunks small and local.

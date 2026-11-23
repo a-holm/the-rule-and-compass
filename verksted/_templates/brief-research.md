@@ -14,7 +14,7 @@ Tools:
 - Use `mcp__tractatus_thinking__tractatus_thinking` to structure the analysis.
 - Use context7 (`mcp__context7__resolve-library-id`, `mcp__context7__query-docs`) for library and API facts (CUDA, CUB, Rust std).
 - Search the web whenever it helps.
-- Read code on the integration branch through a read-only detached worktree: `verksted/_tools/wt-new.sh --research <slug>` from the repo root. Remove it yourself at the end: `verksted/_tools/wt-done.sh --research <slug>`. Never touch other worktrees or the repo root checkout.
+- Read code on the integration branch through a read-only detached worktree: the absolute command `brief.sh` prints (`$VERKSTED/_tools/wt-new.sh --research <slug>`). Remove it yourself at the end: `$VERKSTED/_tools/wt-done.sh --research <slug>`. Never touch other worktrees or the main checkout.
 
 Measurements (allowed, small and cheap):
 - Build with `rc-run.sh build <wt> research-<slug> build --cuda -- cargo build --release --features cuda`. Run with `rc-run.sh run <wt> research-<slug> run1 -- ./target/release/rcsr ...`. Paired A/B comparisons use `ab-pair.sh`. Logs land in `$GATES` (`lib.sh`).

@@ -71,6 +71,31 @@ check section-only "$(echo "$only" | grep -c '^== ')" 1
 release
 check lock-free "$(st --section machine | grep -c '^lock: free$')" 1
 
+# tools worktree: unset, ok, STALE, missing
+LOC=$T/loc
+mkdir -p "$LOC"
+cp "$RCSR_LOCAL/machine.md" "$LOC/machine.md"
+RCSR_LOCAL_SAVE=$RCSR_LOCAL
+export RCSR_LOCAL=$LOC
+check tw-unset "$(st --section git | grep -c '^tools worktree: unset')" 1
+mkdir -p "$T/repo/verksted"
+g -C "$T/repo" worktree add -q -b tools-old "$T/repo/worktrees/toolsold"
+echo v > "$T/repo/verksted/f"
+g -C "$T/repo" add verksted
+g -C "$T/repo" commit -q -m "verksted change"
+g -C "$T/repo" update-ref refs/remotes/origin/main HEAD
+g -C "$T/repo" worktree add -q -b tools-new "$T/repo/worktrees/toolsnew"
+printf -- '- TOOLS_WT: %s (note)\n' "$T/repo/worktrees/toolsold" > "$LOC/rules-local.md"
+check tw-stale "$(st --section git | grep -c "^tools worktree: $T/repo/worktrees/toolsold STALE, 1 verksted/ commit(s) behind origin/main$")" 1
+printf -- '- TOOLS_WT: %s (note)\n' "$T/repo/worktrees/toolsnew" > "$LOC/rules-local.md"
+check tw-ok "$(st --section git | grep -c "^tools worktree: $T/repo/worktrees/toolsnew ok$")" 1
+g -C "$T/repo" commit -q --allow-empty -m "no verksted change"
+g -C "$T/repo" update-ref refs/remotes/origin/main HEAD
+check tw-ok-nonverksted "$(st --section git | grep -c "^tools worktree: $T/repo/worktrees/toolsnew ok$")" 1
+printf -- '- TOOLS_WT: %s (note)\n' "$T/nowhere" > "$LOC/rules-local.md"
+check tw-missing "$(st --section git | grep -c "^tools worktree: $T/nowhere missing$")" 1
+export RCSR_LOCAL=$RCSR_LOCAL_SAVE
+
 st --section bogus > /dev/null 2>&1
 check usage-rc "$?" 2
 check no-pgrep "$(grep -vE '^\s*#' "$TOOLS/status.sh" | grep -cE 'pgrep|pkill')" 0

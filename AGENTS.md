@@ -125,6 +125,6 @@ cd <crate> && cargo build --release && cargo test --release
 cd <crate> && ./target/release/rcsr --help
 cd <crate> && ./target/release/rcsr schema
 
-# start an issue (see docs/issue-workflow.md for the full flow)
-verksted/_tools/wt-new.sh 12 metrics-expansion
+# start an issue: VERKSTED is the absolute path brief.sh prints; never run tools from the main checkout (docs/issue-workflow.md)
+"$VERKSTED/_tools/wt-new.sh" 12 metrics-expansion
 ```
