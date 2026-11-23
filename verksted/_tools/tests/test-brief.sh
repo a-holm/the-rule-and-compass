@@ -57,6 +57,10 @@ check impl-epic "$(printf '%s\n' "$out" | grep -c '^EPIC=3$')" 1
 
 out=$(bash "$S" verifier --issue 7 --pr 9)
 check verifier-w "$(printf '%s\n' "$out" | grep -c '^W=.*/worktrees/verifier-9$')" 1
+check verifier-out "$(printf '%s\n' "$out" | grep -c "^OUT=$LOCAL/verifier/9$")" 1
+check verifier-n "$(printf '%s\n' "$out" | grep -c "^N=7$")" 1
+check verifier-pr "$(printf '%s\n' "$out" | grep -c "^PR=9$")" 1
+check impl-no-out "$(bash "$S" impl --issue 7 --slug demo-slug | grep -c "^OUT=")" 0
 bash "$S" verifier --issue 7 >/dev/null 2>&1; check verifier-no-pr $? 1
 bash "$S" impl --issue 7 >/dev/null 2>&1; check impl-no-slug $? 1
 bash "$S" research --slug x >/dev/null 2>&1; check research-no-issue $? 1

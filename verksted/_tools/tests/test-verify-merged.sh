@@ -116,11 +116,11 @@ check goldens-rc "$rc" 0
 check goldens-args "$(grep -c -- 'cargo test --release --no-fail-fast --test lock_record_golden --test pinned || rc=1' "$T/rc-calls")" 1
 check goldens-not-plain "$(grep -c -- '--test plain' "$T/rc-calls")" 0
 
-# --walk runs the non-strict walk on the verksted tree of the merged worktree
+# --walk runs the strict walk on the verksted tree of the merged worktree
 : > "$T/rc-calls"
 run 7 --walk > /dev/null
-check walk-cmd "$(grep -c "cargo run --release -q -- walk $WTP/verksted" "$T/rc-calls")" 1
-check walk-not-strict "$(grep -c -- '--strict' "$T/rc-calls")" 0
+check walk-cmd "$(grep -c "cargo run --release -q -- walk --strict $WTP/verksted" "$T/rc-calls")" 1
+check walk-strict-flag "$(grep -c -- "--strict" "$T/rc-calls")" 1
 
 # --done removes the worktree and leaves the count as before; a second --done says already gone
 out=$(run 7 --done); rc=$?
@@ -130,6 +130,36 @@ check done-gone "$([ -e "$WTP" ] && echo yes || echo no)" no
 out=$(run 7 --done); rc=$?
 check done-twice-rc "$rc" 0
 check done-twice-msg "$(grep -c '^already gone: ' <<<"$out")" 1
+
+# --done --out: refuses while a record file is missing or empty, names it; removes the worktree when all three are present
+run 7 --lints > /dev/null
+od=$T/record
+mkdir -p "$od"
+printf 'x\n' > "$od/verification.md"; printf 'x\n' > "$od/report.md"
+out=$(run 7 --done --out "$od"); rc=$?
+check doneout-missing-rc "$rc" 1
+check doneout-missing-names "$(grep -c 'check.md' <<<"$out")" 1
+check doneout-missing-kept "$([ -e "$WTP" ] && echo yes || echo no)" yes
+: > "$od/check.md"
+out=$(run 7 --done --out "$od"); rc=$?
+check doneout-empty-rc "$rc" 1
+check doneout-empty-names "$(grep -c 'check.md' <<<"$out")" 1
+rm "$od/report.md"; printf 'pass\n' > "$od/check.md"
+out=$(run 7 --done --out "$od"); check doneout-report-names "$(grep -c 'report.md' <<<"$out")" 1
+check doneout-report-kept "$([ -e "$WTP" ] && echo yes || echo no)" yes
+out=$(run 7 --done --out "$T/nonexistent-dir"); rc=$?
+check doneout-nodir-rc "$rc" 1
+printf 'x\n' > "$od/report.md"
+out=$(run 7 --done --out "$od"); rc=$?
+check doneout-ok-rc "$rc" 0
+check doneout-ok-removed "$([ -e "$WTP" ] && echo yes || echo no)" no
+check doneout-ok-files-kept "$(ls "$od" | wc -l | tr -d ' ')" 3
+out=$(run 7 --done --out "$od"); check doneout-gone-rc "$?" 0
+run 7 --lints --out "$od" > /dev/null; check out-without-done-usage "$?" 2
+run 7 --done --out > /dev/null; check out-no-value-usage "$?" 2
+run 7 --lints > /dev/null
+run 7 --done > /dev/null; check done-without-out-rc "$?" 0
+check done-without-out-removed "$([ -e "$WTP" ] && echo yes || echo no)" no
 
 # --tip: the base tip without a merge
 : > "$T/rc-calls"

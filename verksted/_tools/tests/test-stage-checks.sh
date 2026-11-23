@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Usage: test-stage-checks.sh
-# Hermetic test of the Check commands of the verifier routine: 08_close/stages/01_verifier, 02_close and 03_cleanup, and 04_gate/stages/03_full_gate.
+# Hermetic test of the Check commands of 08_close/stages/02_close and 03_cleanup, and 04_gate/stages/03_full_gate.
 # Each Check is read from its CONTEXT.md and run on fixture outputs with a fake gh.
 # Writes: a temp dir that it removes.
 set -uo pipefail
@@ -20,7 +20,7 @@ check() {
 check_cmd() {
   awk '/^## Check$/ { c = 1; next } c && /^```sh$/ { b = 1; next } b && /^```$/ { exit } b { print }' "$V/$1"
 }
-mkdir -p "$T/bin" "$T/out/08_close/stages/01_verifier/output" "$T/out/04_gate/stages/03_full_gate/output"
+mkdir -p "$T/bin" "$T/out/verifier" "$T/out/04_gate/stages/03_full_gate/output"
 cat > "$T/bin/gh" <<'GH'
 #!/usr/bin/env bash
 args="$*"
@@ -37,47 +37,11 @@ chmod +x "$T/bin/gh"
 run_check() { # run_check <CONTEXT.md> [env assignments...]: exit code of the Check command
   local rel=$1
   shift
-  (cd "$T" && env V="$T/out" N=5 PR=9 WT="$T/wt" PATH="$T/bin:$PATH" FAKE_BODY="$T/body.md" FAKE_COMMENT="$T/out/08_close/stages/01_verifier/output/verification.md" "$@" bash -c "$(check_cmd "$rel")" > /dev/null 2>&1)
+  (cd "$T" && env V="$T/out" OUT="$T/out/verifier" N=5 PR=9 WT="$T/wt" PATH="$T/bin:$PATH" FAKE_BODY="$T/body.md" FAKE_COMMENT="$T/out/verifier/verification.md" "$@" bash -c "$(check_cmd "$rel")" > /dev/null 2>&1)
 }
 
-# 01_verifier: ticked boxes of the issue body equal the met rows of verification.md
-ver=$T/out/08_close/stages/01_verifier/output/verification.md
-V1=08_close/stages/01_verifier/CONTEXT.md
-cat > "$ver" <<'MD'
-Merged into integration/gpu-hardening as abc1234 (PR #9).
-
-# Verification: #5 title
-
-| Row | Criterion | Evidence | Status |
-|---|---|---|---|
-| AC1 | first | log a | met |
-| AC2 | second | test b | met |
-| AC3 | third | needs the full gate | not run (#7) |
-
-Verdict: CLOSE
-MD
-body() { # body <box1> <box2> <box3>
-  printf '## Goal\n\n- [x] a goal box\n\n## Acceptance criteria\n\n- [%s] first\n- [%s] second\n- [%s] third\n\n## Test plan\n\n- [ ] a plan box\n- [x] another plan box\n' "$1" "$2" "$3" > "$T/body.md"
-}
-body x x ' '
-run_check "$V1"; check verifier-ok "$?" 0
-body x x x
-run_check "$V1"; check verifier-more-ticked "$?" 1
-body x ' ' ' '
-run_check "$V1"; check verifier-fewer-ticked "$?" 1
-body ' ' ' ' ' '
-run_check "$V1"; check verifier-none-ticked "$?" 1
-body x x ' '
-run_check "$V1" FAKE_PR_STATE=OPEN; check verifier-not-merged "$?" 1
-sed -i 's/^| AC3 .*/| AC3 | third | log c | met |/' "$ver"
-run_check "$V1"; check verifier-all-met-two-ticked "$?" 1
-body x x x
-run_check "$V1"; check verifier-all-met-three-ticked "$?" 0
-sed -i '1s/.*/no merge line/' "$ver"
-run_check "$V1"; check verifier-no-merge-line "$?" 1
-sed -i '1s/.*/Merged into integration\/gpu-hardening as abc1234 (PR #9)./' "$ver"
-printf 'other comment\n' > "$T/other.md"
-run_check "$V1" FAKE_COMMENT="$T/other.md"; check verifier-comment-differs "$?" 1
+# 01_verifier: its Check is verifier-done.sh, tested in test-verifier-done.sh
+ver=$T/out/verifier/verification.md
 
 # 02_close: every row met, or not run with an open owner issue
 V2=08_close/stages/02_close/CONTEXT.md
