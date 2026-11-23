@@ -55,6 +55,8 @@ check impl-w "$(printf '%s\n' "$out" | grep -c '^W=.*/worktrees/issue-7-demo-slu
 check impl-branch "$(printf '%s\n' "$out" | grep -c '^BRANCH=issue/7-demo-slug$')" 1
 check impl-epic "$(printf '%s\n' "$out" | grep -c '^EPIC=3$')" 1
 
+out=$(bash "$S" verifier --issue 7 --pr 9)
+check verifier-w "$(printf '%s\n' "$out" | grep -c '^W=.*/worktrees/verifier-9$')" 1
 bash "$S" verifier --issue 7 >/dev/null 2>&1; check verifier-no-pr $? 1
 bash "$S" impl --issue 7 >/dev/null 2>&1; check impl-no-slug $? 1
 bash "$S" research --slug x >/dev/null 2>&1; check research-no-issue $? 1

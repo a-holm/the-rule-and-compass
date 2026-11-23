@@ -31,7 +31,7 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 LOG
 bash "$S" "$T/green.log" > "$T/green.out"; rc=$?
 check green-rc "$rc" 0
-check green-tests "$(grep '^tests:' "$T/green.out")" 'tests: passed=3 failed=0 ignored=1 results=2/2'
+check green-tests "$(grep '^tests:' "$T/green.out")" 'tests: passed=3 failed=0 ignored=1 results=2/2 ran=3'
 check green-warnings "$(grep '^warnings:' "$T/green.out")" 'warnings: 1'
 check green-errors "$(grep '^errors:' "$T/green.out")" 'errors: 0'
 check green-failing "$(grep '^failing:' "$T/green.out")" 'failing: none'
@@ -51,7 +51,7 @@ error: test failed, to rerun pass `--lib`
 LOG
 bash "$S" "$T/red.log" > "$T/red.out"; rc=$?
 check red-rc "$rc" 1
-check red-tests "$(grep '^tests:' "$T/red.out")" 'tests: passed=1 failed=2 ignored=0 results=0/1'
+check red-tests "$(grep '^tests:' "$T/red.out")" 'tests: passed=1 failed=2 ignored=0 results=0/1 ran=3'
 check red-failing "$(grep '^failing:' "$T/red.out")" 'failing: mod::two,three'
 check red-errors "$(grep '^errors:' "$T/red.out")" 'errors: 0'
 check red-verdict "$(grep '^verdict:' "$T/red.out")" 'verdict: fail'
@@ -90,6 +90,61 @@ check rc1-rc "$rc" 1
 check rc1-line "$(grep '^rc:' "$T/rc1.out")" 'rc: 1'
 printf 'RC_DONE rc=0 at=x\n' > "$T/rc0.log"
 bash "$S" "$T/rc0.log" > /dev/null; check rc0-rc "$?" 0
+
+
+# a result line with 0 passed (two #[ignore] tests) ran nothing: verdict empty, exit 1
+cat > "$T/empty.log" <<'LOG'
+running 2 tests
+test golden_a ... ignored, needs RCSR_GOLDEN
+test golden_b ... ignored, needs RCSR_GOLDEN
+test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out
+LOG
+bash "$S" "$T/empty.log" > "$T/empty.out"; rc=$?
+check empty-rc "$rc" 1
+check empty-tests "$(grep '^tests:' "$T/empty.out")" 'tests: passed=0 failed=0 ignored=2 results=1/1 ran=0'
+check empty-verdict "$(grep '^verdict:' "$T/empty.out")" 'verdict: empty'
+# an empty binary next to a binary that ran tests is not empty
+cat > "$T/mixed.log" <<'LOG'
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+LOG
+bash "$S" "$T/mixed.log" > /dev/null; check mixed-rc "$?" 0
+# a log without result lines (a build log) is not empty
+printf 'Compiling x\nFinished\nRC_DONE rc=0 at=x\n' > "$T/build.log"
+bash "$S" "$T/build.log" > /dev/null; check build-log-rc "$?" 0
+
+# --expect: a name needs its own `ok` line
+cat > "$T/expect.log" <<'LOG'
+running 3 tests
+test a_test ... ok
+test m::b_test ... ok
+test c_test ... FAILED
+test d_test ... ignored
+test result: FAILED. 2 passed; 1 failed; 1 ignored; 0 measured; 0 filtered out
+LOG
+bash "$S" --expect a_test "$T/expect.log" > "$T/e1.out"; rc=$?
+check expect-found-rc "$rc" 1
+check expect-found-no-line "$(grep -c '^not run:' "$T/e1.out")" 0
+cat > "$T/expect2.log" <<'LOG'
+running 2 tests
+test a_test ... ok
+test m::b_test ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+LOG
+bash "$S" --expect a_test --expect b_test "$T/expect2.log" > "$T/e2.out"; check expect-ok-rc "$?" 0
+check expect-ok-no-line "$(grep -c '^not run:' "$T/e2.out")" 0
+bash "$S" --expect a_test "$T/empty.log" > "$T/e3.out"; rc=$?
+check expect-missing-rc "$rc" 1
+check expect-missing-line "$(grep -c '^not run: a_test$' "$T/e3.out")" 1
+bash "$S" --expect c_test --expect d_test --expect e_test "$T/expect.log" > "$T/e4.out"
+check expect-failed-and-ignored-not-run "$(grep '^not run:' "$T/e4.out" | tr '\n' ' ')" 'not run: c_test not run: d_test not run: e_test '
+bash "$S" --expect a_test "$T/expect2.log" "$T/empty.log" > "$T/e5.out"
+check expect-per-log "$(grep -c '^not run: a_test$' "$T/e5.out")" 1
+# a name is matched whole: a_tes is not a_test
+bash "$S" --expect a_tes "$T/expect2.log" > "$T/e6.out"; check expect-prefix-rc "$?" 1
+check expect-prefix-line "$(grep -c '^not run: a_tes$' "$T/e6.out")" 1
+bash "$S" --expect > /dev/null 2>&1; check expect-no-name "$?" 2
+bash "$S" --expect a_test > /dev/null 2>&1; check expect-no-log "$?" 2
 
 # several logs: one fail makes exit 1, blocks are separated
 bash "$S" "$T/green.log" "$T/red.log" > "$T/multi.out"; rc=$?

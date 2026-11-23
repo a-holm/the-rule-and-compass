@@ -56,6 +56,7 @@ exit "${FAKE_BUILD_RC:-0}"
 STUB
 chmod +x "$T/bin/cargo"
 fake_timeout "$T/bin"
+fake_machine "$T/bin" "$T/local"
 for v in 13.0 12.0; do
   cat > "$T/cuda-$v/bin/compute-sanitizer" <<'STUB'
 #!/usr/bin/env bash
@@ -69,7 +70,7 @@ STUB
 done
 
 run() {
-  env FAKE_DIR="$T" RCSR_MACHINE_DIR="$T" RCSR_GATES="$T/gates" RCSR_SLOT_SCRIPT="$T/slot.sh" RCSR_LOCK_SCRIPT="$T/lock.sh" \
+  env FAKE_DIR="$T" RCSR_MACHINE_DIR="$T" RCSR_LOCAL="$T/local" RCSR_GATES="$T/gates" RCSR_SLOT_SCRIPT="$T/slot.sh" RCSR_LOCK_SCRIPT="$T/lock.sh" \
     RCSR_XID_CMD="cat '$T/xid'" RCSR_SANITIZER="${SANITIZER_PATH:-$T/cuda-13.0/bin/compute-sanitizer}" \
     FAKE_TIMEOUT_LOG="$T/timeouts" PATH="$T/bin:$PATH" bash "$SAN" "$@"
 }
@@ -133,6 +134,20 @@ check san-rc99 "$r" "1"
 # a missing summary gives 1
 FAKE_SUMMARY='no summary here' run "$T/wt" 7 s --test gpu_fit > /dev/null 2>&1; r=$?
 check no-summary "$r" "1"
+
+
+# a release rcsr binary stamped for the CPU feature set is not run under the CUDA sanitizer: exit 3 and the build command that fixes it
+mkdir -p "$T/wt/crate-x/target/release"
+echo cpu > "$T/wt/crate-x/target/release/.rcsr-features"
+: > "$T/san-calls"
+out=$(run "$T/wt" 7 s --test gpu_fit 2>&1); r=$?
+check stamp-cpu-rc "$r" "3"
+case "$out" in *'rc-run.sh build'*'--cuda -- cargo build --release --features cuda --bin rcsr'*) ;; *) echo "FAIL stamp-cpu-fix: '$out'"; fails=$((fails + 1)) ;; esac
+check stamp-cpu-no-sanitizer "$(wc -l < "$T/san-calls" | tr -d ' ')" "0"
+echo cuda > "$T/wt/crate-x/target/release/.rcsr-features"
+run "$T/wt" 7 s --test gpu_fit > /dev/null 2>&1; check stamp-cuda-rc "$?" "0"
+rm "$T/wt/crate-x/target/release/.rcsr-features"
+run "$T/wt" 7 s --test gpu_fit > /dev/null 2>&1; check stamp-none-rc "$?" "0"
 
 # a zero-test run passes with a warning
 out=$(FAKE_BANNER='running 0 tests' run "$T/wt" 7 s --test gpu_fit -- nomatch 2>&1); r=$?

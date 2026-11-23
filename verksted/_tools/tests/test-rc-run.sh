@@ -10,8 +10,6 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 RC=$HERE/../rc-run.sh
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
-mkdir -p "$T/local"
-printf -- '- GATES: /x/gates\n- MACHINE_SCRIPTS: /x/scripts\n- SANITIZER: /x/san\n- CUDA_ARCH: sm_rc\n' > "$T/local/machine.md"
 fails=0
 check() {
   local name=$1 got=$2 want=$3
@@ -37,7 +35,12 @@ has() {
 
 mkdir -p "$T/gates" "$T/wt/pkg" "$T/bin" "$T/oc"
 fake_timeout "$T/bin"
+fake_machine "$T/bin" "$T/local"
 printf '[package]\nname = "rule-and-compass"\n' > "$T/wt/pkg/Cargo.toml"
+git_q() { git -c user.name=t -c user.email=t@t.invalid "$@"; }
+git -C "$T/wt" init -q
+git_q -C "$T/wt" add -A
+git_q -C "$T/wt" commit -q -m init
 echo 0 > "$T/xid"
 for kind in slot lock; do
   cat > "$T/$kind.sh" <<STUB
@@ -57,8 +60,8 @@ STUB
 chmod +x "$T/bin/show-args"
 
 rc() {
-  env -u CARGO_TARGET_DIR RCSR_LOCAL="$T/local" RCSR_GATES="$T/gates" RCSR_SLOT_SCRIPT="$T/slot.sh" RCSR_LOCK_SCRIPT="$T/lock.sh" \
-    RCSR_XID_CMD="cat '$T/xid'" RCSR_MACHINE_DIR="$T/oc" RCSR_REAP_TERM_WAITS=2 RCSR_REAP_KILL_WAITS=50 PATH="$T/bin:$PATH" FAKE_TIMEOUT_LOG="$T/timeouts" "$@"
+  env -u CARGO_TARGET_DIR RCSR_GATES="$T/gates" RCSR_SLOT_SCRIPT="$T/slot.sh" RCSR_LOCK_SCRIPT="$T/lock.sh" \
+    RCSR_XID_CMD="cat '$T/xid'" RCSR_MACHINE_DIR="$T/oc" RCSR_LOCAL="$T/local" RCSR_REAP_TERM_WAITS=2 RCSR_REAP_KILL_WAITS=50 PATH="$T/bin:$PATH" FAKE_TIMEOUT_LOG="$T/timeouts" "$@"
 }
 log=$T/gates/issue9-t.log
 
@@ -86,7 +89,7 @@ for m in "test" "run"; do
   has "lock-$m-xid" "$log" '^xid new=0 since=[0-9-]+ [0-9:]+$'
   has "lock-$m-timeout" "$T/calls" 'timeout -k 30 580 '
 done
-has test-cuda-arch "$log" 'arch=sm_rc'
+has test-cuda-arch "$log" 'arch=sm_86'
 : > "$T/calls"
 rc bash "$RC" test "$T/wt" 9 t -- show-args > /dev/null
 check test-cpu-slot "$(cut -d' ' -f1 "$T/calls")" "slot"
@@ -405,11 +408,135 @@ STUB
 chmod +x "$T/bin/ignore-term"
 mkdir -p "$T/real-bin"
 ln -sf "$T/bin/ignore-term" "$T/real-bin/ignore-term"
+ln -sf "$T/bin/taskset" "$T/real-bin/taskset"
 flock_stub
-RCSR_KILL_AFTER=0.5 env -u CARGO_TARGET_DIR RCSR_LOCAL="$T/local" RCSR_GATES="$T/gates" RCSR_SLOT_SCRIPT="$T/slot.sh" RCSR_LOCK_SCRIPT="$T/lock.sh" \
-  RCSR_XID_CMD="cat '$T/xid'" RCSR_MACHINE_DIR="$T/oc" RCSR_REAP_TERM_WAITS=2 PATH="$T/real-bin:$PATH" \
+RCSR_KILL_AFTER=0.5 env -u CARGO_TARGET_DIR RCSR_GATES="$T/gates" RCSR_SLOT_SCRIPT="$T/slot.sh" RCSR_LOCK_SCRIPT="$T/lock.sh" \
+  RCSR_XID_CMD="cat '$T/xid'" RCSR_MACHINE_DIR="$T/oc" RCSR_LOCAL="$T/local" RCSR_REAP_TERM_WAITS=2 PATH="$T/real-bin:$PATH" \
   bash "$RC" run "$T/wt" 9 t --cuda --timeout 1 -- ignore-term > /dev/null 2>&1; r=$?
 check real-timeout-kill-rc "$r" "137"
+
+
+# --- #1375 guards: RC_HEAD line, pin, duplicate lock, feature stamp, no direct test binary
+rm -f "$T/calls"
+# the log starts with the commit it ran on and whether the tree was dirty
+rc bash "$RC" cpu "$T/wt" 9 t -- show-args > /dev/null
+check head-line-1 "$(head -n 1 "$log" | grep -cE '^RC_HEAD sha=[0-9a-f]{40} dirty=[01]$')" "1"
+has head-sha "$log" "^RC_HEAD sha=$(git -C "$T/wt" rev-parse HEAD) dirty=0\$"
+check head-first-line-only "$(grep -c '^RC_HEAD ' "$log")" "1"
+printf 'x\n' > "$T/wt/untracked.txt"
+rc bash "$RC" cpu "$T/wt" 9 t -- show-args > /dev/null
+has head-dirty "$log" "^RC_HEAD sha=$(git -C "$T/wt" rev-parse HEAD) dirty=1\$"
+rm "$T/wt/untracked.txt"
+mkdir -p "$T/nogit/pkg"
+printf '[package]\nname = "rule-and-compass"\n' > "$T/nogit/pkg/Cargo.toml"
+rc bash "$RC" cpu "$T/nogit" 9 t -- show-args > /dev/null
+has head-no-git "$log" '^RC_HEAD sha=none dirty=1$'
+
+# the command runs pinned to PIN_CORES_BUILD, PIN_CORES_BUSY while the desktop is busy
+for m in build cpu; do
+  rm -f "$T/bin/taskset.mask"
+  rc bash "$RC" $m "$T/wt" 9 t -- show-args > /dev/null
+  check "pin-$m-mask" "$(cat "$T/bin/taskset.mask")" "0,1"
+done
+rm -f "$T/bin/taskset.mask"
+rc bash "$RC" run "$T/wt" 9 t --cuda -- show-args > /dev/null
+check pin-run-mask "$(cat "$T/bin/taskset.mask")" "0,1"
+has pin-before-timeout "$T/calls" 'taskset -c 0,1 timeout -k 30 1500 '
+printf '#!/bin/sh\nexit 0\n' > "$T/oc/desktop-busy.sh"; chmod +x "$T/oc/desktop-busy.sh"
+rm -f "$T/bin/taskset.mask"
+rc bash "$RC" cpu "$T/wt" 9 t -- show-args > /dev/null
+check pin-busy-mask "$(cat "$T/bin/taskset.mask")" "0"
+printf '#!/bin/sh\nexit 1\n' > "$T/oc/desktop-busy.sh"
+rm -f "$T/bin/taskset.mask"
+rc bash "$RC" cpu "$T/wt" 9 t -- show-args > /dev/null
+check pin-idle-mask "$(cat "$T/bin/taskset.mask")" "0,1"
+rm -f "$T/oc/desktop-busy.sh"
+# no default stands in for a missing key or file
+cp "$T/local/machine.md" "$T/machine.md.keep"
+printf -- '%s- PIN_CORES_BUSY: 0\n' "$FAKE_LIB_KEYS" > "$T/local/machine.md"
+rc bash "$RC" cpu "$T/wt" 9 t -- show-args > /dev/null 2> "$T/err"; r=$?
+check pin-key-missing-rc "$r" "2"
+check pin-key-missing-names-key "$(grep -c 'PIN_CORES_BUILD' "$T/err")" "1"
+printf -- '%s- PIN_CORES_BUILD: 0,x\n' "$FAKE_LIB_KEYS" > "$T/local/machine.md"
+rc bash "$RC" cpu "$T/wt" 9 t -- show-args > /dev/null 2>&1; check pin-key-bad-rc "$?" "2"
+rm "$T/local/machine.md"
+rc bash "$RC" cpu "$T/wt" 9 t -- show-args > /dev/null 2>&1; check pin-no-file-rc "$?" "2"
+cp "$T/machine.md.keep" "$T/local/machine.md"
+
+# a test binary is never started directly: a command whose program sits in a deps directory of a target directory is refused
+: > "$T/calls"
+rc bash "$RC" cpu "$T/wt" 9 t -- "$T/wt/pkg/target/release/deps/golden-0123abcd" > /dev/null 2> "$T/err"; r=$?
+check direct-bin-rc "$r" "2"
+check direct-bin-msg "$(grep -c 'cargo test' "$T/err")" "1"
+rc bash "$RC" cpu "$T/wt" 9 t -- env A=1 "$T/wt/pkg/target/debug/deps/golden-0123abcd" > /dev/null 2>&1; check direct-bin-env-rc "$?" "2"
+check direct-bin-no-slot "$(wc -l < "$T/calls" | tr -d ' ')" "0"
+rc bash "$RC" cpu "$T/wt" 9 t -- show-args "$T/wt/pkg/target/release/deps/golden-0123abcd" > /dev/null 2>&1; check direct-bin-arg-ok "$?" "0"
+rc bash "$RC" cpu "$T/wt" 9 t -- "$T/wt/pkg/target/release/rcsr" > /dev/null 2>&1; r=$?
+check direct-rcsr-not-refused "$([ "$r" -ne 2 ] && echo yes || echo no)" "yes"
+
+# the same job twice at once: the second exits 3 naming the first pid and leaves the first log alone; another tag and a later rerun run
+mkfifo "$T/ready" "$T/go"
+cat > "$T/bin/wait-go" <<STUB
+#!/usr/bin/env bash
+echo "first started" 
+echo ready > "$T/ready"
+read -r _ < "$T/go"
+STUB
+chmod +x "$T/bin/wait-go"
+rcenv=(env -u CARGO_TARGET_DIR RCSR_GATES="$T/gates" RCSR_SLOT_SCRIPT="$T/slot.sh" RCSR_LOCK_SCRIPT="$T/lock.sh"
+  RCSR_XID_CMD="cat '$T/xid'" RCSR_MACHINE_DIR="$T/oc" RCSR_LOCAL="$T/local" PATH="$T/bin:$PATH" FAKE_TIMEOUT_LOG="$T/timeouts")
+"${rcenv[@]}" bash "$RC" cpu "$T/wt" 9 dup -- wait-go > /dev/null 2>&1 &
+first=$!
+read -r _ < "$T/ready"
+duplog=$T/gates/issue9-dup.log
+"${rcenv[@]}" bash "$RC" cpu "$T/wt" 9 dup -- show-args > /dev/null 2> "$T/err"; r=$?
+check dup-rc "$r" "3"
+check dup-names-pid "$(grep -c "(pid $first)\$" "$T/err")" "1"
+check dup-log-kept "$(grep -c '^first started$' "$duplog")" "1"
+check dup-log-no-done "$(grep -c '^RC_DONE' "$duplog")" "0"
+"${rcenv[@]}" bash "$RC" cpu "$T/wt" 9 dup2 -- show-args > /dev/null 2>&1; check dup-other-tag-runs "$?" "0"
+"${rcenv[@]}" bash "$RC" cpu "$T/nogit" 9 dup -- show-args > /dev/null 2>&1; check dup-other-worktree-runs "$?" "0"
+echo go > "$T/go"
+wait "$first"; check dup-first-rc "$?" "0"
+"${rcenv[@]}" bash "$RC" cpu "$T/wt" 9 dup -- show-args > /dev/null 2>&1; check dup-rerun-after-end "$?" "0"
+
+# the feature stamp next to the release rcsr binary: written after a successful build or test, never by another mode
+stamp=$T/wt/pkg/target/release/.rcsr-features
+mkdir -p "$T/wt/pkg/target/release"
+rc bash "$RC" build "$T/wt" 9 t -- show-args > /dev/null
+check stamp-no-binary "$([ -e "$stamp" ] && echo yes || echo no)" "no"
+: > "$T/wt/pkg/target/release/rcsr"
+rc bash "$RC" cpu "$T/wt" 9 t -- show-args > /dev/null
+check stamp-cpu-mode-none "$([ -e "$stamp" ] && echo yes || echo no)" "no"
+rc bash "$RC" build "$T/wt" 9 t -- show-args > /dev/null
+check stamp-cpu "$(cat "$stamp")" "cpu"
+rc bash "$RC" build "$T/wt" 9 t --cuda -- show-args > /dev/null
+check stamp-cuda "$(cat "$stamp")" "cuda"
+FAKE_RC=3 rc bash "$RC" build "$T/wt" 9 t -- show-args > /dev/null
+check stamp-failed-build-keeps "$(cat "$stamp")" "cuda"
+rc bash "$RC" test "$T/wt" 9 t -- show-args > /dev/null
+check stamp-cpu-test "$(cat "$stamp")" "cpu"
+rc bash "$RC" test "$T/wt" 9 t --cuda -- show-args > /dev/null
+check stamp-cuda-test "$(cat "$stamp")" "cuda"
+# run refuses a stamp of the other feature set (exit 3, the build command that fixes it, no log, no slot or lock call)
+: > "$T/calls"
+echo cpu > "$stamp"
+rm -f "$log"
+rc bash "$RC" run "$T/wt" 9 t --cuda -- show-args > /dev/null 2> "$T/err"; r=$?
+check stamp-run-cuda-on-cpu-rc "$r" "3"
+check stamp-run-names-fix "$(grep -c -- 'rc-run.sh build .* --cuda -- cargo build --release --features cuda --bin rcsr' "$T/err")" "1"
+check stamp-run-no-log "$([ -e "$log" ] && echo yes || echo no)" "no"
+check stamp-run-no-lock "$(wc -l < "$T/calls" | tr -d ' ')" "0"
+echo cuda > "$stamp"
+rc bash "$RC" run "$T/wt" 9 t -- show-args > /dev/null 2> "$T/err"; r=$?
+check stamp-run-cpu-on-cuda-rc "$r" "3"
+check stamp-run-cpu-fix "$(grep -c -- 'rc-run.sh build .* -- cargo build --release --bin rcsr' "$T/err")" "1"
+rc bash "$RC" run "$T/wt" 9 t --cuda -- show-args > /dev/null 2>&1; check stamp-run-match-rc "$?" "0"
+rm "$stamp"
+rc bash "$RC" run "$T/wt" 9 t --cuda -- show-args > /dev/null 2>&1; check stamp-run-unknown-rc "$?" "0"
+echo cpu > "$stamp"
+rc bash "$RC" test "$T/wt" 9 t --cuda -- show-args > /dev/null 2>&1; check stamp-test-rebuilds-rc "$?" "0"
+rc bash "$RC" cpu "$T/wt" 9 t -- show-args > /dev/null 2>&1; check stamp-cpu-mode-no-check "$?" "0"
 
 # -h prints the header
 check help-rc "$(bash "$RC" -h > "$T/h"; echo $?)" "0"

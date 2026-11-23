@@ -124,6 +124,52 @@ vclock_reset; w --exe "$T/bin/blocker" --timeout 2 > /dev/null; check exe-self-r
 check exe-self-polls "$(polls)" 0
 vclock_reset; w --exe "$T/bin/other" --timeout 2 > /dev/null; check exe-none-rc "$?" 0
 
+
+# one wait per target: a second wait on a target that a live wait watches exits 3 and names the first pid; another target starts.
+# The first wait blocks in its first poll on fifos, so the lock is held at a known point.
+mkdir -p "$T/blk" "$T/locks"; fake_blocking_sleep "$T/blk"
+export RCSR_WAIT_LOCKS=$T/locks
+mkfifo "$T/ready" "$T/go"
+first_wait() { # first_wait <wait-for arguments>: starts the blocked first wait in the background; sets first
+  FAKE_READY=$T/ready FAKE_GO=$T/go PATH="$T/blk:$PATH" RCSR_POLL=1 bash "$W" "$@" > /dev/null 2>&1 &
+  first=$!
+  read -r _ < "$T/ready"
+}
+end_first() { kill "$first" 2> /dev/null; echo go > "$T/go"; wait "$first" 2> /dev/null; }
+: > "$T/lock1.log"
+first_wait --log "$T/lock1.log" --timeout 600
+vclock_reset
+out=$(w --log "$T/lock1.log" --timeout 2 2>&1); rc=$?
+check lock-log-rc "$rc" 3
+check lock-log-names-pid "$(grep -c "(pid $first)\$" <<<"$out")" 1
+out=$(w --log "$T/./lock1.log" --pattern x --timeout 2 2>&1); rc=$?
+check lock-log-spelling-rc "$rc" 3
+printf 'RC_DONE rc=0 at=x\n' > "$T/lock2.log"
+vclock_reset; w --log "$T/lock2.log" --timeout 2 > /dev/null; check lock-other-log-starts "$?" 0
+end_first
+vclock_reset; w --log "$T/lock1.log" --timeout 1 > /dev/null 2>&1; check lock-released-rc "$?" 124
+# the other target kinds lock too
+hold "true"; check lock-pid-hold-ready $? 0
+first_wait --pid "$HOLD_PID" --timeout 600
+vclock_reset; out=$(w --pid "$HOLD_PID" --timeout 2 2>&1); rc=$?
+check lock-pid-rc "$rc" 3
+check lock-pid-names-pid "$(grep -c "(pid $first)\$" <<<"$out")" 1
+end_first
+release
+first_wait --file "$T/never.done" --timeout 600
+vclock_reset; w --file "$T/never.done" --timeout 2 > /dev/null 2>&1; check lock-file-rc "$?" 3
+end_first
+first_wait --count 2 --dir "$T/nodir" --glob '*.x' --timeout 600
+vclock_reset; w --count 2 --dir "$T/nodir" --glob '*.x' --timeout 2 > /dev/null 2>&1; check lock-count-rc "$?" 3
+end_first
+"$T/bin/blocker" -f /dev/null &
+bp2=$!
+first_wait --exe "$T/bin/blocker" --timeout 600
+vclock_reset; w --exe "$T/bin/blocker" --timeout 2 > /dev/null 2>&1; check lock-exe-rc "$?" 3
+end_first
+kill "$bp2" 2> /dev/null
+wait "$bp2" 2> /dev/null
+
 # usage errors
 bash "$W" > /dev/null 2>&1; check usage-none "$?" 2
 bash "$W" --log a --file b > /dev/null 2>&1; check usage-two-modes "$?" 2

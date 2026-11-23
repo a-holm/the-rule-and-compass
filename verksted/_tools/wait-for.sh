@@ -4,14 +4,17 @@
 #        wait-for.sh --count <N> --dir <dir> [--glob <pattern>] [--timeout S]
 #        wait-for.sh --pid <N> [--timeout S]
 #        wait-for.sh --exe <absolute path> [--timeout S]
+# Writes: one lock file per target under $RCSR_WAIT_LOCKS.
 # One blocking wait inside this process, polling every 5 s (RCSR_POLL for tests): until the log has a line
 # matching the pattern (default '^RC_DONE rc='), the file exists and is not empty, or the directory holds at
 # least N entries matching the glob (default '*'), process <N> has ended (gone or a zombie), or no process runs the executable
 # <path> (its /proc/<pid>/exe link equals the path exactly). Never reads a process command line, so a wait cannot match itself.
 # With --log, on a match the matching line is printed, then test-summary.sh output when the log holds cargo test output.
+# One wait per target (rule 52): the target is the log path, file path, directory with glob and count, pid or executable. A second wait on a
+# target that a live wait watches exits 3 and names the first pid. The lock is an flock in $RCSR_WAIT_LOCKS (default: a per-user directory
+# under TMPDIR) and ends with the waiting process.
 # Default timeout 590 s, under the 600 s limit of one blocking tool call; use a larger one in a background shell.
-# Writes: nothing.
-# Exit: 0 matched; 124 timeout; 2 usage.
+# Exit: 0 matched; 124 timeout; 2 usage; 3 another wait watches the target.
 set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
@@ -97,11 +100,28 @@ matched() {
   fi
 }
 
+if [ -n "$log" ]; then target="log:$(realpath -m -- "$log")"
+elif [ -n "$file" ]; then target="file:$(realpath -m -- "$file")"
+elif [ -n "$pid" ]; then target="pid:$pid"
+elif [ -n "$exe" ]; then target="exe:$exe"
+else target="count:$count:$(realpath -m -- "$dir"):$glob"
+fi
+lockdir=${RCSR_WAIT_LOCKS:-${TMPDIR:-/tmp}/rcsr-wait-locks-$(id -u)}
+mkdir -p "$lockdir" || die "cannot create $lockdir"
+lockfile=$lockdir/$(printf '%s' "$target" | sha1sum | cut -c1-20).lock
+exec 9>> "$lockfile"
+if ! flock -n 9; then
+  echo "wait-for.sh: another wait watches $target (pid $(cat "$lockfile" 2> /dev/null))" >&2
+  exit 3
+fi
+: > "$lockfile"
+echo $$ > "$lockfile"
+
 deadline=$(( $(date +%s) + timeout ))
 while :; do
   matched && break
   [ "$(date +%s)" -ge "$deadline" ] && exit 124
-  sleep "$POLL"
+  sleep "$POLL" 9>&-
 done
 
 if [ -n "$log" ]; then

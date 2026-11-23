@@ -65,6 +65,7 @@ exit "${FAKE_BUILD_RC:-0}"
 STUB
 chmod +x "$T/bin/cargo"
 fake_timeout "$T/bin"
+fake_machine "$T/bin" "$T/local"
 cat > "$T/cuda-13.0/bin/compute-sanitizer" <<'STUB'
 #!/usr/bin/env bash
 echo "san under=${RCSR_UNDER_SANITIZER:-} $*" >> "$FAKE_DIR/san-calls"
@@ -104,7 +105,7 @@ chmod +x "$T/cuda-13.0/bin/compute-sanitizer"
 
 run() {
   : > "$T/calls"; : > "$T/san-calls"; : > "$T/cargo-calls"; : > "$T/timeouts"
-  env FAKE_DIR="$T" RCSR_MACHINE_DIR="$T" RCSR_GATES="$T/gates" RCSR_SLOT_SCRIPT="$T/slot.sh" RCSR_LOCK_SCRIPT="$T/lock.sh" \
+  env FAKE_DIR="$T" RCSR_MACHINE_DIR="$T" RCSR_LOCAL="$T/local" RCSR_GATES="$T/gates" RCSR_SLOT_SCRIPT="$T/slot.sh" RCSR_LOCK_SCRIPT="$T/lock.sh" \
     RCSR_XID_CMD="cat '$T/xid'" RCSR_SANITIZER="$T/cuda-13.0/bin/compute-sanitizer" RCSR_SANITIZER_PLAN="${PLAN:-$T/plan}" \
     FAKE_TIMEOUT_LOG="$T/timeouts" PATH="$T/bin:$PATH" bash "$ALL" "$@"
 }
