@@ -192,7 +192,7 @@ verksted/_tools/ab-pair.sh --label <name> --a <bin> --b <bin> --seeds 1,2,3 -- <
 
 ```sh
 verksted/_tools/local-init.sh --dataset "$DS" --card <card.md>        # creates the local area and datasets/<id>/; never overwrites
-verksted/_tools/data-profile.sh --dir "$DATA" --dev-end <date> --out <profile.md>   # stage 03: names, header, counts; no value row
+verksted/_tools/data-profile.sh --dir "$DATA" --dev-end <date> [--tz <offset>] --out <profile.md>   # stage 03: names, header, counts; no value row
 verksted/_tools/ohlcv-view.sh --variant ohlcv --series single              # stage 04_ohlcv: feature_groups and view_excludes
 rcsr lock check --record <record> <store dir>                              # stage 07: exit 0 clean, 4 a finding
 verksted/_tools/run-record.sh new --id <YYYYMMDD-slug> --kind store-build --bin <path> --worktree "$W"

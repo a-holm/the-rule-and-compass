@@ -28,19 +28,19 @@ printf 'ts,a\n2020-01-02 00:00:00,5\n2020-01-02 01:00:00,6\n' > "$D/sub/other-20
 printf 'note\n' > "$D/readme.json"
 printf 'sealed-marker-555.5\n' > "$D-sealed/x-2020-01.csv"
 mkdir -p "$D/zipsrc"
-printf 'a,b\n1,2\n' > "$D/zipsrc/A-2020-01.csv"
-printf 'a,b\n3,4\n' > "$D/zipsrc/A-2024-02.csv"
+printf 'time,b\n1577836800,2\n' > "$D/zipsrc/A-2020-01.csv"
+printf 'time,b\n1706745600,4\n' > "$D/zipsrc/A-2024-02.csv"
 (cd "$D/zipsrc" && zip -q ../Z-2020-01.zip A-2020-01.csv A-2024-02.csv) && rm -r "$D/zipsrc"
 printf 'zipname\n' > "$T/late.txt"
 (cd "$T" && zip -q "$D/Z-2024-03.zip" late.txt)
 
 out=$T/profile.md
-bash "$PROF" --dir "$D" --dev-end 2023-11-15 --out "$out" > "$T/stdout" 2>&1
+bash "$PROF" --dir "$D" --dev-end 2023-11-15 --tz UTC --out "$out" > "$T/stdout" 2>&1
 check rc "$?" 0
 check refused "$(key files_at_or_after_dev_end "$out")" 4
 check files "$(key files "$out")" 4
-check rows "$(key rows "$out")" 5
-check tables "$(key tables "$out")" 2
+check rows "$(key rows "$out")" 6
+check tables "$(key tables "$out")" 3
 check first "$(key first_ts "$out")" 2020-01-01T00:00:00Z
 check last "$(key last_ts "$out")" 2020-01-02T01:00:00Z
 check step "$(key median_step_seconds "$out")" 3600
@@ -56,7 +56,7 @@ check header "$(key header "$out")" "time,open,high,low,close,volume"
 
 # a month before dev_end is kept, the month that holds dev_end is refused
 out2=$T/p2.md
-bash "$PROF" --dir "$D" --dev-end 2024-02-01 --out "$out2" > /dev/null 2>&1
+bash "$PROF" --dir "$D" --dev-end 2024-02-01 --tz UTC --out "$out2" > /dev/null 2>&1
 check late-refused "$(key files_at_or_after_dev_end "$out2")" 2
 
 # usage and missing directory
