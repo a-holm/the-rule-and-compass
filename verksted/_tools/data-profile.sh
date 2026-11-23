@@ -6,7 +6,7 @@
 # (YYYY-MM, YYYY-MM-DD or YYYYMMDD) at or after --dev-end is counted and never read or named. A directory whose
 # name ends in -sealed is never entered. Zip member names come from `unzip -Z1`; nothing is extracted. A table
 # file (.csv, .tsv, .txt) is read for its header, its row count, its first and last time stamp, the median step of
-# its first 10000 rows and the zero count per numeric column. No data row is printed.
+# its first 10000 rows and the zero count per numeric column; a trailing carriage return is stripped from every line. No data row is printed.
 # Writes: <out> only. No network.
 # A row stamped at or after --dev-end counts in rows_after_dev_end and enters no other statistic. A table whose
 # time stamps cannot be parsed is refused and nothing is written.
@@ -89,6 +89,7 @@ function stamp(s,   ip, n, y, m, d, hh, mi, ss) {
   unit = ""; return -1
 }
 BEGIN { FS = sep; nrows = 0; after = 0; bad = 0 }
+{ sub(/\r$/, "") }
 function isname(s) { return s != "" && !isnum(s) && s !~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]/ }
 NR == 1 {
   ncol = NF

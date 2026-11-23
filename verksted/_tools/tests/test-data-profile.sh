@@ -97,6 +97,32 @@ for marker in 1800000000 2027 2023-11-15 4.5; do
   check "span-no-$marker" "$(grep -v '^time_unit' "$T/s.md" "$T/s.out" | grep -c -F "$marker")" 0
 done
 
+# CRLF input: no carriage return in header or raw_columns, and a numeric last column (volume) is counted for zeros
+C=$T/crlf
+mkdir -p "$C"
+printf 'time,open,high,low,close,volume\r\n1577836800,1.5,2,1,1.5,0\r\n1577840400,1.5,2.5,1,2,11\r\n1577844000,2,3,1.5,2.5,0\r\n' > "$C/x.csv"
+bash "$PROF" --dir "$C" --dev-end 2023-11-15 --out "$T/c.md" > "$T/c.out" 2>&1
+check crlf-rc "$?" 0
+check crlf-header "$(key header "$T/c.md")" "time,open,high,low,close,volume"
+check crlf-raw "$(key raw_columns "$T/c.md")" "open,high,low,close,volume"
+check crlf-zero-volume "$(key zero_volume_rows "$T/c.md")" 2
+check crlf-zero-counts "$(key zero_counts "$T/c.md")" "open=0,high=0,low=0,close=0,volume=2"
+check crlf-no-cr "$(grep -c $'\r' "$T/c.md")" 0
+check crlf-rows "$(key rows "$T/c.md")" 3
+for marker in 1577836800 2.5; do
+  check "crlf-no-$marker" "$(grep -v '^time_unit' "$T/c.md" "$T/c.out" | grep -c -F "$marker")" 0
+done
+
+# CRLF with a span across dev_end keeps the leak guard: no row at or after dev_end is counted or printed
+printf 'time,open,volume\r\n1577836800,1.5,0\r\n1800000000,4.5,0\r\n' > "$C/y.csv"
+rm "$C/x.csv"
+bash "$PROF" --dir "$C" --dev-end 2023-11-15 --out "$T/c2.md" > "$T/c2.out" 2>&1
+check crlf-span-rows "$(key rows "$T/c2.md")" 1
+check crlf-span-after "$(key rows_after_dev_end "$T/c2.md")" 1
+check crlf-span-zero-volume "$(key zero_volume_rows "$T/c2.md")" 1
+check crlf-span-last "$(key last_ts "$T/c2.md")" 2020-01-01T00:00:00Z
+check crlf-span-no-late "$(grep -v '^time_unit' "$T/c2.md" "$T/c2.out" | grep -c -F 1800000000)" 0
+
 # a file whose time stamps cannot be parsed is refused without partial output
 U=$T/unparsable
 mkdir -p "$U"
