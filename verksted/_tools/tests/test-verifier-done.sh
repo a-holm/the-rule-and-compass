@@ -134,6 +134,7 @@ run -h; check help "$?" 0
 check no-output-path "$(grep -c 'output/' "$ROUTINE" "$V/_templates/verification-comment.md" "$V/_templates/brief-verifier.md" | grep -vc ':0$')" 0
 check no-dollar-v "$(grep -cE '\$V([^A-Za-z_]|$)' "$ROUTINE" "$V/_templates/verification-comment.md" "$V/_templates/brief-verifier.md" | grep -vc ':0$')" 0
 check no-expected-red "$(grep -ci 'expected red' "$ROUTINE")" 0
+check no-stage-references-old-output "$(grep -rl --include=*.md 01_verifier/output "$V" | wc -l | tr -d " ")" 0
 check names-wait-for "$(grep -c 'wait-for.sh' "$ROUTINE")" 1
 check one-long-wait "$(grep -c 'one long tracked wait' "$ROUTINE")" 1
 check names-out "$(grep -c '\$OUT' "$ROUTINE" | awk '$1 > 0 { print "yes" }')" yes

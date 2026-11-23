@@ -20,7 +20,7 @@ check() {
 check_cmd() {
   awk '/^## Check$/ { c = 1; next } c && /^```sh$/ { b = 1; next } b && /^```$/ { exit } b { print }' "$V/$1"
 }
-mkdir -p "$T/bin" "$T/out/08_close/stages/01_verifier/output" "$T/out/04_gate/stages/03_full_gate/output"
+mkdir -p "$T/bin" "$T/out/verifier" "$T/out/04_gate/stages/03_full_gate/output"
 cat > "$T/bin/gh" <<'GH'
 #!/usr/bin/env bash
 args="$*"
@@ -37,11 +37,11 @@ chmod +x "$T/bin/gh"
 run_check() { # run_check <CONTEXT.md> [env assignments...]: exit code of the Check command
   local rel=$1
   shift
-  (cd "$T" && env V="$T/out" N=5 PR=9 WT="$T/wt" PATH="$T/bin:$PATH" FAKE_BODY="$T/body.md" FAKE_COMMENT="$T/out/08_close/stages/01_verifier/output/verification.md" "$@" bash -c "$(check_cmd "$rel")" > /dev/null 2>&1)
+  (cd "$T" && env V="$T/out" OUT="$T/out/verifier" N=5 PR=9 WT="$T/wt" PATH="$T/bin:$PATH" FAKE_BODY="$T/body.md" FAKE_COMMENT="$T/out/verifier/verification.md" "$@" bash -c "$(check_cmd "$rel")" > /dev/null 2>&1)
 }
 
 # 01_verifier: its Check is verifier-done.sh, tested in test-verifier-done.sh
-ver=$T/out/08_close/stages/01_verifier/output/verification.md
+ver=$T/out/verifier/verification.md
 
 # 02_close: every row met, or not run with an open owner issue
 V2=08_close/stages/02_close/CONTEXT.md

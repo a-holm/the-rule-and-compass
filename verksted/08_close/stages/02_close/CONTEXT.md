@@ -5,8 +5,8 @@ One job: close the issue when every criterion row is met or owned by another ope
 ## Inputs
 
 **This run:**
-- `../01_verifier/output/verification.md`
-- `../01_verifier/output/check.md` (must be `pass`)
+- `$OUT/verification.md` (`OUT` is `$VLOCAL/verifier/$PR`, printed by `brief.sh verifier`)
+- `$OUT/check.md` (must be `pass`)
 
 **Reference (every run):**
 - `../../../_shared/rules.md`
@@ -28,7 +28,7 @@ Do NOT load: closing through a commit or PR keyword.
 ## Check
 
 ```sh
-v="$V/08_close/stages/01_verifier/output/verification.md"; grep -qx 'Verdict: CLOSE' "$v" && ! grep -qE '\| (unmet|not run) \|$' "$v" && for m in $(grep -oE 'not run \(#[0-9]+\)' "$v" | grep -oE '[0-9]+'); do test "$(gh issue view "$m" --json state -q .state)" = OPEN || exit 1; done && test "$(gh issue view "$N" --json state,stateReason -q '.state+" "+.stateReason')" = 'CLOSED COMPLETED'
+v="$OUT/verification.md"; grep -qx 'Verdict: CLOSE' "$v" && ! grep -qE '\| (unmet|not run) \|$' "$v" && for m in $(grep -oE 'not run \(#[0-9]+\)' "$v" | grep -oE '[0-9]+'); do test "$(gh issue view "$m" --json state -q .state)" = OPEN || exit 1; done && test "$(gh issue view "$N" --json state,stateReason -q '.state+" "+.stateReason')" = 'CLOSED COMPLETED'
 ```
 
 Exit 0 writes `pass`. Anything else writes `fail: <what was measured and what was wrong>` to `output/check.md`; `_tools/check.sh` does this. A red result is never rewritten as green.
