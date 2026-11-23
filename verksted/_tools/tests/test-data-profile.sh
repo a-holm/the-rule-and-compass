@@ -130,6 +130,27 @@ bash "$PROF" --dir "$U" --dev-end 2023-11-15 --out "$T/u.md" > /dev/null 2>&1
 check unparsable-rc "$?" 3
 check unparsable-no-output "$([ -e "$T/u.md" ] && echo yes || echo no)" no
 
+# type_stage_suggestion reads the header or the column count only
+sugg() {
+  local d=$T/sg-$1
+  mkdir -p "$d"
+  printf '%b' "$2" > "$d/x.csv"
+  bash "$PROF" --dir "$d" --dev-end 2023-11-15 --out "$d.md" > "$d.out" 2>&1
+  check "sugg-$1-rc" "$?" 0
+  check "sugg-$1" "$(key type_stage_suggestion "$d.md")" "$3"
+  for marker in 4242.5 7777.5 1577836800 SUGSYM; do
+    check "sugg-$1-no-$marker" "$(cat "$d.md" "$d.out" | grep -c -F "$marker")" 0
+  done
+}
+sugg ohlc 'time,open,high,low,close\n1577836800,4242.5,2,1,1.5\n1577840400,7777.5,3,1,2\n' 04_ohlcv
+sugg ohlcv 'Time,Open,High,Low,Close,Volume\n1577836800,4242.5,2,1,1.5,3\n1577840400,7777.5,3,1,2,4\n' 04_ohlcv
+sugg alias 'ts,o,h,l,c\n1577836800,4242.5,2,1,1.5\n1577840400,7777.5,3,1,2\n' 04_ohlcv
+sugg no-ohlc 'time,price,amount\n1577836800,4242.5,2\n1577840400,7777.5,3\n' 04_new_type
+sugg partial 'time,open,close,volume\n1577836800,4242.5,2,1\n1577840400,7777.5,3,1\n' 04_new_type
+sugg headerless12 'SUGSYM,1577836800,4242.5,2,1,1.5,3,1577840399,4,5,6,7\nSUGSYM,1577840400,7777.5,3,1,2,4,1577843999,4,5,6,7\n' 04_ohlcv
+sugg headerless7 '1577836800,4242.5,2,1,1.5,3,9\n1577840400,7777.5,3,1,2,4,9\n' 04_ohlcv
+sugg headerless4 'SUGSYM,1577836800,4242.5,99\nSUGSYM,1577840400,7777.5,98\n' 04_new_type
+
 # the contract table and the adapt template hold the same keys
 contract=$(sed -n 's/^| `\([^|]*\)` | .*/\1/p' "$V/06_data/references/type-stage-contract.md" | tr -d '`' | tr ',' '\n' | tr -d ' ' | grep -v '^Key$' | LC_ALL=C sort)
 template=$(sed -n 's/^\([a-z_]*\): .*/\1/p' "$V/_templates/adapt.md" | LC_ALL=C sort)
