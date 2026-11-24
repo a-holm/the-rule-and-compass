@@ -1228,7 +1228,7 @@ impl Ind {
     /// simplification leaves the tree unchanged. Records the confirmation after
     /// any CPU probe or score.
     fn reeval_carried(&mut self, train: &EvalSample, cfg: &Config, rows: Option<u64>) -> bool {
-        if rows.is_some() && self.inf_rows == rows && self.error == f64::INFINITY && cfg.qd_bins == 0 {
+        if rows.is_some() && self.inf_rows == rows && self.error == f64::INFINITY {
             let simplified = expr::simplify(&self.tree);
             if simplified == self.tree {
                 self.complexity = cfg.complexity_model.complexity(&simplified);
