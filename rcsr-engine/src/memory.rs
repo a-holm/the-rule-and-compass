@@ -677,6 +677,8 @@ pub struct DeviceWorkload {
     pub pnl_book: bool,
     /// #1178: the book has more blocks than its flags hold: a block id byte per row.
     pub pnl_block_ids: bool,
+    /// #1051: the exact f64 columns and bit planes of the device book check.
+    pub check_exact: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -689,6 +691,10 @@ pub struct DeviceTerms {
     pub tile_arena: u64,
     pub tile_pinned: u64,
     pub partials: u64,
+    /// #1051: exact f64 columns of the device book check.
+    pub check_f64: u64,
+    /// #1051: bit planes, undecided-row lists and slot flags of one group of check slots.
+    pub check_bits: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -777,6 +783,14 @@ fn clamp_u64(v: u128, saturated: &mut bool) -> u64 {
     }
 }
 
+/// #1051: device bytes of the planes, undecided lists and flags of one group of check slots.
+pub fn check_bits_bytes(rows: usize) -> u128 {
+    use crate::flat_bound::rows::{CHECK_SLOT_CAP, SLOT_UNDECIDED_CAP};
+    let words = rows.div_ceil(32) as u128;
+    let g = CHECK_SLOT_CAP as u128;
+    2 * g * words * 4 + g * SLOT_UNDECIDED_CAP as u128 * 4 + g * 8
+}
+
 fn device_buffer_bytes(w: &DeviceWorkload) -> u128 {
     let p = w.candidates as u128;
     let width = w.program_words as u128;
@@ -805,6 +819,11 @@ fn plan_core(w: &DeviceWorkload, d: &DeviceInfo, caps: &DeviceCaps) -> DevicePla
         }
     }
     let side_vectors = clamp_u64(side, &mut sat);
+    let (check_f64, check_bits) = if w.check_exact {
+        (clamp_u64(n * v * 8, &mut sat), clamp_u64(check_bits_bytes(w.rows), &mut sat))
+    } else {
+        (0, 0)
+    };
     let fit_n = if w.device_fit && w.fit_rows > 0 && w.fit_rows < w.rows {
         Some(w.fit_rows as u128)
     } else {
@@ -850,11 +869,13 @@ fn plan_core(w: &DeviceWorkload, d: &DeviceInfo, caps: &DeviceCaps) -> DevicePla
     let sum = |parts: &[u64], sat: &mut bool| -> u64 {
         clamp_u64(parts.iter().map(|p| *p as u128).sum::<u128>(), sat)
     };
-    let core = sum(&[data_f32, side_vectors, buffers], &mut sat);
+    let core = sum(&[data_f32, side_vectors, buffers, check_f64, check_bits], &mut sat);
     let core_terms = DeviceTerms {
         data_f32,
         side_vectors,
         buffers,
+        check_f64,
+        check_bits,
         ..DeviceTerms::default()
     };
     let twin_terms = DeviceTerms {
@@ -1097,6 +1118,9 @@ impl DevicePlan {
         if t.fit_twin > 0 {
             parts.push(format!("f64 fit twin {}", human(t.fit_twin)));
         }
+        if t.check_f64 > 0 {
+            parts.push(format!("f64 check columns {} + check planes {}", human(t.check_f64), human(t.check_bits)));
+        }
         if t.side_vectors > 0 {
             parts.push(format!("side vectors {}", human(t.side_vectors)));
         }
@@ -1170,7 +1194,7 @@ impl DevicePlan {
             ),
         };
         format!(
-            "{{\"mode\":{},\"budget_bytes\":{},\"budget_source\":{},\"free_bytes\":{},\"total_bytes\":{},\"reserve_bytes\":{},\"cap_bytes\":{},\"required_bytes\":{},\"saturated\":{},\"terms\":{{\"data_f32\":{},\"side_vectors\":{},\"fit_twin\":{},\"buffers\":{},\"stat_wave\":{},\"tile_arena\":{},\"tile_pinned\":{},\"partials\":{}}},\"rows\":{},\"vars\":{},\"candidates\":{},\"l2_bytes\":{},\"tile_rows\":{},\"waves\":{},\"wave_candidates\":{},\"fit_route\":{},\"fit_reason\":{},\"stat_route\":{},\"stat_reason\":{},\"refusal\":{},\"observed\":{}}}",
+            "{{\"mode\":{},\"budget_bytes\":{},\"budget_source\":{},\"free_bytes\":{},\"total_bytes\":{},\"reserve_bytes\":{},\"cap_bytes\":{},\"required_bytes\":{},\"saturated\":{},\"terms\":{{\"data_f32\":{},\"side_vectors\":{},\"fit_twin\":{},\"buffers\":{},\"stat_wave\":{},\"tile_arena\":{},\"tile_pinned\":{},\"partials\":{},\"check_f64\":{},\"check_bits\":{}}},\"rows\":{},\"vars\":{},\"candidates\":{},\"l2_bytes\":{},\"tile_rows\":{},\"waves\":{},\"wave_candidates\":{},\"fit_route\":{},\"fit_reason\":{},\"stat_route\":{},\"stat_reason\":{},\"refusal\":{},\"observed\":{}}}",
             json_str(self.mode.name()),
             self.budget,
             json_str(self.budget_source),
@@ -1188,6 +1212,8 @@ impl DevicePlan {
             t.tile_arena,
             t.tile_pinned,
             t.partials,
+            t.check_f64,
+            t.check_bits,
             self.workload.rows,
             self.workload.vars,
             self.workload.candidates,
@@ -1305,6 +1331,7 @@ mod tests {
             label_sign: false,
             pnl_book: false,
             pnl_block_ids: false,
+            check_exact: false,
         }
     }
 
@@ -1513,5 +1540,40 @@ mod tests {
         let json = p.to_json();
         assert!(json.starts_with("{\"mode\":\"resident\""));
         assert!(json.contains("\"refusal\":{\"stage\":\"fit\""));
+    }
+
+    #[test]
+    fn check_terms_count_the_exact_columns_and_planes() {
+        let d = rtx3060(11_353);
+        let caps = DeviceCaps::new(None);
+        let base = DeviceWorkload { rows: 1_996_201, pnl_book: true, ..workload(34, 1_000, false) };
+        let off = device_plan(&base, &d, &caps);
+        assert_eq!((off.terms.check_f64, off.terms.check_bits), (0, 0));
+        let on = device_plan(&DeviceWorkload { check_exact: true, ..base }, &d, &caps);
+        let f64_bytes = 1_996_201u64 * 34 * 8;
+        let words = 1_996_201u64.div_ceil(32);
+        let bits = 2 * 64 * words * 4 + 64 * 4096 * 4 + 64 * 8;
+        assert_eq!(on.terms.check_f64, f64_bytes);
+        assert_eq!(on.terms.check_bits, bits);
+        assert_eq!(on.required, off.required + f64_bytes + bits);
+        assert!(on.refusal.is_none());
+        let json = on.to_json();
+        assert!(json.contains(&format!("\"check_f64\":{f64_bytes},\"check_bits\":{bits}")), "{json}");
+    }
+
+    #[test]
+    fn check_terms_can_refuse_the_run() {
+        let d = rtx3060(11_353);
+        let base = DeviceWorkload { rows: 1_996_201, pnl_book: true, ..workload(34, 1_000, false) };
+        let w = DeviceWorkload { check_exact: true, ..base };
+        let fits = device_plan(&base, &d, &DeviceCaps::new(None)).required;
+        let caps = DeviceCaps::new(Some(fits + 1));
+        assert!(device_plan(&base, &d, &caps).refusal.is_none());
+        let p = device_plan(&w, &d, &caps);
+        assert!(p.mode != Residency::Resident, "the exact check columns do not fit beside the rows: {:?}", p.mode);
+        assert!(p.terms.check_f64 == 0 || p.refusal.is_some());
+        if let Some(text) = p.refusal_text() {
+            assert!(text.contains("f64 check columns"), "{text}");
+        }
     }
 }
