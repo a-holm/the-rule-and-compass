@@ -714,26 +714,26 @@ mod tests {
 }
 
 #[cfg(test)]
-mod row_tests {
+pub(crate) mod row_tests {
     use super::rows::*;
     use crate::expr::{constant, input, node, Node, Op};
 
-    struct Rng(u64);
+    pub(crate) struct Rng(pub(crate) u64);
 
     impl Rng {
-        fn u(&mut self) -> u64 {
+        pub(crate) fn u(&mut self) -> u64 {
             self.0 ^= self.0 << 13;
             self.0 ^= self.0 >> 7;
             self.0 ^= self.0 << 17;
             self.0
         }
-        fn f(&mut self) -> f64 {
+        pub(crate) fn f(&mut self) -> f64 {
             (self.u() >> 11) as f64 / (1u64 << 53) as f64
         }
-        fn pick(&mut self, n: usize) -> usize {
+        pub(crate) fn pick(&mut self, n: usize) -> usize {
             (self.u() % n as u64) as usize
         }
-        fn special(&mut self) -> f64 {
+        pub(crate) fn special(&mut self) -> f64 {
             let s = if self.u() & 1 == 0 { 1.0 } else { -1.0 };
             match self.pick(14) {
                 0 => 0.0,
@@ -762,7 +762,7 @@ mod row_tests {
         node(op, vec![a, b])
     }
 
-    fn tree14(r: &mut Rng, depth: u32, vars: usize, pool: &mut Vec<Node>) -> Node {
+    pub(crate) fn tree14(r: &mut Rng, depth: u32, vars: usize, pool: &mut Vec<Node>) -> Node {
         if depth == 0 || r.pick(4) == 0 {
             return if r.pick(2) == 0 { constant(r.special()) } else { input(r.pick(vars)) };
         }

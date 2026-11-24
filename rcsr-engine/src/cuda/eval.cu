@@ -9033,3 +9033,4 @@ const char *rc_last_pnl_book_error(void)
 
 /* #1258: the device arm of rcsr enumerate. */
 #include "enumerate.h"
+#include "check_rows.h"

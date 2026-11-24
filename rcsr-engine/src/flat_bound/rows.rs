@@ -22,6 +22,8 @@ pub const CHECK_ULPS: i64 = 64;
 pub const CHECK_STACK: usize = 16;
 /// Undecided rows one slot may list before the host takes the full CPU pass.
 pub const SLOT_UNDECIDED_CAP: usize = 4096;
+/// Check slots one device group holds.
+pub const CHECK_SLOT_CAP: usize = 64;
 
 /// Opcodes of the check program. The values equal `OP_*` of `eval.cu`.
 pub const CK_CONST: u32 = 0;

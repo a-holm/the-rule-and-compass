@@ -33,6 +33,7 @@ lib shard=gpu-tail-rel shard gpu::fit_tail_tests::rel fit_tail tests, third hold
 lib shard=gpu-tail-st shard gpu::fit_tail_tests::s,gpu::fit_tail_tests::t fit_tail tests, fourth hold
 lib shard=fit shard-no-cuda fit:: CPU-only fit tests: no CUDA call, so memcheck finds no process to attach to (rc 255 is the pass)
 lib shard=search shard search:: search tests, one hold
+lib shard=check-rows shard check_rows_gpu:: exact book check device tests (#1051); small inputs under RCSR_UNDER_SANITIZER, one short hold
 lib shard=rest shard rest every test no other shard claims, so a new test is never left out of the pass
 lib routed_tail_fits_keep_the_better_answer skip CPU-bound refits of a pinned fixture after one device batch that its sibling fit_tail tests also run under memcheck; alone it uses nearly the whole hold budget; sized in #1420
 bin-cpu_bench          *  no-cuda  no tests in this binary: the harness runs 0 tests and makes no CUDA call
