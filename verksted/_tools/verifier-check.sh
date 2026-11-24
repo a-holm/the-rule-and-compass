@@ -16,7 +16,7 @@
 # Exit: 0 when state OPEN, base matches (default $BASE), MERGEABLE, every claim found (or found with an unknown head), nothing out of scope and the worktree (if any) clean at the PR head; 1 otherwise; 2 usage.
 set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
-base=$BASE
+base=${BASE:-}
 SUMMARY=$(dirname "${BASH_SOURCE[0]}")/test-summary.sh
 claims=
 scopes=()
@@ -33,6 +33,7 @@ while [ $# -gt 0 ]; do
   shift
 done
 case "$pr" in ''|*[!0-9]*) usage >&2; exit 2 ;; esac
+[ -n "$base" ] || need_base || exit 2
 if [ -n "$claims" ] && [ ! -r "$claims" ]; then
   echo "claims file $claims unreadable" >&2
   exit 2

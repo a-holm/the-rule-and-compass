@@ -26,7 +26,7 @@ cd "$W/$(verksted/_tools/crate-dir.sh "$W")"
 
 `GATES`, `MACHINE_SCRIPTS`, `SANITIZER` and `CUDA_ARCH` come from `machine.md` (`_shared/local.md`); a missing key stops the script with exit 2. Logs go to `$G/issue$N-<what>.log`. `B` is the build slot, `L` the test lock; use them through `rc-run.sh`. Every `RCSR_*` override is listed in `lib.sh`.
 
-Data and run variables: `DATA`, `STORE`, `ENRICHED`, `MEMBERSHIP`, `TARGET`, `LABEL`. Memory file: `MEM`. Their values come from `../setup/questionnaire.md` or the dispatcher.
+Data and run variables: `DATA`, `STORE`, `ENRICHED`, `MEMBERSHIP`, `TARGET`, `LABEL`; their values come from the dispatcher. `DATA_ROOT` (the root of the data stores), `MEM` (the integration state file) and `NOTES_DIR` (the research notes folder) are keys of `machine.md`.
 
 ## Check a stage
 
@@ -88,7 +88,7 @@ rm "$STREAMING"
 ## Full gate (once, on the integration tip)
 
 ```sh
-verksted/_tools/gate.sh "$WT/integration-gpu-hardening" <tag>   # logs: $G/<tag>-{cpu,cuda,bench}.log
+verksted/_tools/gate.sh "<integration worktree under $WT>" <tag>   # logs: $G/<tag>-{cpu,cuda,bench}.log
 ```
 
 Three lock holds: `cargo test --release --no-fail-fast`; `RCSR_CUDA_ARCH=$CUDA_ARCH cargo test --release --features cuda --no-fail-fast`; `cargo build --release && ./target/release/rcsr-bench --tiny` (must print `recovered 27/27`). Start it as one background shell and wait for the notification.
@@ -171,7 +171,7 @@ git ls-files '*.py'                                                             
 
 ## GPU safety
 
-The build selects the newest CUDA 13 toolkit by rule (`docs/gpu-backend.md`); the sanitizer is `$SANITIZER` (`machine.md`); the system 12.0 `compute-sanitizer` cannot attach on this driver.
+The sanitizer is `$SANITIZER` (`machine.md`): the compute-sanitizer that attaches on the installed driver; the system default may not.
 
 ```sh
 verksted/_tools/sanitize.sh "$W" "$N" memcheck --test <file> -- <filter>    # builds, then runs under compute-sanitizer through the lock; exit 0 before any plain GPU run

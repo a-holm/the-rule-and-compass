@@ -79,6 +79,7 @@ if [ "$done_" -eq 1 ]; then
   exit 0
 fi
 
+need_base || exit 2
 git -C "$RCSR_ROOT" fetch -q origin || fail "git fetch origin failed"
 if [ -e "$w" ]; then
   ! in_merge || git -C "$w" merge --abort || fail "cannot abort the merge in $w"

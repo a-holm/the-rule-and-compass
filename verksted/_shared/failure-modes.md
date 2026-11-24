@@ -36,7 +36,7 @@ Mined from the Claude Code and opencode sessions of this repo and the orchestrat
 | F25 | Device out-of-bounds read after a refused allocation (Xid 31); nvidia_uvm NULL dereference; every CPU soft-locked; desktop frozen 07:33 to 13:07 | kernel log 2026-10-31, #381 | rule 31 |
 | F26 | Only one ticket worked while it blocked a merge; the cap was read as counting lock waiters | user 2026-10-31 | rule 21 |
 | F27 | A pinned binary's RUNPATH pointed into a removed build dir; a sealed run exited 127 | 2026-11-02; #659, PR #660 | rule 29; `../07_longrun/stages/01_preconditions/CONTEXT.md` |
-| F28 | The system `compute-sanitizer` (CUDA 12.0) has no injection library for driver 580 | 2026-11-02 | rule 31 |
+| F28 | The system `compute-sanitizer` (CUDA 12.0) has no injection library for the installed driver | 2026-11-02 | rule 31 |
 | F29 | A sanitized search-level test ran every stage on the CPU, so a clean memcheck proved nothing | #438 | rule 31 |
 | F30 | `git stash` used across worktrees | 14 shell calls | rule 32 |
 | F31 | Agent history rewrites reverted base files | 2026-11-01 | rule 33 |

@@ -19,7 +19,7 @@ Do NOT load: opinions, estimates, agent self-reports.
 ## Process
 
 1. Run `verksted/_tools/status.sh`: it prints the clock, the base tip, open PRs, worktrees, locks, flags, GPU and processes. Add `gh pr list`, `gh issue list`, `git log --oneline origin/main..<base>` and the gate logs in `$GATES`.
-2. Write `state.md`: one bullet per fact, each ending in `(source: status.sh <section>)` or `(source: <command>)`. A fact without a source is not written. The integration branch never goes to `main` as a whole. The one approved exception is `verksted/` alone, copied to `main` as its own issue after epic #666 is done. Any other merge into `main` needs the project lead's written instruction (standing instruction, 2026-11-03).
+2. Write `state.md`: one bullet per fact, each ending in `(source: status.sh <section>)` or `(source: <command>)`. A fact without a source is not written. Merges into `main` follow the standing decision in `decisions.md` of the local area (`../../../_shared/local.md`).
 3. Add the runs: `../../../_tools/run-record.sh latest` prints the newest run card; list its path and the three newest lines of `runs/_index.md` in the local area (`../../../_shared/local.md`), each ending in `(source: run-record.sh latest)`. No card yet: write `unknown: no run card`.
 4. Where something cannot be checked, write `unknown: <what>` and do not guess.
 

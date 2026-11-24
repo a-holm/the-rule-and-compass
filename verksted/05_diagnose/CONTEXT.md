@@ -2,7 +2,7 @@
 
 One job: find out why a GPU test or run hangs or disagrees with the CPU, prove it small, fix it with bounded waits, and classify every parity delta.
 
-Evidence: #303 held the lock and 11 GB of GPU for over 90 minutes (I/O counter frozen, 0.6 % CPU, all threads in `futex_do_wait`); #352 found the projected-ring deadlock (12 of 12 repro hangs); #353 made processes attachable; #355, #357, #359 and #364 sorted parity deltas into production bugs and numeric tiers. A drive-by fix of a bug found by the harness is not allowed: it gets its own issue.
+Evidence: #303 held the lock and a large share of GPU memory for over 90 minutes (I/O counter frozen, 0.6 % CPU, all threads in `futex_do_wait`); #352 found the projected-ring deadlock (12 of 12 repro hangs); #353 made processes attachable; #355, #357, #359 and #364 sorted parity deltas into production bugs and numeric tiers. A drive-by fix of a bug found by the harness is not allowed: it gets its own issue.
 
 ## Inputs
 

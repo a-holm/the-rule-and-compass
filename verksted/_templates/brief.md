@@ -15,7 +15,7 @@ Acceptance criteria: <copy the checkbox list>
 Not to touch: parked issues and everything outside the owned files.
 
 Steps:
-1. Read the issue body and every comment: `gh issue view <N> --comments`. The body is the spec. If it links research notes (`arbeidsmappe/crypto-rcsr/research/<slug>/decision.md`), read them too. If a choice is not covered, or a criterion fails twice for the same reason, stop and report the exact question.
+1. Read the issue body and every comment: `gh issue view <N> --comments`. The body is the spec. If it links research notes (`$NOTES_DIR/research/<slug>/decision.md`), read them too. If a choice is not covered, or a criterion fails twice for the same reason, stop and report the exact question.
 2. For an interface design, sketch at least two interfaces and pick one with reasons before coding.
 3. Setup: run the absolute command `brief.sh` prints (`$VERKSTED/_tools/wt-new.sh <N> <slug>`), never from the main checkout. It fetches origin and creates the worktree and branch from the base. Work only there. If the base moves, `git merge origin/<base>`; never rebase after pushing, never force-push.
 4. Read and follow every line of `../_shared/brief.md`: builds only through `rc-run.sh build`, tests only through `rc-run.sh test`, minimal tests by exact filter, prove red first with a WIP commit, no Python ever, no git stash, no pkill. A wait uses `verksted/_tools/wait-for.sh`, never `pgrep -f`.

@@ -14,7 +14,8 @@ case "${1:-}" in
 esac
 [ $# -le 1 ] || { usage >&2; exit 2; }
 crate=$VERKSTED/_tools/verksted-check
-build=(bash -c "cd '$crate' && CARGO_BUILD_JOBS=2 timeout 600 cargo build --release")
+jobs=$(machine_key BUILD_JOBS) || exit 2
+build=(bash -c "cd '$crate' && CARGO_BUILD_JOBS=$jobs timeout 600 cargo build --release")
 if [ -x "$B" ]; then "$B" "${build[@]}"; else "${build[@]}"; fi
 rc=$?
 if [ "$rc" -eq 0 ]; then

@@ -14,7 +14,7 @@ One job: run the real path on a medium store in under 10 minutes.
 - `../../CONTEXT.md`
 - `../../../_tools/rc-run.sh`
 
-Do NOT load: the 39.8 GB test, a second lock holder.
+Do NOT load: the largest store test, a second lock holder.
 
 ## Process
 
