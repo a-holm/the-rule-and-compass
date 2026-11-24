@@ -211,6 +211,7 @@ gate_sample_refusal   *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0
 cwd_decoys            *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs), so no CUDA call in the test process or its children; memcheck with --target-processes application-only does not trace the children
 stateful_gate          *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs), so no CUDA call in the test process or its children; memcheck with --target-processes application-only does not trace the children; ok-token: "--device-pnl" (a refusal test)
 gate_search            *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs), so no CUDA call in the test process or its children; memcheck with --target-processes application-only does not trace the children; ok-token: "--gpu" (a refusal test)
+h1_mini                *  no-cuda-app-only  CPU-only tests; no CUDA call; the children are bash and jq running scripts/h1-mini/hash.sh, which make no CUDA call
 baselines                  *  device  tests run on the device
 bench                      *  device  tests run on the device
 bench_gpu                  *  device  tests run on the device
