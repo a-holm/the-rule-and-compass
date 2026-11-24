@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The h1-mini hash set H (#1444). Reads grep, jq and sha256sum only; prints hash lines and never a run value.
 # Usage:
-#   hash.sh <out>          eight lines `<name> <sha256>` for the run directory <out> (unit.ckpt, run.json)
+#   hash.sh <out>          nine lines `<name> <sha256>` for the run directory <out> (unit.ckpt, run.json)
 #   hash.sh keys <a> <b>   the key paths whose value differs between the run.json of two run directories (names only)
 # Strip list S: strip.jq next to this script; H1_MINI_STRIP names another jq file (strip-ticket.jq: the ticket list, for comparison).
 set -euo pipefail
