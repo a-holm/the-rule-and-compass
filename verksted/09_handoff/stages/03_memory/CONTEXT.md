@@ -18,7 +18,7 @@ Do NOT load: history, provenance.
 ## Process
 
 1. If an input is missing or empty, stop and say which.
-2. Update the memory file named in the setup answers (`MEM`): what the integration branch holds, which tickets run, what is queued. Present tense.
+2. Update the memory file named by the key `MEM` of `machine.md`: what the integration branch holds, which tickets run, what is queued. Present tense.
 3. Write `memory.md` in `output/`: the path and the tickets written.
 
 ## Outputs

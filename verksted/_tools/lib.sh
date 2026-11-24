@@ -45,7 +45,21 @@ machine_key() {
   printf '%s\n' "$v"
 }
 WT=$ROOT/worktrees
-BASE=${RCSR_BASE:-integration/gpu-hardening}
+# BASE: RCSR_BASE, else the key BASE of machine.md; unset when neither exists. A tool that needs it calls need_base, which
+# exits 2 and names the key (an interactive source returns 2).
+BASE=${RCSR_BASE:-}
+[ -n "$BASE" ] || BASE=$(machine_key BASE 2> /dev/null) || true
+[ -n "$BASE" ] || unset BASE
+need_base() {
+  [ -n "${BASE:-}" ] && return 0
+  machine_key BASE > /dev/null
+  return 2
+}
+# NOTES_DIR, DATA_ROOT and MEM: an environment value wins, else the key of machine.md; left unset when neither exists.
+for k in NOTES_DIR DATA_ROOT MEM; do
+  [ -n "${!k:-}" ] || { v=$(machine_key "$k" 2> /dev/null) && printf -v "$k" '%s' "$v"; }
+done
+unset k v
 if [ -z "${LIB_NO_MACHINE:-}" ]; then
   GATES=${RCSR_GATES:-}
   [ -n "$GATES" ] || GATES=$(machine_key GATES) || { [[ $- == *i* ]] && return 2; exit 2; }

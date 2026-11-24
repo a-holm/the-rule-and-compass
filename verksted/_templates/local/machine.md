@@ -21,6 +21,10 @@ One line per key, `- KEY: value`. A script that reads a key exits 2 and names it
 - BUILD_SLOT_WAIT_MAX: <set me>
 - SANITIZER: <set me>
 - CUDA_ARCH: <set me>
+- BASE: <set me>
+- NOTES_DIR: <set me>
+- DATA_ROOT: <set me>
+- MEM: <set me>
 
 ## Hardware
 

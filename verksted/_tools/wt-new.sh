@@ -9,7 +9,7 @@
 set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 research=0
-base=$BASE
+base=${BASE:-}
 args=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -34,6 +34,7 @@ if ! [[ $slug =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]]; then
   echo "refused: slug '$slug' is not kebab-case" >&2
   exit 1
 fi
+[ -n "$base" ] || need_base || exit 2
 need_gates
 git -C "$ROOT" fetch -q origin || { echo "refused: git fetch origin failed" >&2; exit 1; }
 if ! sha=$(git -C "$ROOT" rev-parse --verify -q "refs/remotes/origin/$base^{commit}"); then

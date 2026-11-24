@@ -100,10 +100,10 @@ FAKE
 FAKE_LIB_KEYS=$'- GATES: /nonexistent-gates\n- MACHINE_SCRIPTS: /nonexistent-machine-dir\n- SANITIZER: /nonexistent-sanitizer/compute-sanitizer\n- CUDA_ARCH: sm_86\n'
 
 # fake_machine <dir> <local dir>: <dir>/taskset records its mask argument (the value after -c) in "<dir>/taskset.mask" and runs the
-# rest; <local dir>/machine.md holds the pin keys rc-run.sh reads (PIN_CORES_BUILD 0,1 and PIN_CORES_BUSY 0).
+# rest; <local dir>/machine.md holds the keys rc-run.sh reads (PIN_CORES_BUILD 0,1, PIN_CORES_BUSY 0, BUILD_JOBS 2).
 fake_machine() {
   printf '#!/usr/bin/env bash\necho "$2" >> %q\nshift 2\nexec "$@"\n' "$1/taskset.mask" > "$1/taskset"
   chmod +x "$1/taskset"
   mkdir -p "$2"
-  printf -- '%s- PIN_CORES_BUILD: 0,1\n- PIN_CORES_BUSY: 0\n' "$FAKE_LIB_KEYS" > "$2/machine.md"
+  printf -- '%s- PIN_CORES_BUILD: 0,1\n- PIN_CORES_BUSY: 0\n- BUILD_JOBS: 2\n' "$FAKE_LIB_KEYS" > "$2/machine.md"
 }

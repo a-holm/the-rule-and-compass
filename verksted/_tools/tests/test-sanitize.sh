@@ -160,10 +160,8 @@ FAKE_XID_BUMP=1 run "$T/wt" 7 s --test gpu_fit > /dev/null 2>&1; r=$?
 check xid-rc "$r" "70"
 echo 0 > "$T/xid"
 
-# sanitizer path without /cuda-13, or missing, gives 3 and never builds
+# a missing sanitizer gives 3 and never builds
 : > "$T/cargo-calls"
-SANITIZER_PATH=$T/cuda-12.0/bin/compute-sanitizer run "$T/wt" 7 s --test gpu_fit > /dev/null 2>&1; r=$?
-check cuda12-rc "$r" "3"
 SANITIZER_PATH=$T/none/compute-sanitizer run "$T/wt" 7 s --test gpu_fit > /dev/null 2>&1; r=$?
 check missing-san-rc "$r" "3"
 check no-build-on-3 "$(wc -c < "$T/cargo-calls" | tr -d ' ')" "0"

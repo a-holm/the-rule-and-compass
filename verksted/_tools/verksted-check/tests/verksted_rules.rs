@@ -190,18 +190,32 @@ fn worktree_paths_scan_shell_files_line_by_line() {
     assert_eq!(worktree_path_problems(dir.path()).len(), 1, "script tests are not scanned");
 }
 
-/// Files whose text holds no machine value: the general rules, briefs, templates, the two edited stage contracts,
-/// the shared script library and the machine.md template.
-const MACHINE_FREE_FILES: [&str; 8] = [
-    "_shared/rules.md",
-    "_shared/brief.md",
-    "_templates/brief.md",
-    "_templates/brief-research.md",
-    "01_issue/stages/01_worktree/CONTEXT.md",
-    "10_machine/stages/01_lock/CONTEXT.md",
-    "_tools/lib.sh",
-    "_templates/local/machine.md",
+/// Tracked files that may hold machine values: the machine scripts, until they read the profile keys (#1413).
+/// `tracked_sources` already leaves out the script tests and this crate.
+const MACHINE_VALUE_ALLOWED: [&str; 1] = ["_tools/machine/"];
+
+/// Lines whose number list or size is a tool parameter, not a machine value: (file, text the line contains).
+const MACHINE_VALUE_LINE_ALLOWED: [(&str, &str); 6] = [
+    ("_tools/ab-pair.sh", "seeds 1,2,3"),
+    ("_tools/ab-pair.sh", "seeds=1,2,3"),
+    ("_index.md", "seeds 1,2,3"),
+    ("_shared/commands.md", "seeds 1,2,3"),
+    ("_tools/run-record.sh", "2 GiB"),
+    ("_tools/resources.sh", "KiB 1024"),
 ];
+
+/// Campaign literals: a branch, a work-folder name or a fixed job count belongs in the local area.
+const CAMPAIGN_LITERALS: [&str; 5] =
+    ["integration/gpu-hardening", "integration-gpu-hardening", "arbeidsmappe", "crypto-rcsr", "CARGO_BUILD_JOBS=2"];
+
+/// Every tracked `.md` and `.sh` file of the workshop that the allow list does not exempt, as paths relative to `root`.
+fn machine_free_files(root: &Path) -> Vec<String> {
+    tracked_sources(root)
+        .iter()
+        .map(|p| p.strip_prefix(root).unwrap_or(p).to_string_lossy().into_owned())
+        .filter(|rel| !MACHINE_VALUE_ALLOWED.iter().any(|a| rel.starts_with(a)))
+        .collect()
+}
 
 const VOLUME_PREFIXES: [&str; 7] = ["/mnt/", "/media/", "/home/", "/usr/local/", "/opt/", "/srv/", "/Volumes/"];
 const SIZE_UNITS: [&str; 8] = ["KiB", "MiB", "GiB", "TiB", "KB", "MB", "GB", "TB"];
@@ -256,6 +270,8 @@ fn machine_value(line: &str) -> Option<&'static str> {
         Some("core list")
     } else if has_arch_or_driver(line) {
         Some("architecture token or driver version")
+    } else if CAMPAIGN_LITERALS.iter().any(|l| line.contains(l)) {
+        Some("campaign value")
     } else {
         None
     }
@@ -270,6 +286,9 @@ fn machine_value_problems(root: &Path, files: &[&str]) -> Vec<String> {
             continue;
         };
         for (n, line) in text.lines().enumerate() {
+            if MACHINE_VALUE_LINE_ALLOWED.iter().any(|(f, s)| f == rel && line.contains(s)) {
+                continue;
+            }
             if let Some(kind) = machine_value(line) {
                 out.push(format!("{rel}:{}: {kind}: {}", n + 1, line.trim()));
             }
@@ -280,7 +299,10 @@ fn machine_value_problems(root: &Path, files: &[&str]) -> Vec<String> {
 
 #[test]
 fn no_machine_values() {
-    let problems = machine_value_problems(&workshop_root(), &MACHINE_FREE_FILES);
+    let root = workshop_root();
+    let files = machine_free_files(&root);
+    let files: Vec<&str> = files.iter().map(String::as_str).collect();
+    let problems = machine_value_problems(&root, &files);
     assert!(
         problems.is_empty(),
         "machine values belong in machine.md or rules-local.md, tracked text names the keys:\n{}",
@@ -298,6 +320,9 @@ fn no_machine_values_fail_on_a_fixture_with_each_kind_of_value() {
         ("pin to 2,3,6,7", "core list"),
         ("works on driver 580", "architecture token or driver version"),
         ("the sanitizer lives in /usr/local/tools", "absolute volume path"),
+        ("branches from integration/gpu-hardening", "campaign value"),
+        ("notes in arbeidsmappe/x", "campaign value"),
+        ("env CARGO_BUILD_JOBS=2 cargo", "campaign value"),
     ] {
         let dir = Scratch::new("mv-bad");
         write(dir.path(), "_shared/rules.md", &format!("# Rules\n\n{bad}\n"));
@@ -370,4 +395,98 @@ fn machine_value_guard_flags_a_lib_default() {
     assert!(problems[0].contains("absolute volume path"));
     assert!(problems[1].contains("architecture token"));
     assert!(problems[2].contains("absolute volume path"));
+}
+
+#[test]
+fn machine_value_scan_covers_every_tracked_markdown_and_shell_file() {
+    let root = workshop_root();
+    let tracked: Vec<String> = tracked_sources(&root)
+        .iter()
+        .map(|p| p.strip_prefix(&root).unwrap_or(p).to_string_lossy().into_owned())
+        .collect();
+    let scanned = machine_free_files(&root);
+    assert!(scanned.len() > 100, "the scan lists {} files", scanned.len());
+    for rel in &tracked {
+        let allowed = MACHINE_VALUE_ALLOWED.iter().any(|a| rel.starts_with(a));
+        assert!(allowed || scanned.contains(rel), "{rel} is neither scanned nor allow-listed");
+    }
+    for allowed in MACHINE_VALUE_ALLOWED {
+        assert!(tracked.iter().any(|rel| rel.starts_with(allowed)), "allow-list entry {allowed} matches no file");
+    }
+    for (file, text) in MACHINE_VALUE_LINE_ALLOWED {
+        let body = fs::read_to_string(root.join(file)).unwrap_or_default();
+        assert!(body.lines().any(|l| l.contains(text)), "line allowance {file}: {text} matches no line");
+    }
+    for must in ["_shared/rules.md", "_tools/lib.sh", "_templates/runbook.sh", "07_longrun/stages/02_launch/CONTEXT.md"] {
+        assert!(scanned.iter().any(|s| s == must), "{must} is not scanned");
+    }
+}
+
+/// Keys of the `## Profile keys` section of the machine.md template.
+fn template_keys(root: &Path) -> Vec<String> {
+    let text = fs::read_to_string(root.join("_templates/local/machine.md")).unwrap_or_default();
+    let mut in_keys = false;
+    let mut keys = Vec::new();
+    for line in text.lines() {
+        if line.starts_with("## ") {
+            in_keys = line == "## Profile keys";
+        } else if in_keys {
+            if let Some((key, _)) = line.strip_prefix("- ").and_then(|l| l.split_once(": ")) {
+                keys.push(key.to_string());
+            }
+        }
+    }
+    keys
+}
+
+/// True when `key` stands as a whole word in `text`.
+fn names_word(text: &str, key: &str) -> bool {
+    text.match_indices(key).any(|(i, _)| {
+        let before = text[..i].chars().next_back();
+        let after = text[i + key.len()..].chars().next();
+        let word = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+        !word(before) && !word(after)
+    })
+}
+
+/// Template keys that no script of `_tools` reads and no contract (`CONTEXT.md`, the shared rules and commands, the
+/// templates outside the local starters) names.
+fn unused_template_keys(root: &Path) -> Vec<String> {
+    let mut readers = String::new();
+    for file in tracked_sources(root) {
+        let rel = file.strip_prefix(root).unwrap_or(&file).to_string_lossy().into_owned();
+        let is_script = rel.starts_with("_tools/") && rel.ends_with(".sh");
+        let is_contract = rel.ends_with("CONTEXT.md")
+            || rel == "_shared/rules.md"
+            || rel == "_shared/commands.md"
+            || rel == "_shared/models.md"
+            || (rel.starts_with("_templates/") && !rel.starts_with("_templates/local/"));
+        if is_script || is_contract {
+            readers.push_str(&fs::read_to_string(&file).unwrap_or_default());
+            readers.push('\n');
+        }
+    }
+    template_keys(root).into_iter().filter(|k| !names_word(&readers, k)).collect()
+}
+
+#[test]
+fn every_machine_template_key_is_read_by_a_script_or_named_by_a_contract() {
+    let root = workshop_root();
+    assert!(template_keys(&root).len() >= 17, "the template lists too few keys");
+    let unused = unused_template_keys(&root);
+    assert!(unused.is_empty(), "template keys that nothing reads or names: {unused:?}");
+}
+
+#[test]
+fn an_unused_template_key_is_reported() {
+    let dir = Scratch::new("keys");
+    write(
+        dir.path(),
+        "_templates/local/machine.md",
+        "# Machine profile\n\n## Profile keys\n\n- READ_KEY: <set me>\n- NAMED_KEY: <set me>\n- LOST_KEY: <set me>\n\n## Hardware\n\n- CPU model: <model>\n",
+    );
+    write(dir.path(), "_tools/a.sh", "x=$(machine_key READ_KEY)\n");
+    write(dir.path(), "01/CONTEXT.md", "The key `NAMED_KEY` is used. LOST_KEY_2 is another word.\n");
+    write(dir.path(), "_shared/local.md", "| `LOST_KEY` | documented only |\n");
+    assert_eq!(unused_template_keys(dir.path()), ["LOST_KEY"]);
 }

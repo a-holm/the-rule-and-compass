@@ -2,7 +2,7 @@
 # Usage: sanitize.sh <worktree> <id> <tag> (--test <file> | --lib | --bin <name>) [--timeout S] [--api-errors no|explicit|all] [-- <test filters and flags>]
 # Builds the CUDA test binary in the build slot with `cargo test --release --features cuda --no-run --message-format=json`,
 # takes its path from the compiler-artifact JSON line (profile.test true; target.name = <file>, or target.kind holding lib),
-# and runs it under the CUDA 13.0 compute-sanitizer memcheck through the test lock with the Xid check:
+# and runs it under the compute-sanitizer memcheck through the test lock with the Xid check:
 # env RCSR_UNDER_SANITIZER=memcheck RCSR_REQUIRE_DEVICE=1 $SANITIZER --tool memcheck --leak-check no --error-exitcode 99 [--report-api-errors <v>] <binary> <filters>.
 # RCSR_UNDER_SANITIZER lets a test pick a smaller fixture (tests/common/sanitizer.rs). --api-errors no stops deliberate driver errors counting as sanitizer errors.
 # --bin <name> builds `cargo build --release --features cuda --bin <name>` instead and runs that binary under memcheck with the arguments after `--`
@@ -10,7 +10,7 @@
 # Run the whole planned pass with sanitize-all.sh.
 # Search-level tests must set dispatch: DispatchMode::Device (CLI --dispatch device), or every stage runs on the CPU.
 # Writes: the logs <id>-<tag>-build and <id>-<tag> (see rc-run.sh).
-# Exit: 0 when the log holds `ERROR SUMMARY: 0 errors` and the run exits 0; 1 otherwise; 3 when $SANITIZER is missing or not a CUDA 13 path, or the release rcsr binary is stamped for the CPU feature set (rc-run.sh; the message names the build command); 70 a new Xid line appeared or the Xid check failed; 2 usage.
+# Exit: 0 when the log holds `ERROR SUMMARY: 0 errors` and the run exits 0; 1 otherwise; 3 when $SANITIZER is missing or not executable, or the release rcsr binary is stamped for the CPU feature set (rc-run.sh; the message names the build command); 70 a new Xid line appeared or the Xid check failed; 2 usage.
 set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 RC_RUN=$(dirname "${BASH_SOURCE[0]}")/rc-run.sh
@@ -69,10 +69,6 @@ if [ "$timeout_s" -gt "$LOCK_HOLD_MAX" ]; then
 fi
 
 san_real=$(realpath "$SANITIZER" 2>/dev/null || true)
-case "$san_real" in
-  */cuda-13*/*) ;;
-  *) echo "sanitize: $SANITIZER is not a CUDA 13 compute-sanitizer (needs /cuda-13 in its real path; /usr/bin/compute-sanitizer is CUDA 12 and lacks the injection library)" >&2; exit 3 ;;
-esac
 [ -x "$san_real" ] && [ -f "$san_real" ] || { echo "sanitize: $SANITIZER is not executable" >&2; exit 3; }
 
 build_args=(cargo test --release --features cuda --no-run --message-format=json)

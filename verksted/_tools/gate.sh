@@ -25,6 +25,7 @@ W=$1
 T=$2
 C=$(crate_dir "$W") || { echo "gate: no single engine crate under $W" >&2; exit 2; }
 D=${RCSR_GATE_DIR:-$GATES}
+jobs=$(machine_key BUILD_JOBS) || exit 2
 if [ ! -d "$D" ]; then
   echo "gate dir $D missing; link it to the log directory or set RCSR_GATES" >&2
   exit 1
@@ -38,12 +39,12 @@ hold() {
 }
 step() {
   local name=$1 cmd=$2
-  hold "cd '$C' && CARGO_BUILD_JOBS=2 $cmd" > "$D/$T-$name.log" 2>&1
+  hold "cd '$C' && CARGO_BUILD_JOBS=$jobs $cmd" > "$D/$T-$name.log" 2>&1
 }
 
-cpu_env="CARGO_BUILD_JOBS=2"
+cpu_env="CARGO_BUILD_JOBS=$jobs"
 cpu_cargo="cargo test --release"
-cuda_env="CARGO_BUILD_JOBS=2 RCSR_CUDA_ARCH=$CUDA_ARCH RCSR_REQUIRE_DEVICE=1"
+cuda_env="CARGO_BUILD_JOBS=$jobs RCSR_CUDA_ARCH=$CUDA_ARCH RCSR_REQUIRE_DEVICE=1"
 cuda_cargo="cargo test --release --features cuda"
 hold_cap=$((LOCK_HOLD_MAX - 20))
 n_targets=0
@@ -140,7 +141,7 @@ suite cuda "$cuda_env" "$cuda_cargo" 1
 g=$s
 cuda_targets=$n_targets cuda_failed=$n_failed cuda_timeouts=$n_timeouts
 step bench "timeout -k $KILL_AFTER 5400 cargo build --release && timeout -k $KILL_AFTER 1800 ./target/release/rcsr-bench --tiny"; b=$?
-"$B" bash -c "cd '$W/verksted/_tools/verksted-check' && CARGO_BUILD_JOBS=2 timeout -k $KILL_AFTER 3000 cargo test --release && CARGO_BUILD_JOBS=2 timeout -k $KILL_AFTER 1800 cargo run --release -- links --external '$W/verksted'" > "$D/$T-verksted.log" 2>&1; v=$?
+"$B" bash -c "cd '$W/verksted/_tools/verksted-check' && CARGO_BUILD_JOBS=$jobs timeout -k $KILL_AFTER 3000 cargo test --release && CARGO_BUILD_JOBS=$jobs timeout -k $KILL_AFTER 1800 cargo run --release -- links --external '$W/verksted'" > "$D/$T-verksted.log" 2>&1; v=$?
 bad=0
 for k in cpu cuda; do
   f=$D/$T-$k.log

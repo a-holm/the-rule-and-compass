@@ -8,6 +8,7 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 . "$HERE/lib/machine.sh"
 V=$HERE/../..
 export RCSR_GATES=/nonexistent-gates
+export RCSR_BASE=integration/gpu-hardening
 LOCAL=$RCSR_LOCAL
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
@@ -135,6 +136,9 @@ g -C "$ROOT" update-ref -d refs/remotes/origin/integration/gpu-hardening
 err=$(bash "$S" impl --issue 7 --slug demo-slug 2>&1 >/dev/null); rc=$?
 check no-origin-rc "$rc" 1
 check no-origin-msg "$(printf '%s\n' "$err" | grep -c '^refused: .*origin/integration/gpu-hardening')" 1
+err=$(env -u RCSR_BASE bash "$S" impl --issue 7 --slug demo-slug 2>&1 >/dev/null); rc=$?
+check no-base-rc "$rc" 2
+check no-base-names-key "$(printf '%s\n' "$err" | grep -c 'key BASE missing in')" 1
 
 # no text sends an agent to the main checkout: the phrase is gone from tracked text
 phrase="from the repo"" root"

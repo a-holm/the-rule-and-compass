@@ -30,6 +30,6 @@ Issues:
 - Plain technical English, short sentences, no em-dashes, no AI or session references, no provenance notes. Measured numbers go in the issue body, never in code comments.
 - Issue and PR comments state only facts that are true now and that you verified. No predictions or plans stated as facts; write "not run", "open" or "not verified".
 
-Notes go to `arbeidsmappe/crypto-rcsr/research/<slug>/` (`question.md`, `method.md`, `decision.md`; starters `research-question.md`, `research-decision.md`). Do not commit them.
+Notes go to `$NOTES_DIR/research/<slug>/` (`question.md`, `method.md`, `decision.md`; starters `research-question.md`, `research-decision.md`). Do not commit them.
 
 Final report (last message): the issues you created (number, title, priority, size, blocked by), the comments you added to existing issues, the top three expected gains with their evidence, and anything that needs the project lead's decision.

@@ -44,6 +44,7 @@ for v in "$issue" "$epic" "$pr"; do
 done
 refuse() { echo "refused: $1" >&2; exit 1; }
 [ "$RCSR_ROOT" != "$ROOT" ] || refuse "run brief.sh from a worktree on the integration tip, not the main checkout (rule 61); main checkout: $ROOT"
+need_base || exit 2
 behind=$(tools_behind "$RCSR_ROOT") || refuse "origin/$BASE not found in $RCSR_ROOT; fetch first"
 [ "$behind" -eq 0 ] || refuse "this worktree is $behind commit(s) behind origin/$BASE in verksted/; merge origin/$BASE in $RCSR_ROOT (or use a current tools worktree) and rerun"
 [ -n "$issue" ] || refuse "--issue is required"

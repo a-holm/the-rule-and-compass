@@ -2,3 +2,4 @@
 - MACHINE_SCRIPTS: /nonexistent-machine-dir
 - SANITIZER: /nonexistent-sanitizer/compute-sanitizer
 - CUDA_ARCH: sm_fixture
+- BUILD_JOBS: 2

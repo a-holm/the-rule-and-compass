@@ -20,12 +20,13 @@ Where: `$VLOCAL`, defined in `_tools/lib.sh` as `verksted/_local/` of the main c
 | `runs/<run-id>/run.md` | one run card per run | `run-record.sh` |
 | `runs/_index.md` | one line per run, newest first, generated | `run-record.sh` |
 | `datasets/<id>/` | `card.md`, `adapt.md`, `manifest.md` of a prepared dataset | `06_data/stages/08_verify_manifest` |
+| `verifier/<PR>/` | `verification.md`, `report.md`, `check.md` and `merge-body.md` of one verified pull request; `verify-merged.sh --done` never removes it | the verifier (`08_close/stages/01_verifier`) |
 
 A run card holds: id, kind, start and end (UTC), the exact command or the path of the script that holds it, binary sha256 and commit, build features, the stores read with their sha256, split id and seed, CPU mask, wall seconds, user CPU seconds, lock-hours, machine load, new Xid lines, key metrics on development rows, paths of the artefacts outside git, deviations, status.
 
 ## Machine profile keys
 
-Tracked text names these keys and never their values. `machine.md` holds one line per key, `- KEY: value`; `local-init.sh` creates it from the template with `<set me>` as the value of every key. `lib.sh` reads `GATES`, `MACHINE_SCRIPTS`, `SANITIZER` and `CUDA_ARCH` through `machine_key`, `resources.sh` reads three more; a missing key, an empty value or `<set me>` makes the script exit 2 (an interactive `source` returns 2) and name the key. No tracked script holds a default for any of them. `TOOLS_WT` lives in `rules-local.md`, the other keys in `machine.md`.
+Tracked text names these keys and never their values. `machine.md` holds one line per key, `- KEY: value`; `local-init.sh` creates it from the template with `<set me>` as the value of every key. `lib.sh` reads `GATES`, `MACHINE_SCRIPTS`, `SANITIZER` and `CUDA_ARCH` through `machine_key` and `BASE`, `NOTES_DIR`, `DATA_ROOT` and `MEM` when present; `resources.sh`, `rc-run.sh`, `gate.sh` and `links.sh` read more; a missing key, an empty value or `<set me>` makes the script exit 2 (an interactive `source` returns 2) and name the key. No tracked script holds a default for any of them. `TOOLS_WT` lives in `rules-local.md`, the other keys in `machine.md`.
 
 | Key | Meaning |
 |---|---|
@@ -46,6 +47,10 @@ Tracked text names these keys and never their values. `machine.md` holds one lin
 | `BUILD_SLOT_WAIT_MAX` | seconds the slot waits before exit 75 |
 | `SANITIZER` | the compute-sanitizer that attaches on this driver |
 | `CUDA_ARCH` | the device architecture of builds |
+| `BASE` | the integration branch that issue branches start from and pull requests target (`RCSR_BASE` overrides; a tool that needs it exits 2 and names the key) |
+| `NOTES_DIR` | folder of research notes outside git (`<NOTES_DIR>/research/<slug>/`) |
+| `DATA_ROOT` | root folder of the data stores of runs |
+| `MEM` | the integration state file that `09_handoff/stages/03_memory` updates |
 | `TOOLS_WT` | a worktree on the integration tip that runs verksted tools before an agent has its own (`rules-local.md`) |
 
 Never in the local area: raw data, a value from inside a locked range before the final seal and reads are posted, secrets, tokens, personal data. Artefacts stay where the run wrote them; a card holds their paths and hashes.

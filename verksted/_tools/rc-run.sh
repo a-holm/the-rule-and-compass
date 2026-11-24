@@ -5,7 +5,7 @@
 # run:   through the test lock ($L) for rcsr, rcsr-bench and any GPU run; default 580 s.
 # cpu:   any CPU-only command through the build slot; default 580 s.
 # Writes: the log $(log_path <id> <tag>) (overwritten on rerun), the stamp, one lock file $GATES/.rc-run-<hash>.lock per job.
-# The command runs in <worktree>/<crate dir> with CARGO_BUILD_JOBS=2 (and RCSR_CUDA_ARCH=$CUDA_ARCH with --cuda)
+# The command runs in <worktree>/<crate dir> with CARGO_BUILD_JOBS=$BUILD_JOBS (the key BUILD_JOBS of machine.md) (and RCSR_CUDA_ARCH=$CUDA_ARCH with --cuda)
 # pinned with `taskset -c` to PIN_CORES_BUILD of $VLOCAL/machine.md (PIN_CORES_BUSY while $OC/desktop-busy.sh exits 0; no default stands in
 # for a missing key) under an outer `timeout -k $KILL_AFTER` (30 s, override RCSR_KILL_AFTER). Lock modes refuse --timeout above LOCK_HOLD_MAX (600 s).
 # A command whose program is a file in the deps directory of a target directory is refused: tests start through cargo test, never as a binary.
@@ -108,7 +108,11 @@ fi
 : > "$dupfile"
 echo $$ > "$dupfile"
 
-env_prefix="CARGO_BUILD_JOBS=2"
+jobs=$(machine_key BUILD_JOBS) || exit 2
+case "$jobs" in
+  *[!0-9]* | "") refuse "key BUILD_JOBS is not a number: $jobs" ;;
+esac
+env_prefix="CARGO_BUILD_JOBS=$jobs"
 [ "$cuda" -eq 1 ] && env_prefix="$env_prefix RCSR_CUDA_ARCH=$CUDA_ARCH"
 reap=
 if [ "$lock" -eq 1 ]; then

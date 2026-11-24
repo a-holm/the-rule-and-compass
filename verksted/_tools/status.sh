@@ -54,6 +54,7 @@ if want git; then
   echo "== git"
   echo "clock: $(date -u +%Y-%m-%dT%H:%M:%SZ) UTC, $(date +%Y-%m-%dT%H:%M:%S%z) local"
   if [ "$fetch" -eq 1 ]; then git -C "$RCSR_ROOT" fetch -q origin 2>/dev/null || echo "fetch: failed"; fi
+  need_base || exit 2
   tip=$(git -C "$RCSR_ROOT" log -1 --format='%h %s' "origin/$BASE" 2>/dev/null) || tip=unavailable
   echo "origin/$BASE: $tip"
   if command -v gh > /dev/null 2>&1; then

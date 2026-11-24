@@ -35,7 +35,7 @@ Each value is defined, with its `RCSR_*` override, in [`../_tools/lib.sh`](../_t
 | CUDA architecture | `CUDA_ARCH` |
 | CUDA 13.0 sanitizer | `SANITIZER` (`RCSR_SANITIZER`) |
 | Integration branch | `BASE` (`RCSR_BASE`) |
-| Memory file `MEM` | the integration state file under the agent's project memory directory |
+| Memory file `MEM` | key `MEM` of `machine.md` |
 | Existing tools | `../../scripts/stacks.sh`, `../../scripts/stall-watch.sh`, `rcsr-launch`, `rcsr-rss` |
 
 Confirm or adjust.

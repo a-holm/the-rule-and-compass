@@ -33,7 +33,9 @@ git_q() { git -c user.name=t -c user.email=t@t.invalid "$@"; }
 # defaults
 want_top=$(git -C "$HERE" rev-parse --show-toplevel)
 check default-RCSR_ROOT "$(lib 'echo $RCSR_ROOT')" "$want_top"
-check default-BASE "$(lib 'echo $BASE')" "integration/gpu-hardening"
+check default-BASE-unset "$(lib 'echo "[${BASE-unset}]"')" "[unset]"
+check need_base-exit "$(lib 'need_base; echo reached' 2> /dev/null; echo $?)" "2"
+check need_base-names-key "$(lib 'need_base' 2>&1 | grep -c "key BASE missing in $DEFLOCAL/machine.md")" "1"
 check default-LOCK_HOLD_MAX "$(lib 'echo $LOCK_HOLD_MAX')" "600"
 check default-VERKSTED "$(lib 'echo $VERKSTED')" "$(cd "$HERE/../.." && pwd)"
 
@@ -99,6 +101,17 @@ check override-all "$(lib 'echo "$GATES $OC $SANITIZER $CUDA_ARCH"' RCSR_LOCAL="
 check override-gates-only-rc "$(lib 'echo reached' RCSR_LOCAL="$d" RCSR_GATES=/g >/dev/null 2>&1; echo $?)" "2"
 # overrides
 check RCSR_BASE "$(lib 'echo $BASE' RCSR_BASE=b/x)" "b/x"
+check need_base-with-env "$(lib 'need_base; echo "ok $BASE"' RCSR_BASE=b/x)" "ok b/x"
+d=$(mach basekey "$all_keys- BASE: int/k
+- NOTES_DIR: /fx/notes
+- DATA_ROOT: /fx/data
+- MEM: /fx/mem.md
+")
+check key-BASE "$(lib 'need_base; echo $BASE' RCSR_LOCAL="$d")" "int/k"
+check RCSR_BASE-wins-over-key "$(lib 'echo $BASE' RCSR_LOCAL="$d" RCSR_BASE=b/x)" "b/x"
+check key-notes-data-mem "$(lib 'echo "$NOTES_DIR $DATA_ROOT $MEM"' RCSR_LOCAL="$d")" "/fx/notes /fx/data /fx/mem.md"
+check env-MEM-wins "$(lib 'echo $MEM' RCSR_LOCAL="$d" MEM=/e/m)" "/e/m"
+check no-keys-leave-vars-unset "$(lib 'echo "[${NOTES_DIR-u}${DATA_ROOT-u}${MEM-u}]"')" "[uuu]"
 check RCSR_GATES "$(lib 'echo "$GATES $G"' RCSR_GATES=/g/h)" "/g/h /g/h"
 check RCSR_MACHINE_DIR "$(lib 'echo "$OC $PAUSE $STREAMING $LOCKFILE $SLOTDIR $B $L"' RCSR_MACHINE_DIR=/m)" \
   "/m /m/PAUSE /m/STREAMING /m/full-suite.lock /m/build-slots /m/build-slot.sh /m/one-full-suite.sh"
