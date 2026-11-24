@@ -233,6 +233,9 @@ pub struct RunLedger {
     fit_tail_join_wait_s: f64,
     /// Exact CPU f64 finalist refit seconds (a subset of the fit stage).
     refit_s: f64,
+    /// #1438: busy seconds of the least and the most loaded finalist refit worker, summed over refit calls.
+    refit_busy_min_s: f64,
+    refit_busy_max_s: f64,
     /// Candidates admitted to the fit stage.
     admitted: u64,
     /// Admitted candidates the device fitted.
@@ -451,6 +454,13 @@ impl RunLedger {
         }
     }
 
+    pub fn record_refit_busy(&mut self, min_s: f64, max_s: f64) {
+        if min_s.is_finite() && max_s.is_finite() {
+            self.refit_busy_min_s += min_s.max(0.0);
+            self.refit_busy_max_s += max_s.max(0.0);
+        }
+    }
+
     pub fn record_fit_counters(
         &mut self,
         admitted: u64,
@@ -542,6 +552,8 @@ impl RunLedger {
         self.fit_tail_join_wait_s += other.fit_tail_join_wait_s;
         self.fit_gate_s += other.fit_gate_s;
         self.refit_s += other.refit_s;
+        self.refit_busy_min_s += other.refit_busy_min_s;
+        self.refit_busy_max_s += other.refit_busy_max_s;
         self.refits += other.refits;
         self.admitted += other.admitted;
         self.device_fits += other.device_fits;
@@ -672,6 +684,14 @@ impl RunLedger {
 
     pub fn refit_s(&self) -> f64 {
         self.refit_s
+    }
+
+    pub fn refit_busy_min_s(&self) -> f64 {
+        self.refit_busy_min_s
+    }
+
+    pub fn refit_busy_max_s(&self) -> f64 {
+        self.refit_busy_max_s
     }
 
     pub fn refits(&self) -> u64 {

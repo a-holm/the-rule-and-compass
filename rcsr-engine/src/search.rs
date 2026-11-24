@@ -6021,6 +6021,9 @@ struct RefitReport {
     refits: usize,
     /// Wall seconds in the exact refit windows.
     refit_s: f64,
+    /// #1438: refit worker busy seconds, least and most loaded, summed over refit calls.
+    refit_busy_min_s: f64,
+    refit_busy_max_s: f64,
     /// Wall seconds in full-data scoring of the unique trees.
     rescore_s: f64,
     /// #848: every candidate had a fixed position, so the front keeps them.
@@ -6107,7 +6110,7 @@ fn refit_band_selection(pre: &[f64], costs: &[f64], band: f64) -> Vec<usize> {
 /// #169: exact CPU f64 refit of `trees` on all training rows, a warm start from
 /// the carried constants. Trees are independent, so the work is split across
 /// workers; the result order is unchanged.
-fn refit_exact(trees: &mut [Node], train: &EvalSample, cfg: &Config, counts: Option<&FitAcceptCounts>) {
+fn refit_exact(trees: &mut [Node], train: &EvalSample, cfg: &Config, counts: Option<&FitAcceptCounts>) -> RefitBusy {
     let fit_one = |t: &mut Node| {
         let (x, y, w) = (&train.sample.x, &train.sample.y, &train.sample.w);
         let (iters, metric) = (cfg.fit_iters, cfg.metric);
@@ -6128,24 +6131,47 @@ fn refit_exact(trees: &mut [Node], train: &EvalSample, cfg: &Config, counts: Opt
     let workers = cfg.threads.max(1).min(trees.len().max(1)); // #463
     let blocks = expr::current_blocks();
     if workers > 1 && trees.len() > 1 {
-        let per = trees.len().div_ceil(workers);
-        std::thread::scope(|scope| {
-            for chunk in trees.chunks_mut(per) {
-                let blocks = blocks.clone();
-                let fit_one = &fit_one;
-                scope.spawn(move || {
-                    expr::set_blocks(blocks);
-                    for t in chunk.iter_mut() {
-                        fit_one(t);
-                    }
-                });
-            }
+        // #1438: one tree per claim; each tree is refit in place at its own index.
+        let slots: Vec<std::sync::Mutex<&mut Node>> = trees.iter_mut().map(std::sync::Mutex::new).collect();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let busy = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..workers)
+                .map(|_| {
+                    let blocks = blocks.clone();
+                    let (fit_one, slots, next) = (&fit_one, &slots, &next);
+                    scope.spawn(move || {
+                        expr::set_blocks(blocks);
+                        let start = std::time::Instant::now();
+                        loop {
+                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let Some(slot) = slots.get(i) else { break };
+                            fit_one(&mut slot.lock().unwrap());
+                        }
+                        start.elapsed().as_secs_f64()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect::<Vec<f64>>()
         });
+        RefitBusy {
+            min_s: busy.iter().copied().fold(f64::INFINITY, f64::min),
+            max_s: busy.iter().copied().fold(0.0, f64::max),
+        }
     } else {
+        let start = std::time::Instant::now();
         for t in trees.iter_mut() {
             fit_one(t);
         }
+        let s = start.elapsed().as_secs_f64();
+        RefitBusy { min_s: s, max_s: s }
     }
+}
+
+/// #1438: busy seconds of the least and the most loaded refit worker.
+#[derive(Clone, Copy, Debug, Default)]
+struct RefitBusy {
+    min_s: f64,
+    max_s: f64,
 }
 
 /// #15/#25/#27: full-data error of one tree; a dimensionally rejected
@@ -6253,7 +6279,9 @@ fn full_data_archive_with(
         // #284: only the exact CPU refit window, not the whole archive rebuild.
         if refit_on {
             let start = std::time::Instant::now();
-            refit_exact(&mut unique, train, cfg, counts);
+            let busy = refit_exact(&mut unique, train, cfg, counts);
+            report.refit_busy_min_s = busy.min_s;
+            report.refit_busy_max_s = busy.max_s;
             report.refits = unique.len();
             report.refit_s = start.elapsed().as_secs_f64();
         }
@@ -6280,7 +6308,9 @@ fn full_data_archive_with(
     let (front, refits) = refit_to_fixpoint(archive.cap, scored, first, |batch: Vec<Node>| {
         let start = std::time::Instant::now();
         let mut batch = batch;
-        refit_exact(&mut batch, train, cfg, counts);
+        let busy = refit_exact(&mut batch, train, cfg, counts);
+        report.refit_busy_min_s += busy.min_s;
+        report.refit_busy_max_s += busy.max_s;
         report.refit_s += start.elapsed().as_secs_f64();
         let start = std::time::Instant::now();
         let rescored = score_all(batch);
@@ -10461,6 +10491,7 @@ fn run_search(
     let refit_tail_s = refit_report.refit_s;
     run_ledger.record_stage(crate::gpu_stats::Stage::Fit, refit_tail_s);
     run_ledger.record_refit(gpu_fit_refits as u64, refit_tail_s);
+    run_ledger.record_refit_busy(refit_report.refit_busy_min_s, refit_report.refit_busy_max_s);
     let end_s = t0.elapsed().as_secs_f64();
     let tail_total = (end_s - pre_tail_elapsed).max(0.0);
     run_ledger.record_stage(crate::gpu_stats::Stage::Io, io_final_s);
@@ -15241,6 +15272,29 @@ mod tests {
         assert_eq!(report.path("survivor"), Some((0, 1)));
         assert_eq!(report.path("finalist"), Some((0, 1)));
         assert_eq!(report.totals(), (0, 3), "the always arm counts nothing");
+    }
+
+    /// #1438: trees go to workers one at a time and land at their own index,
+    /// so trees, counters and order do not depend on the worker count.
+    #[test]
+    fn refit_exact_is_independent_of_the_worker_count() {
+        let s = threshold_panel();
+        let base = accept_config(&s, FitAccept::Fitness);
+        let view = EvalSample::new(&s, &base);
+        let run = |threads: usize| {
+            let mut cfg = accept_config(&s, FitAccept::Fitness);
+            cfg.threads = threads;
+            let counts = FitAcceptCounts::default();
+            let mut trees: Vec<Node> = (0..13).map(|i| start_tree(0.1 + 0.07 * i as f64)).collect();
+            let busy = refit_exact(&mut trees, &view, &cfg, Some(&counts));
+            assert!(busy.min_s <= busy.max_s);
+            let hashes: Vec<u64> = trees.iter().map(expr::structural_hash).collect();
+            let bits: Vec<String> = trees.iter().map(|t| format!("{t:?}")).collect();
+            (hashes, bits, counts.snapshot().totals())
+        };
+        let one = run(1);
+        assert_eq!(run(2), one);
+        assert_eq!(run(4), one);
     }
 
     /// #1117: one tiny CPU run on the threshold panel with a development log;

@@ -1,4 +1,6 @@
-//! `rcsr` — command-line symbolic-regression engine.
+//! `rcsr` — command-line symbolic-reg            fit_refit_busy_min_s: outcome.gpu.as_ref().map(|g| g.ledger.refit_busy_min_s()),
+            fit_refit_busy_max_s: outcome.gpu.as_ref().map(|g| g.ledger.refit_busy_max_s()),
+ression engine.
 //!
 //! Designed to be driven by other programs (including AI agents):
 //! * everything machine-readable goes to **stdout**, anything human-facing to
