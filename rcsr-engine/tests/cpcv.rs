@@ -1092,8 +1092,7 @@ fn cpcv_refuses_values_outside_the_bound() {
 
 #[test]
 fn hole_covers_the_range_under_an_extreme_embargo() {
-    let b = std::hint::black_box;
-    let (a, z) = cpcv::hole(&b(Locked { start: 0, end: 100, embargo: i64::MAX }), b(10));
+    let (a, z) = cpcv::hole(&std::hint::black_box(Locked { start: 0, end: 100, embargo: i64::MAX }), std::hint::black_box(10));
     assert!(a <= -9, "the hole starts at or before the first reaching stamp: {a}");
     assert!(z >= 100, "the hole ends at or after the range end: {z}");
 }
