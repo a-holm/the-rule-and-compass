@@ -9,6 +9,9 @@
 /// Header of a splits table.
 pub const TABLE_HEADER: &str = "split_id,role,start,end";
 
+/// Largest magnitude of a stamp, and largest purge or embargo, in seconds.
+pub const MAX_SECONDS: i64 = 1 << 40;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
     Train,
@@ -203,6 +206,10 @@ fn inside(v: &[(i64, i64)], t: i64) -> bool {
 impl IntervalSplit {
     pub fn new(declared: Declared, purge: i64, embargo: i64, embargo_source: EmbargoSource, embargo_column: Option<String>) -> IntervalSplit {
         IntervalSplit { declared, purge: purge.max(0), embargo: embargo.max(0), embargo_source, embargo_column }
+    }
+
+    pub fn checked(declared: Declared, purge: i64, embargo: i64, embargo_source: EmbargoSource, embargo_column: Option<String>) -> Result<IntervalSplit, String> {
+        Ok(Self::new(declared, purge, embargo, embargo_source, embargo_column))
     }
 
     /// Role of a row stamped `t`: `None` when it lies outside every interval,
@@ -657,5 +664,118 @@ mod tests {
         assert!(s.reaching(2005, 3000, 10, 100).iter().any(|r| r.starts_with("test")));
         assert!(s.reaching(2010, 3000, 10, 100).is_empty());
         assert!(!s.reaching(-200, -95, 10, 100).is_empty(), "the embargo after a range reaches the first interval");
+    }
+
+    #[test]
+    fn reaches_is_exact_at_the_i64_edges() {
+        let b = std::hint::black_box;
+        let cases: [((i64, i64, i64, i64, i64), bool); 12] = [
+            ((0, 100, -5, 10, i64::MAX), true),
+            ((0, i64::MAX, -5, 10, 1), true),
+            ((0, 100, 100, 10, i64::MAX), true),
+            ((0, 100, -10, 10, i64::MAX), false),
+            ((i64::MIN, 0, i64::MIN, 0, 0), true),
+            ((0, 100, i64::MAX, i64::MAX, 0), false),
+            ((0, 100, -5, 10, 300), true),
+            ((0, 100, -9, 10, 300), true),
+            ((0, 100, -10, 10, 300), false),
+            ((0, 100, 399, 10, 300), true),
+            ((0, 100, 400, 10, 300), false),
+            ((0, 100, -1, 0, 0), false),
+        ];
+        for ((start, end, t, purge, embargo), want) in cases {
+            assert_eq!(reaches(b(start), b(end), b(t), b(purge), b(embargo)), want, "reaches({start}, {end}, {t}, {purge}, {embargo})");
+        }
+    }
+
+    #[test]
+    fn interval_reaches_is_exact_at_the_i64_edges() {
+        let b = std::hint::black_box;
+        let cases: [((i64, i64, i64, i64, i64, i64), bool); 7] = [
+            ((0, 100, -20, -4, 10, i64::MAX), true),
+            ((0, 100, -20, -9, 10, i64::MAX), false),
+            ((0, 100, 150, 200, 10, i64::MAX), true),
+            ((0, i64::MAX, -20, -4, 10, 1), true),
+            ((0, 100, -20, -4, 10, 300), true),
+            ((0, 100, -20, -9, 10, 300), false),
+            ((0, 100, 400, 500, 10, 300), false),
+        ];
+        for ((start, end, a, z, purge, embargo), want) in cases {
+            assert_eq!(
+                interval_reaches(b(start), b(end), b(a), b(z), b(purge), b(embargo)),
+                want,
+                "interval_reaches({start}, {end}, {a}, {z}, {purge}, {embargo})"
+            );
+        }
+        assert!(window_in_sample(&[(50, 60)], b(0), b(100), b(10), b(i64::MAX)));
+        assert!(!window_in_sample(&[(500, 600)], b(0), b(100), b(10), b(300)));
+    }
+
+    #[test]
+    fn role_and_effective_hold_under_an_extreme_embargo() {
+        let s = split(&[(-1000, 0), (100, 1000)], &[], &[(0, 100)], 10, std::hint::black_box(i64::MAX));
+        assert_eq!(s.role(-5), None, "label [-5, 5) reaches the test start");
+        assert_eq!(s.role(-10), Some(Role::Train));
+        assert_eq!(s.role(500), None, "inside the embargo after the test end");
+        assert_eq!(s.effective(Role::Train), vec![(-1000, -9)]);
+        let s = split(&[(-1000, 0)], &[], &[(0, i64::MAX)], 10, std::hint::black_box(1));
+        assert_eq!(s.role(-5), None, "a saturated test end");
+        assert_eq!(s.role(-10), Some(Role::Train));
+        assert_eq!(s.effective(Role::Train), vec![(-1000, -9)]);
+    }
+
+    #[test]
+    fn checked_refuses_unbounded_and_malformed_splits() {
+        let d = |train: &[(i64, i64)], validation: &[(i64, i64)], test: &[(i64, i64)]| Declared {
+            split_id: "c".to_string(),
+            train: train.to_vec(),
+            validation: validation.to_vec(),
+            test: test.to_vec(),
+        };
+        let check = |decl: Declared, purge: i64, embargo: i64| IntervalSplit::checked(decl, purge, embargo, EmbargoSource::Flag, None);
+        let good = d(&[(0, 100), (200, 300)], &[(100, 150)], &[(150, 200)]);
+        let refused = [
+            (good.clone(), 10, MAX_SECONDS + 1, "embargo"),
+            (good.clone(), MAX_SECONDS + 1, 10, "purge"),
+            (good.clone(), -1, 10, "purge"),
+            (d(&[(0, MAX_SECONDS + 1)], &[], &[]), 10, 10, "outside"),
+            (d(&[(100, 200), (0, 50)], &[], &[]), 10, 10, "sorted"),
+            (d(&[(0, 100)], &[(50, 150)], &[]), 10, 10, "overlaps"),
+            (d(&[(5, 5)], &[], &[]), 10, 10, "empty"),
+        ];
+        for (decl, purge, embargo, word) in refused {
+            let e = check(decl.clone(), purge, embargo).expect_err(&format!("{decl:?} purge {purge} embargo {embargo}"));
+            assert!(e.contains(word), "{decl:?} purge {purge} embargo {embargo}: {e}");
+        }
+        assert_eq!(check(good.clone(), 10, 20), Ok(IntervalSplit::new(good, 10, 20, EmbargoSource::Flag, None)));
+        let edge = d(&[(-MAX_SECONDS, 0)], &[], &[(0, MAX_SECONDS)]);
+        assert_eq!(
+            check(edge.clone(), MAX_SECONDS, MAX_SECONDS),
+            Ok(IntervalSplit::new(edge, MAX_SECONDS, MAX_SECONDS, EmbargoSource::Flag, None))
+        );
+    }
+
+    #[test]
+    fn resolve_embargo_refuses_a_value_above_the_bound() {
+        let e = resolve_embargo(Some(MAX_SECONDS + 1), H, &[], H).unwrap_err();
+        assert!(e.contains("--embargo") && e.contains("1099511627776"), "{e}");
+        assert_eq!(resolve_embargo(Some(MAX_SECONDS), H, &[], H), Ok((MAX_SECONDS, EmbargoSource::Flag, None)));
+        let huge = "r16_lag9223372036854775807".to_string();
+        assert!(column_lookback(&huge, H) >= 0);
+        let e = resolve_embargo(None, H, &[huge], H).unwrap_err();
+        assert!(e.contains("r16_lag9223372036854775807") && e.contains("outside"), "{e}");
+    }
+
+    #[test]
+    fn table_stamps_outside_the_bound_are_refused() {
+        for end in ["1e19", "9223372036854775807"] {
+            let text = format!("split_id,role,start,end\ns,train,0,100\ns,test,100,{end}\n");
+            let e = parse_table(&text, "s").unwrap_err();
+            assert!(e.contains("outside") && e.contains("line 3"), "{e}");
+        }
+        let over = format!("split_id,role,start,end\ns,train,{},0\n", -MAX_SECONDS - 1);
+        assert!(parse_table(&over, "s").unwrap_err().contains("outside"));
+        let edge = format!("split_id,role,start,end\ns,train,{},0\ns,test,0,{}\n", -MAX_SECONDS, MAX_SECONDS);
+        assert_eq!(parse_table(&edge, "s").unwrap().test, vec![(0, MAX_SECONDS)]);
     }
 }

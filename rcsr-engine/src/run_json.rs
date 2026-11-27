@@ -433,3 +433,44 @@ impl RunFile {
         Ok(flags)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::intervals::{Declared, EmbargoSource, IntervalSplit};
+
+    const SPLIT: &str = "{\"split_id\":\"s\",\"intervals\":{\"train\":[[0,100],[200,300]],\"validation\":[[100,150]],\"test\":[[150,200]]},\
+                         \"interval_purge_seconds\":10,\"embargo_seconds\":20,\"embargo_source\":\"flag\"}";
+
+    fn split_of(text: &str) -> Result<Option<IntervalSplit>, String> {
+        run_intervals(Some(&Json::parse(text).unwrap_or_else(|| panic!("not json: {text}"))))
+    }
+
+    #[test]
+    fn run_intervals_refuses_malformed_splits() {
+        let d = Declared { split_id: "s".to_string(), train: vec![(0, 100), (200, 300)], validation: vec![(100, 150)], test: vec![(150, 200)] };
+        assert_eq!(split_of(SPLIT), Ok(Some(IntervalSplit::checked(d, 10, 20, EmbargoSource::Flag, None).unwrap())));
+        for (from, to) in [
+            ("[[0,100],[200,300]]", "[[200,300],[0,100]]"),
+            ("\"validation\":[[100,150]]", "\"validation\":[[50,150]]"),
+            ("\"test\":[[150,200]]", "\"test\":[[1.5,200]]"),
+            ("\"embargo_seconds\":20", "\"embargo_seconds\":1e19"),
+            ("\"interval_purge_seconds\":10", "\"interval_purge_seconds\":-1"),
+        ] {
+            let text = SPLIT.replace(from, to);
+            assert_ne!(text, SPLIT, "{from}");
+            assert!(split_of(&text).is_err(), "{to}: {:?}", split_of(&text));
+        }
+    }
+
+    #[test]
+    fn an_empty_or_non_finite_window_is_in_sample() {
+        let text = "{\"pareto\":[],\"split\":{\"split_id\":\"s\",\"intervals\":{\"train\":[[0,100]],\"validation\":[],\"test\":[]},\
+                    \"interval_purge_seconds\":10,\"embargo_seconds\":20,\"embargo_source\":\"flag\"}}";
+        let run = RunFile::parse(text).unwrap();
+        for (start, end) in [(500.0, 500.0), (600.0, 500.0), (f64::NAN, 500.0), (500.0, f64::INFINITY)] {
+            assert!(run.in_sample_window(start, end), "[{start}, {end})");
+        }
+        assert!(!run.in_sample_window(500.0, 600.0));
+    }
+}

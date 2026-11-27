@@ -1700,4 +1700,55 @@ mod tests {
     fn lockbox_date(y: i32, m: u32, d: u32) -> i64 {
         crate::ohlcv::days_from_civil(y, m, d) * 86_400
     }
+
+    #[test]
+    fn lockbox_reaches_is_exact_at_the_i64_edges() {
+        let b = std::hint::black_box;
+        let l = Lockbox { start: 0, end: 100 };
+        assert!(l.reaches(b(-5), b(10), b(i64::MAX)), "label [-5, 5) reaches the start");
+        assert!(l.reaches(b(100), b(10), b(i64::MAX)), "inside the embargo after the end");
+        assert!(!l.reaches(b(-10), b(10), b(i64::MAX)));
+        let first = l.first_reaching(b(i64::MAX));
+        assert!(first <= 0, "{first}");
+        assert_eq!(Lockbox { start: i64::MIN + 3, end: 0 }.first_reaching(b(10)), i64::MIN, "the stamp i64::MIN reaches the range");
+        let mut x = 1467u64;
+        let mut draw = |lo: i64, n: u64| -> i64 {
+            x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = x;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            lo + ((z ^ (z >> 31)) % n) as i64
+        };
+        for _ in 0..1000 {
+            let start = draw(-300, 600);
+            let l = Lockbox { start, end: start + draw(1, 300) };
+            let (t, p, e) = (draw(-700, 1400), draw(-50, 250), draw(-50, 250));
+            assert_eq!(l.reaches(t, p, e), crate::intervals::reaches(l.start, l.end, t, p, e), "{l:?} t {t} purge {p} embargo {e}");
+        }
+    }
+
+    #[test]
+    fn resolve_refuses_an_embargo_or_a_range_outside_the_bound() {
+        let max = crate::intervals::MAX_SECONDS;
+        let d = resolve_dir("bound");
+        let data = d.join("a.rcsb").to_str().unwrap().to_string();
+        declare(&data, "enrich.json", &stored());
+        let e = resolve_with(None, Some("9223372036854775807"), &data).unwrap_err();
+        assert_eq!(e.exit, 2, "{}", e.message);
+        assert!(e.message.contains("--lockbox-embargo") && e.message.contains("1099511627776"), "{}", e.message);
+        assert_eq!(resolve_with(None, Some(&max.to_string()), &data).unwrap().embargo.seconds, max);
+        std::fs::write(format!("{}.manifest.json", data), "{\"lockbox_embargo\":{\"seconds\":9223372036854775807}}").unwrap();
+        let e = resolve(None, &data).unwrap_err();
+        assert_eq!(e.exit, 3, "{}", e.message);
+        assert!(e.message.contains("1099511627776"), "{}", e.message);
+        let undeclared = resolve_dir("bound-flag").join("b.csv").to_str().unwrap().to_string();
+        let e = resolve(Some("0,9223372036854775807"), &undeclared).unwrap_err();
+        assert_eq!(e.exit, 2, "{}", e.message);
+        assert!(e.message.contains("--lockbox") && e.message.contains("outside"), "{}", e.message);
+        let far = resolve_dir("bound-file").join("c.rcsb").to_str().unwrap().to_string();
+        std::fs::write(format!("{}.lockbox.json", far), "{\"locked_test\":{\"start\":0,\"end\":9223372036854775807}}").unwrap();
+        let e = resolve(None, &far).unwrap_err();
+        assert_eq!(e.exit, 3, "{}", e.message);
+        assert!(e.message.contains("outside"), "{}", e.message);
+    }
 }
