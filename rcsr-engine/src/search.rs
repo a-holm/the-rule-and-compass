@@ -1228,7 +1228,7 @@ impl Ind {
     /// simplification leaves the tree unchanged. Records the confirmation after
     /// any CPU probe or score.
     fn reeval_carried(&mut self, train: &EvalSample, cfg: &Config, rows: Option<u64>) -> bool {
-        if rows.is_some() && self.inf_rows == rows && self.error == f64::INFINITY && cfg.qd_bins == 0 {
+        if rows.is_some() && self.inf_rows == rows && self.error == f64::INFINITY {
             let simplified = expr::simplify(&self.tree);
             if simplified == self.tree {
                 self.complexity = cfg.complexity_model.complexity(&simplified);
@@ -13866,9 +13866,9 @@ mod tests {
         assert_eq!(GenCounters::total(Some(&counters), |c| &c.reevals), 0);
     }
 
-    /// #500: a `+inf` confirmed on the CPU for these rows is kept without a
-    /// score; unconfirmed, other rows, a descriptor run and an unsimplified
-    /// tree all take the full pass.
+    /// #500, #1437: a `+inf` confirmed on the CPU for these rows is kept without
+    /// a score, also under a descriptor run; unconfirmed and other rows take
+    /// the full pass.
     #[test]
     fn confirmed_inf_is_kept_on_the_same_rows_only() {
         let s = sample();
@@ -13898,7 +13898,28 @@ mod tests {
         qd.qd_bins = 4;
         let qd_data = EvalSample::new(&s, &qd);
         let mut descriptor_run = confirmed(Some(0));
-        assert!(descriptor_run.reeval_carried(&qd_data, &qd, Some(0)));
+        assert!(!descriptor_run.reeval_carried(&qd_data, &qd, Some(0)), "a descriptor run keeps it too");
+        assert_eq!(descriptor_run.error, f64::INFINITY);
+        assert_eq!(descriptor_run.inf_rows, Some(0));
+        assert!(descriptor_run.descriptor.is_none());
+
+        for ind in inf_population(&qd_data, &qd) {
+            let mut full = ind.clone();
+            full.reeval(&qd_data, &qd);
+            let mut carried = ind.clone();
+            carried.inf_rows = ind.error.is_infinite().then_some(0);
+            carried.reeval_carried(&qd_data, &qd, Some(0));
+            assert_eq!(full.tree, carried.tree);
+            assert_eq!(full.error.to_bits(), carried.error.to_bits());
+            assert_eq!(full.complexity.to_bits(), carried.complexity.to_bits());
+            if carried.error == f64::INFINITY {
+                assert_eq!(
+                    full.descriptor.or_else(|| Some(qd_descriptor_of(&full.tree, &qd_data, &qd))),
+                    Some(qd_descriptor_of(&carried.tree, &qd_data, &qd)),
+                    "the victim recompute gives the descriptor a pass would"
+                );
+            }
+        }
 
         for ind in inf_population(&data, &cfg) {
             let mut full = ind.clone();
