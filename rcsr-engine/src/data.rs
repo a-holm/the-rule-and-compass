@@ -3147,14 +3147,14 @@ fn prepare_full_targets_weighted_inner(
             let mut cut = m - vn;
             // #257: a timestamp never straddles fit-train and validation.
             if let Some(keys) = &order_keys {
-                while mutation() != 4 && cut > 0 && keys.cmp(order[cut - 1], order[cut]) == std::cmp::Ordering::Equal {
+                while cut > 0 && keys.cmp(order[cut - 1], order[cut]) == std::cmp::Ordering::Equal {
                     cut -= 1;
                 }
             }
             let vn = m - cut;
             let gap = spec.gap.min(cut.saturating_sub(1));
             let fit_cut = cut - gap;
-            validation_idx = order[if mutation() == 3 { cut.saturating_sub(1) } else { cut }..].to_vec();
+            validation_idx = order[cut..].to_vec();
             train_idx = order[..fit_cut].to_vec();
             report.purged_validation_rows = gap;
             report.notes.push(format!(
@@ -3203,7 +3203,7 @@ fn prepare_full_targets_weighted_inner(
         train_idx = purge_near(st, std::mem::take(&mut train_idx), &test_times, l);
         validation_idx = purge_near(st, std::mem::take(&mut validation_idx), &test_times, l);
         report.purged_test_boundary_rows = before - train_idx.len() - validation_idx.len();
-        if !validation_idx.is_empty() && mutation() != 6 {
+        if !validation_idx.is_empty() {
             let val_times = sorted_finite(st, &validation_idx);
             let before = train_idx.len();
             train_idx = purge_near(st, std::mem::take(&mut train_idx), &val_times, l);
@@ -4355,9 +4355,6 @@ fn interval_split(t: &Table, spec: &SplitSpec) -> Result<(Vec<usize>, Vec<usize>
                 let held = |v: &[(i64, i64)]| v.iter().any(|&(a, b)| a <= ts && ts < b);
                 if held(&d.train) || held(&d.validation) {
                     report.interval_dropped_rows += 1;
-                    if mutation() == 8 && held(&d.train) {
-                        train.push(i);
-                    }
                 } else {
                     report.interval_outside_rows += 1;
                 }
@@ -4587,7 +4584,7 @@ fn build_split(
                     notes.push("kept at least one group for testing".to_string());
                 }
             }
-            let train: Vec<usize> = if mutation() == 7 { (0..n).collect() } else { (0..n).filter(|&i| !is_test[ids[i]]).collect() };
+            let train: Vec<usize> = (0..n).filter(|&i| !is_test[ids[i]]).collect();
             let test_groups: Vec<usize> = order.iter().copied().filter(|&g| is_test[g]).collect();
             let ids = &ids;
             let test: Vec<usize> = test_groups
@@ -4742,9 +4739,7 @@ fn check_split_lockbox(
         report.lockbox_embargo_source = d.embargo.source.as_str();
         let name = t.names.get(tc).map(String::as_str).unwrap_or("time");
         let floored = label_floored(d, spec);
-        if mutation() != 10 {
-            floored.check_times("training split", name, &train_times, boundary_purge)?;
-        }
+        floored.check_times("training split", name, &train_times, boundary_purge)?;
         floored.check_times("validation split", name, &validation_times, boundary_purge)?;
         floored.check_times("test split", name, &test_times, boundary_purge)?;
     }
@@ -4815,7 +4810,7 @@ fn purge_near(stamps: &[f64], rows: Vec<usize>, sorted: &[f64], l: f64) -> Vec<u
     rows.into_iter()
         .filter(|&i| {
             let x = stamps[i];
-            !x.is_finite() || !(nearest_distance(x, sorted) < if mutation() == 5 { l / 2.0 } else { l })
+            !x.is_finite() || !(nearest_distance(x, sorted) < l)
         })
         .collect()
 }
@@ -4843,12 +4838,12 @@ fn split_ordered(order: &[usize], spec: &SplitSpec, folds: usize) -> Option<(Vec
     let test_n = ((m as f64) * spec.test_frac).round() as usize;
     let test_n = test_n.clamp(1, m - 1);
     let train_n = m - test_n;
-    let from = if mutation() == 1 { train_n.min(m - 1) } else { (train_n + spec.gap).min(m - 1) };
+    let from = (train_n + spec.gap).min(m - 1);
     let tail = &order[from..];
     if tail.is_empty() {
         return None;
     }
-    Some((order[..if mutation() == 2 { train_n + 1 } else { train_n }].to_vec(), split_blocks(tail, folds)))
+    Some((order[..train_n].to_vec(), split_blocks(tail, folds)))
 }
 
 /// Chop a sequence into `folds` contiguous, near-equal, non-empty blocks.
@@ -4857,7 +4852,7 @@ fn split_blocks(idx: &[usize], folds: usize) -> Vec<Vec<usize>> {
     let mut out = Vec::with_capacity(folds);
     for k in 0..folds {
         let a = idx.len() * k / folds;
-        let b = if mutation() == 9 { (idx.len() * (k + 1) / folds + 1).min(idx.len()) } else { idx.len() * (k + 1) / folds };
+        let b = idx.len() * (k + 1) / folds;
         if b > a {
             out.push(idx[a..b].to_vec());
         }
@@ -6899,9 +6894,4 @@ mod tests {
             }
         }
     }
-}
-
-fn mutation() -> u32 {
-    static M: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *M.get_or_init(|| std::env::var("RC_MUT").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
 }
