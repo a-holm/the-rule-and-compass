@@ -40,3 +40,57 @@ file = "rcsr-engine/src/trials_table.rs"
 anchor = "fn nan_low(v: f64) -> f64 {"
 close = "}"
 sha256 = "1bd768d2ee288a38894c3d74a9672667b4be141d816a59457a4edc6b8e4ddcea"
+
+[[model]]
+id = "try_insert"
+project = "P2"
+lean = "formal/core/RcsrCore/Pareto/Insert.lean"
+
+[[model.span]]
+role = "modelled"
+file = "rcsr-engine/src/pareto.rs"
+anchor = "pub fn try_insert_view("
+close = "}"
+sha256 = "73c18aef47364ab996567e943749861c8b1c08263e3b5ab4d12d608b62caff36"
+
+[[model.span]]
+role = "modelled"
+file = "rcsr-engine/src/pareto.rs"
+anchor = "fn prune(&mut self) {"
+close = "}"
+sha256 = "fb476918c43e7c42cf9cf84546082d58e1c63587948ff067ee7499b6937510b8"
+
+[[model.span]]
+role = "modelled"
+file = "rcsr-engine/src/pareto.rs"
+anchor = "pub fn admits(&self, error: f64, cost: f64) -> bool {"
+close = "}"
+sha256 = "c8993375f1044106da26c21ed1493d38ebcdaf66d4dbb5face6d60d815c6d4a9"
+
+[[model.span]]
+role = "assumption"
+file = "rcsr-engine/src/pareto.rs"
+anchor = "fn dominates(a_e: f64, a_c: f64, b_e: f64, b_c: f64) -> bool {"
+close = "}"
+sha256 = "82470fef4d9a6fef7ac03254babf99ab8fc69ae0ada62add3dfe8585f77bef4c"
+
+[[model.span]]
+role = "modelled"
+file = "rcsr-engine/src/pareto.rs"
+anchor = "pub fn new(cap: usize) -> Self {"
+close = "}"
+sha256 = "05b3237eddad653cee32e6b6e4c5c706960d0a9e0671fc06cf6635560ed5f6c1"
+
+[[model.span]]
+role = "modelled"
+file = "rcsr-engine/src/error_order.rs"
+anchor = "fn class(v: f64) -> u8 {"
+close = "}"
+sha256 = "fcc4aac67dc15fd35010302bd176c77b95e97165dcde3e46255fc9889e5b421b"
+
+[[model.span]]
+role = "modelled"
+file = "rcsr-engine/src/error_order.rs"
+anchor = "pub fn cmp_error(a: f64, b: f64) -> Ordering {"
+close = "}"
+sha256 = "bf84a03090f6bccbde1f266f8c0bc4c344505e940d5c1dd48e648c5ef17df77a"
