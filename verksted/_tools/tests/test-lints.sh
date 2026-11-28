@@ -15,14 +15,14 @@ check() {
     fails=$((fails + 1))
   fi
 }
-NAMES="test_attributes rcsr_command_lint test_hygiene device_skip_lint no_python sanitizer_plan sanitizer_child_env stdin_write_lint conflict_markers no_banned_words lockbox_literal cpu_config_lint"
+NAMES="test_attributes rcsr_command_lint test_hygiene device_skip_lint no_python sanitizer_plan sanitizer_child_env stdin_write_lint conflict_markers no_banned_words lockbox_literal cpu_config_lint formal_sync"
 want=
 for n in $NAMES; do want="$want --test $n"; done
 want=${want# }
 
 check full-list "$(env -u RCSR_CRATE bash "$S" 2> "$T/err")" "$want"
 check full-list-silent "$(wc -c < "$T/err" | tr -d ' ')" 0
-check full-list-count "$(bash "$S" 2> /dev/null | grep -o -e '--test' | wc -l | tr -d ' ')" 12
+check full-list-count "$(bash "$S" 2> /dev/null | grep -o -e '--test' | wc -l | tr -d ' ')" 13
 
 mkdir -p "$T/tree/pkg/tests"
 printf '[package]\nname = "rule-and-compass"\nversion = "0.1.0"\n' > "$T/tree/pkg/Cargo.toml"
@@ -41,7 +41,7 @@ cp "$T/tree/pkg/Cargo.toml" "$T/empty/pkg/"
 out=$(env -u RCSR_CRATE bash "$S" --tree "$T/empty" 2> "$T/err"); rc=$?
 check tree-empty-rc "$rc" 0
 check tree-empty-out "$out" ""
-check tree-empty-skips "$(wc -l < "$T/err" | tr -d ' ')" 12
+check tree-empty-skips "$(wc -l < "$T/err" | tr -d ' ')" 13
 
 mkdir -p "$T/nocrate"
 env -u RCSR_CRATE bash "$S" --tree "$T/nocrate" > /dev/null 2>&1; check no-crate-rc $? 1

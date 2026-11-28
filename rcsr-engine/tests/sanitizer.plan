@@ -56,6 +56,7 @@ check_rows_bits        *  no-cuda  CPU-only host mirror tests; no CUDA call
 fit_portfolio          *  no-cuda  CPU fits and a mock GPU fitter; no CUDA call
 fit_portfolio_bench    *  no-cuda  its tests are ignored (measurement or external data): 0 tests run and none calls CUDA
 fit_stream_store       *  no-cuda  CPU-only tests; no CUDA call
+formal_sync            *  no-cuda  reads formal/models.toml and source files and hashes text; no CUDA call
 inference              *  no-cuda  CPU-only tests; no CUDA call
 ladder                 *  no-cuda-app-only  every rcsr child runs with RCSR_GPU=0 (tests/common/rcsr.rs); no CUDA call; memcheck runs with --target-processes application-only because the binary spawns processes and the default all crashes the sanitizer on a process tree (#910)
 leakage                *  no-cuda  CPU-only tests; no CUDA call
