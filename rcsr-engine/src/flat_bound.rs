@@ -25,6 +25,8 @@
 use crate::expr::{Node, Op};
 use std::hint::black_box;
 
+pub mod rows;
+
 /// Pieces kept per node and per column.
 pub const MAX_PIECES: usize = 6;
 /// libm widening in ulps on each side of an `exp` or `tanh` endpoint: `2E`
@@ -708,5 +710,243 @@ mod tests {
         }
         assert_eq!(violations, 0, "{non_nan} non-NaN values, {claims} flat claims");
         assert!(non_nan > 1_000_000 && claims > 100, "{non_nan} {claims}");
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod row_tests {
+    use super::rows::*;
+    use crate::expr::{constant, input, node, Node, Op};
+
+    pub(crate) struct Rng(pub(crate) u64);
+
+    impl Rng {
+        pub(crate) fn u(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        pub(crate) fn f(&mut self) -> f64 {
+            (self.u() >> 11) as f64 / (1u64 << 53) as f64
+        }
+        pub(crate) fn pick(&mut self, n: usize) -> usize {
+            (self.u() % n as u64) as usize
+        }
+        pub(crate) fn special(&mut self) -> f64 {
+            let s = if self.u() & 1 == 0 { 1.0 } else { -1.0 };
+            match self.pick(14) {
+                0 => 0.0,
+                1 => -0.0,
+                2 => s * 1e-12,
+                3 => s * 9.9e-13,
+                4 => s * 1e6,
+                5 => s * 700.0,
+                6 => s * 709.78,
+                7 => s * 10f64.powf(self.f() * 40.0 - 30.0),
+                8 => s * 5e-324,
+                9 => s * f64::INFINITY,
+                10 => f64::NAN,
+                11 => s * 1.0,
+                12 => s * self.f() * 20.0,
+                _ => s * 10f64.powf(self.f() * 6.0 - 3.0),
+            }
+        }
+    }
+
+    fn un(op: Op, a: Node) -> Node {
+        node(op, vec![a])
+    }
+
+    fn bin(op: Op, a: Node, b: Node) -> Node {
+        node(op, vec![a, b])
+    }
+
+    pub(crate) fn tree14(r: &mut Rng, depth: u32, vars: usize, pool: &mut Vec<Node>) -> Node {
+        if depth == 0 || r.pick(4) == 0 {
+            return if r.pick(2) == 0 { constant(r.special()) } else { input(r.pick(vars)) };
+        }
+        if !pool.is_empty() && r.pick(6) == 0 {
+            return pool[r.pick(pool.len())].clone();
+        }
+        let kid = |r: &mut Rng, pool: &mut Vec<Node>| tree14(r, depth - 1, vars, pool);
+        let t = match r.pick(17) {
+            0 => un(Op::Neg, kid(r, pool)),
+            1 => un(Op::Abs, kid(r, pool)),
+            2 => un(Op::Square, kid(r, pool)),
+            3 => un(Op::Exp, kid(r, pool)),
+            4 => un(Op::Tanh, kid(r, pool)),
+            5 => un(Op::Logistic, kid(r, pool)),
+            6 => un(Op::Gauss, kid(r, pool)),
+            7 => bin(Op::Add, kid(r, pool), kid(r, pool)),
+            8 => bin(Op::Sub, kid(r, pool), kid(r, pool)),
+            9 => bin(Op::Mul, kid(r, pool), kid(r, pool)),
+            10 => bin(Op::Div, kid(r, pool), kid(r, pool)),
+            11 => bin(Op::Min, kid(r, pool), kid(r, pool)),
+            12 => bin(Op::Max, kid(r, pool), kid(r, pool)),
+            13 => bin(Op::Greater, kid(r, pool), kid(r, pool)),
+            14 => node(Op::If, vec![kid(r, pool), kid(r, pool), kid(r, pool)]),
+            15 => {
+                let k = kid(r, pool);
+                bin(Op::Sub, k.clone(), k)
+            }
+            _ => {
+                let k = kid(r, pool);
+                bin(if r.pick(2) == 0 { Op::Mul } else { Op::Div }, k.clone(), k)
+            }
+        };
+        pool.push(t.clone());
+        t
+    }
+
+    #[derive(Default)]
+    struct Tally {
+        rows: u64,
+        nan: u64,
+        point_rows: u64,
+        classes: [u64; 5],
+        violations: u64,
+    }
+
+    /// Every property of the row state against the CPU evaluator for one tree.
+    fn check_tree(tree: &Node, columns: &[Vec<f64>], ts: &[Thresholds], tally: &mut Tally) {
+        let n = columns[0].len();
+        let words = compile_check_program(tree, columns.len()).expect("encodable");
+        // `greater` has no SoA instruction: the CPU check then walks the tree with `expr::eval`
+        let mut soa = vec![0.0f64; n];
+        match crate::eval_soa::compile(tree) {
+            Some(prog) => {
+                let mut scratch = crate::eval_soa::Scratch::new();
+                crate::eval_soa::eval_rows_into(&prog, columns, 0, n, &mut soa, &mut scratch);
+            }
+            None => (0..n).for_each(|r| soa[r] = crate::expr::eval(tree, &columns.iter().map(|c| c[r]).collect::<Vec<_>>())),
+        }
+        for row in 0..n {
+            let x: Vec<f64> = columns.iter().map(|c| c[row]).collect();
+            let v = soa[row];
+            let reference = crate::expr::eval(tree, &x);
+            assert!(
+                (v.is_nan() && reference.is_nan()) || v.to_bits() == reference.to_bits() || (v == 0.0 && reference == 0.0),
+                "evaluators differ: {tree:?} row {x:?}: soa {v:e} eval {reference:e}"
+            );
+            let iv = row_iv(&words, &|k| columns[k][row]);
+            tally.rows += 1;
+            tally.nan += v.is_nan() as u64;
+            tally.point_rows += (iv.lo == iv.hi && iv.nan == NAN_NO) as u64;
+            let mut bad = |why: &str| {
+                tally.violations += 1;
+                if tally.violations <= 8 {
+                    eprintln!("violation {why}: {tree:?} row {x:?} value {v:e} state {iv:?}");
+                }
+            };
+            if iv.lo.is_nan() || iv.hi.is_nan() {
+                bad("NaN endpoint");
+            }
+            if v.is_nan() && iv.nan == NAN_NO {
+                bad("NaN value, nan == 0");
+            }
+            if iv.nan == NAN_CERTAIN && !v.is_nan() {
+                bad("nan == 2, value not NaN");
+            }
+            if !v.is_nan() && iv.nan != NAN_CERTAIN && !(iv.lo <= v && v <= iv.hi) {
+                bad("value outside the interval");
+            }
+            for &t in ts {
+                let cls = classify(iv, t);
+                tally.classes[cls as usize] += 1;
+                let want = class_of_value(v, t);
+                let ok = match cls {
+                    RowClass::Undecided => true,
+                    c => c == want,
+                };
+                if !ok {
+                    bad(&format!("class {cls:?}, CPU {want:?}"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn row_state_contains_eval() {
+        let (trees, rows, vars) = (20_000usize, 200usize, 3usize);
+        let ts = [Thresholds::new(0.0, 0.0).unwrap(), Thresholds::new(0.25, 0.5).unwrap()];
+        let mut r = Rng(0x2545_f491_4f6c_dd1d);
+        let mut tally = Tally::default();
+        for _ in 0..trees {
+            let mut pool = Vec::new();
+            let tree = tree14(&mut r, 4, vars, &mut pool);
+            let columns: Vec<Vec<f64>> = (0..vars)
+                .map(|_| {
+                    let pick: Vec<f64> = (0..1 + r.pick(8)).map(|_| r.special()).collect();
+                    (0..rows).map(|_| pick[r.pick(pick.len())]).collect()
+                })
+                .collect();
+            if compile_check_program(&tree, vars).is_none() {
+                continue;
+            }
+            check_tree(&tree, &columns, &ts, &mut tally);
+        }
+        let e = |x: Node| un(Op::Exp, x);
+        let named = [
+            bin(Op::Sub, un(Op::Logistic, bin(Op::Sub, e(input(0)), e(input(1)))), constant(2.0)),
+            bin(Op::Sub, constant(0.0), bin(Op::Mul, e(input(0)), e(input(1)))),
+            un(Op::Tanh, bin(Op::Div, input(0), bin(Op::Sub, input(1), input(1)))),
+            un(Op::Gauss, bin(Op::Mul, constant(1e6), input(0))),
+            un(Op::Logistic, bin(Op::Sub, input(2), constant(3423.03))),
+            bin(Op::Sub, input(1), input(1)),
+            e(e(input(0))),
+            node(Op::If, vec![bin(Op::Greater, input(0), input(1)), input(2), e(input(1))]),
+        ];
+        let specials = [0.0, -0.0, 1e-12, 9.9e-13, 700.0, 709.78, 1e6, 5e-324, f64::INFINITY, f64::NEG_INFINITY, f64::NAN, 1.0, -1.0, 3423.03, 2.0, -2.0];
+        let columns: Vec<Vec<f64>> = (0..vars)
+            .map(|v| (0..specials.len() * specials.len()).map(|k| specials[(if v == 0 { k } else { k / specials.len() + v }) % specials.len()]).collect())
+            .collect();
+        for t in &named {
+            check_tree(t, &columns, &ts, &mut tally);
+        }
+        assert_eq!(tally.violations, 0, "{} rows, {} NaN rows", tally.rows, tally.nan);
+        assert!(tally.rows > 3_000_000 && tally.nan > 100_000, "{} {}", tally.rows, tally.nan);
+        let decided = tally.classes[..4].iter().sum::<u64>() as f64 / tally.classes.iter().sum::<u64>() as f64;
+        println!("rows {} nan {} point rows {} classes {:?} decided share {decided:.3}", tally.rows, tally.nan, tally.point_rows, tally.classes);
+        assert!(decided > 0.5);
+    }
+
+    #[test]
+    fn encoder_refuses_what_it_cannot_decide() {
+        let c = |op| bin(op, input(0), constant(1.0));
+        for op in [Op::Pow, Op::Mod, Op::Less, Op::Atan2] {
+            assert!(compile_check_program(&c(op), 1).is_none(), "{op:?}");
+        }
+        assert!(compile_check_program(&un(Op::Ln, input(0)), 1).is_none());
+        assert!(compile_check_program(&input(1), 1).is_none(), "column outside the data");
+        assert!(compile_check_program(&node(Op::Add, vec![input(0)]), 1).is_none());
+        let mut deep = input(0);
+        for _ in 0..16 {
+            deep = bin(Op::Add, input(0), deep);
+        }
+        assert!(compile_check_program(&deep, 1).is_none(), "17 levels exceed the stack");
+        let mut ok = input(0);
+        for _ in 0..14 {
+            ok = bin(Op::Add, input(0), ok);
+        }
+        assert!(compile_check_program(&ok, 1).is_some());
+        for op in [Op::Min, Op::Max, Op::Greater] {
+            assert!(compile_check_program(&c(op), 1).is_some(), "{op:?}");
+        }
+        assert!(compile_check_program(&node(Op::If, vec![input(0), input(0), constant(2.0)]), 1).is_some());
+    }
+
+    #[test]
+    fn select_hull_does_not_claim_certain_nan() {
+        // cond undecided, then-branch certainly NaN, else-branch finite: the row may be finite
+        let tree = node(Op::If, vec![input(0), bin(Op::Div, constant(1.0), constant(0.0)), constant(2.0)]);
+        let w = compile_check_program(&tree, 1).unwrap();
+        let v = row_iv(&w, &|_| f64::NAN);
+        assert_eq!((v.lo, v.hi, v.nan), (2.0, 2.0, NAN_NO), "NaN condition takes the else branch");
+        let cond = bin(Op::Sub, un(Op::Exp, input(0)), constant(1.0));
+        let nan_then = bin(Op::Div, constant(1.0), constant(0.0));
+        let undecided = node(Op::If, vec![cond, nan_then, constant(2.0)]);
+        let v = row_iv(&compile_check_program(&undecided, 1).unwrap(), &|_| 0.0);
+        assert_eq!((v.lo, v.hi, v.nan), (2.0, 2.0, NAN_MAYBE), "undecided condition: the NaN branch may be taken");
     }
 }
