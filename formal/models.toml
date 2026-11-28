@@ -40,3 +40,29 @@ file = "rcsr-engine/src/trials_table.rs"
 anchor = "fn nan_low(v: f64) -> f64 {"
 close = "}"
 sha256 = "1bd768d2ee288a38894c3d74a9672667b4be141d816a59457a4edc6b8e4ddcea"
+
+[[model]]
+id = "f64_add"
+project = "P3"
+lean = "formal/core/RcsrCore/F64.lean"
+vectors = "f64_add"
+
+[[model.span]]
+role = "mirror"
+file = "rcsr-engine/src/formal_vectors.rs"
+anchor = "fn f64_add_row(a: u64, b: u64) -> [u64; 3] {"
+close = "}"
+sha256 = "f89762445be388ead258f23e32f4b85957b7febc8e9d1c0682b2a18a2fde177b"
+
+[[model]]
+id = "f64_sub"
+project = "P3"
+lean = "formal/core/RcsrCore/F64.lean"
+vectors = "f64_sub"
+
+[[model.span]]
+role = "mirror"
+file = "rcsr-engine/src/formal_vectors.rs"
+anchor = "fn f64_sub_row(a: u64, b: u64) -> [u64; 3] {"
+close = "}"
+sha256 = "dc045fa612c09b5d2ad1c4372719a929313dff29035478964b56f6177788c8e1"

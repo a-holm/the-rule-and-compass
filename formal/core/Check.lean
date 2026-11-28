@@ -22,6 +22,8 @@ structure Model where
 def model (name : String) : Option Model :=
   match name with
   | "cmp_error" => some ⟨"w,w->w", 2, 1, fun a => #[ordCode (ErrorOrder.cmpError a[0]! a[1]!)]⟩
+  | "f64_add" => some ⟨"w,w->w", 2, 1, fun a => #[F64.add a[0]! a[1]!]⟩
+  | "f64_sub" => some ⟨"w,w->w", 2, 1, fun a => #[F64.sub a[0]! a[1]!]⟩
   | _ => none
 
 def checkFile (path : String) : IO Bool := do
