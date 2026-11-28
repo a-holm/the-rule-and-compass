@@ -219,10 +219,12 @@ fn rolling_std(bars: &[Bar], i: usize, w: usize, f: impl Fn(&Bar) -> f64) -> f64
     std(&bars[i + 1 - w..=i].iter().map(|b| f(b)).collect::<Vec<_>>(), false)
 }
 
-/// Wilder smoothing seeded with a simple mean, restarted after a gap.
+/// Wilder smoothing seeded with a simple mean. A masked or non-finite row
+/// drops the state; the next row whose trailing `period` values are finite
+/// seeds again from their mean, so no row reads a later value.
 fn wilder(x: &[f64], period: usize, gap: &[bool]) -> Vec<f64> {
     let mut out = vec![f64::NAN; x.len()];
-    if x.len() < period {
+    if period == 0 || x.len() < period {
         return out;
     }
     // Skip a leading NaN run (for example DI, whose first row is undefined)
@@ -240,18 +242,24 @@ fn wilder(x: &[f64], period: usize, gap: &[bool]) -> Vec<f64> {
     }
     let mut prev = seed / period as f64;
     out[start + period - 1] = prev;
+    let mut live = true;
     for i in start + period..x.len() {
         if gap[i] || !x[i].is_finite() {
-            // Restart: the next full window seeds again.
-            if i + period <= x.len() && x[i..i + period].iter().all(|v| v.is_finite()) {
-                let s: f64 = x[i..i + period].iter().sum();
-                prev = s / period as f64;
-                out[i + period - 1] = prev;
-            }
+            live = false;
             continue;
         }
-        prev = (prev * (period as f64 - 1.0) + x[i]) / period as f64;
-        out[i] = prev;
+        if live {
+            prev = (prev * (period as f64 - 1.0) + x[i]) / period as f64;
+            out[i] = prev;
+        } else if x[i + 1 - period..=i].iter().all(|v| v.is_finite()) {
+            let mut s = 0.0;
+            for j in i + 1 - period..=i {
+                s += x[j];
+            }
+            prev = s / period as f64;
+            out[i] = prev;
+            live = true;
+        }
     }
     out
 }
@@ -904,5 +912,186 @@ mod tests {
         )
         .unwrap();
         assert_eq!(c.len(), 2);
+    }
+
+    /// The loop shipped before #1549 (forward restart seed), kept to pin the
+    /// rows that the restart rule does not reach.
+    fn wilder_forward_seed(x: &[f64], period: usize, gap: &[bool]) -> Vec<f64> {
+        let mut out = vec![f64::NAN; x.len()];
+        if x.len() < period {
+            return out;
+        }
+        let mut start = 0usize;
+        while start + period <= x.len() && !x[start..start + period].iter().all(|v| v.is_finite()) {
+            start += 1;
+        }
+        if start + period > x.len() {
+            return out;
+        }
+        let mut seed = 0.0;
+        for i in start..start + period {
+            seed += x[i];
+        }
+        let mut prev = seed / period as f64;
+        out[start + period - 1] = prev;
+        for i in start + period..x.len() {
+            if gap[i] || !x[i].is_finite() {
+                if i + period <= x.len() && x[i..i + period].iter().all(|v| v.is_finite()) {
+                    let s: f64 = x[i..i + period].iter().sum();
+                    prev = s / period as f64;
+                    out[i + period - 1] = prev;
+                }
+                continue;
+            }
+            prev = (prev * (period as f64 - 1.0) + x[i]) / period as f64;
+            out[i] = prev;
+        }
+        out
+    }
+
+    /// A seeded series of 40 to 120 values in `[0, 10]` with `gaps` holes in
+    /// its minute times and a `nan_share` of non-finite values. Each value
+    /// carries a full 53-bit mantissa: sums of 32-bit draws are exact in any
+    /// order and would hide a changed summation order.
+    fn wilder_case(mt: &mut crate::rng::Mt, gaps: usize, nan_share: f64) -> (Vec<f64>, Vec<i64>) {
+        let n = 40 + mt.usize_below(81);
+        let mut times: Vec<i64> = (0..n as i64).map(|i| i * 60).collect();
+        for _ in 0..gaps {
+            let at = 1 + mt.usize_below(n - 1);
+            let missing = 60 * (1 + mt.usize_below(5)) as i64;
+            for t in &mut times[at..] {
+                *t += missing;
+            }
+        }
+        let x = (0..n)
+            .map(|_| {
+                if mt.bool(nan_share) {
+                    if mt.bool(0.5) {
+                        f64::NAN
+                    } else {
+                        f64::INFINITY
+                    }
+                } else {
+                    let hi = (mt.next_u32() >> 5) as f64;
+                    let lo = (mt.next_u32() >> 6) as f64;
+                    10.0 * (hi * 67_108_864.0 + lo) / 9_007_199_254_740_992.0
+                }
+            })
+            .collect();
+        (x, times)
+    }
+
+    #[test]
+    fn wilder_is_prefix_stable() {
+        let mut mt = crate::rng::Mt::new(1549);
+        let mut compared = 0usize;
+        for case in 0..200 {
+            let gaps = mt.usize_below(4);
+            let (x, times) = wilder_case(&mut mt, gaps, 0.05);
+            for p in [2usize, 3, 14] {
+                let gap = window_gap_mask(&times, Timeframe::M1, p + 1);
+                let full = wilder(&x, p, &gap);
+                for cut in 0..=x.len() {
+                    let part = wilder(&x[..cut], p, &gap[..cut]);
+                    for i in 0..cut {
+                        assert_eq!(
+                            part[i].to_bits(),
+                            full[i].to_bits(),
+                            "case {case} period {p} cut {cut} row {i}: {} vs {}",
+                            part[i],
+                            full[i]
+                        );
+                        compared += 1;
+                    }
+                }
+            }
+        }
+        assert!(compared > 100_000, "compared only {compared} values");
+    }
+
+    #[test]
+    fn wilder_gap_free_bits_are_unchanged() {
+        let mut mt = crate::rng::Mt::new(125);
+        let mut compared = 0usize;
+        for case in 0..200 {
+            let (x, _) = wilder_case(&mut mt, 0, 0.0);
+            let gap = vec![false; x.len()];
+            for p in [1usize, 2, 3, 14] {
+                let new = wilder(&x, p, &gap);
+                let old = wilder_forward_seed(&x, p, &gap);
+                for i in 0..x.len() {
+                    assert_eq!(new[i].to_bits(), old[i].to_bits(), "case {case} period {p} row {i}");
+                    compared += 1;
+                }
+            }
+        }
+        assert!(compared > 10_000, "compared only {compared} values");
+    }
+
+    /// Rows before the first restart (a masked or non-finite row after the
+    /// first seed) keep the bits of the shipped loop on series with gaps,
+    /// non-finite values and leading `NaN` runs.
+    #[test]
+    fn wilder_rows_before_the_first_restart_keep_their_bits() {
+        let mut mt = crate::rng::Mt::new(1550);
+        let mut before = 0usize;
+        let mut after_same = 0usize;
+        let mut after_changed = 0usize;
+        let mut nan_changed = 0usize;
+        for case in 0..400 {
+            let gaps = mt.usize_below(4);
+            let (mut x, times) = wilder_case(&mut mt, gaps, 0.03);
+            let lead = mt.usize_below(4);
+            for v in x.iter_mut().take(lead) {
+                *v = f64::NAN;
+            }
+            for p in [2usize, 3, 14] {
+                let gap = window_gap_mask(&times, Timeframe::M1, p + 1);
+                let new = wilder(&x, p, &gap);
+                let old = wilder_forward_seed(&x, p, &gap);
+                let seeded = (0..x.len())
+                    .find(|&s| s + p <= x.len() && x[s..s + p].iter().all(|v| v.is_finite()));
+                let first = match seeded {
+                    Some(s) => (s + p..x.len())
+                        .find(|&i| gap[i] || !x[i].is_finite())
+                        .unwrap_or(x.len()),
+                    None => x.len(),
+                };
+                for i in 0..x.len() {
+                    let same = new[i].to_bits() == old[i].to_bits();
+                    if i < first {
+                        assert!(same, "case {case} period {p} row {i} before the first restart {first}");
+                        before += 1;
+                    } else if same {
+                        after_same += 1;
+                    } else {
+                        after_changed += 1;
+                        if new[i].is_nan() != old[i].is_nan() {
+                            nan_changed += 1;
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "wilder differential: {before} rows before the first restart identical; \
+             after it {after_same} identical, {after_changed} changed ({nan_changed} change NaN-ness)"
+        );
+        assert!(before > 10_000, "compared only {before} rows before a restart");
+    }
+
+    #[test]
+    fn wilder_reseeds_with_the_trailing_mean() {
+        let mut x: Vec<f64> = (1..=12).map(|v| v as f64).collect();
+        let gap: Vec<bool> = (0..12).map(|i| (5..=7).contains(&i)).collect();
+        let out = wilder(&x, 3, &gap);
+        assert!(out[5..=7].iter().all(|v| v.is_nan()), "masked rows: {:?}", &out[5..=7]);
+        assert_eq!(out[8], 8.0, "the mean of rows 6 to 8");
+        assert_eq!(out[9], (8.0 * 2.0 + 10.0) / 3.0);
+        x[9] = 100.0;
+        let moved = wilder(&x, 3, &gap);
+        for i in 0..=8 {
+            assert_eq!(moved[i].to_bits(), out[i].to_bits(), "row {i} reads row 9");
+        }
     }
 }

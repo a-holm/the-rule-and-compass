@@ -369,20 +369,19 @@ fn gap_windows_are_nan_and_a_prefix_is_causal() {
     let (_scratch, dir) = tmp_dir("gaps");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
-    let short_store = dir.join("short.rcsb").to_string_lossy().into_owned();
-    let short_out = dir.join("short_out.rcsb").to_string_lossy().into_owned();
-    // 100 hourly bars with a three-bar hole after index 49.
+    // 100 hourly bars with a three-bar hole after index 49. The true range
+    // varies, so a Wilder window ahead of the row has another mean than the
+    // window behind it.
     let mut rows: Vec<(i64, String, f64, f64, f64, f64, f64)> = Vec::new();
     for i in 0..100i64 {
         let t = if i < 50 { i * 3600 } else { (i + 3) * 3600 };
         let p = 100.0 + i as f64 * 0.5;
-        rows.push((t, "AAA".to_string(), p, p + 0.3, p - 0.4, p + 0.05, 10.0 + i as f64));
+        let w = 0.3 * (i as f64 * 0.7).sin().abs();
+        rows.push((t, "AAA".to_string(), p, p + 0.3 + w, p - 0.4 - 0.5 * w, p + 0.05, 10.0 + i as f64));
     }
     write_store(&src, &rows, 16);
-    write_store(&short_store, &rows[..80], 16);
     let features = "r1,r5,ma20,vol20,atr14,rsi14";
     enrich::build(&opts(&src, &out, features)).unwrap();
-    enrich::build(&opts(&short_store, &short_out, features)).unwrap();
     let r1 = column(&out, "r1");
     let r5 = column(&out, "r5");
     let ma20 = column(&out, "ma20");
@@ -393,15 +392,61 @@ fn gap_windows_are_nan_and_a_prefix_is_causal() {
     assert!(ma20[60].is_nan(), "ma20 spans the hole");
     assert!(ma20[72].is_finite(), "ma20 valid 20 contiguous bars after the hole");
 
-    for name in ["r1", "ma20", "vol20", "atr14", "rsi14"] {
-        let full = column(&out, name);
-        let short = column(&short_out, name);
-        for i in 0..80 {
-            let (a, b) = (full[i], short[i]);
-            assert_eq!(a.is_nan(), b.is_nan(), "{name} differs at {i}");
-            if a.is_finite() {
-                assert!((a - b).abs() <= 1e-12, "{name} at {i}: {a} vs {b}");
+    let names = ["r1", "ma20", "vol20", "atr14", "rsi14"];
+    let fulls: Vec<Vec<f64>> = names.iter().map(|n| column(&out, n)).collect();
+    for cut in 51..=100 {
+        let short_store = dir.join(format!("short{cut}.rcsb")).to_string_lossy().into_owned();
+        let short_out = dir.join(format!("short{cut}_out.rcsb")).to_string_lossy().into_owned();
+        write_store(&short_store, &rows[..cut], 16);
+        enrich::build(&opts(&short_store, &short_out, features)).unwrap();
+        for (name, full) in names.iter().zip(&fulls) {
+            let short = column(&short_out, name);
+            for i in 0..cut {
+                let (a, b) = (full[i], short[i]);
+                assert_eq!(a.is_nan(), b.is_nan(), "{name} differs at {i} (cut {cut})");
+                if a.is_finite() {
+                    assert!((a - b).abs() <= 1e-12, "{name} at {i} (cut {cut}): {a} vs {b}");
+                }
             }
+        }
+    }
+}
+
+/// #1549: 1,100 hourly bars with varying ranges and one missing bar before
+/// row 950. Moving the range of one bar after the gap leaves every earlier
+/// `atr14` value as it was.
+#[test]
+fn atr14_does_not_read_bars_after_the_row() {
+    let (_scratch, dir) = tmp_dir("atr14-causal");
+    let mut rows = wavy_rows("AAA", 1100, 0, 3600, 0.3);
+    for r in rows.iter_mut().skip(950) {
+        r.0 += 3600;
+    }
+    let build = |tag: &str, rows: &[(i64, String, f64, f64, f64, f64, f64)]| {
+        let src = dir.join(format!("{tag}.rcsb")).to_string_lossy().into_owned();
+        let out = dir.join(format!("{tag}_out.rcsb")).to_string_lossy().into_owned();
+        write_store(&src, rows, 128);
+        enrich::build(&opts(&src, &out, "atr14")).unwrap();
+        column(&out, "atr14")
+    };
+    let base = build("base", &rows);
+    assert!(base[949].is_finite(), "atr14 before the gap");
+    assert!(base[950..964].iter().all(|v| v.is_nan()), "the 14 rows whose window spans the gap");
+    assert!(base[964].is_finite(), "atr14 on the first row after the masked window");
+    for bar in 964..=990 {
+        let mut moved = rows.clone();
+        moved[bar].3 += 5.0;
+        moved[bar].4 -= 5.0;
+        let a = build(&format!("bar{bar}"), &moved);
+        assert_ne!(a[bar].to_bits(), base[bar].to_bits(), "the moved bar {bar} changes its own row");
+        for i in 0..bar {
+            assert_eq!(
+                a[i].to_bits(),
+                base[i].to_bits(),
+                "moving bar {bar} changed atr14 at row {i}: {} vs {}",
+                a[i],
+                base[i]
+            );
         }
     }
 }
