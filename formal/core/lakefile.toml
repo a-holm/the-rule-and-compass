@@ -1,0 +1,10 @@
+name = "rcsr_core"
+version = "0.1.0"
+defaultTargets = ["RcsrCore"]
+
+[leanOptions]
+autoImplicit = false
+relaxedAutoImplicit = false
+
+[[lean_lib]]
+name = "RcsrCore"

@@ -1,0 +1,58 @@
+# Formal verification
+
+## What this is
+
+Lean 4 models of single Rust functions, with machine-checked theorems. A model is written by hand. The proofs are about the model, not about the Rust code.
+
+## Layout
+
+```
+formal/
+  .gitignore          ignores .lake/
+  README.md           build commands
+  THEOREMS.txt        theorem inventory
+  core/               Lake package rcsr_core, no Mathlib
+    lean-toolchain    pinned Lean release
+    lakefile.toml
+    lake-manifest.json
+    RcsrCore.lean     root module, imports every module
+    RcsrCore/Prim.lean  shared bit-pattern primitives
+    Audit.lean        trust audit program
+```
+
+## Trust base
+
+A theorem under the namespace `Rcsr` may depend only on:
+
+- `propext`, `Classical.choice`, `Quot.sound`
+- names of the form `<declaration>._native.bv_decide.ax_<n>_<m>`, one per use of `bv_decide`
+
+`bv_decide` trusts an LRAT certificate checked by a verified checker that runs as compiled code. Assumptions of a proof are hypotheses or structure fields, never declared facts.
+
+## Source rules
+
+- Refused words in `formal/**/*.lean`, comments included: `sorry`, `axiom`, `native_decide`, `implemented_by`, `extern`, `unsafe`, `csimp`, `opaque`. Check with `grep -w`.
+- `bv_decide` appears only in the macro `rcsr_bv` of `Prim.lean` (timeout 600 s) and in `Audit.lean`. Every proof calls `rcsr_bv`.
+- Models that feed the SAT tactic use `bif` or Boolean operators, not nested `if` on a `Bool` used as a `Prop`.
+- One module per Rust module. `RcsrCore.lean` imports every module; an unimported file is neither built nor audited.
+- Each module starts with a doc comment that has a `Limits` paragraph.
+- Names: `Rcsr.<Module>`, lower camel case functions.
+
+## Theorem inventory
+
+`formal/THEOREMS.txt` is the exact stdout of the audit: one line `<full name> <kernel|bv_decide>` per theorem, sorted. A deleted or weakened theorem changes the file. Regenerate with the audit command below and commit the result.
+
+## Build and audit
+
+```sh
+cd formal/core
+lake build --wfail
+lake env lean --run Audit.lean > /tmp/audit.out
+diff /tmp/audit.out ../THEOREMS.txt
+```
+
+The audit is a program, not an elaboration-time command, because Lake replays a cached build without running commands. It exits 1 and names every dependency outside the trust base.
+
+## Toolchain
+
+`formal/core/lean-toolchain` pins `leanprover/lean4:v4.36.0`. elan installs it. A toolchain change is its own issue and re-runs every proof.

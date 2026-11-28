@@ -1,0 +1,5 @@
+Rcsr.Prim.finite_not_nan kernel
+Rcsr.Prim.fold_signed_zero kernel
+Rcsr.Prim.key66_toInt kernel
+Rcsr.Prim.nan_not_finite kernel
+Rcsr.Prim.satAdd_spec bv_decide
