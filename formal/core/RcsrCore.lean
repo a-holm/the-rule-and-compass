@@ -9,3 +9,4 @@ import RcsrCore.Cpcv
 import RcsrCore.Lockbox
 import RcsrCore.Intervals.Bounds
 import RcsrCore.TrialsTable.Fronts
+import RcsrCore.Pareto.Canonical

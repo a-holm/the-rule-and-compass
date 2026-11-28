@@ -40,3 +40,36 @@ file = "rcsr-engine/src/trials_table.rs"
 anchor = "fn nan_low(v: f64) -> f64 {"
 close = "}"
 sha256 = "1bd768d2ee288a38894c3d74a9672667b4be141d816a59457a4edc6b8e4ddcea"
+
+[[model]]
+id = "canonicalize"
+project = "P2"
+lean = "formal/core/RcsrCore/Pareto/Canonical.lean"
+
+[[model.span]]
+role = "modelled"
+file = "rcsr-engine/src/pareto.rs"
+anchor = "pub fn canonicalize(&mut self) {"
+close = "}"
+sha256 = "f80cdadbc75b1d425609fccbca50365e896d12b0604323b3d64a52ad171d122c"
+
+[[model.span]]
+role = "modelled"
+file = "rcsr-engine/src/pareto.rs"
+anchor = "pub fn hash(&self) -> u64 {"
+close = "}"
+sha256 = "fd6a553534623e47e693aa70595d86afb4d6eb0590031eb4e38a495465d721d9"
+
+[[model.span]]
+role = "modelled"
+file = "rcsr-engine/src/error_order.rs"
+anchor = "fn class(v: f64) -> u8 {"
+close = "}"
+sha256 = "fcc4aac67dc15fd35010302bd176c77b95e97165dcde3e46255fc9889e5b421b"
+
+[[model.span]]
+role = "modelled"
+file = "rcsr-engine/src/error_order.rs"
+anchor = "pub fn cmp_error(a: f64, b: f64) -> Ordering {"
+close = "}"
+sha256 = "bf84a03090f6bccbde1f266f8c0bc4c344505e940d5c1dd48e648c5ef17df77a"
