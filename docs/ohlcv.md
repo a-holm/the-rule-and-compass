@@ -264,8 +264,7 @@ explicit. A feature window or label window that spans a missing bucket is
 - `cross:btc`: `cross_ret1`, `cross_beta20` (requires a benchmark series);
 - `calendar`: `dow_sin`, `dow_cos`, `hour_sin`, `hour_cos`.
 
-Every column reports its warm-up. Wilder indicators (ATR, RSI, ADX/DI) restart
-after a gap rather than carrying state across an outage.
+Every column reports its warm-up. Wilder indicators (ATR, RSI, ADX/DI) restart after a gap rather than carrying state across an outage: after a gap a Wilder average is `NaN` until `period` clean bars exist, then starts from their mean. The restart never reads a bar after its own row.
 
 `LabelSpec::parse("fwd:1h,cost=10bp,volnorm=96,stride=1", tf)` and
 `forward_label(bars, tf, spec)` enter at the **next open**, exit at the close

@@ -1219,7 +1219,7 @@ fn engine_formula(name: &str) -> &'static str {
         };
     }
     match name {
-        "atr14" => "Wilder ATR(14) in price units, seeded on the first 14 true ranges",
+        "atr14" => "Wilder ATR(14) in price units, seeded on the first 14 true ranges and after a gap on the first 14 clean ones",
         "natr14" => "100 * ATR14 / C_t",
         "atr50" => "ATR50 / C_t (fractional, Python py15m definition)",
         "bb20_z" => "(C_t - SMA20) / sd20, population sd",

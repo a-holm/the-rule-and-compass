@@ -120,17 +120,7 @@ touches, so the run finishes with an empty Pareto front and `inf` baselines —
 which reads as "no structure found" when the real answer is "the data has
 gaps". Failing loudly names the problem and the fix.
 
-Feature columns produced by `rcsr enrich` follow a stricter rule than the search
-preparation fills above: a trailing window that spans a missing bucket, listing,
-delisting, migration or outage is `NaN`, and Wilder/EMA state restarts after the
-gap. This includes the #125 engine names (`ta:*`, `exotic:cheap`,
-`candle:geometry`, `cross:btc`): `ret1`/`ret5`, the moving-average, Bollinger,
-volume, CMF/MFI/VWAP and close-position windows, `open_gap1`, `cross_ret1` and
-`cross_beta20` are all missing across the boundary. Preparation `--fill` is a
-separate, explicit choice made later; it never changes the stored feature value
-or bridges a gap in the producer. The compact 52-name profile and every name in
-`engine_catalogue` follow the same rule, even where the historical compact
-builder used positional windows that bridged a hole.
+Feature columns produced by `rcsr enrich` follow a stricter rule than the search preparation fills above: a trailing window that spans a missing bucket, listing, delisting, migration or outage is `NaN`, and Wilder/EMA state restarts after the gap. In the #125 Wilder columns of `rcsr::features` (`atr14` in `rcsr enrich`; `atr14`, `natr14`, `rsi14`, `adx14`, `di_plus` and `di_minus` in `rcsr prep --features`), after a gap a Wilder average is `NaN` until `period` clean bars exist, then starts from their mean; the restart never reads a bar after its own row (`wilder_is_prefix_stable`, `atr14_does_not_read_bars_after_the_row`). This includes the #125 engine names (`ta:*`, `exotic:cheap`, `candle:geometry`, `cross:btc`): `ret1`/`ret5`, the moving-average, Bollinger, volume, CMF/MFI/VWAP and close-position windows, `open_gap1`, `cross_ret1` and `cross_beta20` are all missing across the boundary. Preparation `--fill` is a separate, explicit choice made later; it never changes the stored feature value or bridges a gap in the producer. The compact 52-name profile and every name in `engine_catalogue` follow the same rule, even where the historical compact builder used positional windows that bridged a hole.
 
 `rcsr enrich --threads <n>` (default: the CPUs the process may run on) computes the per-symbol feature segments on `n` workers and commits them in segment order. The temp columns, every per-feature SHA-256 and the output store are byte-identical for every `n` (`parallel_segments_are_byte_identical`). At most `2 x n` segment outputs are held in memory at once; one output is the segment rows times the feature columns times 8 bytes. `--chunk-rows` bounds each batch per worker.
 
