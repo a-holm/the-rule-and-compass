@@ -21,3 +21,22 @@ file = "rcsr-engine/src/error_order.rs"
 anchor = "pub fn cmp_error(a: f64, b: f64) -> Ordering {"
 close = "}"
 sha256 = "bf84a03090f6bccbde1f266f8c0bc4c344505e940d5c1dd48e648c5ef17df77a"
+
+[[model]]
+id = "pareto_fronts"
+project = "P2"
+lean = "formal/core/RcsrCore/TrialsTable/Fronts.lean"
+
+[[model.span]]
+role = "modelled"
+file = "rcsr-engine/src/trials_table.rs"
+anchor = "pub fn pareto_fronts(values: &[Vec<f64>]) -> Vec<usize> {"
+close = "}"
+sha256 = "7291baebe4d6650b9de44a74cbd87f2542d347c4dc1e15227c6f74e271c3a7c9"
+
+[[model.span]]
+role = "modelled"
+file = "rcsr-engine/src/trials_table.rs"
+anchor = "fn nan_low(v: f64) -> f64 {"
+close = "}"
+sha256 = "1bd768d2ee288a38894c3d74a9672667b4be141d816a59457a4edc6b8e4ddcea"

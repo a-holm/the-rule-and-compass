@@ -5,3 +5,4 @@ import RcsrCore.Intervals
 import RcsrCore.Intervals.Effective
 import RcsrCore.Lockbox
 import RcsrCore.Intervals.Bounds
+import RcsrCore.TrialsTable.Fronts
