@@ -17,6 +17,7 @@ formal/
     lake-manifest.json
     RcsrCore.lean     root module, imports every module
     RcsrCore/Prim.lean  shared bit-pattern primitives
+    RcsrCore/ErrorOrder.lean  model of error_order.rs
     Audit.lean        trust audit program
 ```
 
@@ -56,3 +57,9 @@ The audit is a program, not an elaboration-time command, because Lake replays a 
 ## Toolchain
 
 `formal/core/lean-toolchain` pins `leanprover/lean4:v4.36.0`. elan installs it. A toolchain change is its own issue and re-runs every proof.
+
+## What is proven
+
+| Rust function | Lean module | Theorems | Limit |
+|---|---|---|---|
+| `cmp_error`, `class` in `rcsr-engine/src/error_order.rs` | `RcsrCore/ErrorOrder.lean` | `le_refl`, `le_total`, `le_trans`, `lt_trans`, `eqv_symm`, `eqv_trans`, `lt_eqv_congr`, `eqv_lt_congr`, `trichotomy`, `cmpError_swap`, `cmpError_eq_iff`, `neg_inf_least`, `nan_greatest`, `signed_zeros_equal` | the model is flattened by hand |
