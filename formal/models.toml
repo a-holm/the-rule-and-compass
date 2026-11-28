@@ -1,0 +1,23 @@
+# Source spans of the Rust and CUDA text that the Lean models under formal/ were written from.
+# Checked by rcsr-engine/tests/formal_sync.rs. Rules: docs/formal-verification.md.
+version = 1
+
+[[model]]
+id = "cmp_error"
+project = "P0"
+lean = "formal/core/RcsrCore/ErrorOrder.lean"
+vectors = "cmp_error"
+
+[[model.span]]
+role = "modelled"
+file = "rcsr-engine/src/error_order.rs"
+anchor = "fn class(v: f64) -> u8 {"
+close = "}"
+sha256 = "fcc4aac67dc15fd35010302bd176c77b95e97165dcde3e46255fc9889e5b421b"
+
+[[model.span]]
+role = "modelled"
+file = "rcsr-engine/src/error_order.rs"
+anchor = "pub fn cmp_error(a: f64, b: f64) -> Ordering {"
+close = "}"
+sha256 = "bf84a03090f6bccbde1f266f8c0bc4c344505e940d5c1dd48e648c5ef17df77a"
