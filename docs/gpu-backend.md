@@ -2711,6 +2711,24 @@ Per run at the campaign shape: max size 4 on 1 book takes 43.4 s (the whole clas
 
 **Safety.** Every new kernel goes through `rc_launch` and every allocation through `rc_dev_alloc`; the device tests ran first under `compute-sanitizer --tool memcheck` on at most 3 x 8,192 + 77 rows, 8 trees per batch, 16 cuts and 3 books (`RCSR_UNDER_SANITIZER` selects those limits), and `tests/sanitizer.plan` lists `tests/enumerate_gpu.rs` and the deliberate refusals.
 
+## Exact book decisions on the device (issue #1051)
+
+`src/cuda/check_rows.h` (included at the end of `eval.cu`) and `src/check_rows_gpu.rs` decide, per slot, the two bit planes the band book needs: `enter` (row prediction above `t + band`) and `stay` (above `t - band`). The host mirror is `src/flat_bound/rows.rs`; the device follows `row_iv` and `classify` rule for rule. Nothing calls it from the search yet: the search wiring, counters and the band book kernel are issue #1080.
+
+**Inputs.** The exact `f64` input columns upload once (`GpuEvaluator::check_rows`, tag `check_f64`, `rows x vars x 8` bytes), beside the resident `f32` columns. A check program per tree comes from `compile_check_program`: the 14 operators, stack depth at most 16, at most 64 slots and `word_cap` program words per batch. The host validates every program before a launch (`rc_check_validate`); a malformed one is refused with an error that names `malformed`.
+
+**Per row.** An `f64` interval `[lo, hi]` and a NaN state (0 never, 1 maybe, 2 certain) bound the CPU value. The libm operators (`exp`, `tanh`, `logistic`, `gauss`) widen their result by 64 ulps through an integer step on the ordered bit pattern (`rc_ulps`, `ulps_step` on the host); the `.cu` build runs with `-fmad=false`. A row is Nonfinite, Enter, Stay, Neither or Undecided. A decision needs finite endpoints and NaN state 0. The `if` hull follows the corrected rule: both branches certainly NaN gives 2; otherwise 1 when either may be NaN; a certainly NaN branch adds no values.
+
+**Per slot.** `rc_check_batch` writes the two planes, a flag word, an undecided count and the first 4,096 undecided rows. `CheckRows::settle` patches those rows with the CPU scalar evaluator `expr::eval`, so a settled slot has the planes of the CPU prediction. A certainly non-finite row makes the slot `+inf`. A slot with more undecided rows than the list holds stays `Unsettled` and goes to the CPU path.
+
+**Memory plan.** `check_f64` and `check_bits` are terms of `rcsr schema` `memory_plan` (`DeviceWorkload.check_exact`, false until #1080 turns it on). An upload that does not fit is refused with `device_memory`, the tag and the bytes, and no allocation survives.
+
+**Exactness.** Pricing a synthetic prediction vector that carries exactly the decided planes through `FitnessBook::regret_shape_signed` and `band_pass` gives the CPU totals bit for bit. `tests/check_rows_bits.rs` proves this on the host mirror (90,000 rows, 8 groups); the `check_rows_gpu` tests prove it for the device planes. The settle share is the fraction of slots that end `Settled` or `Inf` (not `Unsettled`).
+
+**Measured.** RTX 3060, ignored test `device_check_cost_at_the_campaign_shape`: 1,996,201 rows, 4 columns, 64 random trees of the 14 operators (depth 4) per batch, uniform random data in `[-2, 2]`, threshold 0 and band 0. A batch takes 2.672 ms per slot (device pass and plane copy, 5 batches after one warm-up). Random trees over wide data leave many rows undecided (29,943,015 over the 320 slot runs, about 93,000 per slot), so most slots end `Unsettled` here; the real-data settle share is in the issue. `check_rows_kernel` uses 58 registers and `check_iv_kernel` 52, both with a 408-byte cumulative stack frame and no spill; no existing kernel changed its registers, frame or spill (the ptxas listing of the base and head differs only by the three new entries).
+
+**Safety.** Every kernel goes through `rc_launch`, every allocation through `rc_dev_alloc`. The device tests ran first under `compute-sanitizer --tool memcheck` on at most 8,192 rows and 16 slots (`RCSR_UNDER_SANITIZER`).
+
 ## Long-only P&L reduction (issue #304)
 
 `src/cuda/pnl.cu` is a separate, fused long-only `{0, +1}` P&L reduction over a

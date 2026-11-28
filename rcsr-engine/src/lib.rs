@@ -113,6 +113,8 @@ pub mod compose; // #1181: regime-switching composition of specialist pools into
 pub mod enumerate; // #1183: exhaustive scoring of a small class, its optimum, the gap of a search and the family null
 #[cfg(feature = "cuda")]
 pub mod enumerate_gpu; // #1258: the device arm of rcsr enumerate
+#[cfg(feature = "cuda")]
+pub mod check_rows_gpu; // #1051: exact device row decisions of the book check
 pub mod gate_search; // #1182: gate search between two frozen branches (--gate-search)
 pub mod trading; // #263: exact long/flat P&L, Sharpe and log-growth objective
 pub mod trading_gpu; // #304/#305: fused long-only P&L, exact threshold and shared mask
