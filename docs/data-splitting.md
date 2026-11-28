@@ -153,6 +153,32 @@ contributes to both the training and the test side — so the test set still ask
 "predict the future", but now over many series at once, which is far more data
 than a single series gives you.
 
+### The partition law
+
+A split gives every row at most one role: training, validation or test. Every other row is discarded. The law, per mode:
+
+| mode | rows discarded |
+|---|---|
+| `random`, `group` | the `--gap` rows purged before the validation slice (`purged_validation_rows`) |
+| `temporal` | `min(train_n + gap, n - 1) - train_n` embargo rows after the last training row, plus `purged_validation_rows`; `train_n = n - clamp(round(n * test_frac), 1, n - 1)` |
+| `temporal-group` | the same embargo count for each group, summed, plus `purged_validation_rows` |
+| `temporal-intervals` | `interval_dropped_rows + interval_outside_rows` |
+
+With a target spec the rows removed by the time purge (`purged_test_boundary_rows + purged_validation_boundary_rows`) are discarded too, in every time mode. In every mode the roles are pairwise disjoint, no kept training or validation row is closer than the purge to a test stamp, no kept training row is closer than the purge to a validation stamp, and a kept row never reaches a declared locked range: a split that would keep one is refused instead.
+
+The temporal cut is by row index. `temporal` and `temporal-group` do not move the train and test cut off a tied timestamp, so on a table with tied stamps at the cut one stamp can be on both sides: six rows stamped `s, s+1h, s+2h, s+2h, s+3h, s+4h` with `--test-frac 0.5` train on rows 0 to 2 and test on rows 3 to 5. A target spec purge removes the tied training row (a purge of 1 s: train rows 0 and 1, `purged_test_boundary_rows` 1). The validation cut does move off a tied stamp.
+
+The law is stated by these tests in `rcsr-engine/tests/split.rs`, 600 random tables and specs per mode:
+
+* `every_split_mode_gives_disjoint_roles_inside_the_table`
+* `every_split_mode_accounts_for_every_row`
+* `folds_partition_the_test_rows_in_every_mode`
+* `temporal_modes_never_train_after_the_test_block`
+* `purge_keeps_every_training_row_outside_the_label_distance`
+* `interval_roles_follow_the_split_table`
+* `temporal_cut_on_a_tied_stamp_is_pinned`
+* `a_kept_row_never_reaches_a_declared_locked_range`
+
 ### Interval-list splits
 
 A single train/validation/test cut can only test the end of the data. `--split-table <csv> --split-id <id>` (mode `temporal-intervals`) assigns rows from a table of UTC half-open intervals instead, so a split can train before and after a test interval (the base of combinatorial purged cross-validation, López de Prado 2018, chapter 12) and can hold several validation intervals spread over the training span:

@@ -1,6 +1,8 @@
 //! Train/test splitting for i.i.d., time-series and grouped (panel) data.
 
 use rcsr::data::{self, SplitMode, SplitSpec};
+use rcsr::intervals::{Declared as IvDeclared, EmbargoSource, IntervalSplit, Role};
+use rcsr::lockbox::{Declared as LockDeclared, Embargo, Lockbox};
 use rcsr::rng::Mt;
 
 fn spec(mode: SplitMode) -> SplitSpec {
@@ -343,4 +345,716 @@ fn split_report_names_the_row_selector() {
     )
     .unwrap();
     assert!(p.report.selector.contains("set"), "{}", p.report.selector);
+}
+
+// ---------------------------------------------------------------------------
+// Partition law: every row has at most one role, every other row is discarded.
+// ---------------------------------------------------------------------------
+
+const BASE: i64 = 1_000_000_000;
+const H: i64 = 3600;
+const MODES: [SplitMode; 5] = [
+    SplitMode::Random,
+    SplitMode::Temporal,
+    SplitMode::Group,
+    SplitMode::TemporalGroup,
+    SplitMode::TemporalIntervals,
+];
+const CASES: usize = 600;
+const OK_FLOOR: usize = 400;
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Shape {
+    Unique,
+    Tied,
+    Gapped,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum PurgePolicy {
+    Mixed,
+    Always,
+    Never,
+}
+
+/// A table whose target is the row id and whose stamps and groups are known by id.
+/// Ids ascend with the stamp, so the id order is the time order.
+struct Fixture {
+    n: usize,
+    stamp: Vec<i64>,
+    group: Vec<usize>,
+    shape: Shape,
+    shuffled: bool,
+    table: data::Table,
+}
+
+struct Case {
+    mode: SplitMode,
+    test_frac: f64,
+    gap: usize,
+    vfrac: f64,
+    folds: usize,
+    purge: Option<f64>,
+    iv: Option<IntervalSplit>,
+}
+
+fn layout(rng: &mut Mt, n: usize, shape: Shape, groups: usize, step: i64, gap_unit: i64, gap_max: usize) -> (Vec<i64>, Vec<usize>) {
+    let mut stamp = Vec::with_capacity(n);
+    let mut group = Vec::with_capacity(n);
+    let mut t = BASE;
+    match shape {
+        Shape::Unique => {
+            for _ in 0..n {
+                stamp.push(t);
+                group.push(rng.usize_below(groups));
+                t += step;
+            }
+        }
+        Shape::Gapped => {
+            for _ in 0..n {
+                stamp.push(t);
+                group.push(rng.usize_below(groups));
+                t += (1 + rng.usize_below(gap_max)) as i64 * gap_unit;
+            }
+        }
+        Shape::Tied => {
+            while stamp.len() < n {
+                let k = (1 + rng.usize_below(4)).min(groups).min(n - stamp.len());
+                let mut gs: Vec<usize> = (0..groups).collect();
+                for j in 0..k {
+                    let s = j + rng.usize_below(groups - j);
+                    gs.swap(j, s);
+                    stamp.push(t);
+                    group.push(gs[j]);
+                }
+                t += step;
+            }
+        }
+    }
+    (stamp, group)
+}
+
+fn build_table(stamp: &[i64], group: &[usize], rng: &mut Mt, shuffled: bool) -> data::Table {
+    let n = stamp.len();
+    let mut order: Vec<usize> = (0..n).collect();
+    if shuffled {
+        for i in (1..n).rev() {
+            let j = rng.usize_below(i + 1);
+            order.swap(i, j);
+        }
+    }
+    let mut s = String::from("t,g,x,y\n");
+    for &id in &order {
+        s.push_str(&format!("{},g{},{},{}\n", stamp[id], group[id], (0.37 * id as f64).sin(), id));
+    }
+    data::parse_table(&s).unwrap()
+}
+
+const PURGE_HOURS: [i64; 4] = [1, 5, 24, 72];
+const INTERVAL_HOURS: [i64; 3] = [1, 5, 12];
+
+/// Contiguous hourly blocks, each a train, validation, test or unused interval,
+/// with at least one train and one test block.
+fn random_intervals(rng: &mut Mt) -> (IntervalSplit, i64) {
+    let blocks = 3 + rng.usize_below(6);
+    let mut roles: Vec<usize> = (0..blocks).map(|_| rng.usize_below(4)).collect(); // 0 validation, 1 test, 2 unused, 3 train
+    if !roles.contains(&3) {
+        let i = rng.usize_below(blocks);
+        roles[i] = 3;
+    }
+    while !roles.contains(&1) {
+        let i = rng.usize_below(blocks);
+        if roles[i] == 3 && roles.iter().filter(|&&r| r == 3).count() == 1 {
+            continue;
+        }
+        roles[i] = 1;
+    }
+    let mut d = IvDeclared { split_id: "law".to_string(), ..IvDeclared::default() };
+    let mut t = BASE;
+    for r in roles {
+        let len = (24 + rng.usize_below(97)) as i64 * H;
+        match r {
+            0 => d.validation.push((t, t + len)),
+            1 => d.test.push((t, t + len)),
+            3 => d.train.push((t, t + len)),
+            _ => {}
+        }
+        t += len;
+    }
+    let purge = *rng.pick(&INTERVAL_HOURS) * H;
+    let embargo = *rng.pick(&INTERVAL_HOURS) * H;
+    (IntervalSplit::new(d, purge, embargo, EmbargoSource::Flag, None), t - BASE)
+}
+
+fn gen_case(rng: &mut Mt, mode: SplitMode, policy: PurgePolicy) -> (Case, Fixture) {
+    let shape = *rng.pick(&[Shape::Unique, Shape::Tied, Shape::Gapped]);
+    let groups = 1 + rng.usize_below(6);
+    let shuffled = rng.bool(0.5);
+    let test_frac = *rng.pick(&[0.05, 0.1, 0.25, 0.3, 0.5, 0.9]);
+    let gap = *rng.pick(&[0usize, 1, 2, 5, 40]);
+    let vfrac = if mode == SplitMode::TemporalIntervals || rng.bool(0.5) { 0.0 } else { *rng.pick(&[0.1, 0.2, 0.5]) };
+    let folds = *rng.pick(&[1usize, 2, 3, 7]);
+    let hours: &[i64] = if mode == SplitMode::TemporalIntervals { &PURGE_HOURS[..3] } else { &PURGE_HOURS };
+    let timed = matches!(mode, SplitMode::Temporal | SplitMode::TemporalGroup | SplitMode::TemporalIntervals);
+    let purge = if !timed {
+        None
+    } else {
+        match policy {
+            PurgePolicy::Never => None,
+            PurgePolicy::Always => Some(*rng.pick(hours) as f64 * 3600.0),
+            PurgePolicy::Mixed => rng.bool(0.5).then(|| *rng.pick(hours) as f64 * 3600.0),
+        }
+    };
+    let (n, stamp, group, iv);
+    if mode == SplitMode::TemporalIntervals {
+        let (split, span) = random_intervals(rng);
+        n = 160 + rng.usize_below(81);
+        let step = (span / n as i64).max(1);
+        let (s, g) = layout(rng, n, shape, groups, step, 1, (2 * step) as usize);
+        stamp = s;
+        group = g;
+        iv = Some(split);
+    } else {
+        n = if rng.bool(0.1) { 2 + rng.usize_below(5) } else { 2 + rng.usize_below(239) };
+        let (s, g) = layout(rng, n, shape, groups, H, H, 200);
+        stamp = s;
+        group = g;
+        iv = None;
+    }
+    let table = build_table(&stamp, &group, rng, shuffled);
+    (
+        Case { mode, test_frac, gap, vfrac, folds, purge, iv },
+        Fixture { n, stamp, group, shape, shuffled, table },
+    )
+}
+
+fn spec_of(c: &Case) -> SplitSpec {
+    SplitSpec {
+        mode: c.mode,
+        time_col: Some(0),
+        group_col: Some(1),
+        test_frac: c.test_frac,
+        gap: c.gap,
+        validation_frac: c.vfrac,
+        folds: c.folds,
+        purge_seconds: c.purge,
+        intervals: c.iv.clone(),
+        ..Default::default()
+    }
+}
+
+fn prepare(c: &Case, fx: &Fixture) -> Result<data::Prepared, String> {
+    data::prepare_full(&fx.table, &["x".to_string()], "y", &spec_of(c), &mut Mt::new(7))
+}
+
+fn describe(c: &Case, fx: &Fixture) -> String {
+    format!(
+        "{:?} n={} shape={:?} shuffled={} test_frac={} gap={} vfrac={} folds={} purge={:?} iv={:?}",
+        c.mode,
+        fx.n,
+        fx.shape,
+        fx.shuffled,
+        c.test_frac,
+        c.gap,
+        c.vfrac,
+        c.folds,
+        c.purge,
+        c.iv.as_ref().map(|i| (&i.declared, i.purge, i.embargo))
+    )
+}
+
+struct Stats {
+    ok: usize,
+    errors: std::collections::BTreeMap<String, usize>,
+}
+
+impl Stats {
+    fn has_error(&self, needle: &str) -> bool {
+        self.errors.keys().any(|k| k.contains(needle))
+    }
+
+    fn assert_floor(&self, mode: SplitMode) {
+        assert!(self.ok >= OK_FLOOR, "{:?}: {} of {} cases ok, errors {:?}", mode, self.ok, CASES, self.errors);
+    }
+}
+
+/// Runs `CASES` generated cases of one mode and calls `check` on every `Ok` result.
+fn drive(mode: SplitMode, seed: u32, policy: PurgePolicy, mut check: impl FnMut(&Case, &Fixture, &data::Prepared)) -> Stats {
+    let mut rng = Mt::new(seed);
+    let mut stats = Stats { ok: 0, errors: Default::default() };
+    for _ in 0..CASES {
+        let (case, fx) = gen_case(&mut rng, mode, policy);
+        match prepare(&case, &fx) {
+            Ok(p) => {
+                stats.ok += 1;
+                check(&case, &fx, &p);
+            }
+            Err(e) => {
+                let key: String = e.chars().map(|c| if c.is_ascii_digit() { '#' } else { c }).take(90).collect();
+                *stats.errors.entry(key).or_insert(0) += 1;
+            }
+        }
+    }
+    stats
+}
+
+struct Roles {
+    train: Vec<usize>,
+    validation: Vec<usize>,
+    test: Vec<usize>,
+    folds: Vec<Vec<usize>>,
+    discarded: Vec<usize>,
+}
+
+fn ids(y: &[f64]) -> Vec<usize> {
+    y.iter().map(|&v| v as usize).collect()
+}
+
+fn roles(p: &data::Prepared, n: usize) -> Roles {
+    let train = ids(&p.train.y);
+    let validation = p.validation.as_ref().map(|s| ids(&s.y)).unwrap_or_default();
+    let test = ids(&p.test.y);
+    let folds: Vec<Vec<usize>> = p.fold_samples.iter().map(|s| ids(&s.y)).collect();
+    let mut seen = vec![false; n];
+    for &i in train.iter().chain(&validation).chain(&test) {
+        if i < n {
+            seen[i] = true;
+        }
+    }
+    let discarded = (0..n).filter(|&i| !seen[i]).collect();
+    Roles { train, validation, test, folds, discarded }
+}
+
+/// Rows between the last training row and the first test row: the documented rule
+/// of `docs/data-splitting.md`.
+fn embargo(m: usize, test_frac: f64, gap: usize) -> usize {
+    if m < 2 {
+        return 0;
+    }
+    let test_n = (((m as f64) * test_frac).round() as usize).clamp(1, m - 1);
+    let train_n = m - test_n;
+    (train_n + gap).min(m - 1) - train_n
+}
+
+fn purge_count(p: &data::Prepared) -> usize {
+    p.report.purged_test_boundary_rows + p.report.purged_validation_boundary_rows
+}
+
+fn expected_discarded(c: &Case, fx: &Fixture, p: &data::Prepared) -> usize {
+    let r = &p.report;
+    match c.mode {
+        SplitMode::Random | SplitMode::Group => r.purged_validation_rows,
+        SplitMode::Temporal => embargo(fx.n, c.test_frac, c.gap) + r.purged_validation_rows + purge_count(p),
+        SplitMode::TemporalGroup => {
+            let mut counts = std::collections::BTreeMap::new();
+            for &g in &fx.group {
+                *counts.entry(g).or_insert(0usize) += 1;
+            }
+            counts.values().map(|&m| embargo(m, c.test_frac, c.gap)).sum::<usize>() + r.purged_validation_rows + purge_count(p)
+        }
+        SplitMode::TemporalIntervals => r.interval_dropped_rows + r.interval_outside_rows + purge_count(p),
+    }
+}
+
+#[test]
+fn every_split_mode_gives_disjoint_roles_inside_the_table() {
+    for (k, &mode) in MODES.iter().enumerate() {
+        let stats = drive(mode, 0x1461_0000 + k as u32, PurgePolicy::Mixed, |c, fx, p| {
+            let ctx = describe(c, fx);
+            let r = roles(p, fx.n);
+            let mut count = vec![0u8; fx.n];
+            for (name, v) in [("train", &r.train), ("validation", &r.validation), ("test", &r.test)] {
+                for &i in v {
+                    assert!(i < fx.n, "{ctx}: {name} id {i} outside the table");
+                    count[i] += 1;
+                    assert!(count[i] == 1, "{ctx}: row {i} in two roles or twice ({name})");
+                }
+            }
+            assert!(!r.train.is_empty(), "{ctx}: no training rows");
+            assert_eq!(p.report.rows_total, fx.n, "{ctx}");
+            assert_eq!(p.report.train_rows, r.train.len(), "{ctx}");
+            assert_eq!(p.report.validation_rows, r.validation.len(), "{ctx}");
+            assert_eq!(p.report.test_rows, r.test.len(), "{ctx}");
+        });
+        stats.assert_floor(mode);
+    }
+}
+
+#[derive(Default)]
+struct Edges {
+    n2: usize,
+    n3: usize,
+    gap_beyond_block: usize,
+    single_row_group: usize,
+    single_group: usize,
+    no_validation_slice: usize,
+    tied_validation_cut: usize,
+    interval_purged_before_test: usize,
+    interval_embargoed_after_test: usize,
+    interval_outside: usize,
+    shuffled: usize,
+    purge_removed_everything: usize,
+}
+
+#[test]
+fn every_split_mode_accounts_for_every_row() {
+    let mut e = Edges::default();
+    for (k, &mode) in MODES.iter().enumerate() {
+        let stats = drive(mode, 0x1461_1000 + k as u32, PurgePolicy::Mixed, |c, fx, p| {
+            let ctx = describe(c, fx);
+            let r = roles(p, fx.n);
+            let want = expected_discarded(c, fx, p);
+            assert_eq!(
+                r.train.len() + r.validation.len() + r.test.len() + r.discarded.len(),
+                fx.n,
+                "{ctx}"
+            );
+            assert_eq!(r.discarded.len(), want, "{ctx}: discarded rows");
+
+            if mode == SplitMode::Temporal && c.purge.is_none() && fx.shape == Shape::Unique {
+                let m = fx.n - (((fx.n as f64) * c.test_frac).round() as usize).clamp(1, fx.n - 1);
+                let gv = p.report.purged_validation_rows;
+                let fit = r.train.len();
+                assert_eq!(m, fit + gv + r.validation.len(), "{ctx}");
+                let emb = embargo(fx.n, c.test_frac, c.gap);
+                let mut tr = r.train.clone();
+                tr.sort_unstable();
+                assert_eq!(tr, (0..fit).collect::<Vec<_>>(), "{ctx}: fit rows");
+                let mut va = r.validation.clone();
+                va.sort_unstable();
+                assert_eq!(va, (fit + gv..m).collect::<Vec<_>>(), "{ctx}: validation rows");
+                let mut disc: Vec<usize> = (fit..fit + gv).collect();
+                disc.extend(m..m + emb);
+                assert_eq!(r.discarded, disc, "{ctx}: discarded rows");
+                assert_eq!(r.test, (m + emb..fx.n).collect::<Vec<_>>(), "{ctx}: test rows");
+            }
+
+            e.n2 += (fx.n == 2) as usize;
+            e.n3 += (fx.n == 3) as usize;
+            e.shuffled += fx.shuffled as usize;
+            let notes = p.report.notes.join("\n");
+            if mode == SplitMode::Temporal && fx.n >= 2 {
+                let test_n = (((fx.n as f64) * c.test_frac).round() as usize).clamp(1, fx.n - 1);
+                let m = fx.n - test_n;
+                e.gap_beyond_block += (m + c.gap > fx.n - 1) as usize;
+                if c.vfrac > 0.0 && m >= 2 {
+                    let want = (((m as f64) * c.vfrac).round() as usize).clamp(1, m - 1);
+                    let cut = m - want;
+                    e.tied_validation_cut += (cut > 0 && fx.stamp[cut - 1] == fx.stamp[cut]) as usize;
+                }
+            }
+            e.single_row_group += notes.contains("too few rows for a temporal split") as usize;
+            e.single_group += notes.contains("only one group") as usize;
+            e.no_validation_slice += notes.contains("fewer than 2 rows") as usize;
+            if let Some(iv) = &c.iv {
+                let d = &iv.declared;
+                let inside = |v: &[(i64, i64)], t: i64| v.iter().any(|&(a, b)| a <= t && t < b);
+                for &i in &r.discarded {
+                    let t = fx.stamp[i];
+                    if inside(&d.train, t) {
+                        e.interval_purged_before_test += d.test.iter().any(|&(s, _)| t < s && t + iv.purge > s) as usize;
+                        e.interval_embargoed_after_test += d.test.iter().any(|&(_, en)| t >= en && t < en + iv.embargo) as usize;
+                    } else if !inside(&d.validation, t) {
+                        e.interval_outside += 1;
+                    }
+                }
+            }
+        });
+        stats.assert_floor(mode);
+        e.purge_removed_everything += stats.has_error("after purging") as usize;
+    }
+    assert!(e.n2 > 0 && e.n3 > 0, "n=2: {}, n=3: {}", e.n2, e.n3);
+    assert!(e.gap_beyond_block > 0, "no gap beyond the test block");
+    assert!(e.single_row_group > 0, "no one-row temporal group");
+    assert!(e.single_group > 0, "no one-group table");
+    assert!(e.no_validation_slice > 0, "no validation fraction on a one-row training part");
+    assert!(e.tied_validation_cut > 0, "no tied stamp at the validation cut");
+    assert!(e.interval_purged_before_test > 0, "no interval row purged before a test interval");
+    assert!(e.interval_embargoed_after_test > 0, "no interval row embargoed after a test interval");
+    assert!(e.interval_outside > 0, "no row outside every interval");
+    assert!(e.shuffled > 0, "no shuffled file order");
+    assert!(e.purge_removed_everything > 0, "no purge removed every training row");
+}
+
+#[test]
+fn folds_partition_the_test_rows_in_every_mode() {
+    for (k, &mode) in MODES.iter().enumerate() {
+        let stats = drive(mode, 0x1461_2000 + k as u32, PurgePolicy::Mixed, |c, fx, p| {
+            let ctx = describe(c, fx);
+            let r = roles(p, fx.n);
+            if c.folds == 1 || r.test.len() < 2 {
+                assert!(p.fold_samples.is_empty(), "{ctx}: fold samples without several folds");
+                return;
+            }
+            assert!(p.fold_samples.is_empty() || p.fold_samples.len() >= 2, "{ctx}");
+            assert!(p.fold_samples.len() <= c.folds, "{ctx}");
+            if mode != SplitMode::TemporalGroup {
+                assert_eq!(p.fold_samples.len(), c.folds.min(r.test.len()), "{ctx}: fold count");
+            }
+            if p.fold_samples.is_empty() {
+                return;
+            }
+            let mut seen = vec![false; fx.n];
+            for (j, f) in r.folds.iter().enumerate() {
+                assert!(!f.is_empty(), "{ctx}: fold {j} is empty");
+                for &i in f {
+                    assert!(!seen[i], "{ctx}: row {i} in two folds");
+                    seen[i] = true;
+                }
+            }
+            let joined: Vec<usize> = r.folds.iter().flatten().copied().collect();
+            assert_eq!(joined, r.test, "{ctx}: folds in order are the test rows");
+        });
+        stats.assert_floor(mode);
+    }
+}
+
+fn stamps_of(fx: &Fixture, v: &[usize]) -> Vec<i64> {
+    v.iter().map(|&i| fx.stamp[i]).collect()
+}
+
+fn max_of(v: &[i64]) -> Option<i64> {
+    v.iter().copied().max()
+}
+
+fn min_of(v: &[i64]) -> Option<i64> {
+    v.iter().copied().min()
+}
+
+#[test]
+fn temporal_modes_never_train_after_the_test_block() {
+    for (k, &mode) in [SplitMode::Temporal, SplitMode::TemporalGroup, SplitMode::Group].iter().enumerate() {
+        let stats = drive(mode, 0x1461_3000 + k as u32, PurgePolicy::Mixed, |c, fx, p| {
+            let ctx = describe(c, fx);
+            let r = roles(p, fx.n);
+            match mode {
+                SplitMode::Temporal => {
+                    let tr = stamps_of(fx, &r.train);
+                    let va = stamps_of(fx, &r.validation);
+                    let te = stamps_of(fx, &r.test);
+                    let (tr_max, te_min) = (max_of(&tr).unwrap(), min_of(&te).unwrap());
+                    assert!(tr_max <= te_min, "{ctx}: training after the test block");
+                    if fx.shape != Shape::Tied {
+                        assert!(tr_max < te_min, "{ctx}: unique stamps must be strictly ordered");
+                    }
+                    if let Some(va_min) = min_of(&va) {
+                        assert!(tr_max < va_min, "{ctx}: a stamp straddles fit and validation");
+                        assert!(max_of(&va).unwrap() <= te_min, "{ctx}: validation after the test block");
+                    }
+                }
+                SplitMode::TemporalGroup => {
+                    let all = stamps_of(fx, &r.train);
+                    let va = stamps_of(fx, &r.validation);
+                    if let (Some(a), Some(b)) = (max_of(&all), min_of(&va)) {
+                        assert!(a < b, "{ctx}: a stamp straddles fit and validation");
+                    }
+                    for g in 0..=*fx.group.iter().max().unwrap() {
+                        let of = |v: &[usize]| -> Vec<i64> { v.iter().filter(|&&i| fx.group[i] == g).map(|&i| fx.stamp[i]).collect() };
+                        let (tr, va, te) = (of(&r.train), of(&r.validation), of(&r.test));
+                        if let (Some(a), Some(b)) = (max_of(&tr), min_of(&te)) {
+                            assert!(a < b, "{ctx}: group {g} trains after its test block");
+                        }
+                        if let (Some(a), Some(b)) = (max_of(&va), min_of(&te)) {
+                            assert!(a < b, "{ctx}: group {g} validates after its test block");
+                        }
+                    }
+                }
+                _ => {
+                    let test_groups: std::collections::BTreeSet<usize> = r.test.iter().map(|&i| fx.group[i]).collect();
+                    for &i in r.train.iter().chain(&r.validation) {
+                        assert!(!test_groups.contains(&fx.group[i]), "{ctx}: group {} on both sides", fx.group[i]);
+                    }
+                }
+            }
+        });
+        stats.assert_floor(mode);
+    }
+}
+
+fn distance_to(t: i64, sorted: &[i64]) -> i64 {
+    sorted.iter().map(|&s| (s - t).abs()).min().unwrap_or(i64::MAX)
+}
+
+#[test]
+fn purge_keeps_every_training_row_outside_the_label_distance() {
+    let timed = [SplitMode::Temporal, SplitMode::TemporalGroup, SplitMode::TemporalIntervals];
+    for (k, &mode) in timed.iter().enumerate() {
+        let mut positive = 0usize;
+        let stats = drive(mode, 0x1461_4000 + k as u32, PurgePolicy::Always, |c, fx, p| {
+            let ctx = describe(c, fx);
+            let l = c.purge.unwrap() as i64;
+            let r = roles(p, fx.n);
+            let tr = stamps_of(fx, &r.train);
+            let va = stamps_of(fx, &r.validation);
+            let te = stamps_of(fx, &r.test);
+            for &t in tr.iter().chain(&va) {
+                assert!(distance_to(t, &te) >= l, "{ctx}: stamp {t} within {l} s of a test stamp");
+            }
+            for &t in &tr {
+                assert!(distance_to(t, &va) >= l, "{ctx}: fit stamp {t} within {l} s of a validation stamp");
+            }
+            if te.is_empty() {
+                assert_eq!(p.report.purge_seconds, None, "{ctx}");
+            } else {
+                let nearest = tr.iter().map(|&t| distance_to(t, &te)).min().unwrap();
+                let reported = p.report.purge_seconds.unwrap_or_else(|| panic!("{ctx}: purge_seconds is not recorded"));
+                assert!(reported >= l as f64 && reported == nearest as f64, "{ctx}: reported distance {reported}, measured {nearest}");
+            }
+
+            let open = Case { mode: c.mode, test_frac: c.test_frac, gap: c.gap, vfrac: c.vfrac, folds: c.folds, purge: None, iv: c.iv.clone() };
+            let base = prepare(&open, fx).expect("the same case without a purge is ok");
+            let removed = base.train.y.len() + base.validation.as_ref().map_or(0, |s| s.y.len()) - r.train.len() - r.validation.len();
+            assert_eq!(removed, purge_count(p), "{ctx}: purge counters");
+            positive += (removed > 0) as usize;
+        });
+        stats.assert_floor(mode);
+        assert!(positive > 0, "{:?}: the purge never removed a row", mode);
+    }
+}
+
+#[test]
+fn interval_roles_follow_the_split_table() {
+    let mut before = 0usize;
+    let mut after = 0usize;
+    let mut outside = 0usize;
+    let stats = drive(SplitMode::TemporalIntervals, 0x1461_5000, PurgePolicy::Never, |c, fx, p| {
+        let ctx = describe(c, fx);
+        let iv = c.iv.as_ref().unwrap();
+        let d = &iv.declared;
+        let r = roles(p, fx.n);
+        let mut role_of: Vec<Option<Role>> = vec![None; fx.n];
+        for (role, v) in [(Role::Train, &r.train), (Role::Validation, &r.validation), (Role::Test, &r.test)] {
+            for &i in v {
+                role_of[i] = Some(role);
+            }
+        }
+        let inside = |v: &[(i64, i64)], t: i64| v.iter().any(|&(a, b)| a <= t && t < b);
+        let (mut dropped, mut out) = (0usize, 0usize);
+        for i in 0..fx.n {
+            let t = fx.stamp[i];
+            assert_eq!(role_of[i], iv.role(t), "{ctx}: row {i} at {t}");
+            if role_of[i].is_none() {
+                if inside(&d.train, t) || inside(&d.validation, t) {
+                    dropped += 1;
+                    if inside(&d.train, t) {
+                        before += d.test.iter().any(|&(s, _)| t < s && t + iv.purge > s) as usize;
+                        after += d.test.iter().any(|&(_, e)| t >= e && t < e + iv.embargo) as usize;
+                    }
+                } else {
+                    out += 1;
+                }
+            }
+        }
+        outside += out;
+        assert_eq!(p.report.interval_dropped_rows, dropped, "{ctx}");
+        assert_eq!(p.report.interval_outside_rows, out, "{ctx}");
+    });
+    stats.assert_floor(SplitMode::TemporalIntervals);
+    assert!(before > 0 && after > 0 && outside > 0, "purged before {before}, embargoed after {after}, outside {outside}");
+}
+
+#[test]
+fn temporal_cut_on_a_tied_stamp_is_pinned() {
+    let s = BASE;
+    let stamps = [s, s + H, s + 2 * H, s + 2 * H, s + 3 * H, s + 4 * H];
+    let mut csv = String::from("t,x,y\n");
+    for (id, t) in stamps.iter().enumerate() {
+        csv.push_str(&format!("{},{},{}\n", t, (0.37 * id as f64).sin(), id));
+    }
+    let table = data::parse_table(&csv).unwrap();
+    let run = |purge: Option<f64>| {
+        let mut sp = spec(SplitMode::Temporal);
+        sp.time_col = Some(0);
+        sp.test_frac = 0.5;
+        sp.purge_seconds = purge;
+        data::prepare_full(&table, &["x".to_string()], "y", &sp, &mut Mt::new(1)).unwrap()
+    };
+    let open = run(None);
+    assert_eq!(ids(&open.train.y), vec![0, 1, 2], "the stamp s+2h is on both sides of the cut");
+    assert_eq!(ids(&open.test.y), vec![3, 4, 5]);
+    let purged = run(Some(1.0));
+    assert_eq!(ids(&purged.train.y), vec![0, 1]);
+    assert_eq!(ids(&purged.test.y), vec![3, 4, 5]);
+    assert_eq!(purged.report.purged_test_boundary_rows, 1);
+}
+
+#[test]
+fn a_kept_row_never_reaches_a_declared_locked_range() {
+    let mut rng = Mt::new(0x1461_6000);
+    let mut ran = [0usize; 3];
+    for case in 0..300 {
+        let kind = case % 3;
+        let mode = if (case / 3) % 2 == 0 { SplitMode::Temporal } else { SplitMode::TemporalGroup };
+        let groups = 1 + rng.usize_below(3);
+        let exact = rng.bool(0.5);
+        let extra = |rng: &mut Mt| if exact { 0 } else { (1 + rng.usize_below(5)) as i64 * H };
+        let mut stamp: Vec<i64>;
+        let start: i64;
+        let end: i64;
+        match kind {
+            2 => {
+                let m = 30 + rng.usize_below(40);
+                let k = 1 + rng.usize_below(3);
+                let r = (m + 1) / 2;
+                let l = m - k - r;
+                let len = (24 + rng.usize_below(100)) as i64 * H;
+                start = BASE + (l as i64 + 2) * H;
+                let before = extra(&mut rng);
+                end = start + len;
+                stamp = (0..l as i64).map(|i| start - before - (l as i64 - i) * H).collect::<Vec<_>>();
+                stamp.extend((0..k as i64).map(|j| start - 900 * (k as i64 - j)));
+                let first = end + H + extra(&mut rng);
+                stamp.extend((0..r as i64).map(|j| first + j * H));
+            }
+            _ => {
+                let l = 6 + rng.usize_below(25);
+                let r = 6 + rng.usize_below(25);
+                let len = (24 + rng.usize_below(100)) as i64 * H;
+                start = BASE + (l as i64 + 2) * H;
+                let before = extra(&mut rng);
+                end = start + len;
+                stamp = (0..l as i64).map(|i| start - before - (l as i64 - i) * H).collect::<Vec<_>>();
+                if kind == 1 {
+                    let k = 1 + rng.usize_below(4) as i64;
+                    stamp.extend((1..=k).map(|j| start + j * len / (k + 1)));
+                }
+                let first = end + H + extra(&mut rng);
+                stamp.extend((0..r as i64).map(|j| first + j * H));
+            }
+        }
+        let group: Vec<usize> = (0..stamp.len()).map(|i| i % groups).collect();
+        let shuffled = rng.bool(0.5);
+        let table = build_table(&stamp, &group, &mut rng, shuffled);
+        let mut sp = spec(mode);
+        sp.time_col = Some(0);
+        sp.group_col = Some(1);
+        sp.boundary_purge_seconds = Some(3600.0);
+        sp.declared_lockbox = Some(LockDeclared {
+            lockbox: Lockbox { start, end },
+            source: "flag",
+            also: None,
+            embargo: Embargo::none(),
+        });
+        let ctx = format!("kind {kind} {mode:?} start {start} end {end} stamps {stamp:?}");
+        let res = data::prepare_full(&table, &["x".to_string()], "y", &sp, &mut Mt::new(3));
+        match (kind, res) {
+            (0, Ok(p)) => {
+                let k = p.keys.as_ref().expect("time keys");
+                let lb = Lockbox { start, end };
+                for &t in k.train.iter().chain(k.validation.iter().flatten()).chain(&k.test) {
+                    assert!(!lb.reaches(t as i64, 3600, 3600), "{ctx}: kept stamp {t} reaches the range");
+                }
+            }
+            (0, Err(e)) => panic!("{ctx}: refused: {e}"),
+            (1, Err(e)) => assert!(e.contains("lock"), "{ctx}: {e}"),
+            (2, Err(e)) => {
+                assert!(e.contains("declared locked test"), "{ctx}: {e}");
+                assert!(e.starts_with("training split has"), "{ctx}: {e}");
+            }
+            (_, Ok(_)) => panic!("{ctx}: a row that reaches the range was kept"),
+            _ => unreachable!(),
+        }
+        ran[kind] += 1;
+    }
+    assert_eq!(ran, [100, 100, 100]);
 }
