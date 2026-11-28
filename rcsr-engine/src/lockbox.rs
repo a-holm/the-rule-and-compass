@@ -100,12 +100,12 @@ impl Lockbox {
     /// exactly at `start` does not reach it. A row has at least its own second,
     /// so `purge == 0` tests the stamp itself.
     pub fn reaches(&self, t: i64, purge: i64, embargo: i64) -> bool {
-        t + purge.max(1) > self.start && t < self.end + embargo.max(0)
+        crate::intervals::reaches(self.start, self.end, t, purge, embargo)
     }
 
     /// First stamp whose label window reaches the range.
     pub fn first_reaching(&self, purge: i64) -> i64 {
-        self.start - purge.max(1) + 1
+        self.start.saturating_sub(purge.max(1) - 1)
     }
 
     /// Count the timestamps inside the lockbox and group them by UTC month.
@@ -864,7 +864,7 @@ pub fn embargo_json(seconds: i64, column: &str, rule: &str, bar_seconds: i64) ->
 /// The `lockbox_embargo` seconds one carrier text declares.
 pub fn embargo_from_declaration(text: &str) -> Option<i64> {
     let obj = crate::manifest::object(text, "lockbox_embargo")?;
-    int_field(obj, "seconds").filter(|s| *s >= 0)
+    int_field(obj, "seconds").filter(|s| (0..=crate::intervals::MAX_SECONDS).contains(s))
 }
 
 /// The largest `lockbox_embargo.seconds` over the carriers of `data_path`, with
@@ -885,7 +885,11 @@ pub fn declared_embargo(data_path: &str) -> Result<Option<(String, i64)>, Resolv
             continue;
         }
         let Some(s) = embargo_from_declaration(&text) else {
-            return Err(input(format!("{}: unreadable lockbox_embargo declaration (needs integer seconds >= 0)", file)));
+            return Err(input(format!(
+                "{}: unreadable lockbox_embargo declaration (needs integer seconds in 0..={})",
+                file,
+                crate::intervals::MAX_SECONDS
+            )));
         };
         if best.as_ref().map_or(true, |(_, b)| s > *b) {
             best = Some((file, s));
@@ -915,10 +919,23 @@ pub fn resolve_with(flag: Option<&str>, embargo_flag: Option<&str>, data_path: &
 pub fn resolve_retired(flag: Option<&str>, embargo_flag: Option<&str>, data_path: &str, retired: Option<&str>) -> Result<Resolved, ResolveError> {
     let retired = retired.map(crate::retire::Retirement::load).transpose()?;
     let mut r = resolve_ranges(flag, data_path, retired)?;
+    for (file, l) in r.declared_in.iter().map(|(f, l)| (f.as_str(), l)).chain(r.also.iter().map(|l| ("the second guarded range", l))) {
+        for t in [l.start, l.end] {
+            crate::intervals::bounded_stamp(t, &format!("{}: the locked_test stamp", file)).map_err(input)?;
+        }
+    }
+    let flagged = matches!(r.source, Source::Flag | Source::FlagAndDefault);
+    for t in r.range.iter().flat_map(|l| [l.start, l.end]) {
+        if flagged {
+            crate::intervals::bounded_stamp(t, "--lockbox: the stamp").map_err(usage)?;
+        } else {
+            crate::intervals::bounded_stamp(t, "the declared locked test: the stamp").map_err(input)?;
+        }
+    }
     let requested = match embargo_flag {
         None => None,
         Some(s) => match s.trim().parse::<i64>() {
-            Ok(v) if v >= 0 => Some(v),
+            Ok(v) if v >= 0 => Some(crate::intervals::bounded_span(v, "--lockbox-embargo").map_err(usage)?),
             _ => return Err(usage(format!("--lockbox-embargo: '{}' is not a number of seconds >= 0", s))),
         },
     };

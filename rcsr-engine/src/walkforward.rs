@@ -605,9 +605,9 @@ impl ProtocolOptions {
     }
 
     /// Whole seconds of purge in front of a sealed range: the label purge, or
-    /// the spec embargo when that is larger.
+    /// the spec embargo when that is larger, within `0..=MAX_SECONDS`.
     pub fn locked_purge_seconds(&self, spec: &EvalSpec) -> i64 {
-        self.required_purge_seconds(spec.horizon).max(spec.embargo_seconds()).ceil() as i64
+        (self.required_purge_seconds(spec.horizon).max(spec.embargo_seconds()).ceil() as i64).clamp(0, crate::intervals::MAX_SECONDS)
     }
 
     /// The seconds after the end of a sealed range that no row may read:
@@ -627,7 +627,7 @@ impl ProtocolOptions {
             .iter()
             .map(|&(s, e)| {
                 let range = crate::lockbox::Lockbox { start: s, end: e };
-                (s as f64, e as f64, range.first_reaching(purge) as f64, (e + embargo) as f64)
+                (s as f64, e as f64, range.first_reaching(purge) as f64, e.saturating_add(embargo) as f64)
             })
             .collect()
     }

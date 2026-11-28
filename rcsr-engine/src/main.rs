@@ -577,9 +577,9 @@ DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
   --lockbox-embargo <SECONDS>
                              widen the lookback embargo after the end of every locked range
                              (default: lockbox_embargo declared with the data, else 10972800);
-                             a smaller value is refused (exit 2). Rows in
-                             [START - purge, END + embargo) are refused (exit 3); with a
-                             target spec, rows before END + max(embargo, purge) too
+                             a smaller value or one above 1099511627776 is refused (exit 2).
+                             Rows in [START - purge, END + embargo) are refused (exit 3);
+                             with a target spec, rows before END + max(embargo, purge) too
   --retired <retired.json>
                              record from `rcsr protocol retire`: its range had its one sealed
                              read and no longer guards next to --lockbox on undeclared data;
@@ -671,9 +671,11 @@ HOW ROWS ARE SPLIT (important for time series and panel data):
                              (default auto: the larger of the label purge and the
                              longest lookback of the --vars columns, rule
                              rcsr-lookback/1 at the modal bar of the data; a column
-                             without a rule counts as 10972800). A smaller value
-                             exits 2. embargo_source is flag, lookback or purge
-  --time <col>               time/ordering column; implies temporal. Accepts
+                             without a rule counts as 10972800). A smaller value,
+                             or an embargo or purge above 1099511627776, exits 2;
+                             so does a table stamp beyond +-1099511627776.
+                             embargo_source is flag, lookback or purge
+  --time <col>              time/ordering column; implies temporal. Accepts
                              epoch numbers or ISO 8601 with a Z / +-HH:MM offset
   --date-only <policy>       date-only time values: error (default, refuses an
                              under-specified instant), utc-midnight or
@@ -6072,6 +6074,13 @@ fn main() {
             let Some(purge) = purge else {
                 trading_usage("--split-table needs the label purge of a declared target: add --target-spec");
             };
+            if !purge.is_finite() || purge.ceil() > rcsr::intervals::MAX_SECONDS as f64 {
+                trading_usage(&format!(
+                    "--split-table: the label purge {} s of the target spec is not finite or above {} s",
+                    purge,
+                    rcsr::intervals::MAX_SECONDS
+                ));
+            }
             let purge = purge.ceil() as i64;
             let tc = time_col.expect("the interval mode resolved a time column");
             let keys = data::time_keys_with(&table, tc, &data::TimeSpec { date_only, unit: time_unit, tz })
@@ -6104,7 +6113,7 @@ fn main() {
                 embargo_columns.extend(gs.columns(&vars));
             }
             let (embargo, source, column) = rcsr::intervals::resolve_embargo(flag, purge, &embargo_columns, bar).unwrap_or_else(|e| trading_usage(&e));
-            Some(rcsr::intervals::IntervalSplit::new(declared, purge, embargo, source, column))
+            Some(rcsr::intervals::IntervalSplit::checked(declared, purge, embargo, source, column).unwrap_or_else(|e| trading_usage(&e)))
         }
     };
     let split_fingerprint: Option<String> = interval_split.as_ref().map(|s| s.fingerprint());
@@ -12276,8 +12285,9 @@ OPTIONS:
   --lockbox-embargo <SECONDS>
                              widen the lookback embargo after the end of every locked range
                              (default: lockbox_embargo declared with the data, else 10972800);
-                             a smaller value is refused (exit 2). Rows in
-                             [START - purge, END + max(embargo, purge)) are refused (exit 3)
+                             a smaller value or one above 1099511627776 is refused (exit 2).
+                             Rows in [START - purge, END + max(embargo, purge)) are refused
+                             (exit 3)
   --retired <retired.json>
                              record from `rcsr protocol retire`: its range had its one sealed
                              read and no longer guards next to --lockbox on undeclared data;
