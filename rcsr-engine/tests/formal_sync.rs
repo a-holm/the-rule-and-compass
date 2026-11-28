@@ -3,10 +3,12 @@
 //! `formal/models.toml` lists, for each model, the source spans it was written from, with the
 //! SHA-256 of each span. A changed span fails here, in the pull request that changes it, without
 //! a Lean toolchain.
+//! The committed golden vectors are compared with what the Rust functions return today.
 //! Rules: `docs/formal-verification.md`.
 
 use std::path::{Path, PathBuf};
 
+use rcsr::formal_vectors;
 use rcsr::manifest::sha256_hex;
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -230,4 +232,49 @@ fn parser_refuses_what_it_does_not_know() {
     assert!(parse_manifest(&good.replace("sha256 = \"0000", "sha256 = \"00")).is_err());
     assert!(parse_manifest(&good.replace("[[model.span]]", "[model.span]")).is_err());
     assert!(parse_manifest("").is_err());
+}
+
+#[test]
+fn manifest_models_have_golden_vectors() {
+    let models = load_manifest();
+    let mut named: Vec<String> = models.iter().filter_map(|m| m.vectors.clone()).collect();
+    named.sort();
+    let mut generated: Vec<String> = formal_vectors::MODELS.iter().map(|s| s.to_string()).collect();
+    generated.sort();
+    assert_eq!(named, generated, "the `vectors` names of formal/models.toml and formal_vectors::MODELS differ");
+    for name in &named {
+        let path = root().join(format!("formal/vectors/golden/{name}.vec"));
+        assert!(path.is_file(), "{} is missing", path.display());
+    }
+}
+
+#[test]
+fn golden_vectors_match_rust() {
+    for model in formal_vectors::MODELS {
+        let path = root().join(format!("formal/vectors/golden/{model}.vec"));
+        let committed = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let now = formal_vectors::golden(model).expect("a generator for every name in MODELS");
+        if committed != now {
+            let line = committed.lines().zip(now.lines()).position(|(a, b)| a != b).map_or(0, |i| i + 1);
+            panic!(
+                "golden vectors of {model} differ from the Rust function (first differing line {line}; committed has {} lines, Rust gives {}). The function changed behaviour: follow docs/formal-verification.md \"When a modelled function changes\".",
+                committed.lines().count(),
+                now.lines().count()
+            );
+        }
+    }
+}
+
+#[test]
+fn golden_files_have_the_declared_shape() {
+    for model in formal_vectors::MODELS {
+        let text = formal_vectors::golden(model).expect("a generator for every name in MODELS");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), formal_vectors::GOLDEN_COUNT + 2, "{model}");
+        assert_eq!(lines[0], format!("rcsr-vec 1 {model} sig=w,w->w"));
+        assert_eq!(lines[lines.len() - 1], format!("end {}", formal_vectors::GOLDEN_COUNT));
+        assert!(formal_vectors::directed_len(model).expect("known model") <= formal_vectors::GOLDEN_COUNT);
+        assert!(formal_vectors::vectors(model, 0, 1).is_none(), "a count below the directed set is refused");
+    }
+    assert!(formal_vectors::vectors("no_such_model", 5000, 1).is_none());
 }

@@ -1,6 +1,6 @@
 name = "rcsr_core"
 version = "0.1.0"
-defaultTargets = ["RcsrCore"]
+defaultTargets = ["RcsrCore", "rcsr_model_check"]
 
 [leanOptions]
 autoImplicit = false
@@ -8,3 +8,7 @@ relaxedAutoImplicit = false
 
 [[lean_lib]]
 name = "RcsrCore"
+
+[[lean_exe]]
+name = "rcsr_model_check"
+root = "Check"
