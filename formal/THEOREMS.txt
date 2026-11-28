@@ -1,3 +1,17 @@
+Rcsr.ErrorOrder.cmpError_eq_iff bv_decide
+Rcsr.ErrorOrder.cmpError_swap bv_decide
+Rcsr.ErrorOrder.eqv_lt_congr bv_decide
+Rcsr.ErrorOrder.eqv_symm bv_decide
+Rcsr.ErrorOrder.eqv_trans bv_decide
+Rcsr.ErrorOrder.le_refl kernel
+Rcsr.ErrorOrder.le_total bv_decide
+Rcsr.ErrorOrder.le_trans bv_decide
+Rcsr.ErrorOrder.lt_eqv_congr bv_decide
+Rcsr.ErrorOrder.lt_trans bv_decide
+Rcsr.ErrorOrder.nan_greatest bv_decide
+Rcsr.ErrorOrder.neg_inf_least bv_decide
+Rcsr.ErrorOrder.signed_zeros_equal kernel
+Rcsr.ErrorOrder.trichotomy bv_decide
 Rcsr.Prim.finite_not_nan kernel
 Rcsr.Prim.fold_signed_zero kernel
 Rcsr.Prim.key66_toInt kernel
