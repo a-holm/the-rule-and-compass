@@ -1058,3 +1058,41 @@ fn cpcv_refuses_ppy_contradicting_period_time() {
     assert!(e.contains("annualization.periods_per_year") && e.contains("365") && e.contains("8760") && e.contains(&reports[2]), "{e}");
     assert!(!bad.join("path_1.json").exists());
 }
+
+#[test]
+fn cpcv_refuses_values_outside_the_bound() {
+    let over = rcsr::intervals::MAX_SECONDS + 1;
+    let lock = Locked { start: day("2020-03-01"), end: day("2020-06-01"), embargo: over };
+    for plan in [Plan { embargo: over, ..pilot_plan(1) }, Plan { purge: over, ..pilot_plan(1) }, Plan { locked: vec![lock], ..pilot_plan(1) }] {
+        match cpcv::generate(&plan) {
+            Err((code, msg)) => {
+                assert_eq!(code, 2, "{msg}");
+                assert!(msg.contains("1099511627776"), "{msg}");
+            }
+            Ok(_) => panic!("accepted purge {} embargo {} locked {:?}", plan.purge, plan.embargo, plan.locked),
+        }
+    }
+    let s = Scratch::new("cpcv-bound");
+    let r1 = ["--start", "2020-01-01", "--end", "2020-03-01", "--groups", "4", "--test-groups", "1", "--purge-seconds", "86400"];
+    let huge = s.path().join("huge");
+    let mut args = r1.to_vec();
+    args.extend_from_slice(&["--lockbox", "none", "--embargo-seconds", "9223372036854775807"]);
+    let o = generate_cli(&huge, &args);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).contains("--embargo-seconds") && stderr(&o).contains("1099511627776"), "{}", stderr(&o));
+    assert!(!huge.join("splits.csv").exists());
+    let lock_huge = s.path().join("lock-huge");
+    let mut args = r1.to_vec();
+    args.extend_from_slice(&["--embargo-seconds", "172800", "--lockbox", "2020-02-01,2020-02-10", "--lockbox-embargo", "9223372036854775807"]);
+    let o = generate_cli(&lock_huge, &args);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stderr(&o).contains("--lockbox-embargo"), "{}", stderr(&o));
+    assert!(!lock_huge.join("splits.csv").exists());
+}
+
+#[test]
+fn hole_covers_the_range_under_an_extreme_embargo() {
+    let (a, z) = cpcv::hole(&std::hint::black_box(Locked { start: 0, end: 100, embargo: i64::MAX }), std::hint::black_box(10));
+    assert!(a <= -9, "the hole starts at or before the first reaching stamp: {a}");
+    assert!(z >= 100, "the hole ends at or after the range end: {z}");
+}

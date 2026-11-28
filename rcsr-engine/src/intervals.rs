@@ -9,6 +9,32 @@
 /// Header of a splits table.
 pub const TABLE_HEADER: &str = "split_id,role,start,end";
 
+/// Largest magnitude of a stamp, and largest purge or embargo, in seconds.
+pub const MAX_SECONDS: i64 = 1 << 40;
+
+/// `v` when it lies in `-MAX_SECONDS..=MAX_SECONDS`.
+pub fn bounded_stamp(v: i64, what: &str) -> Result<i64, String> {
+    if (-MAX_SECONDS..=MAX_SECONDS).contains(&v) {
+        Ok(v)
+    } else {
+        Err(format!("{} {} is outside +-{} s", what, v, MAX_SECONDS))
+    }
+}
+
+/// `v` when it lies in `0..=MAX_SECONDS`.
+pub fn bounded_span(v: i64, what: &str) -> Result<i64, String> {
+    if (0..=MAX_SECONDS).contains(&v) {
+        Ok(v)
+    } else {
+        Err(format!("{} {} is outside 0..={} s", what, v, MAX_SECONDS))
+    }
+}
+
+/// A whole-second `f64` inside the stamp bound, else `None` (NaN, infinities, fractions, out of range).
+pub fn whole_seconds(v: f64) -> Option<i64> {
+    (v.is_finite() && v.fract() == 0.0 && v.abs() <= MAX_SECONDS as f64).then(|| v as i64)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
     Train,
@@ -74,6 +100,55 @@ pub struct Declared {
     pub test: Vec<(i64, i64)>,
 }
 
+impl Declared {
+    /// Every interval non-empty and inside the stamp bound; each role sorted by
+    /// start; no two intervals of any roles overlap (touching is allowed).
+    pub fn validate(&self) -> Result<(), String> {
+        let id = &self.split_id;
+        let roles = [(Role::Train, &self.train), (Role::Validation, &self.validation), (Role::Test, &self.test)];
+        for (role, v) in roles {
+            for &(a, b) in v.iter() {
+                bounded_stamp(a, &format!("split '{}': the {} interval start", id, role.as_str()))?;
+                bounded_stamp(b, &format!("split '{}': the {} interval end", id, role.as_str()))?;
+                if b <= a {
+                    return Err(format!("split '{}': the {} interval [{}, {}) is empty", id, role.as_str(), a, b));
+                }
+            }
+            if let Some(w) = v.windows(2).find(|w| w[1].0 < w[0].0) {
+                return Err(format!(
+                    "split '{}': the {} intervals are not sorted by start ([{}, {}) after [{}, {}))",
+                    id,
+                    role.as_str(),
+                    w[1].0,
+                    w[1].1,
+                    w[0].0,
+                    w[0].1
+                ));
+            }
+        }
+        let mut all: Vec<(i64, i64, Role)> = Vec::new();
+        for (role, v) in roles {
+            all.extend(v.iter().map(|&(a, b)| (a, b, role)));
+        }
+        all.sort_unstable_by_key(|&(a, b, _)| (a, b));
+        for w in all.windows(2) {
+            if w[1].0 < w[0].1 {
+                return Err(format!(
+                    "split '{}': the {} interval {}..{} overlaps the {} interval {}..{}",
+                    id,
+                    w[0].2.as_str(),
+                    iso(w[0].0),
+                    iso(w[0].1),
+                    w[1].2.as_str(),
+                    iso(w[1].0),
+                    iso(w[1].1)
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// True when a table is a splits table (its first non-comment line is the header).
 pub fn is_table(text: &str) -> bool {
     text.lines()
@@ -88,7 +163,7 @@ fn stamp(s: &str, line: usize, what: &str) -> Result<i64, String> {
     if !v.is_finite() || v.fract() != 0.0 {
         return Err(format!("--split-table line {}: {} '{}' is not a whole second", line, what, s));
     }
-    Ok(v as i64)
+    whole_seconds(v).ok_or_else(|| format!("--split-table line {}: {} '{}' is outside +-{} s", line, what, s, MAX_SECONDS))
 }
 
 /// Parse a splits table and pick the split `split_id`. Overlapping intervals
@@ -146,25 +221,7 @@ pub fn parse_table(text: &str, split_id: &str) -> Result<Declared, String> {
     for v in [&mut out.train, &mut out.validation, &mut out.test] {
         v.sort_unstable();
     }
-    let mut all: Vec<(i64, i64, Role)> = Vec::new();
-    for (role, v) in [(Role::Train, &out.train), (Role::Validation, &out.validation), (Role::Test, &out.test)] {
-        all.extend(v.iter().map(|&(a, b)| (a, b, role)));
-    }
-    all.sort_unstable_by_key(|&(a, b, _)| (a, b));
-    for w in all.windows(2) {
-        if w[1].0 < w[0].1 {
-            return Err(format!(
-                "--split-table: split '{}': the {} interval {}..{} overlaps the {} interval {}..{}",
-                split_id,
-                w[0].2.as_str(),
-                iso(w[0].0),
-                iso(w[0].1),
-                w[1].2.as_str(),
-                iso(w[1].0),
-                iso(w[1].1)
-            ));
-        }
-    }
+    out.validate().map_err(|e| format!("--split-table: {}", e))?;
     Ok(out)
 }
 
@@ -175,12 +232,14 @@ fn iso(t: i64) -> String {
 /// The label window `[t, t + purge)` of a row stamped `t` meets `[start, end)`,
 /// or `t` lies in `[end, end + embargo)` ([`crate::lockbox::Lockbox::reaches`]).
 pub fn reaches(start: i64, end: i64, t: i64, purge: i64, embargo: i64) -> bool {
-    t + purge.max(1) > start && t < end + embargo.max(0)
+    let t = t as i128;
+    t + purge.max(1) as i128 > start as i128 && t < end as i128 + embargo.max(0) as i128
 }
 
-/// Some stamp of the half-open `[a, b)` reaches `[start, end)`.
+/// Some stamp of the half-open `[a, b)` reaches `[start, end)`. Needs
+/// `start < end`: the formula does not know that an empty range is reached by no stamp.
 pub fn interval_reaches(start: i64, end: i64, a: i64, b: i64, purge: i64, embargo: i64) -> bool {
-    a < b && a < end + embargo.max(0) && (b - 1) + purge.max(1) > start
+    a < b && (a as i128) < end as i128 + embargo.max(0) as i128 && b as i128 - 1 + purge.max(1) as i128 > start as i128
 }
 
 /// A resolved split: the intervals, the label purge and the embargo after
@@ -195,14 +254,24 @@ pub struct IntervalSplit {
     pub embargo_column: Option<String>,
 }
 
-fn inside(v: &[(i64, i64)], t: i64) -> bool {
+pub(crate) fn inside(v: &[(i64, i64)], t: i64) -> bool {
     let p = v.partition_point(|&(a, _)| a <= t);
     p > 0 && t < v[p - 1].1
 }
 
 impl IntervalSplit {
+    /// No validation; production code calls [`IntervalSplit::checked`].
     pub fn new(declared: Declared, purge: i64, embargo: i64, embargo_source: EmbargoSource, embargo_column: Option<String>) -> IntervalSplit {
         IntervalSplit { declared, purge: purge.max(0), embargo: embargo.max(0), embargo_source, embargo_column }
+    }
+
+    /// A split whose intervals pass [`Declared::validate`] and whose purge and
+    /// embargo lie in `0..=MAX_SECONDS`.
+    pub fn checked(declared: Declared, purge: i64, embargo: i64, embargo_source: EmbargoSource, embargo_column: Option<String>) -> Result<IntervalSplit, String> {
+        declared.validate()?;
+        let purge = bounded_span(purge, "the label purge")?;
+        let embargo = bounded_span(embargo, "the embargo")?;
+        Ok(IntervalSplit { declared, purge, embargo, embargo_source, embargo_column })
     }
 
     /// Role of a row stamped `t`: `None` when it lies outside every interval,
@@ -240,9 +309,9 @@ impl IntervalSplit {
             Role::Test => return d.test.clone(),
         };
         let p1 = self.purge.max(1);
-        let mut zones: Vec<(i64, i64)> = d.test.iter().map(|&(s, e)| (s - p1 + 1, e + self.embargo)).collect();
+        let mut zones: Vec<(i64, i64)> = d.test.iter().map(|&(s, e)| (s.saturating_sub(p1 - 1), e.saturating_add(self.embargo))).collect();
         if role == Role::Train {
-            zones.extend(d.validation.iter().map(|&(s, e)| (s - p1 + 1, e + self.purge)));
+            zones.extend(d.validation.iter().map(|&(s, e)| (s.saturating_sub(p1 - 1), e.saturating_add(self.purge))));
         }
         zones.sort_unstable();
         let mut out = Vec::new();
@@ -409,7 +478,7 @@ pub fn column_lookback(name: &str, bar_seconds: i64) -> i64 {
     }
     if let Some((stem, k)) = name.rsplit_once("_lag") {
         if let (Ok(k), Some(l)) = (k.parse::<i64>(), crate::enrich::lookback_seconds(stem, bar_seconds)) {
-            return l + k * bar_seconds;
+            return l.saturating_add(k.saturating_mul(bar_seconds));
         }
     }
     crate::protocol::DEFAULT_LOCKBOX_EMBARGO_SECONDS
@@ -417,8 +486,10 @@ pub fn column_lookback(name: &str, bar_seconds: i64) -> i64 {
 
 /// `--embargo auto` (`flag = None`) or an explicit value: the embargo is the
 /// larger of the label purge and the longest column lookback; an explicit
-/// value below it is refused.
+/// value below it is refused, and so are a purge or an embargo outside
+/// `0..=MAX_SECONDS`.
 pub fn resolve_embargo(flag: Option<i64>, purge: i64, columns: &[String], bar_seconds: i64) -> Result<(i64, EmbargoSource, Option<String>), String> {
+    let purge = bounded_span(purge, "the label purge")?;
     let mut best: Option<(i64, &str)> = None;
     for c in columns {
         let l = column_lookback(c, bar_seconds);
@@ -430,10 +501,10 @@ pub fn resolve_embargo(flag: Option<i64>, purge: i64, columns: &[String], bar_se
         Some((l, c)) if l > purge => (l, EmbargoSource::Lookback, Some(c.to_string())),
         _ => (purge, EmbargoSource::Purge, None),
     };
-    match flag {
-        None => Ok((auto, source, column)),
-        Some(v) if v >= auto => Ok((v, EmbargoSource::Flag, None)),
-        Some(v) => Err(format!(
+    let (embargo, source, column) = match flag {
+        None => (auto, source, column),
+        Some(v) if v >= auto => (v, EmbargoSource::Flag, None),
+        Some(v) => return Err(format!(
             "--embargo {} is below the automatic embargo {} s ({}): rows after a test interval would read its bars \
              or share its labels; pass at least {} or --embargo auto",
             v,
@@ -444,7 +515,14 @@ pub fn resolve_embargo(flag: Option<i64>, purge: i64, columns: &[String], bar_se
             },
             auto
         )),
-    }
+    };
+    let what = match &column {
+        _ if source == EmbargoSource::Flag => "--embargo".to_string(),
+        Some(c) => format!("the lookback embargo of column '{}'", c),
+        None => "the embargo".to_string(),
+    };
+    bounded_span(embargo, &what)?;
+    Ok((embargo, source, column))
 }
 
 #[cfg(test)]
@@ -657,5 +735,118 @@ mod tests {
         assert!(s.reaching(2005, 3000, 10, 100).iter().any(|r| r.starts_with("test")));
         assert!(s.reaching(2010, 3000, 10, 100).is_empty());
         assert!(!s.reaching(-200, -95, 10, 100).is_empty(), "the embargo after a range reaches the first interval");
+    }
+
+    #[test]
+    fn reaches_is_exact_at_the_i64_edges() {
+        let b = std::hint::black_box;
+        let cases: [((i64, i64, i64, i64, i64), bool); 12] = [
+            ((0, 100, -5, 10, i64::MAX), true),
+            ((0, i64::MAX, -5, 10, 1), true),
+            ((0, 100, 100, 10, i64::MAX), true),
+            ((0, 100, -10, 10, i64::MAX), false),
+            ((i64::MIN, 0, i64::MIN, 0, 0), true),
+            ((0, 100, i64::MAX, i64::MAX, 0), false),
+            ((0, 100, -5, 10, 300), true),
+            ((0, 100, -9, 10, 300), true),
+            ((0, 100, -10, 10, 300), false),
+            ((0, 100, 399, 10, 300), true),
+            ((0, 100, 400, 10, 300), false),
+            ((0, 100, -1, 0, 0), false),
+        ];
+        for ((start, end, t, purge, embargo), want) in cases {
+            assert_eq!(reaches(b(start), b(end), b(t), b(purge), b(embargo)), want, "reaches({start}, {end}, {t}, {purge}, {embargo})");
+        }
+    }
+
+    #[test]
+    fn interval_reaches_is_exact_at_the_i64_edges() {
+        let b = std::hint::black_box;
+        let cases: [((i64, i64, i64, i64, i64, i64), bool); 7] = [
+            ((0, 100, -20, -4, 10, i64::MAX), true),
+            ((0, 100, -20, -9, 10, i64::MAX), false),
+            ((0, 100, 150, 200, 10, i64::MAX), true),
+            ((0, i64::MAX, -20, -4, 10, 1), true),
+            ((0, 100, -20, -4, 10, 300), true),
+            ((0, 100, -20, -9, 10, 300), false),
+            ((0, 100, 400, 500, 10, 300), false),
+        ];
+        for ((start, end, a, z, purge, embargo), want) in cases {
+            assert_eq!(
+                interval_reaches(b(start), b(end), b(a), b(z), b(purge), b(embargo)),
+                want,
+                "interval_reaches({start}, {end}, {a}, {z}, {purge}, {embargo})"
+            );
+        }
+        assert!(window_in_sample(&[(50, 60)], b(0), b(100), b(10), b(i64::MAX)));
+        assert!(!window_in_sample(&[(500, 600)], b(0), b(100), b(10), b(300)));
+    }
+
+    #[test]
+    fn role_and_effective_hold_under_an_extreme_embargo() {
+        let s = split(&[(-1000, 0), (100, 1000)], &[], &[(0, 100)], 10, std::hint::black_box(i64::MAX));
+        assert_eq!(s.role(-5), None, "label [-5, 5) reaches the test start");
+        assert_eq!(s.role(-10), Some(Role::Train));
+        assert_eq!(s.role(500), None, "inside the embargo after the test end");
+        assert_eq!(s.effective(Role::Train), vec![(-1000, -9)]);
+        let s = split(&[(-1000, 0)], &[], &[(0, i64::MAX)], 10, std::hint::black_box(1));
+        assert_eq!(s.role(-5), None, "a saturated test end");
+        assert_eq!(s.role(-10), Some(Role::Train));
+        assert_eq!(s.effective(Role::Train), vec![(-1000, -9)]);
+    }
+
+    #[test]
+    fn checked_refuses_unbounded_and_malformed_splits() {
+        let d = |train: &[(i64, i64)], validation: &[(i64, i64)], test: &[(i64, i64)]| Declared {
+            split_id: "c".to_string(),
+            train: train.to_vec(),
+            validation: validation.to_vec(),
+            test: test.to_vec(),
+        };
+        let check = |decl: Declared, purge: i64, embargo: i64| IntervalSplit::checked(decl, purge, embargo, EmbargoSource::Flag, None);
+        let good = d(&[(0, 100), (200, 300)], &[(100, 150)], &[(150, 200)]);
+        let refused = [
+            (good.clone(), 10, MAX_SECONDS + 1, "embargo"),
+            (good.clone(), MAX_SECONDS + 1, 10, "purge"),
+            (good.clone(), -1, 10, "purge"),
+            (d(&[(0, MAX_SECONDS + 1)], &[], &[]), 10, 10, "outside"),
+            (d(&[(100, 200), (0, 50)], &[], &[]), 10, 10, "sorted"),
+            (d(&[(0, 100)], &[(50, 150)], &[]), 10, 10, "overlaps"),
+            (d(&[(5, 5)], &[], &[]), 10, 10, "empty"),
+        ];
+        for (decl, purge, embargo, word) in refused {
+            let e = check(decl.clone(), purge, embargo).expect_err(&format!("{decl:?} purge {purge} embargo {embargo}"));
+            assert!(e.contains(word), "{decl:?} purge {purge} embargo {embargo}: {e}");
+        }
+        assert_eq!(check(good.clone(), 10, 20), Ok(IntervalSplit::new(good, 10, 20, EmbargoSource::Flag, None)));
+        let edge = d(&[(-MAX_SECONDS, 0)], &[], &[(0, MAX_SECONDS)]);
+        assert_eq!(
+            check(edge.clone(), MAX_SECONDS, MAX_SECONDS),
+            Ok(IntervalSplit::new(edge, MAX_SECONDS, MAX_SECONDS, EmbargoSource::Flag, None))
+        );
+    }
+
+    #[test]
+    fn resolve_embargo_refuses_a_value_above_the_bound() {
+        let e = resolve_embargo(Some(MAX_SECONDS + 1), H, &[], H).unwrap_err();
+        assert!(e.contains("--embargo") && e.contains("1099511627776"), "{e}");
+        assert_eq!(resolve_embargo(Some(MAX_SECONDS), H, &[], H), Ok((MAX_SECONDS, EmbargoSource::Flag, None)));
+        let huge = "r16_lag9223372036854775807".to_string();
+        assert!(column_lookback(&huge, H) >= 0);
+        let e = resolve_embargo(None, H, &[huge], H).unwrap_err();
+        assert!(e.contains("r16_lag9223372036854775807") && e.contains("outside"), "{e}");
+    }
+
+    #[test]
+    fn table_stamps_outside_the_bound_are_refused() {
+        for end in ["1e19", "9223372036854775807"] {
+            let text = format!("split_id,role,start,end\ns,train,0,100\ns,test,100,{end}\n");
+            let e = parse_table(&text, "s").unwrap_err();
+            assert!(e.contains("outside") && e.contains("line 3"), "{e}");
+        }
+        let over = format!("split_id,role,start,end\ns,train,{},0\n", -MAX_SECONDS - 1);
+        assert!(parse_table(&over, "s").unwrap_err().contains("outside"));
+        let edge = format!("split_id,role,start,end\ns,train,{},0\ns,test,0,{}\n", -MAX_SECONDS, MAX_SECONDS);
+        assert_eq!(parse_table(&edge, "s").unwrap().test, vec![(0, MAX_SECONDS)]);
     }
 }

@@ -100,12 +100,12 @@ impl Lockbox {
     /// exactly at `start` does not reach it. A row has at least its own second,
     /// so `purge == 0` tests the stamp itself.
     pub fn reaches(&self, t: i64, purge: i64, embargo: i64) -> bool {
-        t + purge.max(1) > self.start && t < self.end + embargo.max(0)
+        crate::intervals::reaches(self.start, self.end, t, purge, embargo)
     }
 
     /// First stamp whose label window reaches the range.
     pub fn first_reaching(&self, purge: i64) -> i64 {
-        self.start - purge.max(1) + 1
+        self.start.saturating_sub(purge.max(1) - 1)
     }
 
     /// Count the timestamps inside the lockbox and group them by UTC month.
@@ -864,7 +864,7 @@ pub fn embargo_json(seconds: i64, column: &str, rule: &str, bar_seconds: i64) ->
 /// The `lockbox_embargo` seconds one carrier text declares.
 pub fn embargo_from_declaration(text: &str) -> Option<i64> {
     let obj = crate::manifest::object(text, "lockbox_embargo")?;
-    int_field(obj, "seconds").filter(|s| *s >= 0)
+    int_field(obj, "seconds").filter(|s| (0..=crate::intervals::MAX_SECONDS).contains(s))
 }
 
 /// The largest `lockbox_embargo.seconds` over the carriers of `data_path`, with
@@ -885,7 +885,11 @@ pub fn declared_embargo(data_path: &str) -> Result<Option<(String, i64)>, Resolv
             continue;
         }
         let Some(s) = embargo_from_declaration(&text) else {
-            return Err(input(format!("{}: unreadable lockbox_embargo declaration (needs integer seconds >= 0)", file)));
+            return Err(input(format!(
+                "{}: unreadable lockbox_embargo declaration (needs integer seconds in 0..={})",
+                file,
+                crate::intervals::MAX_SECONDS
+            )));
         };
         if best.as_ref().map_or(true, |(_, b)| s > *b) {
             best = Some((file, s));
@@ -915,10 +919,23 @@ pub fn resolve_with(flag: Option<&str>, embargo_flag: Option<&str>, data_path: &
 pub fn resolve_retired(flag: Option<&str>, embargo_flag: Option<&str>, data_path: &str, retired: Option<&str>) -> Result<Resolved, ResolveError> {
     let retired = retired.map(crate::retire::Retirement::load).transpose()?;
     let mut r = resolve_ranges(flag, data_path, retired)?;
+    for (file, l) in r.declared_in.iter().map(|(f, l)| (f.as_str(), l)).chain(r.also.iter().map(|l| ("the second guarded range", l))) {
+        for t in [l.start, l.end] {
+            crate::intervals::bounded_stamp(t, &format!("{}: the locked_test stamp", file)).map_err(input)?;
+        }
+    }
+    let flagged = matches!(r.source, Source::Flag | Source::FlagAndDefault);
+    for t in r.range.iter().flat_map(|l| [l.start, l.end]) {
+        if flagged {
+            crate::intervals::bounded_stamp(t, "--lockbox: the stamp").map_err(usage)?;
+        } else {
+            crate::intervals::bounded_stamp(t, "the declared locked test: the stamp").map_err(input)?;
+        }
+    }
     let requested = match embargo_flag {
         None => None,
         Some(s) => match s.trim().parse::<i64>() {
-            Ok(v) if v >= 0 => Some(v),
+            Ok(v) if v >= 0 => Some(crate::intervals::bounded_span(v, "--lockbox-embargo").map_err(usage)?),
             _ => return Err(usage(format!("--lockbox-embargo: '{}' is not a number of seconds >= 0", s))),
         },
     };
@@ -1699,5 +1716,57 @@ mod tests {
 
     fn lockbox_date(y: i32, m: u32, d: u32) -> i64 {
         crate::ohlcv::days_from_civil(y, m, d) * 86_400
+    }
+
+    #[test]
+    fn lockbox_reaches_is_exact_at_the_i64_edges() {
+        let b = std::hint::black_box;
+        let l = Lockbox { start: 0, end: 100 };
+        assert!(l.reaches(b(-5), b(10), b(i64::MAX)), "label [-5, 5) reaches the start");
+        assert!(l.reaches(b(100), b(10), b(i64::MAX)), "inside the embargo after the end");
+        assert!(!l.reaches(b(-10), b(10), b(i64::MAX)));
+        let first = l.first_reaching(b(i64::MAX));
+        assert!(first <= 0, "{first}");
+        assert_eq!(Lockbox { start: i64::MIN + 3, end: 0 }.first_reaching(b(10)), i64::MIN, "the stamp i64::MIN reaches the range");
+        let mut x = 1467u64;
+        let mut draw = |lo: i64, n: u64| -> i64 {
+            x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = x;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            lo + ((z ^ (z >> 31)) % n) as i64
+        };
+        for _ in 0..1000 {
+            let start = draw(-300, 600);
+            let l = Lockbox { start, end: start + draw(1, 300) };
+            let (t, p, e) = (draw(-700, 1400), draw(-50, 250), draw(-50, 250));
+            assert_eq!(l.reaches(t, p, e), crate::intervals::reaches(l.start, l.end, t, p, e), "{l:?} t {t} purge {p} embargo {e}");
+        }
+    }
+
+    #[test]
+    fn resolve_refuses_an_embargo_or_a_range_outside_the_bound() {
+        let max = crate::intervals::MAX_SECONDS;
+        let d = resolve_dir("bound");
+        let data = d.join("a.rcsb").to_str().unwrap().to_string();
+        declare(&data, "enrich.json", &stored());
+        let e = resolve_with(None, Some("9223372036854775807"), &data).unwrap_err();
+        assert_eq!(e.exit, 2, "{}", e.message);
+        assert!(e.message.contains("--lockbox-embargo") && e.message.contains("1099511627776"), "{}", e.message);
+        assert_eq!(resolve_with(None, Some(&max.to_string()), &data).unwrap().embargo.seconds, max);
+        std::fs::write(format!("{}.manifest.json", data), "{\"lockbox_embargo\":{\"seconds\":9223372036854775807}}").unwrap();
+        let e = resolve(None, &data).unwrap_err();
+        assert_eq!(e.exit, 3, "{}", e.message);
+        assert!(e.message.contains("1099511627776"), "{}", e.message);
+        let undeclared = resolve_dir("bound-flag").join("b.csv").to_str().unwrap().to_string();
+        let e = resolve(Some("0,9223372036854775807"), &undeclared).unwrap_err();
+        assert_eq!(e.exit, 2, "{}", e.message);
+        assert!(e.message.contains("--lockbox") && e.message.contains("outside"), "{}", e.message);
+        let far_dir = resolve_dir("bound-file");
+        let far = far_dir.join("c.rcsb").to_str().unwrap().to_string();
+        std::fs::write(format!("{}.lockbox.json", far), "{\"locked_test\":{\"start\":0,\"end\":9223372036854775807}}").unwrap();
+        let e = resolve(None, &far).unwrap_err();
+        assert_eq!(e.exit, 3, "{}", e.message);
+        assert!(e.message.contains("outside"), "{}", e.message);
     }
 }

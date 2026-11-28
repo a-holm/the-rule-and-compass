@@ -136,7 +136,7 @@ fn floor_day(t: i64) -> i64 {
 }
 
 fn ceil_day(t: i64) -> i64 {
-    (t + DAY - 1).div_euclid(DAY) * DAY
+    t.saturating_add(DAY - 1).div_euclid(DAY) * DAY
 }
 
 /// A locked range and the embargo after its end.
@@ -151,7 +151,7 @@ pub struct Locked {
 /// label window `[t, t + purge)` reaches it and the embargo after its end (at
 /// least the purge), widened to UTC midnights.
 pub fn hole(l: &Locked, purge: i64) -> (i64, i64) {
-    (floor_day(l.start - purge.max(1) + 1), ceil_day(l.end + l.embargo.max(purge).max(0)))
+    (floor_day(l.start.saturating_sub(purge.max(1) - 1)), ceil_day(l.end.saturating_add(l.embargo.max(purge).max(0))))
 }
 
 fn subtract(pieces: &[(i64, i64)], za: i64, zb: i64) -> Vec<(i64, i64)> {
@@ -182,7 +182,7 @@ pub fn usable(start: i64, end: i64, holes: &[(i64, i64)]) -> Vec<(i64, i64)> {
 }
 
 /// The pieces of usable time between the usable offsets `[lo, hi)`.
-fn slice(pieces: &[(i64, i64)], lo: i64, hi: i64) -> Vec<(i64, i64)> {
+pub(crate) fn slice(pieces: &[(i64, i64)], lo: i64, hi: i64) -> Vec<(i64, i64)> {
     let mut out = Vec::new();
     let mut off = 0i64;
     for &(a, b) in pieces {
@@ -260,9 +260,20 @@ fn stamp_text(t: i64) -> String {
     format!("{}Z", crate::protocol::iso(t as f64))
 }
 
-/// Exit 2 for a plan that cannot give a complete CPCV table, 3 when an interval
+/// Exit 2 for a plan that cannot give a complete CPCV table or holds a stamp or
+/// span outside the bound of [`intervals::MAX_SECONDS`], 3 when an interval
 /// reaches a locked range (the #1173 refusal).
 pub fn generate(p: &Plan) -> Result<Generated, Fail> {
+    let bound = |r: Result<i64, String>| r.map_err(|e| (2, e));
+    bound(intervals::bounded_stamp(p.start, "--start"))?;
+    bound(intervals::bounded_stamp(p.end, "--end"))?;
+    bound(intervals::bounded_span(p.purge, "--purge-seconds"))?;
+    bound(intervals::bounded_span(p.embargo, "--embargo-seconds"))?;
+    for l in &p.locked {
+        bound(intervals::bounded_stamp(l.start, "the locked range start"))?;
+        bound(intervals::bounded_stamp(l.end, "the locked range end"))?;
+        bound(intervals::bounded_span(l.embargo, "--lockbox-embargo"))?;
+    }
     let (n, k) = (p.groups, p.test_groups);
     if n < 2 || n > MAX_GROUPS {
         return usage(format!("--groups must be in 2..={}, got {}", MAX_GROUPS, n));
@@ -321,7 +332,7 @@ pub fn generate(p: &Plan) -> Result<Generated, Fail> {
             whole.train.extend(slice(&group.pieces, 0, total - validation_seconds[g]));
             whole.validation.extend(slice(&group.pieces, total - validation_seconds[g], total));
         }
-        let full = IntervalSplit::new(whole, p.purge, p.embargo, p.embargo_source, p.embargo_column.clone());
+        let full = IntervalSplit::checked(whole, p.purge, p.embargo, p.embargo_source, p.embargo_column.clone()).map_err(|e| (2, format!("split {}: {}", id, e)))?;
         let train = full.effective(Role::Train);
         let validation = full.effective(Role::Validation);
         let tests: Vec<String> = set.iter().map(|&g| label(g)).collect();
@@ -348,7 +359,7 @@ pub fn generate(p: &Plan) -> Result<Generated, Fail> {
             }
         }
         let declared = Declared { split_id: id.clone(), train, validation, test: full.declared.test.clone() };
-        let split = IntervalSplit::new(declared, p.purge, p.embargo, p.embargo_source, p.embargo_column.clone());
+        let split = IntervalSplit::checked(declared, p.purge, p.embargo, p.embargo_source, p.embargo_column.clone()).map_err(|e| (2, format!("split {}: {}", id, e)))?;
         for l in &p.locked {
             let hit = split.reaching(l.start, l.end, p.purge, l.embargo.max(p.purge));
             if !hit.is_empty() {
@@ -531,7 +542,10 @@ pub fn protocol_usage() -> &'static str {
       --data or --lockbox (as for a search) are holes [start - P, end + max(embargo,
       P)) widened to midnights; an interval that still reaches one exits 3.
       K >= N, a group with no time left after the holes, purge and embargo, or a
-      non-midnight START or END exits 2. Then one search per split, one
+      non-midnight START or END exits 2. P, S and --lockbox-embargo above
+      1099511627776 s, and START, END or a --lockbox stamp beyond
+      +-1099511627776 s, exit 2 (a declared range beyond it exits 3). Then
+      one search per split, one
       `rcsr walkforward --windows DIR/windows_<id>.csv --pool-reset-flat
       --period-grid target` per split (the splits of a group share its period
       grid whatever NaN coverage or gate their formulas have) and
@@ -540,12 +554,16 @@ pub fn protocol_usage() -> &'static str {
 }
 
 fn int_arg(flag: &str, v: &str) -> Result<i64, Fail> {
-    v.trim().parse::<i64>().ok().filter(|x| *x >= 0).map_or_else(|| usage(format!("{} needs whole seconds >= 0, got '{}'", flag, v)), Ok)
+    match v.trim().parse::<i64>() {
+        Ok(x) if x >= 0 => intervals::bounded_span(x, flag).map_err(|e| (2, e)),
+        _ => usage(format!("{} needs whole seconds >= 0, got '{}'", flag, v)),
+    }
 }
 
 fn time_arg(flag: &str, v: &str) -> Result<i64, Fail> {
     match crate::data::parse_time(v) {
-        Some(t) if t.is_finite() && t.fract() == 0.0 => Ok(t as i64),
+        Some(t) if t.is_finite() && t.fract() == 0.0 => intervals::whole_seconds(t)
+            .map_or_else(|| usage(format!("{} '{}' is outside +-{} s", flag, v, intervals::MAX_SECONDS)), Ok),
         _ => usage(format!("{} cannot parse '{}' (ISO 8601 date or epoch seconds)", flag, v)),
     }
 }

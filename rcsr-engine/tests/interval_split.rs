@@ -936,3 +936,45 @@ fn embargo_auto_follows_the_gate_column_lookbacks() {
     assert_eq!(code(&out), 2, "{}", stderr(&out));
     assert!(stderr(&out).contains(&format!("below the automatic embargo {trend}")), "{}", stderr(&out));
 }
+
+#[test]
+fn huge_embargo_exits_2() {
+    let s = Scratch::new("interval-split-huge-embargo");
+    let dir = s.path();
+    let data = write_series(dir, 2400);
+    let table = write_table(
+        dir,
+        "t.csv",
+        &[("c", "train", hour(0), hour(720)), ("c", "test", hour(720), hour(960)), ("c", "train", hour(960), hour(2400))],
+    );
+    let h1 = write_spec(dir, "h1.json", H, H);
+    let vars = ["--vars", "r16,r672", "--split-table", &table, "--split-id", "c", "--generations", "1", "--pop", "8"];
+    let mut huge = vars.to_vec();
+    huge.extend_from_slice(&["--embargo", "9223372036854775807"]);
+    let out = search(&data, &h1, &huge);
+    assert_eq!(code(&out), 2, "{}", stderr(&out));
+    assert!(stderr(&out).contains("--embargo") && stderr(&out).contains("1099511627776"), "{}", stderr(&out));
+    let mut sane = vars.to_vec();
+    sane.extend_from_slice(&["--embargo", "2419200"]);
+    let j = ok_json(&search(&data, &h1, &sane));
+    assert_eq!(num(&j, &["split", "train_rows"]), 1487.0);
+    assert_eq!(num(&j, &["split", "interval_rows", "dropped"]), 673.0);
+}
+
+#[test]
+fn huge_lockbox_embargo_exits_2() {
+    let s = Scratch::new("interval-split-huge-lockbox-embargo");
+    let dir = s.path();
+    let data = write_series(dir, 2400);
+    let h1 = write_spec(dir, "h1.json", H, H);
+    let lock = format!("{},{}", hour(1000), hour(1100));
+    let base = ["--vars", "r16,r96", "--generations", "1", "--pop", "8", "--lockbox", lock.as_str()];
+    let out = search(&data, &h1, &base);
+    assert_eq!(code(&out), 3, "{}", stderr(&out));
+    assert!(stderr(&out).contains("800 row(s) whose label window reaches the declared locked test"), "{}", stderr(&out));
+    let mut huge = base.to_vec();
+    huge.extend_from_slice(&["--lockbox-embargo", "9223372036854775807"]);
+    let out = search(&data, &h1, &huge);
+    assert_eq!(code(&out), 2, "{}", stderr(&out));
+    assert!(stderr(&out).contains("--lockbox-embargo"), "{}", stderr(&out));
+}

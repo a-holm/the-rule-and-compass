@@ -8350,7 +8350,7 @@ fn enrich_inner(
                 std::sync::Arc::new(
                     times
                         .iter()
-                        .map(|&t| guarded.iter().all(|r| t + p.max(1) <= r.start || t >= r.end + embargo_l.0))
+                        .map(|&t| guarded.iter().all(|r| !crate::intervals::reaches(r.start, r.end, t, p, embargo_l.0)))
                         .collect(),
                 )
             });

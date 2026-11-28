@@ -347,7 +347,16 @@ fn interval_list(j: Option<&Json>, key: &str) -> Result<Vec<(i64, i64)>, String>
             .iter()
             .map(|p| match p {
                 Json::Arr(q) if q.len() == 2 => match (q[0].as_f64(), q[1].as_f64()) {
-                    (Some(s), Some(e)) => Ok((s as i64, e as i64)),
+                    (Some(s), Some(e)) => match (crate::intervals::whole_seconds(s), crate::intervals::whole_seconds(e)) {
+                        (Some(a), Some(b)) => Ok((a, b)),
+                        _ => Err(format!(
+                            "split.intervals.{} holds [{}, {}]: stamps must be whole seconds within +-{} s",
+                            key,
+                            s,
+                            e,
+                            crate::intervals::MAX_SECONDS
+                        )),
+                    },
                     _ => Err(bad()),
                 },
                 _ => Err(bad()),
@@ -368,18 +377,19 @@ fn run_intervals(split: Option<&Json>) -> Result<Option<crate::intervals::Interv
         validation: interval_list(iv.get("validation"), "validation")?,
         test: interval_list(iv.get("test"), "test")?,
     };
-    let int = |key: &str| {
-        s.get(key)
-            .and_then(Json::as_f64)
-            .map(|v| v as i64)
-            .ok_or_else(|| format!("split.intervals needs split.{}", key))
+    let int = |key: &str| -> Result<i64, String> {
+        let v = s.get(key).and_then(Json::as_f64).ok_or_else(|| format!("split.intervals needs split.{}", key))?;
+        crate::intervals::whole_seconds(v)
+            .ok_or_else(|| format!("split.{} {} is not whole seconds within +-{} s", key, v, crate::intervals::MAX_SECONDS))
     };
     let source = s
         .get("embargo_source")
         .and_then(Json::as_str)
         .and_then(crate::intervals::EmbargoSource::parse)
         .ok_or_else(|| "split.intervals needs split.embargo_source (flag, lookback or purge)".to_string())?;
-    Ok(Some(crate::intervals::IntervalSplit::new(declared, int("interval_purge_seconds")?, int("embargo_seconds")?, source, None)))
+    crate::intervals::IntervalSplit::checked(declared, int("interval_purge_seconds")?, int("embargo_seconds")?, source, None)
+        .map(Some)
+        .map_err(|e| format!("split.intervals: {}", e))
 }
 
 impl RunFile {
@@ -387,9 +397,11 @@ impl RunFile {
     /// interval-list run compares intervals: in sample when a kept training or
     /// validation row has a label window that reaches the window or lies within
     /// the embargo after it, so a window before later training rows can be out of
+    /// sample. A window that is empty or has a bound that is not finite is in
     /// sample. Any other run keeps [`RunFile::in_sample`].
     pub fn in_sample_window(&self, test_start: f64, test_end: f64) -> bool {
         match &self.intervals {
+            Some(_) if !test_start.is_finite() || !test_end.is_finite() || test_end.ceil() <= test_start.floor() => true,
             Some(iv) => {
                 let mut kept = iv.effective(crate::intervals::Role::Train);
                 kept.extend(iv.effective(crate::intervals::Role::Validation));
@@ -431,5 +443,46 @@ impl RunFile {
             }
         }
         Ok(flags)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::intervals::{Declared, EmbargoSource, IntervalSplit};
+
+    const SPLIT: &str = "{\"split_id\":\"s\",\"intervals\":{\"train\":[[0,100],[200,300]],\"validation\":[[100,150]],\"test\":[[150,200]]},\
+                         \"interval_purge_seconds\":10,\"embargo_seconds\":20,\"embargo_source\":\"flag\"}";
+
+    fn split_of(text: &str) -> Result<Option<IntervalSplit>, String> {
+        run_intervals(Some(&Json::parse(text).unwrap_or_else(|| panic!("not json: {text}"))))
+    }
+
+    #[test]
+    fn run_intervals_refuses_malformed_splits() {
+        let d = Declared { split_id: "s".to_string(), train: vec![(0, 100), (200, 300)], validation: vec![(100, 150)], test: vec![(150, 200)] };
+        assert_eq!(split_of(SPLIT), Ok(Some(IntervalSplit::checked(d, 10, 20, EmbargoSource::Flag, None).unwrap())));
+        for (from, to) in [
+            ("[[0,100],[200,300]]", "[[200,300],[0,100]]"),
+            ("\"validation\":[[100,150]]", "\"validation\":[[50,150]]"),
+            ("\"test\":[[150,200]]", "\"test\":[[1.5,200]]"),
+            ("\"embargo_seconds\":20", "\"embargo_seconds\":1e19"),
+            ("\"interval_purge_seconds\":10", "\"interval_purge_seconds\":-1"),
+        ] {
+            let text = SPLIT.replace(from, to);
+            assert_ne!(text, SPLIT, "{from}");
+            assert!(split_of(&text).is_err(), "{to}: {:?}", split_of(&text));
+        }
+    }
+
+    #[test]
+    fn an_empty_or_non_finite_window_is_in_sample() {
+        let text = "{\"pareto\":[],\"split\":{\"split_id\":\"s\",\"intervals\":{\"train\":[[0,100]],\"validation\":[],\"test\":[]},\
+                    \"interval_purge_seconds\":10,\"embargo_seconds\":20,\"embargo_source\":\"flag\"}}";
+        let run = RunFile::parse(text).unwrap();
+        for (start, end) in [(500.0, 500.0), (600.0, 500.0), (f64::NAN, 500.0), (500.0, f64::INFINITY)] {
+            assert!(run.in_sample_window(start, end), "[{start}, {end})");
+        }
+        assert!(!run.in_sample_window(500.0, 600.0));
     }
 }
