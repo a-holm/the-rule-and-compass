@@ -78,7 +78,7 @@ init > /dev/null
 keys=$(sed -n 's/^| `\([A-Z_]*\)` | .*/\1/p' "$HERE/../../_shared/local.md" | grep -vx TOOLS_WT | LC_ALL=C sort)
 have=$(sed -n 's/^- \([A-Z_]*\): <set me>$/\1/p' "$L/machine.md" | LC_ALL=C sort)
 check keys-in-template "$have" "$keys"
-check keys-count "$(wc -l <<< "$have")" "17"
+check keys-count "$(wc -l <<< "$have")" "18"
 out=$(RCSR_LOCAL=$L bash -c "source '$HERE/../lib.sh'; echo reached" 2>&1); rc=$?
 check seed-rc "$rc" "2"
 check seed-names-first-key "$(grep -c 'key GATES missing' <<< "$out")" "1"
