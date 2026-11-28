@@ -94,7 +94,7 @@ want_seed=$((16#${head:0:15}))
 run() {
   rm -rf "$W/formal/core/.lake" "$W/crate-x/target"
   : > "$T/calls"; : > "$T/replays"; : > "$T/vecbin-calls"; : > "$T/timeouts"; rm -f "$T"/gates/*
-  env FAKE_DIR="$T" RCSR_GATES="$T/gates" RCSR_SLOT_SCRIPT="$T/slot.sh" RCSR_ELAN_BIN="$T/elan" FAKE_TIMEOUT_LOG="$T/timeouts" \
+  env FAKE_DIR="$T" RCSR_MACHINE_DIR="$T/no-machine-dir" RCSR_GATES="$T/gates" RCSR_SLOT_SCRIPT="$T/slot.sh" RCSR_ELAN_BIN="$T/elan" FAKE_TIMEOUT_LOG="$T/timeouts" \
     PATH="$T/bin:$PATH" "$@" bash "$FORMAL" "$W" t1 > "$T/out" 2> "$T/err"
 }
 log=$T/gates/t1-formal.log
@@ -181,8 +181,8 @@ run FAKE_CHECK_MODE=empty; r=$?
 check empty-run "$r" 1
 has empty-run-summary "$T/out" 'vectors=0 '
 
-env FAKE_DIR="$T" RCSR_GATES="$T/gates" RCSR_SLOT_SCRIPT="$T/slot.sh" bash "$FORMAL" "$W" > /dev/null 2>&1; check usage-one "$?" 2
-env FAKE_DIR="$T" RCSR_GATES="$T/gates" RCSR_SLOT_SCRIPT="$T/slot.sh" bash "$FORMAL" a b c > /dev/null 2>&1; check usage-three "$?" 2
+env FAKE_DIR="$T" RCSR_MACHINE_DIR="$T/no-machine-dir" RCSR_GATES="$T/gates" RCSR_SLOT_SCRIPT="$T/slot.sh" bash "$FORMAL" "$W" > /dev/null 2>&1; check usage-one "$?" 2
+env FAKE_DIR="$T" RCSR_MACHINE_DIR="$T/no-machine-dir" RCSR_GATES="$T/gates" RCSR_SLOT_SCRIPT="$T/slot.sh" bash "$FORMAL" a b c > /dev/null 2>&1; check usage-three "$?" 2
 bash "$FORMAL" --help > "$T/help" 2>&1; check help "$?" 0
 has help-usage "$T/help" '^Usage: formal.sh <worktree> <tag>$'
 
