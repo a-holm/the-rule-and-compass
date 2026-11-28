@@ -40,3 +40,23 @@ file = "rcsr-engine/src/trials_table.rs"
 anchor = "fn nan_low(v: f64) -> f64 {"
 close = "}"
 sha256 = "1bd768d2ee288a38894c3d74a9672667b4be141d816a59457a4edc6b8e4ddcea"
+
+[[model]]
+id = "ulps_step"
+project = "P0"
+lean = "formal/core/RcsrCore/FlatBound/Rows.lean"
+vectors = "ulps_step"
+
+[[model.span]]
+role = "modelled"
+file = "rcsr-engine/src/flat_bound/rows.rs"
+anchor = "pub fn ulps_step(v: f64, k: i64) -> f64 {"
+close = "}"
+sha256 = "9f32ef666c6e8f447e5ba2c1404365443ca8501abcc8cdd30c732a963aa64425"
+
+[[model.span]]
+role = "mirror"
+file = "rcsr-engine/src/cuda/check_rows.h"
+anchor = "__device__ __forceinline__ double rc_ulps(double v, int k)"
+close = "}"
+sha256 = "a4871db8710f55ced38458b79d72529139eb610b5ae451f6606320f82d2e35b7"

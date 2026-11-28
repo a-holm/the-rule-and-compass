@@ -20,6 +20,7 @@ formal/
     RcsrCore.lean     root module, imports every module
     RcsrCore/Prim.lean  shared bit-pattern primitives
     RcsrCore/ErrorOrder.lean  model of error_order.rs
+    RcsrCore/FlatBound/Rows.lean  model of ulps_step and rc_ulps
     Audit.lean        trust audit program
     Check.lean        rcsr_model_check, replays vector files against the models
 ```
@@ -143,3 +144,13 @@ A hash update without one of the two statements is a review failure.
 | `floor_day`, `ceil_day`, `hole`, `subtract`, `usable`, `slice`, group bounds of `calendar_groups` in `rcsr-engine/src/cpcv.rs` | `RcsrCore/Cpcv.lean` | `hole_covers_reach`, `usable_clear_of_locked`, `usable_chain`, `mem_slice`, `slice_disjoint`, `slice_cover`, `groupBound_mono` | interval functions only; `generate`, the partition into `n` groups and the combinatorics are not proven; model on unbounded integers; not tied to the Rust text before #1512 |
 | `Lockbox::check`, `contains`, `reaches`, `first_reaching`, `Guard::check`, `Guard::check_times`, `Declared::check_times` in `rcsr-engine/src/lockbox.rs` | `RcsrCore/Lockbox.lean` | `check_no_row_inside`, `guard_checkTimes_ok_iff`, `declared_checkTimes_ok_iff`, `reaches_iff_firstReaching`, `guard_open` | armed guards only; the construction of guards and the call sites are not proven; model on unbounded integers |
 | `pareto_fronts`, `nan_low` in `rcsr-engine/src/trials_table.rs` | `RcsrCore/TrialsTable/Fronts.lean` | `paretoFrontsK_total`, `paretoFrontsK_first`, `paretoFrontsK_equal_rows`, `rowDom_lex` | values are read through the order key (#1498 ties the key to the float order); fronts after the first are characterised only by the loop; no permutation law |
+| `ulps_step` in `rcsr-engine/src/flat_bound/rows.rs`, its device copy `rc_ulps` in `rcsr-engine/src/cuda/check_rows.h` | `RcsrCore/FlatBound/Rows.lean` | `inf_fixed`, `not_nan`, `key_spec`, `key_int_raw`, `key_int`, `key_bounds`, `mono`, `strict_up`, `strict_down`, `device_eq_host`, `rc_add_no_overflow`, `step_one_next_up`, `step_minus_one_next_down`, `compose_up`, `zero_step` | all 2^64 inputs and every `i64` step; `ulps_step(-0.0, 0)` is `+0.0` and the smallest negative subnormal steps up to `+0.0` where `next_up` gives `-0.0` (`zero_step`, `step_one_next_up`): no proof may assume that `ulps_step` keeps the sign of a zero; `rc_ulps` is modelled as source text, not as compiled code; the Rust function is tied to the model by vectors and the span hash |
+
+### Device mirrors
+
+A CUDA copy of a modelled function is never modelled alone. Its text is a `mirror` span of the model of the Rust function, so a text change fails `manifest_spans_match_sources`.
+
+- A copy with a different structure gets a second Lean definition that follows the C text line by line, and one theorem `<c name>_eq_host` that states equality with the host definition for every input (`device_eq_host` for `rc_ulps`).
+- A line-by-line copy has only the `mirror` hash.
+
+The compiled device code is not proven. The ties are the `mirror` hash, the `_eq_host` theorem and the device tests under the sanitizer-first rule.
