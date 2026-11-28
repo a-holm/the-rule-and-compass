@@ -132,6 +132,36 @@ A hash update without one of the two statements is a review failure.
 
 `formal/core/lean-toolchain` pins `leanprover/lean4:v4.36.0`. elan installs it. A toolchain change is its own issue and re-runs every proof.
 
+## Gate
+
+`verksted/_tools/formal.sh <worktree> <tag>` runs every Lean-side check once on an integration tip. Stage `03_full_gate` calls it after `gate.sh`. A pull request runs only the Rust lint `formal_sync`; it needs no Lean.
+
+Steps, in order. Every step runs even when an earlier one failed.
+
+| Step | Check |
+|---|---|
+| toolchain | `formal/core/lean-toolchain` and `formal/math/lean-toolchain` (when present) are identical |
+| source-rules | no refused word; `bv_decide` only in the macro of `Prim.lean` and in `Audit.lean`; every file under `formal/core/RcsrCore/` is imported by `RcsrCore.lean` |
+| build | `lake build --wfail` |
+| audit | `lake env lean --run Audit.lean` exits 0 |
+| inventory | the audit output equals `formal/THEOREMS.txt` |
+| replay | `lake env leanchecker <module>`, one call per module, no retry |
+| golden | `rcsr_model_check formal/vectors/golden/*.vec` |
+| bulk | `rcsr-formal-vectors --bulk` from the release build of the tested tree, 100,000 vectors per model, seeded by the first 15 hex digits of HEAD, then `rcsr_model_check` |
+
+Lean and cargo commands run through the build slot. The script prints `<step>: ok` or `<step>: FAILED (rc=<n>)` per step, then
+
+```
+formal: theorems=<n> bv_decide=<n> vectors=<n> mismatches=<n> lean=<release> mathlib=<revision or none>
+tested: <sha>
+```
+
+It writes `<tag>-formal.log` and `<tag>-formal-theorems.txt` to the gates directory. The script fails when `mismatches` is not 0, when no theorem is listed or when no vector was replayed.
+
+Exit codes: 0 every step passed; 1 a step failed; 2 usage; 3 the Lean toolchain is missing (no `ELAN_BIN`, no `lake` or `elan` there, or the release is not installed).
+
+The machine key `ELAN_BIN` in the local `machine.md` names the directory that holds `lake` and `elan`; `RCSR_ELAN_BIN` overrides it. There is no skip mode: a machine without the toolchain fails the gate with exit 3.
+
 ## What is proven
 
 | Rust function | Lean module | Theorems | Limit |

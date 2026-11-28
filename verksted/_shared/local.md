@@ -46,6 +46,7 @@ Tracked text names these keys and never their values. `machine.md` holds one lin
 | `BUILD_SLOT_WAIT_MAX` | seconds the slot waits before exit 75 |
 | `SANITIZER` | the compute-sanitizer that attaches on this driver |
 | `CUDA_ARCH` | the device architecture of builds |
+| `ELAN_BIN` | directory that holds `lake` and `elan` of the Lean toolchain (`formal.sh`) |
 | `TOOLS_WT` | a worktree on the integration tip that runs verksted tools before an agent has its own (`rules-local.md`) |
 
 Never in the local area: raw data, a value from inside a locked range before the final seal and reads are posted, secrets, tokens, personal data. Artefacts stay where the run wrote them; a card holds their paths and hashes.

@@ -1,6 +1,6 @@
 # 03_full_gate: the one full gate
 
-One job: run the CPU suite, the CUDA suite and the tiny benchmark once on the base tip.
+One job: run the CPU suite, the CUDA suite, the tiny benchmark and the formal step once on the base tip.
 
 ## Inputs
 
@@ -11,6 +11,7 @@ One job: run the CPU suite, the CUDA suite and the tiny benchmark once on the ba
 **Reference (every run):**
 - `../../../_shared/rules.md`
 - `../../../_tools/gate.sh`
+- `../../../_tools/formal.sh`
 - `../../../_tools/test-summary.sh`
 - `../../../_tools/rc-run.sh`
 - `../../../_tools/sanitize-all.sh`
@@ -25,18 +26,19 @@ Do NOT load: per-ticket reruns, anything but the three suites.
 2. Look first: no other cargo, rustc or `rcsr-bench` process (`ps -eo pcpu,args | grep -E 'cargo|rustc|rcsr-bench'`). Then run `verksted/_tools/gate.sh <integration worktree> <tag>` as one background shell and wait for its notification.
 3. Write `gate.md` from the output: `cpu: ok=N failed=0`, `cuda: ok=N failed=0`, the bench line, `tested: <sha>`, and the three log paths.
 4. The memcheck pass is `verksted/_tools/sanitize-all.sh <integration worktree> <tag>` as one background shell. It runs every CUDA test binary from `<crate>/tests/sanitizer.plan` under compute-sanitizer through the lock, one hold per run of at most 580 s, and writes `<tag>-san-summary.log`. `gate.sh` has no sanitizer stage: this step, not the script, calls `sanitize-all.sh`. A `skip`, `api-errors-no`, `no-cuda`, `no-cuda-app-only`, `app-only`, `device` or `run-bin` line in the plan carries its reason (a `run-bin` line carries the arguments of the binary, for example `rcsr-gpu-bench * run-bin --batch 64 --reps 1 --depth 3`); a binary that exits 255 without a CUDA call and has no `no-cuda` line fails as `unexpected no CUDA call`. Every test executable has exactly one `*` line (`device` for a CUDA binary), and a `no-cuda*` line whose binary names a device token carries `ok-token: <token>` (`tests/sanitizer_plan.rs`). Exit 0 needs every run at rc 0 with `ERROR SUMMARY: 0 errors`; a `budget` line means a run hit the 580 s timeout. Do not raise the timeout; size the fixture or add a plan line with a reason. A binary that spawns processes runs only with `--target-processes application-only` (`app-only`, `no-cuda-app-only` or `skip`; `tests/sanitizer_plan.rs` enforces it) and `run-bin` lines run application-only too, because compute-sanitizer crashes (rc 139) while it tracks a process tree; `sanitize-all.sh` reports rc 139 as `tool crash` and fails the pass without a retry. rcsr children of a sanitized test run without the sanitizer injection environment (`tests/common/rcsr.rs`): no `NV_SANITIZER_INJECTION_*`, `NVIDIA_PROCESS_INJECTION_*`, `NVTX_INJECTION64_PATH`, `CUDA_INJECTION64_PATH` or `LD_PRELOAD`, and no compute-sanitizer directory in `LD_LIBRARY_PATH`.
-5. Tests marked `#[ignore]` whose reason names an environment variable or a file run in the gate with it set (rule 70). List them with `grep -rn -A1 '#\[ignore' "$(verksted/_tools/crate-dir.sh <integration worktree>)/tests"`. Run each with `--include-ignored` through `verksted/_tools/rc-run.sh` (`test` mode, `--cuda` for a CUDA test) and read the count with `verksted/_tools/test-summary.sh <log> --expect <test>`. Write `ignored: <test> passed=<n>` into `gate.md`, one line per test. `passed=0` fails the Check: the test did not run.
-6. A red suite is not retried silently. A flake gets its own issue (`../../_shared/failure-modes.md`).
+5. The formal step is `verksted/_tools/formal.sh <integration worktree> <tag>` as one background shell, started after `gate.sh` has ended. It runs through the build slot. Copy its `formal:` line into `gate.md`. Exit 3 means the Lean toolchain is missing on this machine: the gate fails, the step is not skipped.
+6. Tests marked `#[ignore]` whose reason names an environment variable or a file run in the gate with it set (rule 70). List them with `grep -rn -A1 '#\[ignore' "$(verksted/_tools/crate-dir.sh <integration worktree>)/tests"`. Run each with `--include-ignored` through `verksted/_tools/rc-run.sh` (`test` mode, `--cuda` for a CUDA test) and read the count with `verksted/_tools/test-summary.sh <log> --expect <test>`. Write `ignored: <test> passed=<n>` into `gate.md`, one line per test. `passed=0` fails the Check: the test did not run.
+7. A red suite is not retried silently. A flake gets its own issue (`../../_shared/failure-modes.md`).
 
 ## Outputs
 
-- `gate.md` -> `output/`
+- `gate.md` -> `output/` (holds the `formal:` line)
 - `check.md` -> `output/`
 
 ## Check
 
 ```sh
-g="$V/04_gate/stages/03_full_gate/output/gate.md"; grep -q '^cpu: ok=[0-9]* failed=0$' "$g" && grep -q '^cuda: ok=[0-9]* failed=0$' "$g" && grep -q 'recovered 27/27' "$g" && grep -q '^tested: [0-9a-f]\{40\}$' "$g" && ! grep -q '^ignored: .* passed=0$' "$g"
+g="$V/04_gate/stages/03_full_gate/output/gate.md"; grep -q '^cpu: ok=[0-9]* failed=0$' "$g" && grep -q '^cuda: ok=[0-9]* failed=0$' "$g" && grep -q 'recovered 27/27' "$g" && grep -q '^tested: [0-9a-f]\{40\}$' "$g" && grep -q '^formal: theorems=[1-9][0-9]* bv_decide=[0-9]* vectors=[1-9][0-9]* mismatches=0 ' "$g" && ! grep -q '^ignored: .* passed=0$' "$g"
 ```
 
 Exit 0 writes `pass`. Anything else writes `fail: <what was measured and what was wrong>` to `output/check.md`; `_tools/check.sh` does this. A red result is never rewritten as green.

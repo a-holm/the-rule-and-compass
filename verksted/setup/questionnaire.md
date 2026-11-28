@@ -33,6 +33,7 @@ Each value is defined, with its `RCSR_*` override, in [`../_tools/lib.sh`](../_t
 | Pause file | `PAUSE` |
 | Gate logs | `$GATES` (`GATES` of `machine.md`) |
 | CUDA architecture | `CUDA_ARCH` |
+| Lean toolchain directory | `ELAN_BIN` (`RCSR_ELAN_BIN`) |
 | CUDA 13.0 sanitizer | `SANITIZER` (`RCSR_SANITIZER`) |
 | Integration branch | `BASE` (`RCSR_BASE`) |
 | Memory file `MEM` | the integration state file under the agent's project memory directory |
