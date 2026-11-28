@@ -3,4 +3,5 @@ import RcsrCore.ErrorOrder
 import RcsrCore.FlatBound.Planes
 import RcsrCore.Intervals
 import RcsrCore.Intervals.Effective
+import RcsrCore.Intervals.Trim
 import RcsrCore.Lockbox
