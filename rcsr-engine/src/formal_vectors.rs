@@ -13,7 +13,7 @@ pub const GOLDEN_COUNT: usize = 4096;
 /// Seed of the committed golden files.
 pub const GOLDEN_SEED: u64 = 0x5eed_0001;
 /// Models with a generator, in file order.
-pub const MODELS: &[&str] = &["cmp_error"];
+pub const MODELS: &[&str] = &["cmp_error", "f64_add", "f64_sub"];
 
 const SIGN: u64 = 0x8000_0000_0000_0000;
 const TOP: u64 = 0x7ff0_0000_0000_0000;
@@ -112,11 +112,70 @@ fn cmp_error_rows(count: usize, seed: u64) -> Vec<[u64; 3]> {
     rows
 }
 
+/// A NaN result is written as this pattern: Rust does not fix the sign or the payload of a NaN result.
+const QNAN: u64 = 0x7ff8_0000_0000_0000;
+
+fn canon(v: f64) -> u64 {
+    if v.is_nan() {
+        QNAN
+    } else {
+        v.to_bits()
+    }
+}
+
+fn f64_add_row(a: u64, b: u64) -> [u64; 3] {
+    [a, b, canon(f64::from_bits(a) + f64::from_bits(b))]
+}
+
+fn f64_sub_row(a: u64, b: u64) -> [u64; 3] {
+    [a, b, canon(f64::from_bits(a) - f64::from_bits(b))]
+}
+
+/// Second operands that make alignment shifts, cancellation and rounding ties likely for `a`.
+fn near_operand(rng: &mut SplitMix64, a: u64, directed: &[u64]) -> u64 {
+    match rng.next() % 8 {
+        0 | 1 | 2 => {
+            let ea = (a >> 52) & 0x7ff;
+            let eb = (ea + rng.next() % 120 + 2047 - 60) % 2047;
+            (rng.next() & 0x800f_ffff_ffff_ffff) | (eb << 52)
+        }
+        3 => a ^ (1 << (rng.next() % 64)),
+        4 => a ^ SIGN,
+        5 => rng.pick(directed),
+        _ => rng.next(),
+    }
+}
+
+fn f64_arith_rows(row: fn(u64, u64) -> [u64; 3], count: usize, seed: u64) -> Vec<[u64; 3]> {
+    let base = base_values();
+    let directed = directed_values();
+    let mut rows = Vec::new();
+    for &a in &base {
+        for &b in &base {
+            rows.push(row(a, b));
+        }
+    }
+    for &v in &directed {
+        for anchor in [0x3ff0_0000_0000_0000, 0x7fef_ffff_ffff_ffff] {
+            rows.push(row(v, anchor));
+            rows.push(row(anchor, v));
+        }
+    }
+    let mut rng = SplitMix64(seed);
+    while rows.len() < count {
+        let a = if rng.next() % 4 == 0 { rng.pick(&directed) } else { rng.next() };
+        let b = near_operand(&mut rng, a, &directed);
+        rows.push(row(a, b));
+    }
+    rows
+}
+
 /// Rows a file of `model` always holds, whatever the count asked for.
 pub fn directed_len(model: &str) -> Option<usize> {
     let (b, d) = (base_values().len(), directed_values().len());
     match model {
         "cmp_error" => Some(b * b + 4 * d),
+        "f64_add" | "f64_sub" => Some(b * b + 4 * d),
         _ => None,
     }
 }
@@ -129,6 +188,8 @@ pub fn vectors(model: &str, count: usize, seed: u64) -> Option<String> {
     }
     let rows = match model {
         "cmp_error" => cmp_error_rows(count, seed),
+        "f64_add" => f64_arith_rows(f64_add_row, count, seed),
+        "f64_sub" => f64_arith_rows(f64_sub_row, count, seed),
         _ => return None,
     };
     let mut text = format!("rcsr-vec 1 {model} sig=w,w->w\n");

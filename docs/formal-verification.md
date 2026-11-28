@@ -104,6 +104,8 @@ Two flows share one generator:
 - Golden. `formal/vectors/golden/<model>.vec` is tracked. The test `golden_vectors_match_rust` regenerates it in memory and compares bytes. The checker replays the same file.
 - Bulk. `rcsr-formal-vectors --bulk <dir> --count <n> --seed <s>` writes `<n>` vectors per model to a scratch directory. Nothing is tracked. The checker replays the files.
 
+`F64.add` and `F64.sub` (`formal/core/RcsrCore/F64.lean`) are executable definitions of the Rust operators `a + b` and `a - b` on `f64`, on bit patterns. They have no theorems. The vector models `f64_add` and `f64_sub` tie them to the hardware, and the models of project P3 take the addition as a parameter. Rust does not fix the sign or payload of a NaN result, so the generator writes every NaN result as `0x7ff8000000000000` and the Lean model returns that pattern.
+
 Directed set. Every file starts with directed rows, so a bulk file holds them too. For a float input: both zeros, both smallest subnormals, the largest subnormal, the smallest normal, plus and minus 1, plus and minus `MAX`, both infinities, a signalling NaN, a quiet NaN, a quiet NaN with payload and the all-ones pattern, each with both signs, and the 64 bit-pattern neighbours of zero and of `+inf` on each side. The rest of a file is random rows from SplitMix64 with a fixed seed, biased toward the directed set and toward one-bit differences.
 
 ```sh
