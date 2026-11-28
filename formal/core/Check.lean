@@ -22,6 +22,7 @@ structure Model where
 def model (name : String) : Option Model :=
   match name with
   | "cmp_error" => some ⟨"w,w->w", 2, 1, fun a => #[ordCode (ErrorOrder.cmpError a[0]! a[1]!)]⟩
+  | "ulps_step" => some ⟨"w,w->w", 2, 1, fun a => #[FlatBound.Rows.ulpsStep a[0]! a[1]!]⟩
   | _ => none
 
 def checkFile (path : String) : IO Bool := do
