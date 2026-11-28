@@ -59,16 +59,25 @@ git -C "$T/repo" branch -q -D issue/5-x
 V4=04_gate/stages/03_full_gate/CONTEXT.md
 g=$T/out/04_gate/stages/03_full_gate/output/gate.md
 sha=0123456789abcdef0123456789abcdef01234567
-printf 'cpu: ok=10 failed=0\ncuda: ok=5 failed=0\nrecovered 27/27\ntested: %s\n' "$sha" > "$g"
+formal='formal: theorems=51 bv_decide=39 vectors=208192 mismatches=0 lean=x mathlib=none'
+printf 'cpu: ok=10 failed=0\ncuda: ok=5 failed=0\nrecovered 27/27\ntested: %s\n%s\n' "$sha" "$formal" > "$g"
 run_check "$V4"; check gate-ok "$?" 0
 printf 'ignored: x passed=2\n' >> "$g"
 run_check "$V4"; check gate-ignored-ran "$?" 0
 printf 'ignored: x passed=0\n' >> "$g"
 run_check "$V4"; check gate-ignored-zero "$?" 1
-printf 'cpu: ok=10 failed=0\ncuda: ok=5 failed=0\nrecovered 27/27\ntested: %s\nignored: y passed=0\n' "$sha" > "$g"
+printf 'cpu: ok=10 failed=0\ncuda: ok=5 failed=0\nrecovered 27/27\ntested: %s\n%s\nignored: y passed=0\n' "$sha" "$formal" > "$g"
 run_check "$V4"; check gate-ignored-zero-alone "$?" 1
-printf 'cpu: ok=10 failed=0\ncuda: ok=5 failed=0\nrecovered 27/27\ntested: %s\nignored: y passed=10\n' "$sha" > "$g"
+printf 'cpu: ok=10 failed=0\ncuda: ok=5 failed=0\nrecovered 27/27\ntested: %s\n%s\nignored: y passed=10\n' "$sha" "$formal" > "$g"
 run_check "$V4"; check gate-ignored-ten "$?" 0
+printf 'cpu: ok=10 failed=0\ncuda: ok=5 failed=0\nrecovered 27/27\ntested: %s\n' "$sha" > "$g"
+run_check "$V4"; check gate-formal-missing "$?" 1
+printf 'cpu: ok=10 failed=0\ncuda: ok=5 failed=0\nrecovered 27/27\ntested: %s\n%s\n' "$sha" "${formal/mismatches=0/mismatches=3}" > "$g"
+run_check "$V4"; check gate-formal-mismatches "$?" 1
+printf 'cpu: ok=10 failed=0\ncuda: ok=5 failed=0\nrecovered 27/27\ntested: %s\n%s\n' "$sha" "${formal/theorems=51/theorems=0}" > "$g"
+run_check "$V4"; check gate-formal-no-theorems "$?" 1
+printf 'cpu: ok=10 failed=0\ncuda: ok=5 failed=0\nrecovered 27/27\ntested: %s\n%s\n' "$sha" "${formal/vectors=208192/vectors=0}" > "$g"
+run_check "$V4"; check gate-formal-no-vectors "$?" 1
 
 # 04_gate/stages/05_merge_main: the merge is on origin/main and the main checkout is at origin/main
 V5=04_gate/stages/05_merge_main/CONTEXT.md
