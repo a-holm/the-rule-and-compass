@@ -1762,7 +1762,8 @@ mod tests {
         let e = resolve(Some("0,9223372036854775807"), &undeclared).unwrap_err();
         assert_eq!(e.exit, 2, "{}", e.message);
         assert!(e.message.contains("--lockbox") && e.message.contains("outside"), "{}", e.message);
-        let far = resolve_dir("bound-file").join("c.rcsb").to_str().unwrap().to_string();
+        let far_dir = resolve_dir("bound-file");
+        let far = far_dir.join("c.rcsb").to_str().unwrap().to_string();
         std::fs::write(format!("{}.lockbox.json", far), "{\"locked_test\":{\"start\":0,\"end\":9223372036854775807}}").unwrap();
         let e = resolve(None, &far).unwrap_err();
         assert_eq!(e.exit, 3, "{}", e.message);

@@ -189,6 +189,7 @@ walkforward            *  app-only  the test process calls CUDA: missing_score_d
 occam_code             *  no-cuda  CPU-only tests; no CUDA call; the binary spawns no process
 occam_measure          *  no-cuda  its tests are ignored (measurement or external data): 0 tests run and none calls CUDA
 trading_period         *  no-cuda  CPU-only tests; no CUDA call; the binary spawns no process
+split_construction     *  no-cuda  text lint over src/; no CUDA call; the binary spawns no process
 # run-bin: the release binary runs under memcheck with --target-processes application-only and must start no CUDA-using child; several lines per binary are allowed (smallest runs)
 rcsr-gpu-bench      *  run-bin  --batch 64 --reps 1 --depth 3
 rcsr                *  run-bin  calibrate --gpu --no-enrich --out target/sanitizer-calibration.json
