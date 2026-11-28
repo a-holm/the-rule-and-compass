@@ -1630,6 +1630,7 @@ rcsr-engine/
     bin/
       gpu_bench.rs  GPU vs CPU evaluation benchmark (--features cuda)
       rcsr_bench.rs the `rcsr-bench` benchmark harness and `compare` command
+      rcsr_formal_vectors.rs  the `rcsr-formal-vectors` writer of the vector files that the Lean checker replays
   tests/
     recover.rs    end-to-end recovery tests + unit tests
     split.rs      split-mode tests (temporal, group, panel, folds)

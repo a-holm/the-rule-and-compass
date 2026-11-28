@@ -40,6 +40,10 @@ name = "rcsr_serve"
 path = "src/bin/rcsr_serve.rs"
 required-features = []
 
+[[bin]]
+name = "rcsr-formal-vectors"
+path = "src/bin/rcsr_formal_vectors.rs"
+
 [features]
 default = []
 cuda = []
