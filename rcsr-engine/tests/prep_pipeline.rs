@@ -457,6 +457,71 @@ fn prep_help_and_schema_document_the_command() {
     assert!(schema.contains("--dry-run"));
 }
 
+/// #1549: 300 one-minute Binance-style bars with varying ranges and two
+/// missing minutes before row 150.
+fn gapped_binance_lines() -> Vec<String> {
+    (0..300usize)
+        .map(|i| {
+            let t = i as f64;
+            let minute = i as i64 + if i < 150 { 0 } else { 2 };
+            let open_ms = 1_704_067_200_000i64 + minute * 60_000;
+            let p = 100.0 + 3.0 * (t * 0.21).sin() + 0.01 * t;
+            let o = p + 0.2 * (t * 0.13).cos();
+            let c = p + 0.25 * (t * 0.5).sin();
+            let h = o.max(c) + 0.3 + 0.2 * (t * 0.7).sin().abs();
+            let l = o.min(c) - 0.25 - 0.15 * (t * 0.3).cos().abs();
+            let v = 10.0 + (i % 7) as f64;
+            format!(
+                "{},{},{},{},{},{},{},{},{},{},{},0",
+                open_ms,
+                o,
+                h,
+                l,
+                c,
+                v,
+                open_ms + 59_999,
+                v * p,
+                1 + i % 5,
+                v * 0.6,
+                v * 0.6 * p
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn legacy_ta_columns_are_prefix_stable_through_prep() {
+    let (_scratch, dir) = tmp_dir("prep-ta-prefix");
+    let lines = gapped_binance_lines();
+    let names = rcsr::features::expand("ta:full").unwrap();
+    let run = |cut: usize| {
+        let path = dir.join(format!("c{cut}.csv"));
+        std::fs::write(&path, lines[..cut].join("\n") + "\n").unwrap();
+        let mut opts = base(path.to_string_lossy().into_owned());
+        opts.features = names.clone();
+        let build = prep::build(&opts).unwrap();
+        assert_eq!(build.table.len(), cut);
+        names
+            .iter()
+            .map(|n| build.table.col(build.table.index_of(n).unwrap()).to_vec())
+            .collect::<Vec<Vec<f64>>>()
+    };
+    let full = run(300);
+    assert_eq!(full.len(), names.len());
+    let mut compared = 0usize;
+    for cut in 40..=300 {
+        let part = run(cut);
+        for ((name, f), p) in names.iter().zip(&full).zip(&part) {
+            for i in 0..cut {
+                let same = f[i].to_bits() == p[i].to_bits() || (f[i].is_nan() && p[i].is_nan());
+                assert!(same, "{name} row {i} differs at cut {cut}: full {} prefix {}", f[i], p[i]);
+                compared += 1;
+            }
+        }
+    }
+    assert!(compared > 100_000, "compared only {compared} values");
+}
+
 // ---------------------------------------------------------------------------
 // A tiny stored-ZIP writer so the test has a real archive without a data blob.
 // ---------------------------------------------------------------------------
