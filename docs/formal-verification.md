@@ -11,6 +11,7 @@ formal/
   .gitignore          ignores .lake/
   README.md           build commands
   THEOREMS.txt        theorem inventory
+  models.toml         source-span manifest of the models
   core/               Lake package rcsr_core, no Mathlib
     lean-toolchain    pinned Lean release
     lakefile.toml
@@ -53,6 +54,40 @@ diff /tmp/audit.out ../THEOREMS.txt
 ```
 
 The audit is a program, not an elaboration-time command, because Lake replays a cached build without running commands. It exits 1 and names every dependency outside the trust base.
+
+## Source-span manifest
+
+`formal/models.toml` lists for each model the source spans it was written from, with the SHA-256 of each span. `rcsr-engine/tests/formal_sync.rs` recomputes the hashes. It is in the fast lint set and needs no Lean toolchain. The hash ties text to a review. It does not show that the model equals the code. A change of a std function that a model mirrors (`partial_cmp`, `saturating_add`) changes no span; only the golden vectors guard that.
+
+Accepted lines, after trimming: an empty line; a line that starts with `#`; `version = 1` as the first entry; the headers `[[model]]` and `[[model.span]]`; `key = "value"`. A value has no escapes: a `"` or a backslash inside a value is an error. Anything else is an error.
+
+Model keys: `id` (unique), `project` (`P0` to `P9`), `lean` (path of the Lean module from the repository root; the file must exist), `vectors` (optional; the name of the vector file without `.vec`). Span keys: `role`, `file` (path from the repository root), `anchor`, `close` (optional), `sha256` (64 hex digits).
+
+| Role | Meaning |
+|---|---|
+| `modelled` | the Lean definition is a model of this text |
+| `mirror` | a second implementation that must equal the modelled one (a CUDA copy) |
+| `assumption` | text a proof relies on without modelling it (a constant, a compiler flag line) |
+
+Every crate-local function that a modelled function calls is itself a span of the same model.
+
+Span rule:
+
+1. The start is the one line of `file` that equals `anchor` after leading and trailing white space is removed. Zero or several matches are an error.
+2. With `close`, the end is the first later line that equals the start line's indentation followed by `close` (trailing white space ignored). Without `close` the span is the start line alone.
+3. The hashed text is the lines from start to end, each with trailing white space removed and the start line's indentation removed, joined by `\n`, with a final `\n`.
+4. The hash is the SHA-256 of that text, lowercase hex.
+
+Moving a function or changing its indentation changes no hash. A doc comment above the function is outside the span. A comment inside the function is part of it. Renaming the function is "anchor matches 0 lines", a failure. A missing file, a missing anchor or a repeated anchor is a failure, never a skip.
+
+## When a modelled function changes
+
+The pull request that changes a span sees `manifest_spans_match_sources` fail. The failure message prints the new hash. The author does one of two things in the same pull request and says which in the pull request text.
+
+- Behaviour unchanged: update the `sha256` and state why the model still matches.
+- Behaviour changed: update the Lean model and the proofs, update `formal/THEOREMS.txt` if statements changed, then update the `sha256`.
+
+A hash update without one of the two statements is a review failure.
 
 ## Toolchain
 

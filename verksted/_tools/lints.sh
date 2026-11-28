@@ -10,6 +10,7 @@ set -uo pipefail
 LINTS=(
   test_attributes rcsr_command_lint test_hygiene device_skip_lint no_python sanitizer_plan
   sanitizer_child_env stdin_write_lint conflict_markers no_banned_words lockbox_literal cpu_config_lint
+  formal_sync
 )
 
 tree=

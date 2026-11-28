@@ -69,13 +69,13 @@ verksted/_tools/test-summary.sh "$G/issue$N-<what>.log"        # passed, failed,
 ## Fast lint set (once per PR, on your head merged with the base tip)
 
 ```sh
-verksted/_tools/lints.sh --tree "$W"        # prints the 12 `--test` arguments of the crate; one home of the list
+verksted/_tools/lints.sh --tree "$W"        # prints the 13 `--test` arguments of the crate; one home of the list
 verksted/_tools/rc-run.sh test "$W" "$N" lints -- cargo test --release $(verksted/_tools/lints.sh --tree "$W")
 verksted/_tools/rc-run.sh cpu "$W" "$N" verksted -- bash -c 'cd "$1/verksted/_tools/verksted-check" && cargo test --release' _ "$W"
 verksted/_tools/links.sh --strict
 ```
 
-The 12 crate targets plus `cargo test --release` in `verksted/_tools/verksted-check/` (links, walk and tools guard tests) are the whole set. A new test file that spawns processes needs a line in `<crate>/tests/sanitizer.plan`.
+The 13 crate targets plus `cargo test --release` in `verksted/_tools/verksted-check/` (links, walk and tools guard tests) are the whole set. A new test file that spawns processes needs a line in `<crate>/tests/sanitizer.plan`.
 
 While the desktop streams video the scripts pin work to `PIN_CORES_BUSY`, the build slots drop to `BUILD_SLOTS_BUSY` and `RUST_TEST_THREADS=4`. Force the streaming restriction, clear it, and check it:
 
