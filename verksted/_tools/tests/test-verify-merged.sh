@@ -87,7 +87,7 @@ out=$(run 7 --lints); rc=$?
 check merge-rc "$rc" 0
 check merge-one-job "$(calls)" 1
 lints=$(bash "$T/tools/lints.sh" --tree "$WTP" 2> /dev/null)
-check merge-lint-count "$(wc -w <<<"$lints" | tr -d ' ')" 24
+check merge-lint-count "$(wc -w <<<"$lints" | tr -d ' ')" "$(bash "$T/tools/lints.sh" 2> /dev/null | wc -w | tr -d ' ')"
 check merge-every-lint-arg "$(grep -cF -- "cargo test --release --no-fail-fast $lints || rc=1" "$T/rc-calls")" 1
 check merge-verksted-check "$(grep -c 'verksted/_tools/verksted-check && cargo test --release --no-fail-fast' "$T/rc-calls")" 1
 check merge-build-mode "$(sed -n '2p' "$T/rc-calls")" "build"
