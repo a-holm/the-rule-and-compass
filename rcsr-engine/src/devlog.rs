@@ -913,6 +913,9 @@ pub struct RunEnd {
     pub prune_s: f64,
     /// #495: exact finalist refit seconds.
     pub fit_refit_s: Option<f64>,
+    /// #1438: busy seconds of the least and the most loaded finalist refit worker.
+    pub fit_refit_busy_min_s: Option<f64>,
+    pub fit_refit_busy_max_s: Option<f64>,
     /// #858: seconds in the CPU check of device `+inf` scores (inside eval) and
     /// the full f64 passes it ran.
     pub eval_check_s: Option<f64>,
@@ -943,7 +946,7 @@ pub fn run_end_json(r: &RunEnd) -> String {
          \"json\":{},\"peak_rss_bytes\":{},\"gpu_wall_s\":{},\"device_hours\":{},\
          \"device_seconds_incl_fit\":{},\"device_fraction_of_run\":{},\
          \"run_wall_s\":{},\"device_busy_s\":{},\"duty_run\":{},\"unaccounted_s\":{},\
-         \"fit_kernel_s\":{},\"fit_kernel_lm_s\":{},\"fit_kernel_polish_s\":{},\"fit_fallback_s\":{},\"fit_refit_s\":{},\"eval_check_s\":{},\"eval_check_full_passes\":{},\"fit_refits\":{},\"fit_calls\":{},\"fit_candidates\":{},\"fit_call_s_max\":{},\
+         \"fit_kernel_s\":{},\"fit_kernel_lm_s\":{},\"fit_kernel_polish_s\":{},\"fit_fallback_s\":{},\"fit_refit_s\":{},\"fit_refit_busy_min_s\":{},\"fit_refit_busy_max_s\":{},\"eval_check_s\":{},\"eval_check_full_passes\":{},\"fit_refits\":{},\"fit_calls\":{},\"fit_candidates\":{},\"fit_call_s_max\":{},\
          \"irls_reweighted\":{},\
          \"prune\":{{\"fits\":{},\"accepted\":{},\"seconds\":{}}},{}\
          \"events\":{},\"bytes\":{},\"dropped\":{},\"end\":{}}}",
@@ -981,6 +984,8 @@ pub fn run_end_json(r: &RunEnd) -> String {
         opt_num(r.fit_kernel_polish_s),
         opt_num(r.fit_fallback_s),
         opt_num(r.fit_refit_s),
+        opt_num(r.fit_refit_busy_min_s),
+        opt_num(r.fit_refit_busy_max_s),
         opt_num(r.eval_check_s),
         match r.eval_check_full_passes {
             Some(n) => n.to_string(),

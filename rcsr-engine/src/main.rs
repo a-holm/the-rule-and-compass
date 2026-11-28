@@ -2545,6 +2545,8 @@ impl DevSink {
             prune_accepted: outcome.prune.accepted,
             prune_s: outcome.prune.seconds,
             fit_refit_s: outcome.gpu.as_ref().map(|g| g.ledger.refit_s()),
+            fit_refit_busy_min_s: outcome.gpu.as_ref().map(|g| g.ledger.refit_busy_min_s()),
+            fit_refit_busy_max_s: outcome.gpu.as_ref().map(|g| g.ledger.refit_busy_max_s()),
             eval_check_s: outcome.gpu.as_ref().map(|g| g.ledger.eval_check().seconds()),
             eval_check_full_passes: outcome.gpu.as_ref().map(|g| g.ledger.eval_check().full_passes),
             fit_refits: outcome.gpu.as_ref().map(|g| g.fit_refits),
